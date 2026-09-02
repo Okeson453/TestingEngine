@@ -30,6 +30,10 @@ async function loadRecentRoundsForPrediction(
   sql: Sql,
   limit = MAX_HISTORY,
 ): Promise<HistoricalRound[]> {
+  // Temporal-integrity guard: only include rounds whose outcome is fully known
+  // at the moment we generate the prediction (crashed_at <= now). This is the
+  // existing MAX_HISTORY cap (model input budget), plus an explicit cutoff
+  // that defends against any future-dated rows from the upstream ingest path.
   const rows = await sql<{
     game_id: string;
     multiplier: string | number;
@@ -38,6 +42,7 @@ async function loadRecentRoundsForPrediction(
   }>`
     select game_id, multiplier, began_at, crashed_at
     from crash_rounds
+    where crashed_at <= now()
     order by crashed_at desc, game_id desc
     limit ${limit}
   `;
@@ -68,6 +73,10 @@ export async function generateAndQueuePrediction(): Promise<PredictionSignal | n
   const timestamp = new Date().toISOString();
   const signal = engine.predict({
     priorRounds: rounds,
+    // The target round is the next BC.Game round after `rounds[0]`. We do NOT
+    // know its game_id until it lands, so target_round_id is "next" — but the
+    // model input is strictly history that already resolved, so the target
+    // round's own multiplier is never fed in.
     targetRoundId: "next",
     timestamp,
     target: DEFAULT_TARGET,
@@ -84,67 +93,157 @@ export async function generateAndQueuePrediction(): Promise<PredictionSignal | n
       ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
       ${signal.modelVersion}, ${timestamp}
     )
+    on conflict (prediction_id) do nothing
   `;
   return signal;
 }
 
+/**
+ * Outcome of one validation pass: how many predictions were resolved against
+ * how many newly-inserted rounds in this cycle, plus the durable game_id
+ * mapping the worker wrote (one row per (prediction_id, game_id) pair).
+ */
+export interface ValidationOutcome {
+  resolved: number;
+  insertedRounds: number;
+  pairs: Array<{ predictionId: string; gameId: string; result: "WIN" | "LOSS" }>;
+}
+
+/**
+ * Pair newly-inserted rounds with the oldest unmatched pending predictions,
+ * writing WIN/LOSS deterministically. Enforces the durable 1:1:1 invariant:
+ *
+ *   exactly 1 prediction  ↔  exactly 1 target game_id  ↔  exactly 1 validation
+ *
+ *   * Each newly-inserted round is validated at most once
+ *     (UNIQUE(prediction_validations.game_id) — see 0007).
+ *   * Each pending prediction is validated at most once
+ *     (UNIQUE(prediction_validations.prediction_id) — already in 0005,
+ *      plus `pending_predictions.target_game_id` is set as the durable anchor).
+ *   * The pairing is oldest-pending ↔ oldest-new-round, so cycles that
+ *     discover N rounds in one poll resolve N predictions (capped by the
+ *     number of unmatched pendings).  Any leftover rounds simply wait for
+ *     the next cycle / next prediction generation.
+ *   * The whole pass is idempotent: a re-run after a worker crash leaves
+ *     already-resolved rows untouched (ON CONFLICT DO NOTHING).
+ */
 export async function validateAgainstNewRounds(
   insertedRounds: CrashRound[],
-): Promise<number> {
-  if (insertedRounds.length === 0) return 0;
+): Promise<ValidationOutcome> {
+  const outcome: ValidationOutcome = { resolved: 0, insertedRounds: 0, pairs: [] };
+  if (insertedRounds.length === 0) return outcome;
   const sql = await getSql();
 
-  const targetRound = insertedRounds[0];
+  // Newest first → sort so we can walk oldest-newest deterministically.
+  const sortedNew = [...insertedRounds].sort((a, b) => {
+    if (a.crashedAt === b.crashedAt) return a.gameId.localeCompare(b.gameId);
+    return a.crashedAt < b.crashedAt ? -1 : 1;
+  });
 
-  const pending = await sql<{
-    prediction_id: string;
-    target_multiplier: number;
-    probability: number;
-    confidence: number;
-    regime_name: string | null;
-    regime_confidence: number | null;
-    reasoning: string[];
-    feature_summary: unknown;
-    model_version: string;
-    requested_at: string;
-  }>`
-    select prediction_id, target_multiplier, probability, confidence,
-           regime_name, regime_confidence, reasoning, feature_summary,
-           model_version, requested_at
-    from pending_predictions
-    where matched = false
-    order by requested_at asc
-    limit 1
-  `;
+  for (const targetRound of sortedNew) {
+    outcome.insertedRounds += 1;
 
-  if (pending.length === 0) return 0;
-  const p = pending[0];
-  const actualMultiplier = targetRound.multiplier;
-  const result = actualMultiplier >= p.target_multiplier ? "WIN" : "LOSS";
+    // If this round was already validated (worker crash between validation
+    // insert and pending-row update), skip — the UNIQUE(game_id) on
+    // prediction_validations guarantees a duplicate insert would no-op.
+    const existing = await sql<{ prediction_id: string; result: string }>`
+      select prediction_id, result
+      from prediction_validations
+      where game_id = ${targetRound.gameId}
+      limit 1
+    `;
+    if (existing.length > 0) {
+      outcome.resolved += 1;
+      outcome.pairs.push({
+        predictionId: existing[0]!.prediction_id,
+        gameId: targetRound.gameId,
+        result: existing[0]!.result as "WIN" | "LOSS",
+      });
+      continue;
+    }
 
-  await sql`
-    insert into prediction_validations (
-      prediction_id, game_id, target_multiplier, predicted_probability,
-      predicted_confidence, actual_multiplier, result, model_version,
-      regime_name, regime_confidence, reasoning, feature_summary,
-      requested_at, resolved_at
-    ) values (
-      ${p.prediction_id}, ${targetRound.gameId}, ${p.target_multiplier},
-      ${p.probability}, ${p.confidence}, ${actualMultiplier}, ${result},
-      ${p.model_version}, ${p.regime_name}, ${p.regime_confidence},
-      ${p.reasoning}, ${JSON.stringify(p.feature_summary)},
-      ${p.requested_at}, ${new Date().toISOString()}
-    )
-    on conflict (prediction_id) do nothing
-  `;
+    // Oldest unmatched pending prediction. The row may already have a
+    // target_game_id from a prior partial match — if so, the prediction was
+    // already paired, skip to avoid double-matching.
+    const pending = await sql<{
+      prediction_id: string;
+      target_multiplier: number;
+      probability: number;
+      confidence: number;
+      regime_name: string | null;
+      regime_confidence: number | null;
+      reasoning: string[];
+      feature_summary: unknown;
+      model_version: string;
+      requested_at: string;
+      target_game_id: string | null;
+    }>`
+      select prediction_id, target_multiplier, probability, confidence,
+             regime_name, regime_confidence, reasoning, feature_summary,
+             model_version, requested_at, target_game_id
+      from pending_predictions
+      where matched = false
+      order by requested_at asc
+      limit 1
+    `;
+    if (pending.length === 0) break; // no more pendings to resolve; the rest wait
+    const p = pending[0]!;
+    if (p.target_game_id && p.target_game_id !== targetRound.gameId) {
+      // Pending row was already paired to a different round. Treat as no
+      // longer available; the duplicate is unreachable here in practice (the
+      // validation row already exists) — defensive guard.
+      continue;
+    }
 
-  await sql`
-    update pending_predictions
-    set matched = true, matched_game_id = ${targetRound.gameId}, matched_at = ${new Date().toISOString()}
-    where prediction_id = ${p.prediction_id}
-  `;
+    const actualMultiplier = targetRound.multiplier;
+    const result = actualMultiplier >= p.target_multiplier ? "WIN" : "LOSS";
+    const now = new Date().toISOString();
 
-  return 1;
+    // Durable anchor: stamp the pending row with its target_game_id BEFORE
+    // the validation insert.  A crash between the two leaves the system in
+    // a recoverable state (next run re-resolves the same round against the
+    // same pending row thanks to the UNIQUE(game_id) index).
+    await sql`
+      update pending_predictions
+         set target_game_id = ${targetRound.gameId}
+       where prediction_id = ${p.prediction_id}
+         and matched = false
+         and (target_game_id is null or target_game_id = ${targetRound.gameId})
+    `;
+
+    await sql`
+      insert into prediction_validations (
+        prediction_id, game_id, target_multiplier, predicted_probability,
+        predicted_confidence, actual_multiplier, result, model_version,
+        regime_name, regime_confidence, reasoning, feature_summary,
+        requested_at, resolved_at
+      ) values (
+        ${p.prediction_id}, ${targetRound.gameId}, ${p.target_multiplier},
+        ${p.probability}, ${p.confidence}, ${actualMultiplier}, ${result},
+        ${p.model_version}, ${p.regime_name}, ${p.regime_confidence},
+        ${p.reasoning}, ${JSON.stringify(p.feature_summary)},
+        ${p.requested_at}, ${now}
+      )
+      on conflict on constraint prediction_validations_prediction_id_key do nothing
+    `;
+
+    await sql`
+      update pending_predictions
+         set matched = true,
+             matched_game_id = ${targetRound.gameId},
+             matched_at = ${now}
+       where prediction_id = ${p.prediction_id}
+    `;
+
+    outcome.resolved += 1;
+    outcome.pairs.push({
+      predictionId: p.prediction_id,
+      gameId: targetRound.gameId,
+      result,
+    });
+  }
+
+  return outcome;
 }
 
 export interface DailyTarget {

@@ -66,6 +66,7 @@ export interface WorkerCycleResult {
   resolved: number;
   generated: string | null;
   error: string | null;
+  ok: boolean; // true iff the cycle completed end-to-end without any error
 }
 
 /* ── Distributed lock ──────────────────────────────────────────────────── */
@@ -155,15 +156,34 @@ async function readStateMap(sql: Sql): Promise<Map<string, string>> {
 
 /**
  * One full server-side cycle, independent of any dashboard request:
- *   poll BC.Game → ingest new rounds → validate a pending prediction → generate
- *   the next prediction (respecting the daily target). Idempotent and DB-gated:
- *   safe to re-run after a crash. The caller owns the distributed lock.
+ *   poll BC.Game → ingest new rounds → validate any matching pending
+ *   predictions (1:1) → generate the next prediction (if no pending and
+ *   daily target not met). Idempotent and DB-gated: safe to re-run after a
+ *   crash. The caller owns the distributed lock.
+ *
+ * Error-state contract: a failure in ANY step (fetch, insert, validate,
+ * generate) MUST leave `last_error` set and `last_sync_ok = 0`. A successful
+ * cycle clears `last_error` to the empty string. This prevents a partial
+ * cycle (e.g. fetch failed, then insert succeeded on an empty list) from
+ * being reported as "ok" — and prevents a transient DB blip from being
+ * hidden by a later successful step.
  */
 export async function runWorkerCycle(): Promise<WorkerCycleResult> {
   const sql = await getSql();
   const ownerId = randomUUID();
   const acquired = await acquireLock(sql, ownerId);
-  if (!acquired) return { ran: false, fetched: 0, inserted: 0, onlinePlayers: null, resolved: 0, generated: null, error: null };
+  if (!acquired) {
+    return {
+      ran: false,
+      fetched: 0,
+      inserted: 0,
+      onlinePlayers: null,
+      resolved: 0,
+      generated: null,
+      error: null,
+      ok: true, // a no-op cycle is not an error
+    };
+  }
   try {
     return await runCycleWork(sql);
   } finally {
@@ -180,56 +200,99 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     resolved: 0,
     generated: null,
     error: null,
+    ok: true, // flipped to false on the first error observed
   };
 
   let rounds: FetchedRound[] = [];
   let insertedRounds: CrashRound[] = [];
   let onlinePlayers: number | null = null;
+  let firstError: string | null = null;
+  const fail = (msg: string): void => {
+    if (firstError == null) firstError = msg;
+    result.error = msg;
+    result.ok = false;
+  };
 
+  // 1. BC.Game history polling (server-side, no browser/dashboard).
   try {
-    // 1. BC.Game history polling (server-side, no browser/dashboard).
     [rounds, onlinePlayers] = await Promise.all([
-      fetchCrashHistory(FETCH_PAGES).catch((e: unknown) => {
-        result.error = (e as Error)?.message ?? String(e);
-        return [] as FetchedRound[];
-      }),
+      fetchCrashHistory(FETCH_PAGES),
       fetchOnlinePlayers().catch(() => null as number | null),
     ]);
     result.fetched = rounds.length;
     result.onlinePlayers = onlinePlayers;
-
-    // 2. New-round detection + permanent persistence (idempotent on game_id).
-    const ins = await insertNewRounds(rounds);
-    result.inserted = ins.inserted;
-    insertedRounds = ins.rounds;
-
-    // 3. WIN/LOSS validation: resolve the oldest pending prediction against the
-    //    newest newly-ingested round (one round → one prediction → one record).
-    if (insertedRounds.length > 0) {
-      result.resolved = await validateAgainstNewRounds(insertedRounds);
-    }
-
-    // 4. Daily entry counting: never exceed the configured 20–500 target.
-    const [today, pending] = await Promise.all([getTodayStats(), getPendingStatus()]);
-    if (today.remaining > 0 && !pending.hasPending) {
-      // 5. Generate the next prediction; it stays pending until a new round
-      //    resolves it, preserving strict one-round-per-prediction cadence.
-      const signal = await generateAndQueuePrediction().catch((_e: unknown) => null);
-      if (signal) result.generated = signal.predictionId;
-    }
-
-    result.error = null;
   } catch (e: unknown) {
-    result.error = (e as Error)?.message ?? String(e);
-    logger.error({ component: "PredictionWorker", error: result.error }, "cycle error");
-  } finally {
-    // 6. Persist heartbeat + feed summary so the dashboard can render live status
-    //    without driving any work itself.
-    const nowIso = new Date().toISOString();
-    const latest = insertedRounds[0] ?? rounds[0];
+    fail((e as Error)?.message ?? String(e));
+    // Keep going so we still persist a heartbeat + last_error — the worker
+    // must never silently swallow a BC.Game failure.
+    rounds = [];
+    onlinePlayers = null;
+    result.fetched = 0;
+  }
+
+  // 2. New-round detection + permanent persistence (idempotent on game_id).
+  if (firstError == null) {
+    try {
+      const ins = await insertNewRounds(rounds);
+      result.inserted = ins.inserted;
+      insertedRounds = ins.rounds;
+    } catch (e: unknown) {
+      fail((e as Error)?.message ?? String(e));
+      insertedRounds = [];
+      result.inserted = 0;
+    }
+  } else {
+    // Skip — we don't want to write partial state when the fetch already failed.
+    insertedRounds = [];
+    result.inserted = 0;
+  }
+
+  // 3. WIN/LOSS validation: pair oldest-pending ↔ oldest-new-round, durable 1:1.
+  if (insertedRounds.length > 0) {
+    try {
+      const outcome = await validateAgainstNewRounds(insertedRounds);
+      result.resolved = outcome.resolved;
+    } catch (e: unknown) {
+      fail((e as Error)?.message ?? String(e));
+    }
+  }
+
+  // 4. Daily entry counting: only generate a new prediction if the daily
+  //    target isn't met AND there's no pending AND no unmatched-new-round
+  //    waiting to be resolved (otherwise the next cycle will handle it).
+  //    The daily target is an OPERATING target only — prediction_validations
+  //    history is permanent and never truncated.
+  if (firstError == null) {
+    try {
+      const [today, pending] = await Promise.all([getTodayStats(), getPendingStatus()]);
+      if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0) {
+        const signal = await generateAndQueuePrediction().catch((_e: unknown) => null);
+        if (signal) result.generated = signal.predictionId;
+      }
+    } catch (e: unknown) {
+      fail((e as Error)?.message ?? String(e));
+    }
+  }
+
+  if (firstError) {
+    logger.error(
+      { component: "PredictionWorker", error: firstError },
+      "cycle error",
+    );
+  }
+
+  // 6. Persist heartbeat + feed summary. State writes are intentionally
+  //    best-effort: a state-write failure MUST NOT mask the real error.
+  const nowIso = new Date().toISOString();
+  const latest = insertedRounds[0] ?? rounds[0];
+  try {
     await setState(sql, STATE.LAST_SYNC_AT, nowIso);
-    await setState(sql, STATE.LAST_SYNC_OK, result.error === null ? "1" : "0");
-    await setState(sql, STATE.LAST_ERROR, result.error ?? "");
+    await setState(sql, STATE.LAST_SYNC_OK, result.ok ? "1" : "0");
+    // CRITICAL: do NOT clear a previous error to "" on a successful cycle
+    // until we know the cycle genuinely finished end-to-end. Clearing the
+    // error on partial success used to mask failures (e.g. fetch failed
+    // but a later step succeeded on an empty list).
+    await setState(sql, STATE.LAST_ERROR, result.ok ? "" : result.error ?? firstError ?? "");
     await setStateNum(sql, STATE.LAST_FETCH_COUNT, result.fetched);
     await setStateNum(sql, STATE.LAST_INSERTED_COUNT, result.inserted);
     await setState(
@@ -239,6 +302,11 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     );
     if (latest) await setState(sql, STATE.LAST_SEEN_GAME_ID, latest.gameId);
     await incrementCycles(sql);
+  } catch (e: unknown) {
+    logger.error(
+      { component: "PredictionWorker", error: e },
+      "state-write failed (cycle result still valid)",
+    );
   }
 
   return result;

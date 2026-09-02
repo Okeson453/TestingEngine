@@ -1,0 +1,35 @@
+# Railway service definition for the persistent prediction worker.
+#
+# The worker is intentionally a SEPARATE long-lived process from the Vercel
+# dashboard deployment — it owns the BC.Game polling, prediction generation,
+# and WIN/LOSS validation lifecycle 24/7, regardless of whether anyone is
+# viewing the dashboard.
+#
+# Continuous ~10s polling cannot be implemented reliably on Vercel Hobby
+# Cron (which is daily / 1-minute, not sub-minute, and which does not
+# preserve warm state across invocations).  Railway's persistent background
+# worker model is the correct fit.
+#
+# Deploy on Railway:
+#   1. Create a new Railway project from this repository.
+#   2. Add a PostgreSQL database (or use Neon / any external Postgres URL).
+#   3. Set environment variables — see README.md "Production environment".
+#   4. The service auto-detects this file; Start Command is `npm run worker`.
+#   5. The build runs `npm install` (see [build]) so the workspace's
+#      `@electric-sql/pglite`, `pg`, and TypeScript runtime are available
+#      to the worker.
+#
+# The Vercel deployment of this same repository runs only the dashboard
+# (Vite SSR + Nitro); it is read-only against `worker_state` and never
+# touches BC.Game or prediction lifecycle.
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "npm install"
+
+[deploy]
+startCommand = "npm run worker"
+healthcheckPath = ""
+healthcheckTimeout = 0
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

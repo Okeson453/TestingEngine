@@ -68,12 +68,16 @@ export async function insertNewRounds(
     if (rows.length > 0) {
       inserted += 1;
       affectedDates.add(round.crashedAt.toISOString().slice(0, 10));
+      // FIX: beganAt is the round's start time, NOT the crash time. Previously
+      // this used crashedAt as beganAt, which leaked the round's outcome into
+      // history rows and made temporal-integrity checks meaningless.
+      const beganIso = round.beganAt ? round.beganAt.toISOString() : null;
       insertedRounds.push({
         gameId: round.gameId,
         multiplier: round.multiplier,
         hash: round.hash,
         salt: round.salt,
-        beganAt: round.beganAt ? round.crashedAt.toISOString() : null,
+        beganAt: beganIso,
         crashedAt: round.crashedAt.toISOString(),
       });
     }
