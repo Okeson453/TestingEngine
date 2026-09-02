@@ -1,3 +1,5 @@
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { pendingMigrations } from "../../scripts/migration-plan.mjs";
 
 /** Which database backend is active. */
@@ -9,6 +11,23 @@ const rawDatabaseUrl =
   typeof process !== "undefined" ? process.env.DATABASE_URL : undefined;
 const databaseUrl =
   rawDatabaseUrl && rawDatabaseUrl.trim() ? rawDatabaseUrl : undefined;
+
+/**
+ * On-disk directory the embedded PGLite instance persists to.
+ *
+ * PGLite is single-process by design; persisting to a directory is what lets a
+ * server restart (or a stop/restart of the background worker) recover pending
+ * predictions and ingested rounds instead of replaying the sequence from scratch.
+ * Override with `PG_DATA_PATH` (production/Neon deployments run a separate
+ * worker process against a remote DB and never touch this path).
+ *
+ * Resolved against `process.cwd()` (the directory the server process was
+ * launched from) — not `import.meta.url`, which Vite SSR virtualises and is
+ * therefore unreliable for filesystem placement.
+ */
+export const pgliteDataPath =
+  (typeof process !== "undefined" && process.env.PG_DATA_PATH) ||
+  join(process.cwd(), "data", "crashwave");
 
 /**
  * Active backend: real **Neon** when `DATABASE_URL` is set (deployed / configured
@@ -107,11 +126,16 @@ function createNeonSql(): Promise<Sql> {
 
 async function createPgliteSql(): Promise<Sql> {
   // Embedded Postgres, imported on demand so it never loads on the Neon path.
-  // One in-memory instance per process, shared across HMR module instances, so
-  // data survives source edits (it resets on dev-server restart).
+  // One *persistent* instance per process, shared across HMR module instances.
+  // `dataDir` (pgliteDataPath) makes the DB survive a dev-server / worker
+  // restart so pending predictions and ingested rounds recover instead of
+  // replaying the sequence from scratch. HMR data survives source edits; a
+  // full process restart reloads from disk.
   globalRef.__pgliteInstance__ ??= (async () => {
     const { PGlite } = await import("@electric-sql/pglite");
+    mkdirSync(pgliteDataPath, { recursive: true });
     const pg = new PGlite({
+      dataDir: pgliteDataPath,
       parsers: {
         [OID_INT8]: Number,
         [OID_DATE]: identity,

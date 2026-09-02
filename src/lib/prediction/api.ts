@@ -10,6 +10,7 @@ import {
   getPendingStatus,
   type ValidationHistoryOpts,
 } from "./service.ts";
+import { getWorkerStatus, type WorkerStatus } from "./worker";
 
 export const predictionGetDailyTarget = createServerFn({ method: "GET" }).handler(getDailyTarget);
 
@@ -55,3 +56,6 @@ export const predictionGetHistory = createServerFn({ method: "POST" })
   );
 
 export const predictionGetPending = createServerFn({ method: "GET" }).handler(getPendingStatus);
+
+export const predictionGetWorkerStatus = createServerFn({ method: "GET" }).handler(getWorkerStatus);
+export type { WorkerStatus } from "./worker";

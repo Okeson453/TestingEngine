@@ -51,6 +51,33 @@ function pgliteBootstrapPlugin(): Plugin {
   };
 }
 
+function predictionWorkerPlugin(): Plugin {
+  /**
+   * Start the autonomous prediction/validation background worker at dev-server
+   * boot — a real server-side process, NOT a browser/timer/refreshDashboard
+   * driver. It survives the dashboard closing because it lives in the dev
+   * server process (the long-lived Node process startup.sh keeps alive).
+   *
+   * `apply: "serve"` keeps it out of production builds; production deployments
+   * with a remote DB (DATABASE_URL / Neon) run the worker as a separate long-lived
+   * process via `npm run worker` instead.
+   */
+  return {
+    name: "app-builder:prediction-worker",
+    apply: "serve",
+    async configureServer(server) {
+      try {
+        const mod = await server.ssrLoadModule("/src/lib/prediction/worker.ts");
+        if (typeof mod.startWorker === "function") {
+          mod.startWorker();
+        }
+      } catch (err) {
+        console.error("[app-builder] prediction worker failed to start:", err);
+      }
+    },
+  };
+}
+
 /**
  * Live-preview OAuth popup — handled HERE so the agent never has to create a
  * `/auth/popup` route (and cannot break it by scaffolding a React page that
@@ -159,6 +186,9 @@ export default defineConfig(({ command, isPreview }) => ({
   resolve: { tsconfigPaths: true },
   plugins: [
     pgliteBootstrapPlugin(),
+    // Start the background prediction worker right after the DB is bootstrapped
+    // so migrations (incl. worker_locks/worker_state) exist before it runs.
+    predictionWorkerPlugin(),
     // Before tanstackStart so /auth/popup never falls through to the SPA.
     authPopupPlugin(),
     // Dev-only /__app-env, read by scripts/check-auth-invariant.mjs.

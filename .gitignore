@@ -3,3 +3,6 @@ node_modules/
 .github_repo
 .env
 .env.*
+
+# PGLite embedded DB data directory (persisted for worker restart recovery).
+data/
