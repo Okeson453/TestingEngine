@@ -7,20 +7,22 @@ import {
   predictionGetStreaks,
   predictionGetRecent,
   predictionGetPending,
+  predictionGetWorkerStatus,
 } from "@/lib/prediction/api";
 
 export const Route = createFileRoute("/predictions")({
   component: PredictionsPage,
   loader: async () => {
-    const [dailyTarget, today, lifetime, streaks, recent, pending] = await Promise.all([
+    const [dailyTarget, today, lifetime, streaks, recent, pending, worker] = await Promise.all([
       predictionGetDailyTarget(),
       predictionGetTodayStats(),
       predictionGetLifetimeStats(),
       predictionGetStreaks(),
       predictionGetRecent(),
       predictionGetPending(),
+      predictionGetWorkerStatus(),
     ]);
-    return { dailyTarget, today, lifetime, streaks, recent, pending };
+    return { dailyTarget, today, lifetime, streaks, recent, pending, worker };
   },
   head: () => ({
     meta: [{ title: "Prediction Validation — CrashWave" }],

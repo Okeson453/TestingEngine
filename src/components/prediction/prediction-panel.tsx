@@ -14,6 +14,7 @@ import {
   ChevronRight,
   BarChart3,
   Zap,
+  Cpu,
   History,
   ArrowLeft,
 } from "lucide-react";
@@ -27,7 +28,9 @@ import {
   predictionGetRecent,
   predictionGetHistory,
   predictionGetPending,
+  predictionGetWorkerStatus,
 } from "@/lib/prediction/api";
+import type { WorkerStatus } from "@/lib/prediction/api";
 import type {
   DailyTarget,
   TodayStats,
@@ -42,6 +45,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { formatClock, formatRelative } from "../dashboard/format";
 
 function formatPct(n: number): string {
   return `${(n * 100).toFixed(1)}%`;
@@ -86,6 +90,7 @@ interface PredictionPanelProps {
     streaks: StreakSnapshot;
     recent: ValidationRecord[];
     pending: PendingStatus;
+    worker: WorkerStatus;
   };
 }
 
@@ -159,8 +164,15 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
   const today = todayQ.data ?? initial.today;
   const lifetime = lifetimeQ.data ?? initial.lifetime;
   const streaks = streaksQ.data ?? initial.streaks;
-  const recent = recentQ.data ?? initial.recent;
+   const recent = recentQ.data ?? initial.recent;
   const pending = pendingQ.data ?? initial.pending;
+  const workerQ = useQuery({
+    queryKey: ["prediction-worker"],
+    queryFn: () => predictionGetWorkerStatus(),
+    initialData: initial.worker,
+    refetchInterval: 4_000,
+  });
+  const worker = workerQ.data ?? initial.worker;
   const history = historyQ.data;
 
   const progressPct =
@@ -257,6 +269,63 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
           />
           <StatTile label="Win Rate" value={formatPct(lifetime.winRate)} />
         </section>
+
+        {/* Worker health */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Cpu className="size-4 text-accent" />
+              <div>
+                <CardTitle>Worker Health</CardTitle>
+                <CardDescription>
+                  Server-side background engine (independent of this dashboard)
+                </CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <div className="flex flex-col gap-3 p-6 pt-0">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    "inline-block size-2 rounded-full",
+                    worker.running ? "bg-high" : "bg-low",
+                  )}
+                />
+                <span className="font-medium">
+                  {worker.running ? "Running" : "Offline"}
+                </span>
+              </div>
+              <Badge variant={worker.running ? "live" : "warn"}>
+                {worker.lastSyncOk ? "Last sync OK" : "Last sync failed"}
+              </Badge>
+            </div>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <StatTile
+                label="Cycles"
+                value={String(worker.cyclesTotal)}
+                hint={worker.running ? "poll cycles run" : "since start"}
+              />
+              <StatTile
+                label="Last Sync"
+                value={worker.lastSyncAt ? formatClock(worker.lastSyncAt) : "—"}
+              hint={worker.lastSyncAt ? formatRelative(worker.lastSyncAt) : undefined}
+              />
+              <StatTile
+                label="Today Resolved"
+                value={`${worker.resolvedToday}/${worker.dailyTarget}`}
+              />
+              <StatTile
+                label="Pending"
+                value={String(worker.pendingCount)}
+                hint={worker.remainingToday === 0 ? "target reached today" : `${worker.remainingToday} remaining`}
+              />
+            </div>
+            {worker.lastError ? (
+              <p className="text-xs text-low">Error: {worker.lastError}</p>
+            ) : null}
+          </div>
+        </Card>
 
         <section className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <StatTile label="Today" value={`${today.wins}/${today.losses}`} />

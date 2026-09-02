@@ -1,11 +1,14 @@
 import { createServerFn } from "@tanstack/react-start";
 import { getSql } from "@/lib/db";
-import { fetchCrashHistory, fetchCrashHistoryDeep, fetchOnlinePlayers, type FetchedRound } from "./fetch-bc";
+import { fetchCrashHistory, fetchCrashHistoryDeep } from "./fetch-bc";
 import { computeRanges, computeStats, computeStreaks } from "./stats";
 import {
-  generateAndQueuePrediction,
-  validateAgainstNewRounds,
-} from "@/lib/prediction/service";
+  loadRounds,
+  insertNewRounds,
+  recomputeDaily,
+  toIso,
+  type RoundRow,
+} from "./ingest";
 import {
   HISTORY_LIMIT,
   STATS_LIMIT,
@@ -13,111 +16,8 @@ import {
   type CrashDaily,
   type DailyPayload,
   type DashboardPayload,
+  type FeedStatus,
 } from "./types";
-
-type RoundRow = {
-  game_id: string;
-  multiplier: string | number;
-  hash: string | null;
-  salt: string | null;
-  began_at: string | Date | null;
-  crashed_at: string | Date;
-};
-
-function toIso(value: string | Date | null | undefined): string | null {
-  if (!value) return null;
-  if (value instanceof Date) return value.toISOString();
-  const asDate = new Date(value);
-  if (!Number.isNaN(asDate.getTime())) return asDate.toISOString();
-  return String(value);
-}
-
-function mapRow(row: RoundRow): CrashRound | null {
-  const multiplier = Number(row.multiplier);
-  if (!Number.isFinite(multiplier)) return null;
-  const crashedAt = toIso(row.crashed_at);
-  if (!crashedAt) return null;
-  return {
-    gameId: row.game_id,
-    multiplier,
-    hash: row.hash,
-    salt: row.salt,
-    beganAt: toIso(row.began_at),
-    crashedAt,
-  };
-}
-
-async function insertNewRounds(rounds: FetchedRound[]): Promise<{ inserted: number; rounds: CrashRound[] }> {
-  if (rounds.length === 0) return { inserted: 0, rounds: [] };
-  const sql = await getSql();
-  let inserted = 0;
-  const affectedDates = new Set<string>();
-  const insertedRounds: CrashRound[] = [];
-
-  for (const round of rounds) {
-    const rows = await sql<{ game_id: string }>`
-      insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
-      values (
-        ${round.gameId},
-        ${round.multiplier},
-        ${round.hash},
-        ${round.salt},
-        ${round.beganAt ? round.beganAt.toISOString() : null},
-        ${round.crashedAt.toISOString()}
-      )
-      on conflict (game_id) do nothing
-      returning game_id
-    `;
-    if (rows.length > 0) {
-      inserted += 1;
-      affectedDates.add(round.crashedAt.toISOString().slice(0, 10));
-      insertedRounds.push({
-        gameId: round.gameId,
-        multiplier: round.multiplier,
-        hash: round.hash,
-        salt: round.salt,
-        beganAt: round.beganAt ? round.beganAt.toISOString() : null,
-        crashedAt: round.crashedAt.toISOString(),
-      });
-    }
-  }
-
-  if (affectedDates.size > 0) {
-    await recomputeDaily(Array.from(affectedDates));
-  }
-
-  return { inserted, rounds: insertedRounds };
-}
-
-async function loadRounds(limit: number): Promise<CrashRound[]> {
-  const sql = await getSql();
-  const rows = await sql<RoundRow>`
-    select game_id, multiplier, hash, salt, began_at, crashed_at
-    from crash_rounds
-    order by crashed_at desc, game_id desc
-    limit ${limit}
-  `;
-  return rows.map(mapRow).filter((row): row is CrashRound => row !== null);
-}
-
-function buildPayload(
-  all: CrashRound[],
-  feed: DashboardPayload["feed"],
-): DashboardPayload {
-  const rounds = all.slice(0, HISTORY_LIMIT);
-  const chart = [...rounds].slice(0, 60).reverse();
-  return {
-    latest: rounds[0] ?? null,
-    rounds,
-    chart,
-    stats: computeStats(all),
-    ranges: computeRanges(all),
-    streaks: computeStreaks(rounds),
-    feed,
-  };
-}
-
-/* ── Daily aggregation ─────────────────────────────────────────────────── */
 
 type DailyRow = {
   date: string;
@@ -148,98 +48,66 @@ function mapDailyRow(row: DailyRow): CrashDaily {
   };
 }
 
-/** Build a [start, end) timestamp range for a calendar date (UTC). */
-function dateRangeUtc(dateStr: string): { start: string; end: string } {
-  const start = new Date(`${dateStr}T00:00:00.000Z`);
-  const end = new Date(start);
-  end.setUTCDate(end.getUTCDate() + 1);
-  return { start: start.toISOString(), end: end.toISOString() };
+function buildPayload(
+  all: CrashRound[],
+  feed: DashboardPayload["feed"],
+): DashboardPayload {
+  const rounds = all.slice(0, HISTORY_LIMIT);
+  const chart = [...rounds].slice(0, 60).reverse();
+  return {
+    latest: rounds[0] ?? null,
+    rounds,
+    chart,
+    stats: computeStats(all),
+    ranges: computeRanges(all),
+    streaks: computeStreaks(rounds),
+    feed,
+  };
 }
 
 /**
- * Recompute crash_daily for the given YYYY-MM-DD dates.
- * Uses an upsert so existing rows are refreshed in-place.
- * Query uses a timestamp range so the B-tree index on crashed_at is usable.
+ * Read the feed status written by the autonomous background worker into
+ * `worker_state`. The dashboard is a pure read: it does NOT poll BC.Game, does
+ * NOT generate predictions and does NOT validate — the worker owns all of that
+ * server-side, independently of any dashboard being open.
  */
-async function recomputeDaily(dates: string[]): Promise<void> {
-  if (dates.length === 0) return;
-  const sql = await getSql();
-
-  for (const date of dates) {
-    const { start, end } = dateRangeUtc(date);
-    await sql`
-      insert into crash_daily (
-        date, total_rounds, avg_multiplier, median_multiplier,
-        highest_multiplier, lowest_multiplier,
-        low_count, high_count, moon_count, sum_multipliers, updated_at
-      )
-      select
-        ${date}::date as date,
-        count(*)::int as total_rounds,
-        avg(multiplier)::numeric(12,4) as avg_multiplier,
-        percentile_cont(0.5) within group (order by multiplier)::numeric(12,4) as median_multiplier,
-        max(multiplier)::numeric(12,4) as highest_multiplier,
-        min(multiplier)::numeric(12,4) as lowest_multiplier,
-        count(*) filter (where multiplier < 2)::int as low_count,
-        count(*) filter (where multiplier >= 2 and multiplier < 10)::int as high_count,
-        count(*) filter (where multiplier >= 10)::int as moon_count,
-        sum(multiplier)::numeric(16,4) as sum_multipliers,
-        now() as updated_at
-      from crash_rounds
-      where crashed_at >= ${start}::timestamptz
-        and crashed_at < ${end}::timestamptz
-      on conflict (date) do update set
-        total_rounds = excluded.total_rounds,
-        avg_multiplier = excluded.avg_multiplier,
-        median_multiplier = excluded.median_multiplier,
-        highest_multiplier = excluded.highest_multiplier,
-        lowest_multiplier = excluded.lowest_multiplier,
-        low_count = excluded.low_count,
-        high_count = excluded.high_count,
-        moon_count = excluded.moon_count,
-        sum_multipliers = excluded.sum_multipliers,
-        updated_at = excluded.updated_at
-    `;
-  }
+async function readWorkerFeed(sql: Awaited<ReturnType<typeof getSql>>): Promise<FeedStatus> {
+  const rows = await sql<{ key: string; value: string | null }>`
+    select key, value
+    from worker_state
+    where key in (
+      'last_sync_at', 'last_sync_ok', 'last_error', 'last_fetch_count',
+      'last_inserted_count', 'last_online_players'
+    )
+  `;
+  const m = new Map(rows.map((r) => [r.key, r.value]));
+  const ok = m.get("last_sync_ok") === "1";
+  const lastSyncAt = m.get("last_sync_at") ?? "";
+  const fetched = Number(m.get("last_fetch_count") ?? 0) || 0;
+  const inserted = Number(m.get("last_inserted_count") ?? 0) || 0;
+  const rawPlayers = m.get("last_online_players");
+  const onlinePlayers = rawPlayers != null && rawPlayers !== "" ? Number(rawPlayers) : null;
+  return {
+    ok,
+    lastSyncAt,
+    fetched,
+    inserted,
+    error: m.get("last_error") ?? null,
+    onlinePlayers,
+  };
 }
 
+/**
+ * Refresh the dashboard view. READ ONLY: returns the currently persisted state
+ * (rounds + worker sync feed). No BC.Game polling, no prediction generation, no
+ * validation — those run in the background worker and are reflected here.
+ */
 export const refreshDashboard = createServerFn({ method: "POST" }).handler(
   async (): Promise<DashboardPayload> => {
-    let fetched = 0;
-    let inserted = 0;
-    let error: string | null = null;
-    let onlinePlayers: number | null = null;
-
-    // Generate prediction for the NEXT round BEFORE discovering new outcomes.
-    // This guarantees no data leakage: the prediction uses only rounds already
-    // in the database, not the round whose outcome is about to be fetched.
-    await generateAndQueuePrediction().catch(() => undefined);
-
-    try {
-      const [history, players] = await Promise.all([
-        fetchCrashHistory(),
-        fetchOnlinePlayers(),
-      ]);
-      fetched = history.length;
-      onlinePlayers = players;
-      const insertResult = await insertNewRounds(history);
-      inserted = insertResult.inserted;
-
-      // Validate the prediction queued before this poll against the newest round.
-      await validateAgainstNewRounds(insertResult.rounds).catch(() => undefined);
-    } catch (err) {
-      error = err instanceof Error ? err.message : "Could not reach BC.Game";
-    }
-
+    const sql = await getSql();
+    const feed = await readWorkerFeed(sql);
     const all = await loadRounds(STATS_LIMIT);
-    return buildPayload(all, {
-      ok: error === null,
-      lastSyncAt: new Date().toISOString(),
-      fetched,
-      inserted,
-      error,
-      onlinePlayers,
-    });
+    return buildPayload(all, feed);
   },
 );
 
@@ -265,9 +133,6 @@ export const getDailyStats = createServerFn({ method: "GET" })
 
     const days = rows.map(mapDailyRow);
 
-    // Overall stats are computed from crash_daily (not raw rounds) so the query
-    // stays fast even when raw rounds have been purged.
-    // Weighted average uses sum_multipliers for exact results.
     const overallRows = await sql<{
       count: number;
       avg: number | null;
@@ -338,15 +203,12 @@ export const cleanupOldRounds = createServerFn({ method: "POST" })
     const rows = await sql<{ deleted: number }>`
       select purge_old_crash_rounds(${data.retentionDays}) as deleted
     `;
-    // Vacuum reclaims dead tuples and updates planner stats.
-    // Use .query() because VACUUM is a utility command.
     await sql.query("vacuum analyze crash_rounds");
     return { deleted: rows[0]?.deleted ?? 0 };
   });
 
 /* ── CSV export ────────────────────────────────────────────────────────── */
 
-/** Escape a CSV cell: wrap in quotes if it contains commas, quotes, or newlines. */
 function csvCell(value: string | number | null): string {
   const text = value == null ? "" : String(value);
   if (/[",\n\r]/.test(text)) {
