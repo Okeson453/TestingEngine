@@ -29,8 +29,8 @@ import {
   predictionGetHistory,
   predictionGetPending,
   predictionGetWorkerStatus,
-} from "@/lib/prediction/api";
-import type { WorkerStatus } from "@/lib/prediction/api";
+} from "@/lib/p";
+import type { WorkerStatus } from "@/lib/p";
 import type {
   DailyTarget,
   TodayStats,

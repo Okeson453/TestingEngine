@@ -8,7 +8,7 @@ import {
   predictionGetRecent,
   predictionGetPending,
   predictionGetWorkerStatus,
-} from "@/lib/prediction/api";
+} from "@/lib/p";
 
 export const Route = createFileRoute("/predictions")({
   component: PredictionsPage,
