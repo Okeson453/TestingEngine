@@ -4,7 +4,7 @@
  */
 
 import { CURRENT_FEATURE_VERSION } from '../features/feature-meta.ts';
-import { FeatureVector, ThresholdTarget, ModelIdentity, PredictionOutput, Regime, Dataset } from '../types.ts';
+import type { FeatureVector, ThresholdTarget, ModelIdentity, PredictionOutput, Regime, Dataset } from '../types.ts';
 import { randomUUID } from 'crypto';
 
 /**

@@ -1,5 +1,6 @@
-import { PredictiveModel, BaselineStatisticalModel } from './baseline-model.ts';
-import { ModelIdentity } from '../types.ts';
+import type { PredictiveModel } from './baseline-model.ts';
+import { BaselineStatisticalModel } from './baseline-model.ts';
+import type { ModelIdentity } from '../types.ts';
 import { getLogger } from '../../observability/logger.ts';
 
 export class ModelRegistry {

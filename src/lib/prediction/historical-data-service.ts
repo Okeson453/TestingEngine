@@ -8,7 +8,7 @@
 
 import { RoundRepository, RoundRecord } from '../persistence/repositories/round-repo.ts';
 import { getLogger } from '../observability/logger.ts';
-import { HistoricalRound } from './types.ts';
+import type { HistoricalRound } from './types.ts';
 import { RollingHistoryBuffer } from './rolling-history-buffer.ts';
 
 const QUALITY_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };

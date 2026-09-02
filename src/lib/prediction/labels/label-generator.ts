@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
-import { HistoricalRound, Label, TargetVersion, ThresholdTarget, SUPPORTED_TARGETS } from '../types.ts';
+import { SUPPORTED_TARGETS } from '../types.ts';
+import type { HistoricalRound, Label, TargetVersion, ThresholdTarget } from '../types.ts';
 export const CURRENT_TARGET_VERSION: TargetVersion = 'tv-1.0.0';
 export class LabelGenerator {
   readonly targetVersion: TargetVersion;

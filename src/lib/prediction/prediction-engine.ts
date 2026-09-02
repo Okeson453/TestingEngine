@@ -1,4 +1,4 @@
-import { HistoricalRound, ThresholdTarget, PredictionSignal, FeatureVector, Regime } from './types.ts';
+import type { HistoricalRound, ThresholdTarget, PredictionSignal, FeatureVector, Regime } from './types.ts';
 import { FeatureEngine } from './features/feature-engine.ts';
 import { RegimeDetector } from './regimes/regime-detector.ts';
 import { ModelRegistry } from './models/model-registry.ts';

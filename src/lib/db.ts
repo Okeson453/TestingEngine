@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { pendingMigrations } from "../../scripts/migration-plan.mjs";
 
@@ -154,18 +154,44 @@ async function createPgliteSql(): Promise<Sql> {
   const pg = await globalRef.__pgliteInstance__;
 
   // Apply migrations/ (the single schema source) so preview matches production.
-  // SQL is inlined by the bundler via import.meta.glob (no runtime fs); applied
-  // files are tracked in _migrations. The glob does not descend, so the opt-in
-  // auth schema under migrations/auth/ stays out. Runs once per module instance
-  // — so an HMR reload after adding a migration file applies it live — with
-  // passes serialized on a global chain so concurrent callers never
-  // double-apply.
+  // In Vite, SQL is inlined at build/dev time via import.meta.glob (no runtime fs);
+  // the glob does not descend, so the opt-in auth schema under migrations/auth/
+  // stays out. Runs once per module instance — so an HMR reload after adding a
+  // migration file applies it live — with passes serialized on a global chain so
+  // concurrent callers never double-apply.
   const migrate = async (): Promise<void> => {
-    const migrations = import.meta.glob("/migrations/*.sql", {
-      query: "?raw",
-      import: "default",
-      eager: true,
-    }) as Record<string, string>;
+    let migrations: Record<string, string>;
+    try {
+      // Vite runtime: import.meta.glob inlines files at dev/build time.
+      migrations = import.meta.glob("/migrations/*.sql", {
+        query: "?raw",
+        import: "default",
+        eager: true,
+      }) as Record<string, string>;
+    } catch {
+      // Standalone Node (e.g. `npm run worker`): fall back to filesystem reads.
+      const { pendingMigrations: pending } = await import(
+        "../../scripts/migration-plan.mjs",
+      );
+      const dirs = [join(process.cwd(), "migrations")];
+      const entries: string[] = [];
+      for (const dir of dirs) {
+        try {
+          for (const name of readdirSync(dir)) {
+            if (name.endsWith(".sql")) entries.push(name);
+          }
+        } catch {
+          /* no migrations dir */
+        }
+      }
+      migrations = {};
+      for (const name of entries) {
+        migrations[name] = readFileSync(
+          join(dirs[0], name),
+          "utf8",
+        );
+      }
+    }
     const doneRows = await pg.query<{ name: string }>(
       "select name from _migrations",
     );

@@ -1,4 +1,4 @@
-import { PredictionOutput, PredictionSignal } from '../types.ts';
+import type { PredictionOutput, PredictionSignal } from '../types.ts';
 
 export function toSignal(output: PredictionOutput): PredictionSignal {
   return Object.freeze({

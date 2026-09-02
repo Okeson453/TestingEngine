@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { HistoricalRound, FeatureVector, FeatureVersion } from '../types.ts';
+import type { HistoricalRound, FeatureVector, FeatureVersion } from '../types.ts';
 import { computeFeatures } from './calculators.ts';
 import { getLogger } from '../../observability/logger.ts';
 

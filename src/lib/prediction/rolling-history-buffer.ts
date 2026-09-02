@@ -6,7 +6,7 @@
  * Live prediction reads only from memory — no per-entry SQL.
  */
 
-import { HistoricalRound } from './types.ts';
+import type { HistoricalRound } from './types.ts';
 import { getLogger } from '../observability/logger.ts';
 
 export class RollingHistoryBuffer {

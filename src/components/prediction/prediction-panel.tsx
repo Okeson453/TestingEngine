@@ -146,14 +146,16 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
     queryKey: ["prediction-history", historyPage, historyFilter],
     queryFn: () =>
       predictionGetHistory({
-        page: historyPage,
-        pageSize: 20,
-        result: historyFilter === "all" ? null : historyFilter,
+        data: {
+          page: historyPage,
+          pageSize: 20,
+          result: historyFilter === "all" ? null : historyFilter,
+        },
       }),
   });
 
   const setTargetMut = useMutation({
-    mutationFn: (target: number) => predictionSetDailyTarget({ target }),
+    mutationFn: (target: number) => predictionSetDailyTarget({ data: { target } }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["prediction-daily-target"] });
       queryClient.invalidateQueries({ queryKey: ["prediction-today"] });

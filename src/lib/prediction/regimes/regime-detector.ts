@@ -1,4 +1,4 @@
-import { HistoricalRound, Regime } from '../types.ts';
+import type { HistoricalRound, Regime } from '../types.ts';
 import { mean, std, hitRate } from '../features/calculators.ts';
 import { randomUUID } from 'crypto';
 

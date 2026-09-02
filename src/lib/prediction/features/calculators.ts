@@ -1,4 +1,4 @@
-import { HistoricalRound } from '../types.ts';
+import type { HistoricalRound } from '../types.ts';
 
 export function mean(values: number[]): number {
   if (values.length === 0) return 0;

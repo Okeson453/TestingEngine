@@ -8,20 +8,21 @@
  * (DATABASE_URL / Neon). In local PGLite/preview mode the worker runs
  * in-process inside the dev server — there is no separate process.
  *
- * Usage: `node --experimental-strip-types --import ./scripts/paths-loader.mjs ...`
+ * Usage: `node --experimental-strip-types --import ./scripts/paths-loader.mjs scripts/worker.mjs`
  */
 import { existsSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { register } from "node:module";
 
 const ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "..");
 
-function isTsFile(p: string): boolean {
+function isTsFile(p) {
   return p.endsWith(".ts");
 }
 
 /** Append `.ts` to a relative specifier when it has no recognised extension. */
-function resolveRelative(specifier: string, parentUrl: string | undefined): string | null {
+function resolveRelative(specifier, parentUrl) {
   const base =
     specifier.endsWith(".ts") ||
     specifier.endsWith(".js") ||
@@ -34,11 +35,9 @@ function resolveRelative(specifier: string, parentUrl: string | undefined): stri
   return existsSync(target) ? target : null;
 }
 
-export async function resolve(
-  specifier: string,
-  context: { parentURL?: string },
-  nextResolve: (spec: string, ctx: typeof context) => Promise<{ url: string }>,
-): Promise<{ url: string; shortCircuit: true }> {
+register(import.meta.url);
+
+export async function resolve(specifier, context, nextResolve) {
   // @/ alias -> <root>/src/...(.ts)
   if (specifier.startsWith("@/")) {
     const target = resolvePath(ROOT, "src", specifier.slice(2));
@@ -56,5 +55,5 @@ export async function resolve(
     }
   }
 
-  return nextResolve(specifier, context).then((r) => ({ url: r.url, shortCircuit: false }));
+  return nextResolve(specifier, context);
 }
