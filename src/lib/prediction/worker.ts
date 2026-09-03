@@ -11,14 +11,33 @@ import {
   getPendingStatus,
   getDailyTarget,
 } from "./service.ts";
+import {
+  formatPredictionMessage,
+  formatValidationMessage,
+  sendTelegramMessage,
+  telegramConfigured,
+  type SendResult,
+} from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("prediction-worker");
 
 /* ── Tuning (env-overridable for tests/verification) ───────────────────── */
 
-/** How often the worker polls BC.Game for new rounds. */
-const POLL_INTERVAL_MS = Number(process.env.PREDICTION_POLL_MS ?? 10_000);
+/**
+ * How often the worker polls BC.Game for new rounds. Default 3000ms per the
+ * Telegram design (lower bound 2000ms — anything tighter hits cached/empty
+ * upstream responses).
+ */
+const POLL_INTERVAL_MS = Math.max(
+  2000,
+  Number(process.env.PREDICTION_POLL_MS ?? 3000),
+);
+/** Backoff poll used while a prediction is pending — see `run()`. */
+const PENDING_POLL_INTERVAL_MS = Math.max(
+  2000,
+  Number(process.env.PREDICTION_PENDING_POLL_MS ?? 10_000),
+);
 /** Distributed lock time-to-live. A crashed worker is recovered after this. */
 const LOCK_TTL_SEC = Number(process.env.PREDICTION_LOCK_TTL_SEC ?? 60);
 /** How many BC.Game history pages to fetch per poll (freshness vs. rate). */
@@ -36,6 +55,9 @@ const STATE = {
   LAST_ONLINE_PLAYERS: "last_online_players",
   LAST_SEEN_GAME_ID: "last_seen_game_id",
   CYCLES_TOTAL: "cycles_total",
+  TELEGRAM_ENABLED: "telegram_enabled",
+  TELEGRAM_LAST_SENT_AT: "telegram_last_sent_at",
+  TELEGRAM_LAST_ERROR: "telegram_last_error",
 } as const;
 
 export type WorkerStatus = {
@@ -56,6 +78,12 @@ export type WorkerStatus = {
   resolvedToday: number;
   dailyTarget: number;
   remainingToday: number;
+  /** Whether the Telegram notification adapter is configured (env present). */
+  telegramEnabled: boolean;
+  /** ISO timestamp of the most recent Telegram send attempt. */
+  telegramLastSentAt: string | null;
+  /** Last Telegram delivery error (empty on success). */
+  telegramLastError: string | null;
 };
 
 export interface WorkerCycleResult {
@@ -150,6 +178,55 @@ async function readStateMap(sql: Sql): Promise<Map<string, string>> {
   const m = new Map<string, string>();
   for (const r of rows) if (r.value != null) m.set(r.key, r.value);
   return m;
+}
+
+/* ── Telegram notification fan-out (fire-and-forget) ─────────────────── */
+
+/**
+ * Fire-and-forget Telegram send. The cycle never awaits this. Outcome is
+ * recorded to `worker_state` so the dashboard can surface delivery health.
+ * A Telegram failure never throws, never blocks, never corrupts the cycle.
+ */
+function fireTelegram(text: string, sql: Sql): void {
+  const sentAt = new Date().toISOString();
+  void sendTelegramMessage(text)
+    .then((res: SendResult) => {
+      void recordTelegramResult(sql, sentAt, res).catch((e: unknown) => {
+        logger.warn(
+          { component: "PredictionWorker", error: e },
+          "telegram state-write failed",
+        );
+      });
+    })
+    .catch((e: unknown) => {
+      // Defensive — sendTelegramMessage never rejects, so this branch is for
+      // programmer-error only (e.g. a bad formatter). Keep the worker alive.
+      logger.warn(
+        { component: "PredictionWorker", error: e },
+        "telegram fan-out rejected",
+      );
+    });
+}
+
+/** Best-effort write of the last Telegram delivery outcome. */
+async function recordTelegramResult(
+  sql: Sql,
+  sentAt: string,
+  res: SendResult,
+): Promise<void> {
+  try {
+    await setState(sql, STATE.TELEGRAM_LAST_SENT_AT, sentAt);
+    await setState(
+      sql,
+      STATE.TELEGRAM_LAST_ERROR,
+      res.ok ? "" : (res.error ?? "unknown_error"),
+    );
+  } catch (e: unknown) {
+    logger.warn(
+      { component: "PredictionWorker", error: e },
+      "telegram state-write failed",
+    );
+  }
 }
 
 /* ── The core prediction/validate cycle (no lock management) ───────────── */
@@ -247,31 +324,83 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     result.inserted = 0;
   }
 
-  // 3. WIN/LOSS validation: pair oldest-pending ↔ oldest-new-round, durable 1:1.
-  if (insertedRounds.length > 0) {
-    try {
-      const outcome = await validateAgainstNewRounds(insertedRounds);
-      result.resolved = outcome.resolved;
-    } catch (e: unknown) {
-      fail((e as Error)?.message ?? String(e));
-    }
-  }
-
-  // 4. Daily entry counting: only generate a new prediction if the daily
-  //    target isn't met AND there's no pending AND no unmatched-new-round
-  //    waiting to be resolved (otherwise the next cycle will handle it).
-  //    The daily target is an OPERATING target only — prediction_validations
-  //    history is permanent and never truncated.
+    // 3+4. WIN/LOSS validation (durable 1:1) and daily-stats/pending read
+  //     can run concurrently — the read-only stats queries are independent of
+  //     the validate step (which itself short-circuits when
+  //     `insertedRounds.length === 0`, the common case). This is the safe
+  //     Tier-1 pipeline parallelization from design §10.1.
   if (firstError == null) {
-    try {
-      const [today, pending] = await Promise.all([getTodayStats(), getPendingStatus()]);
-      if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0) {
-        const signal = await generateAndQueuePrediction().catch((_e: unknown) => null);
-        if (signal) result.generated = signal.predictionId;
-      }
-    } catch (e: unknown) {
-      fail((e as Error)?.message ?? String(e));
+    const validatePromise =
+      insertedRounds.length > 0
+        ? validateAgainstNewRounds(insertedRounds).catch((e: unknown) => {
+            fail((e as Error)?.message ?? String(e));
+            return { resolved: 0, insertedRounds: 0, pairs: [] };
+          })
+        : Promise.resolve({
+            resolved: 0,
+            insertedRounds: 0,
+            pairs: [] as Array<never>,
+          });
+    const statsPromise = Promise.all([getTodayStats(), getPendingStatus()]);
+    const [outcome, [today, pending]] = await Promise.all([
+      validatePromise,
+      statsPromise,
+    ]);
+    result.resolved = outcome.resolved;
+    // Telegram fan-out for each newly-resolved pair. targetMultiplier === 0
+    // is the recovery re-pass sentinel (the row was validated by an earlier
+    // worker); we skip notification in that case to avoid noise on restart.
+    for (const pair of outcome.pairs) {
+      if (pair.targetMultiplier === 0) continue;
+      if (!telegramConfigured()) continue;
+      fireTelegram(
+        formatValidationMessage({
+          predictionId: pair.predictionId,
+          gameId: pair.gameId,
+          targetMultiplier: pair.targetMultiplier,
+          actualMultiplier: pair.actualMultiplier,
+          probability: pair.probability,
+          result: pair.result,
+          resolvedAt: pair.resolvedAt,
+        }),
+        sql,
+      );
     }
+
+    // 4. Daily entry counting: only generate a new prediction if the daily
+    //    target isn't met AND there's no pending AND no unmatched-new-round
+    //    waiting to be resolved (otherwise the next cycle will handle it).
+    //    The daily target is an OPERATING target only — prediction_validations
+    //    history is permanent and never truncated.
+    if (firstError == null) {
+      try {
+        if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0) {
+          const queued = await generateAndQueuePrediction().catch((_e: unknown) => null);
+          if (queued) {
+            result.generated = queued.signal.predictionId;
+            if (telegramConfigured()) {
+              const signal = queued.signal;
+              fireTelegram(
+                formatPredictionMessage({
+                  predictionId: signal.predictionId,
+                  targetMultiplier: Number(signal.target ?? 1.3),
+                  probability: signal.probability,
+                  confidence: signal.confidence,
+                  regimeName: signal.regimeId ?? null,
+                  lastRoundMultiplier: queued.lastRound?.multiplier ?? null,
+                  generatedAt: new Date().toISOString(),
+                }),
+                sql,
+              );
+            }
+          }
+        }
+      } catch (e: unknown) {
+        fail((e as Error)?.message ?? String(e));
+      }
+    }
+  } else {
+    // Fetch already failed; skip validate/generate but still persist heartbeat.
   }
 
   if (firstError) {
@@ -301,6 +430,11 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
       onlinePlayers == null ? "" : String(onlinePlayers),
     );
     if (latest) await setState(sql, STATE.LAST_SEEN_GAME_ID, latest.gameId);
+    await setState(
+      sql,
+      STATE.TELEGRAM_ENABLED,
+      telegramConfigured() ? "1" : "0",
+    );
     await incrementCycles(sql);
   } catch (e: unknown) {
     logger.error(
@@ -351,6 +485,9 @@ export async function getWorkerStatus(): Promise<WorkerStatus> {
     resolvedToday: today.total,
     dailyTarget: target.dailyTarget,
     remainingToday: today.remaining,
+    telegramEnabled: state.get(STATE.TELEGRAM_ENABLED) === "1",
+    telegramLastSentAt: state.get(STATE.TELEGRAM_LAST_SENT_AT) ?? null,
+    telegramLastError: state.get(STATE.TELEGRAM_LAST_ERROR) ?? null,
   };
 }
 
@@ -391,7 +528,15 @@ export function startWorker(): WorkerHandle {
   if (handle.running) return handle;
   handle.running = true;
   handle.ownerId = randomUUID();
-  logger.info({ component: "PredictionWorker" }, "worker starting");
+  logger.info(
+    {
+      component: "PredictionWorker",
+      telegram: telegramConfigured() ? "enabled" : "disabled (no env)",
+      pollIntervalMs: POLL_INTERVAL_MS,
+      pendingPollIntervalMs: PENDING_POLL_INTERVAL_MS,
+    },
+    "worker starting",
+  );
   void run(handle);
   return handle;
 }
@@ -457,7 +602,20 @@ async function run(handle: WorkerHandle): Promise<void> {
         );
         break;
       }
-      await sleep(handle, POLL_INTERVAL_MS);
+      // Adaptive poll (Telegram design §10.3): when a prediction is pending,
+      // the next round's outcome is what matters, not new data. Drop the
+      // cadence to a coarser poll so we save ~70% of upstream calls during
+      // the 2–5s window where we're waiting for the round to land. End-to-end
+      // latency is unchanged because the worker still polls; we just call the
+      // upstream less aggressively.
+      let nextInterval = POLL_INTERVAL_MS;
+      try {
+        const pending = await getPendingStatus();
+        if (pending.hasPending) nextInterval = PENDING_POLL_INTERVAL_MS;
+      } catch {
+        /* fall through to default poll */
+      }
+      await sleep(handle, nextInterval);
     }
   } finally {
     await releaseLock(sql, handle.ownerId);
