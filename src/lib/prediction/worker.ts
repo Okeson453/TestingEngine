@@ -20,6 +20,7 @@ import {
   type SendResult,
 } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
+import { bcGameSocket, startEventDrivenPipeline, stopEventDrivenPipeline } from "./events/game-event-handlers";
 
 const logger = getLogger("prediction-worker");
 
@@ -59,6 +60,10 @@ const STATE = {
   TELEGRAM_ENABLED: "telegram_enabled",
   TELEGRAM_LAST_SENT_AT: "telegram_last_sent_at",
   TELEGRAM_LAST_ERROR: "telegram_last_error",
+  // NEW: Socket.IO connection state
+  SOCKET_CONNECTED: "socket_connected",
+  SOCKET_LAST_CONNECTED_AT: "socket_last_connected_at",
+  SOCKET_LAST_ERROR: "socket_last_error",
 } as const;
 
 export type WorkerStatus = {
@@ -85,6 +90,10 @@ export type WorkerStatus = {
   telegramLastSentAt: string | null;
   /** Last Telegram delivery error (empty on success). */
   telegramLastError: string | null;
+  // NEW: Socket.IO connection status
+  socketConnected: boolean;
+  socketLastConnectedAt: string | null;
+  socketLastError: string | null;
 };
 
 export interface WorkerCycleResult {
@@ -251,6 +260,25 @@ async function recordTelegramResult(
   }
 }
 
+/* ── Socket.IO state management ──────────────────────────────────────── */
+
+/**
+ * Update Socket.IO connection state in worker state
+ */
+async function updateSocketState(sql: Sql): Promise<void> {
+  const state = bcGameSocket.getState();
+  try {
+    await setState(sql, STATE.SOCKET_CONNECTED, state.status === "connected" ? "1" : "0");
+    await setState(sql, STATE.SOCKET_LAST_CONNECTED_AT, state.lastConnectedAt ?? "");
+    await setState(sql, STATE.SOCKET_LAST_ERROR, state.lastError ?? "");
+  } catch (e: unknown) {
+    logger.warn(
+      { component: "PredictionWorker", error: e },
+      "socket state-write failed",
+    );
+  }
+}
+
 /* ── The core prediction/validate cycle (no lock management) ───────────── */
 
 /**
@@ -266,6 +294,9 @@ async function recordTelegramResult(
  * cycle (e.g. fetch failed, then insert succeeded on an empty list) from
  * being reported as "ok" — and prevents a transient DB blip from being
  * hidden by a later successful step.
+ *
+ * NEW: This now works alongside the event-driven Socket.IO prediction pipeline.
+ * The REST polling path remains as a reconciliation and recovery safety net.
  */
 export async function runWorkerCycle(): Promise<WorkerCycleResult> {
   const sql = await getSql();
@@ -313,6 +344,7 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
   };
 
   // 1. BC.Game history polling (server-side, no browser/dashboard).
+  // This is now the FALLBACK path - the primary prediction trigger is Socket.IO
   try {
     [rounds, onlinePlayers] = await Promise.all([
       fetchCrashHistory(FETCH_PAGES),
@@ -346,7 +378,7 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     result.inserted = 0;
   }
 
-    // 3+4. WIN/LOSS validation (durable 1:1) and daily-stats/pending read
+  // 3+4. WIN/LOSS validation (durable 1:1) and daily-stats/pending read
   //     can run concurrently — the read-only stats queries are independent of
   //     the validate step (which itself short-circuits when
   //     `insertedRounds.length === 0`, the common case). This is the safe
@@ -392,8 +424,11 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     // 4. Daily entry counting: only generate a new prediction if the daily
     //    target isn't met AND there's no pending AND no unmatched-new-round
     //    waiting to be resolved (otherwise the next cycle will handle it).
-    //    The daily target is an OPERATING target only — prediction_validations
-    //    history is permanent and never truncated.
+    //    
+    // NEW: This is now the FALLBACK prediction generation path.
+    // The primary path is the Socket.IO event-driven approach via bg events.
+    // The REST polling path must NEVER become the primary prediction trigger
+    // and must NEVER generate predictions from already-settled rounds.
     if (firstError == null) {
       try {
         if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0) {
@@ -458,6 +493,9 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
       telegramConfigured() ? "1" : "0",
     );
     await incrementCycles(sql);
+    
+    // NEW: Update Socket.IO connection state
+    await updateSocketState(sql);
   } catch (e: unknown) {
     logger.error(
       { component: "PredictionWorker", error: e },
@@ -490,6 +528,11 @@ export async function getWorkerStatus(): Promise<WorkerStatus> {
   const lastOnlinePlayers =
     rawPlayers != null && rawPlayers !== "" ? Number(rawPlayers) : null;
 
+  // NEW: Get Socket.IO connection state
+  const socketConnected = state.get(STATE.SOCKET_CONNECTED) === "1";
+  const socketLastConnectedAt = state.get(STATE.SOCKET_LAST_CONNECTED_AT) ?? null;
+  const socketLastError = state.get(STATE.SOCKET_LAST_ERROR) ?? null;
+
   return {
     running,
     ownerId: lock?.owner_id ?? null,
@@ -510,6 +553,10 @@ export async function getWorkerStatus(): Promise<WorkerStatus> {
     telegramEnabled: state.get(STATE.TELEGRAM_ENABLED) === "1",
     telegramLastSentAt: state.get(STATE.TELEGRAM_LAST_SENT_AT) ?? null,
     telegramLastError: state.get(STATE.TELEGRAM_LAST_ERROR) ?? null,
+    // NEW: Socket.IO state
+    socketConnected,
+    socketLastConnectedAt,
+    socketLastError,
   };
 }
 
@@ -541,6 +588,8 @@ function getHandle(): WorkerHandle {
  * browser code. A no-op if already running. The loop holds the distributed lock
  * across cycles (so engine health is continuous) and re-acquires it if ever
  * lost, backing off until the previous owner's TTL expires.
+ *
+ * NEW: Also starts the event-driven Socket.IO prediction pipeline.
  */
 export function startWorker(): WorkerHandle {
   if (typeof window !== "undefined") {
@@ -563,6 +612,15 @@ export function startWorker(): WorkerHandle {
   } else {
     console.warn(bootMsg);
   }
+  
+  // NEW: Start the event-driven prediction pipeline
+  void startEventDrivenPipeline().catch((error) => {
+    logger.error(
+      { component: "PredictionWorker", error },
+      "Failed to start event-driven prediction pipeline"
+    );
+  });
+  
   void run(handle);
   return handle;
 }
@@ -582,6 +640,17 @@ export async function stopWorker(): Promise<void> {
   } catch {
     /* ignore — TTL reclaims the lock */
   }
+  
+  // NEW: Stop the event-driven prediction pipeline
+  try {
+    await stopEventDrivenPipeline();
+  } catch (error) {
+    logger.warn(
+      { component: "PredictionWorker", error },
+      "Error stopping event-driven pipeline"
+    );
+  }
+  
   logger.info({ component: "PredictionWorker" }, "worker stopped");
 }
 
@@ -649,3 +718,9 @@ async function run(handle: WorkerHandle): Promise<void> {
     if (handle.running) void run(handle);
   }
 }
+
+export {
+  bcGameSocket,
+  startEventDrivenPipeline,
+  stopEventDrivenPipeline,
+};
