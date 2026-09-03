@@ -18,11 +18,20 @@ const logger = getLogger("prediction-worker");
 /* ── Tuning (env-overridable for tests/verification) ───────────────────── */
 
 /** How often the worker polls BC.Game for new rounds. */
-const POLL_INTERVAL_MS = Number(process.env.PREDICTION_POLL_MS ?? 10_000);
+const POLL_INTERVAL_MS = Number(process.env.PREDICTION_POLL_MS ?? 3_000);
 /** Distributed lock time-to-live. A crashed worker is recovered after this. */
 const LOCK_TTL_SEC = Number(process.env.PREDICTION_LOCK_TTL_SEC ?? 60);
 /** How many BC.Game history pages to fetch per poll (freshness vs. rate). */
 const FETCH_PAGES = Number(process.env.PREDICTION_FETCH_PAGES ?? 2);
+
+/**
+ * When a prediction is awaiting resolution, the outstanding round's outcome is
+ * the only thing that matters — so back off the BC.Game poll to reduce upstream
+ * load without losing end-to-end latency. Resume the configured cadence once the
+ * prediction resolves. Floor of 2000ms (below this the upstream API serves cached
+ * / empty responses — see Design §9 configuration notes).
+ */
+const POLL_INTERVAL_AWAITING_MS = Math.max(2_000, Number(process.env.PREDICTION_POLL_AWAITING_MS ?? 10_000));
 
 const LOCK_KEY = "prediction_worker";
 
@@ -36,6 +45,9 @@ const STATE = {
   LAST_ONLINE_PLAYERS: "last_online_players",
   LAST_SEEN_GAME_ID: "last_seen_game_id",
   CYCLES_TOTAL: "cycles_total",
+  TELEGRAM_ENABLED: "telegram_enabled",
+  TELEGRAM_LAST_SENT_AT: "telegram_last_sent_at",
+  TELEGRAM_LAST_ERROR: "telegram_last_error",
 } as const;
 
 export type WorkerStatus = {

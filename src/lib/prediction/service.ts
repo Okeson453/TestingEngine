@@ -7,6 +7,7 @@ import type {
 } from "./types.ts";
 import type { CrashRound } from "@/lib/crash/types";
 import type { Sql } from "@/lib/db";
+import { loadLatestRound, toIso } from "@/lib/crash/ingest.ts";
 
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
 const MIN_HISTORY = 20;
@@ -64,9 +65,27 @@ async function loadRecentRoundsForPrediction(
   );
 }
 
-export async function generateAndQueuePrediction(): Promise<PredictionSignal | null> {
+export interface LastRoundSnapshot {
+  gameId: string;
+  multiplier: number;
+  crashedAt: string;
+}
+
+export interface QueuedPrediction {
+  signal: PredictionSignal;
+  /** The most recent resolved round in the DB at generation time (null on cold start). */
+  lastRound: LastRoundSnapshot | null;
+}
+
+export async function generateAndQueuePrediction(): Promise<QueuedPrediction | null> {
   const sql = await getSql();
-  const rounds = await loadRecentRoundsForPrediction(sql);
+  // Run the last-round snapshot in parallel with the full history load so the
+  // worker can include a "Last round" line in the notification without an extra
+  // DB round-trip on the critical path. Cost: one extra index-only read.
+  const [rounds, latestRound] = await Promise.all([
+    loadRecentRoundsForPrediction(sql),
+    loadLatestRound(sql),
+  ]);
   if (rounds.length < MIN_HISTORY) return null;
 
   const engine = new PredictionEngine();
@@ -95,7 +114,14 @@ export async function generateAndQueuePrediction(): Promise<PredictionSignal | n
     )
     on conflict (prediction_id) do nothing
   `;
-  return signal;
+  const lastRound: LastRoundSnapshot | null = latestRound
+    ? {
+        gameId: latestRound.gameId,
+        multiplier: latestRound.multiplier,
+        crashedAt: latestRound.crashedAt,
+      }
+    : null;
+  return { signal, lastRound };
 }
 
 /**
@@ -106,7 +132,15 @@ export async function generateAndQueuePrediction(): Promise<PredictionSignal | n
 export interface ValidationOutcome {
   resolved: number;
   insertedRounds: number;
-  pairs: Array<{ predictionId: string; gameId: string; result: "WIN" | "LOSS" }>;
+  pairs: Array<{
+    predictionId: string;
+    gameId: string;
+    result: "WIN" | "LOSS";
+    targetMultiplier: number;
+    actualMultiplier: number;
+    probability: number;
+    resolvedAt: string;
+  }>;
 }
 
 /**
@@ -146,18 +180,35 @@ export async function validateAgainstNewRounds(
     // If this round was already validated (worker crash between validation
     // insert and pending-row update), skip — the UNIQUE(game_id) on
     // prediction_validations guarantees a duplicate insert would no-op.
-    const existing = await sql<{ prediction_id: string; result: string }>`
-      select prediction_id, result
+    const existing = await sql<{
+      prediction_id: string;
+      result: string;
+      actual_multiplier: string | number;
+      predicted_probability: string | number | null;
+      resolved_at: string | Date;
+    }>`
+      select prediction_id, result, actual_multiplier, predicted_probability, resolved_at
       from prediction_validations
       where game_id = ${targetRound.gameId}
       limit 1
     `;
     if (existing.length > 0) {
       outcome.resolved += 1;
+      // Recovery pass: the round was already validated (worker crashed between
+      // validation insert and pending-row update). Represent as a skip sentinel
+      // (targetMultiplier: 0) so the worker does NOT re-fire a notification —
+      // the dashboard already shows the historical WIN/LOSS, and notifying again
+      // on a recovery pass would be noise.
       outcome.pairs.push({
         predictionId: existing[0]!.prediction_id,
         gameId: targetRound.gameId,
         result: existing[0]!.result as "WIN" | "LOSS",
+        targetMultiplier: 0,
+        actualMultiplier: Number(existing[0]!.actual_multiplier),
+        probability: Number(existing[0]!.predicted_probability ?? 0),
+        resolvedAt:
+          toIso(existing[0]!.resolved_at) ??
+          new Date().toISOString(),
       });
       continue;
     }
@@ -240,6 +291,10 @@ export async function validateAgainstNewRounds(
       predictionId: p.prediction_id,
       gameId: targetRound.gameId,
       result,
+      targetMultiplier: p.target_multiplier,
+      actualMultiplier,
+      probability: p.probability,
+      resolvedAt: now,
     });
   }
 
