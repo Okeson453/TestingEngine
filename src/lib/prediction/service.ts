@@ -26,6 +26,34 @@ function mapCrashRoundToHistorical(r: CrashRound): HistoricalRound {
   };
 }
 
+export interface LastRoundSnapshot {
+  gameId: string;
+  multiplier: number;
+  crashedAt: string;
+}
+
+async function loadLastRoundSnapshot(sql: Sql): Promise<LastRoundSnapshot | null> {
+  const rows = await sql<{
+    game_id: string;
+    multiplier: string | number;
+    crashed_at: string | Date;
+  }>`
+    select game_id, multiplier, crashed_at
+    from crash_rounds
+    order by crashed_at desc, game_id desc
+    limit 1
+  `;
+  if (rows.length === 0) return null;
+  const r = rows[0]!;
+  const crashedAt =
+    r.crashed_at instanceof Date ? r.crashed_at.toISOString() : String(r.crashed_at);
+  return {
+    gameId: r.game_id,
+    multiplier: Number(r.multiplier),
+    crashedAt,
+  };
+}
+
 async function loadRecentRoundsForPrediction(
   sql: Sql,
   limit = MAX_HISTORY,
@@ -64,9 +92,22 @@ async function loadRecentRoundsForPrediction(
   );
 }
 
-export async function generateAndQueuePrediction(): Promise<PredictionSignal | null> {
+/**
+ * Returned to callers (the worker) so they can build a richer notification
+ * payload (the `lastRound` is the most recently-resolved round at the moment
+ * of generation — the "Last round" line in the Telegram prediction message).
+ */
+export interface QueuedPrediction {
+  signal: PredictionSignal;
+  lastRound: LastRoundSnapshot | null;
+}
+
+export async function generateAndQueuePrediction(): Promise<QueuedPrediction | null> {
   const sql = await getSql();
-  const rounds = await loadRecentRoundsForPrediction(sql);
+  const [rounds, lastRound] = await Promise.all([
+    loadRecentRoundsForPrediction(sql),
+    loadLastRoundSnapshot(sql),
+  ]);
   if (rounds.length < MIN_HISTORY) return null;
 
   const engine = new PredictionEngine();
@@ -95,18 +136,32 @@ export async function generateAndQueuePrediction(): Promise<PredictionSignal | n
     )
     on conflict (prediction_id) do nothing
   `;
-  return signal;
+  return { signal, lastRound };
 }
 
 /**
  * Outcome of one validation pass: how many predictions were resolved against
  * how many newly-inserted rounds in this cycle, plus the durable game_id
  * mapping the worker wrote (one row per (prediction_id, game_id) pair).
+ *
+ * `pairs` is rich enough for the worker to build a Telegram validation
+ * notification without any additional DB query — `targetMultiplier`/`probability`
+ * are present for normal matches; on the worker-crash recovery re-pass,
+ * `targetMultiplier === 0` and the worker skips notification (the dashboard
+ * already shows the historical WIN/LOSS, and re-notifying would be noise).
  */
 export interface ValidationOutcome {
   resolved: number;
   insertedRounds: number;
-  pairs: Array<{ predictionId: string; gameId: string; result: "WIN" | "LOSS" }>;
+  pairs: Array<{
+    predictionId: string;
+    gameId: string;
+    result: "WIN" | "LOSS";
+    targetMultiplier: number;
+    actualMultiplier: number;
+    probability: number;
+    resolvedAt: string;
+  }>;
 }
 
 /**
@@ -146,18 +201,27 @@ export async function validateAgainstNewRounds(
     // If this round was already validated (worker crash between validation
     // insert and pending-row update), skip — the UNIQUE(game_id) on
     // prediction_validations guarantees a duplicate insert would no-op.
-    const existing = await sql<{ prediction_id: string; result: string }>`
-      select prediction_id, result
+    const existing = await sql<{ prediction_id: string; result: string; target_multiplier: string | number | null; predicted_probability: string | number | null; resolved_at: string | Date }>`
+      select prediction_id, result, target_multiplier, predicted_probability, resolved_at
       from prediction_validations
       where game_id = ${targetRound.gameId}
       limit 1
     `;
     if (existing.length > 0) {
       outcome.resolved += 1;
+      // Recovery re-pass: target is unknown to the recovery branch, so signal
+      // the worker with targetMultiplier=0 to skip re-notification.
       outcome.pairs.push({
         predictionId: existing[0]!.prediction_id,
         gameId: targetRound.gameId,
         result: existing[0]!.result as "WIN" | "LOSS",
+        targetMultiplier: 0,
+        actualMultiplier: targetRound.multiplier,
+        probability: Number(existing[0]!.predicted_probability ?? 0),
+        resolvedAt:
+          existing[0]!.resolved_at instanceof Date
+            ? existing[0]!.resolved_at.toISOString()
+            : String(existing[0]!.resolved_at),
       });
       continue;
     }
@@ -240,6 +304,10 @@ export async function validateAgainstNewRounds(
       predictionId: p.prediction_id,
       gameId: targetRound.gameId,
       result,
+      targetMultiplier: Number(p.target_multiplier),
+      actualMultiplier,
+      probability: Number(p.probability),
+      resolvedAt: now,
     });
   }
 
