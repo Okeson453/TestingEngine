@@ -1,10 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { getSql } from "@/lib/db";
-import { fetchCrashHistory, fetchCrashHistoryDeep } from "./fetch-bc";
 import { computeRanges, computeStats, computeStreaks } from "./stats";
 import {
   loadRounds,
-  insertNewRounds,
   recomputeDaily,
   toIso,
   type RoundRow,
@@ -173,15 +171,6 @@ export const backfillDaily = createServerFn({ method: "POST" }).handler(
     `;
     await recomputeDaily(rows.map((r) => r.date));
     return { dates: rows.length };
-  },
-);
-
-/** Deep sync: fetch up to 10,000 rounds from BC.Game to backfill missed history. */
-export const deepSync = createServerFn({ method: "POST" }).handler(
-  async (): Promise<{ fetched: number; inserted: number }> => {
-    const history = await fetchCrashHistoryDeep(200);
-    const { inserted } = await insertNewRounds(history);
-    return { fetched: history.length, inserted };
   },
 );
 

@@ -142,14 +142,6 @@ export async function fetchCrashHistory(maxPages = 20): Promise<FetchedRound[]> 
   return rounds;
 }
 
-/**
- * Deep backfill: fetch up to 200 pages (10,000 rounds) of crash history.
- * Use this to populate an empty database or catch up after downtime.
- */
-export async function fetchCrashHistoryDeep(maxPages = 100): Promise<FetchedRound[]> {
-  return fetchCrashHistory(maxPages);
-}
-
 export async function fetchOnlinePlayers(): Promise<number | null> {
   try {
     const payload = await postJson<StatResponse>(
