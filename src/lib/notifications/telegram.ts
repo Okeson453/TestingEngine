@@ -1,7 +1,7 @@
 /**
  * Telegram push-delivery adapter for the BcTracker prediction worker.
  *
- * Server-only. Reads `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from
+ * Server-only. Reads the Telegram bot token and the chat-id list from
  * `process.env` at the moment of send so Railway env-var changes take effect
  * on the next send without a redeploy. Plain text only — no Markdown/HTML,
  * no bot commands, no WebSocket. Fire-and-forget from the caller's perspective:
@@ -12,6 +12,18 @@
  * `api.telegram.org`. The worker treats Telegram strictly as a notification
  * surface — a Telegram outage cannot block, terminate, or corrupt the
  * prediction/validation lifecycle.
+ *
+ * Multi-destination delivery (env-driven, server-only):
+ *   TELEGRAM_BOT_TOKEN         (required)  Bot API token from @BotFather
+ *   TELEGRAM_CHAT_ID           (required*) Primary 1:1 chat id
+ *   TELEGRAM_GROUP_CHAT_ID     (optional)  Single group/supergroup/channel id
+ *   TELEGRAM_EXTRA_CHAT_IDS    (optional)  Comma-separated list of additional
+ *                                            chat ids (e.g. multiple groups
+ *                                            or alert channels)
+ *   * The "configured" check requires the token AND at least one of
+ *     TELEGRAM_CHAT_ID, TELEGRAM_GROUP_CHAT_ID, or TELEGRAM_EXTRA_CHAT_IDS.
+ *     Every message is fanned out to all configured chat ids; each send is
+ *     independent — a failure to one chat never affects the others.
  */
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -21,6 +33,7 @@ export type SendResult = {
   ok: boolean;
   status: number;
   error?: string;
+  chatId: string;
 };
 
 /** Narrow shape passed to `formatPredictionMessage`. */
@@ -51,9 +64,43 @@ function readEnv(name: string): string {
   return typeof v === "string" ? v : "";
 }
 
-/** Whether both Telegram env vars are present (token + chat id). */
+/**
+ * Parse a comma-separated list of chat ids, trim each, drop empties, preserve
+ * order, dedupe. Returns the list as a new array. Defensive against
+ * `",, ,123,123,  -100 ,,"` style operator misconfig.
+ */
+function parseChatList(raw: string): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const part of raw.split(",")) {
+    const t = part.trim();
+    if (!t) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * The ordered, deduped list of chat ids the bot will fan out to on every
+ * send. Order: primary, then group, then extras (each in input order). The
+ * worker does not care about order — Telegram's API is independent per chat.
+ */
+export function getConfiguredChatIds(): string[] {
+  return parseChatList(
+    [
+      readEnv("TELEGRAM_CHAT_ID"),
+      readEnv("TELEGRAM_GROUP_CHAT_ID"),
+      readEnv("TELEGRAM_EXTRA_CHAT_IDS"),
+    ].join(","),
+  );
+}
+
+/** Whether the bot is configured (token present + at least one chat id). */
 export function telegramConfigured(): boolean {
-  return Boolean(readEnv("TELEGRAM_BOT_TOKEN")) && Boolean(readEnv("TELEGRAM_CHAT_ID"));
+  return Boolean(readEnv("TELEGRAM_BOT_TOKEN")) && getConfiguredChatIds().length > 0;
 }
 
 /** Format the multiplier the operator asked for: `1.30x`. */
@@ -99,17 +146,16 @@ export function formatValidationMessage(v: ValidationForMessage): string {
 }
 
 /**
- * Low-level: send arbitrary text to the configured chat. Never throws —
- * every failure mode (missing env, timeout, HTTP error, malformed body,
- * network failure) is captured into the returned `SendResult`.
+ * Low-level: send a single message to a single chat id. Never throws.
+ * Every failure mode (missing token, timeout, HTTP error, malformed body,
+ * network failure) is captured into the returned `SendResult` and tagged
+ * with the destination chat id so the caller can record per-chat health.
  */
-export async function sendTelegramMessage(text: string): Promise<SendResult> {
-  const token = readEnv("TELEGRAM_BOT_TOKEN");
-  const chatId = readEnv("TELEGRAM_CHAT_ID");
-  if (!token || !chatId) {
-    return { ok: false, status: 0, error: "not_configured" };
-  }
-
+async function sendToChat(
+  token: string,
+  chatId: string,
+  text: string,
+): Promise<SendResult> {
   const url = `${TELEGRAM_API}/bot${token}/sendMessage`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
@@ -128,25 +174,43 @@ export async function sendTelegramMessage(text: string): Promise<SendResult> {
     try {
       parsed = await response.json();
     } catch {
-      return { ok: false, status: response.status, error: "malformed_response" };
+      return { ok: false, status: response.status, error: "malformed_response", chatId };
     }
     if (response.ok && isTelegramOk(parsed)) {
-      return { ok: true, status: response.status };
+      return { ok: true, status: response.status, chatId };
     }
     const description =
       isRecord(parsed) && typeof parsed.description === "string"
         ? parsed.description
         : `http_${response.status}`;
-    return { ok: false, status: response.status, error: description };
+    return { ok: false, status: response.status, error: description, chatId };
   } catch (e: unknown) {
     const name = (e as { name?: string })?.name;
     if (name === "AbortError") {
-      return { ok: false, status: 0, error: `timeout_${SEND_TIMEOUT_MS}ms` };
+      return { ok: false, status: 0, error: `timeout_${SEND_TIMEOUT_MS}ms`, chatId };
     }
-    return { ok: false, status: 0, error: (e as Error)?.message ?? "network_error" };
+    return { ok: false, status: 0, error: (e as Error)?.message ?? "network_error", chatId };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Fan out a message to every configured chat id. Returns one `SendResult`
+ * per destination, in the same order as `getConfiguredChatIds()`. When the
+ * bot is not configured, returns a single `not_configured` result tagged
+ * with the empty chat id so callers can record the no-op without crashing.
+ *
+ * Never throws. Each destination is an independent `AbortController`-bound
+ * fetch, so a slow or failing chat never delays or blocks another.
+ */
+export async function sendTelegramMessage(text: string): Promise<SendResult[]> {
+  const token = readEnv("TELEGRAM_BOT_TOKEN");
+  const chatIds = getConfiguredChatIds();
+  if (!token || chatIds.length === 0) {
+    return [{ ok: false, status: 0, error: "not_configured", chatId: "" }];
+  }
+  return Promise.all(chatIds.map((chatId) => sendToChat(token, chatId, text)));
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

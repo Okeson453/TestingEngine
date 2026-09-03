@@ -183,15 +183,27 @@ async function readStateMap(sql: Sql): Promise<Map<string, string>> {
 /* ── Telegram notification fan-out (fire-and-forget) ─────────────────── */
 
 /**
- * Fire-and-forget Telegram send. The cycle never awaits this. Outcome is
- * recorded to `worker_state` so the dashboard can surface delivery health.
- * A Telegram failure never throws, never blocks, never corrupts the cycle.
+ * Fire-and-forget Telegram send. The cycle never awaits this. Each configured
+ * chat is an independent destination (per-chat send, per-chat AbortController);
+ * the array of results is collapsed to a single error string for the dashboard
+ * (first non-ok wins; empty string when every destination succeeded). The
+ * cycle never throws, never blocks, never corrupts the worker.
  */
 function fireTelegram(text: string, sql: Sql): void {
   const sentAt = new Date().toISOString();
   void sendTelegramMessage(text)
-    .then((res: SendResult) => {
-      void recordTelegramResult(sql, sentAt, res).catch((e: unknown) => {
+    .then((results: SendResult[]) => {
+      const errorSummary = results
+        .filter((r) => !r.ok)
+        .map((r) => `${r.chatId || "<unset>"}:${r.error ?? "unknown_error"}`)
+        .join(";");
+      const summary: SendResult = {
+        ok: results.every((r) => r.ok),
+        status: results.find((r) => !r.ok)?.status ?? results[0]?.status ?? 0,
+        error: errorSummary || undefined,
+        chatId: results.map((r) => r.chatId).filter(Boolean).join(","),
+      };
+      void recordTelegramResult(sql, sentAt, summary).catch((e: unknown) => {
         logger.warn(
           { component: "PredictionWorker", error: e },
           "telegram state-write failed",

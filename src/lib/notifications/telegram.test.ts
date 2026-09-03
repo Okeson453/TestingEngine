@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   formatPredictionMessage,
   formatValidationMessage,
+  getConfiguredChatIds,
   sendTelegramMessage,
   telegramConfigured,
 } from "./telegram.ts";
@@ -24,52 +25,140 @@ function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
   }
 }
 
-test("telegramConfigured: false when either env var is missing", () => {
+test("telegramConfigured: false when token missing", () => {
   withEnv(
     { TELEGRAM_BOT_TOKEN: undefined, TELEGRAM_CHAT_ID: undefined },
     () => assert.equal(telegramConfigured(), false),
   );
   withEnv(
-    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: undefined },
-    () => assert.equal(telegramConfigured(), false),
-  );
-  withEnv(
-    { TELEGRAM_BOT_TOKEN: undefined, TELEGRAM_CHAT_ID: "-100123" },
+    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: undefined, TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     () => assert.equal(telegramConfigured(), false),
   );
 });
 
-test("telegramConfigured: true when both env vars are present", () => {
+test("telegramConfigured: false when token present but no chat ids", () => {
   withEnv(
-    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123" },
+    {
+      TELEGRAM_BOT_TOKEN: "123:abc",
+      TELEGRAM_CHAT_ID: undefined,
+      TELEGRAM_GROUP_CHAT_ID: undefined,
+      TELEGRAM_EXTRA_CHAT_IDS: undefined,
+    },
+    () => assert.equal(telegramConfigured(), false),
+  );
+});
+
+test("telegramConfigured: true when token + primary chat", () => {
+  withEnv(
+    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     () => assert.equal(telegramConfigured(), true),
   );
 });
 
-test("sendTelegramMessage: returns not_configured when env missing", async () => {
-  await withEnv(
-    { TELEGRAM_BOT_TOKEN: undefined, TELEGRAM_CHAT_ID: undefined },
-    async () => {
-      const r = await sendTelegramMessage("hello");
-      assert.equal(r.ok, false);
-      assert.equal(r.status, 0);
-      assert.equal(r.error, "not_configured");
+test("telegramConfigured: true when token + group only (no primary)", () => {
+  withEnv(
+    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: undefined, TELEGRAM_GROUP_CHAT_ID: "-200456", TELEGRAM_EXTRA_CHAT_IDS: undefined },
+    () => assert.equal(telegramConfigured(), true),
+  );
+});
+
+test("telegramConfigured: true when token + extras only", () => {
+  withEnv(
+    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: undefined, TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: "-300,-301" },
+    () => assert.equal(telegramConfigured(), true),
+  );
+});
+
+test("getConfiguredChatIds: primary + group + extras in order, deduped", () => {
+  withEnv(
+    {
+      TELEGRAM_CHAT_ID: "100",
+      TELEGRAM_GROUP_CHAT_ID: "-200",
+      TELEGRAM_EXTRA_CHAT_IDS: "  -300 ,, -200 ,-301",
+    },
+    () => {
+      assert.deepEqual(getConfiguredChatIds(), ["100", "-200", "-300", "-301"]);
     },
   );
 });
 
-test("sendTelegramMessage: never throws on malformed upstream body", async () => {
+test("getConfiguredChatIds: empty list when nothing set", () => {
+  withEnv(
+    {
+      TELEGRAM_CHAT_ID: undefined,
+      TELEGRAM_GROUP_CHAT_ID: undefined,
+      TELEGRAM_EXTRA_CHAT_IDS: undefined,
+    },
+    () => assert.deepEqual(getConfiguredChatIds(), []),
+  );
+});
+
+test("sendTelegramMessage: returns single not_configured result when env missing", async () => {
   await withEnv(
-    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123" },
+    {
+      TELEGRAM_BOT_TOKEN: undefined,
+      TELEGRAM_CHAT_ID: undefined,
+      TELEGRAM_GROUP_CHAT_ID: undefined,
+      TELEGRAM_EXTRA_CHAT_IDS: undefined,
+    },
+    async () => {
+      const results = await sendTelegramMessage("hello");
+      assert.equal(results.length, 1);
+      assert.equal(results[0]!.ok, false);
+      assert.equal(results[0]!.status, 0);
+      assert.equal(results[0]!.error, "not_configured");
+      assert.equal(results[0]!.chatId, "");
+    },
+  );
+});
+
+test("sendTelegramMessage: fans out to all configured chats in order", async () => {
+  await withEnv(
+    {
+      TELEGRAM_BOT_TOKEN: "123:abc",
+      TELEGRAM_CHAT_ID: "100",
+      TELEGRAM_GROUP_CHAT_ID: "-200",
+      TELEGRAM_EXTRA_CHAT_IDS: "-300,-301",
+    },
     async () => {
       const realFetch = globalThis.fetch;
-      globalThis.fetch = (async () =>
-        new Response("not-json", { status: 200 })) as typeof fetch;
+      const urls: string[] = [];
+      const bodies: Array<Record<string, unknown>> = [];
+      globalThis.fetch = (async (
+        url: unknown,
+        init: { body?: string } = {},
+      ): Promise<Response> => {
+        urls.push(String(url));
+        bodies.push(JSON.parse(init.body ?? "{}"));
+        return new Response(
+          JSON.stringify({ ok: true, result: { message_id: urls.length } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as typeof fetch;
       try {
-        const r = await sendTelegramMessage("hello");
-        assert.equal(r.ok, false);
-        assert.equal(r.status, 200);
-        assert.equal(r.error, "malformed_response");
+        const results = await sendTelegramMessage("hello");
+        assert.equal(results.length, 4);
+        for (const r of results) assert.equal(r.ok, true);
+        assert.deepEqual(
+          results.map((r) => r.chatId),
+          ["100", "-200", "-300", "-301"],
+        );
+        // Each fetch body has the message + no-link-preview; the set of
+        // chat_ids the API was called with must equal the configured set.
+        // (bodies is appended in fetch-completion order, which is non-
+        // deterministic, so we assert on the SET of chat_ids, not their
+        // order in `bodies`.)
+        for (const b of bodies) {
+          assert.equal(b.text, "hello");
+          assert.equal(b.disable_web_page_preview, true);
+        }
+        assert.deepEqual(
+          bodies.map((b) => String(b.chat_id)).sort(),
+          ["-200", "-300", "-301", "100"],
+        );
+        // 4 distinct URL fetches, all using the same token
+        assert.equal(urls.length, 4);
+        for (const u of urls) assert.match(u, /api\.telegram\.org\/bot123:abc\/sendMessage/);
       } finally {
         globalThis.fetch = realFetch;
       }
@@ -77,9 +166,30 @@ test("sendTelegramMessage: never throws on malformed upstream body", async () =>
   );
 });
 
-test("sendTelegramMessage: returns ok:true on Telegram success envelope", async () => {
+test("sendTelegramMessage: never throws on malformed upstream body", async () => {
   await withEnv(
-    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123" },
+    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
+    async () => {
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async () =>
+        new Response("not-json", { status: 200 })) as typeof fetch;
+      try {
+        const results = await sendTelegramMessage("hello");
+        assert.equal(results.length, 1);
+        assert.equal(results[0]!.ok, false);
+        assert.equal(results[0]!.status, 200);
+        assert.equal(results[0]!.error, "malformed_response");
+        assert.equal(results[0]!.chatId, "-100123");
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    },
+  );
+});
+
+test("sendTelegramMessage: returns ok:true per chat on Telegram success envelope", async () => {
+  await withEnv(
+    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
       const realFetch = globalThis.fetch;
       globalThis.fetch = (async () =>
@@ -87,9 +197,11 @@ test("sendTelegramMessage: returns ok:true on Telegram success envelope", async 
           status: 200,
         })) as typeof fetch;
       try {
-        const r = await sendTelegramMessage("hello");
-        assert.equal(r.ok, true);
-        assert.equal(r.status, 200);
+        const results = await sendTelegramMessage("hello");
+        assert.equal(results.length, 1);
+        assert.equal(results[0]!.ok, true);
+        assert.equal(results[0]!.status, 200);
+        assert.equal(results[0]!.chatId, "-100123");
       } finally {
         globalThis.fetch = realFetch;
       }
@@ -97,9 +209,9 @@ test("sendTelegramMessage: returns ok:true on Telegram success envelope", async 
   );
 });
 
-test("sendTelegramMessage: captures Telegram description on 4xx", async () => {
+test("sendTelegramMessage: captures Telegram description per chat on 4xx", async () => {
   await withEnv(
-    { TELEGRAM_BOT_TOKEN: "bad", TELEGRAM_CHAT_ID: "-100123" },
+    { TELEGRAM_BOT_TOKEN: "bad", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
       const realFetch = globalThis.fetch;
       globalThis.fetch = (async () =>
@@ -108,10 +220,12 @@ test("sendTelegramMessage: captures Telegram description on 4xx", async () => {
           { status: 400 },
         )) as typeof fetch;
       try {
-        const r = await sendTelegramMessage("hello");
-        assert.equal(r.ok, false);
-        assert.equal(r.status, 400);
-        assert.equal(r.error, "chat not found");
+        const results = await sendTelegramMessage("hello");
+        assert.equal(results.length, 1);
+        assert.equal(results[0]!.ok, false);
+        assert.equal(results[0]!.status, 400);
+        assert.equal(results[0]!.error, "chat not found");
+        assert.equal(results[0]!.chatId, "-100123");
       } finally {
         globalThis.fetch = realFetch;
       }
@@ -119,9 +233,9 @@ test("sendTelegramMessage: captures Telegram description on 4xx", async () => {
   );
 });
 
-test("sendTelegramMessage: timeout produces timeout_5000ms error", async () => {
+test("sendTelegramMessage: per-chat timeout produces timeout_5000ms", async () => {
   await withEnv(
-    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123" },
+    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
       const realFetch = globalThis.fetch;
       globalThis.fetch = ((_url: unknown, init: RequestInit) =>
@@ -133,9 +247,11 @@ test("sendTelegramMessage: timeout produces timeout_5000ms error", async () => {
           });
         })) as typeof fetch;
       try {
-        const r = await sendTelegramMessage("hello");
-        assert.equal(r.ok, false);
-        assert.equal(r.error, "timeout_5000ms");
+        const results = await sendTelegramMessage("hello");
+        assert.equal(results.length, 1);
+        assert.equal(results[0]!.ok, false);
+        assert.equal(results[0]!.error, "timeout_5000ms");
+        assert.equal(results[0]!.chatId, "-100123");
       } finally {
         globalThis.fetch = realFetch;
       }
@@ -143,18 +259,60 @@ test("sendTelegramMessage: timeout produces timeout_5000ms error", async () => {
   );
 });
 
-test("sendTelegramMessage: never throws on network failure", async () => {
+test("sendTelegramMessage: never throws on per-chat network failure", async () => {
   await withEnv(
-    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123" },
+    { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
       const realFetch = globalThis.fetch;
       globalThis.fetch = (async () => {
         throw new Error("ECONNREFUSED");
       }) as typeof fetch;
       try {
-        const r = await sendTelegramMessage("hello");
-        assert.equal(r.ok, false);
-        assert.equal(r.error, "ECONNREFUSED");
+        const results = await sendTelegramMessage("hello");
+        assert.equal(results.length, 1);
+        assert.equal(results[0]!.ok, false);
+        assert.equal(results[0]!.error, "ECONNREFUSED");
+        assert.equal(results[0]!.chatId, "-100123");
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    },
+  );
+});
+
+test("sendTelegramMessage: per-chat independence — one bad chat does not block others", async () => {
+  await withEnv(
+    {
+      TELEGRAM_BOT_TOKEN: "123:abc",
+      TELEGRAM_CHAT_ID: "100",
+      TELEGRAM_GROUP_CHAT_ID: "-200",
+      TELEGRAM_EXTRA_CHAT_IDS: undefined,
+    },
+    async () => {
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (
+        _url: unknown,
+        init: { body?: string } = {},
+      ): Promise<Response> => {
+        const parsed = JSON.parse(init.body ?? "{}");
+        if (String(parsed.chat_id) === "100") {
+          return new Response(
+            JSON.stringify({ ok: false, description: "chat not found" }),
+            { status: 400, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ ok: true, result: { message_id: 1 } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as typeof fetch;
+      try {
+        const results = await sendTelegramMessage("hello");
+        assert.equal(results.length, 2);
+        const byChat = new Map(results.map((r) => [r.chatId, r]));
+        assert.equal(byChat.get("100")!.ok, false);
+        assert.equal(byChat.get("100")!.error, "chat not found");
+        assert.equal(byChat.get("-200")!.ok, true);
       } finally {
         globalThis.fetch = realFetch;
       }
@@ -226,7 +384,7 @@ test("formatValidationMessage: LOSS shape", () => {
 
 test("formatPredictionMessage: never exposes env or secrets", () => {
   withEnv(
-    { TELEGRAM_BOT_TOKEN: "SECRET_TOKEN_VALUE", TELEGRAM_CHAT_ID: "-1001" },
+    { TELEGRAM_BOT_TOKEN: "SECRET_TOKEN_VALUE", TELEGRAM_CHAT_ID: "-1001", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     () => {
       const msg = formatPredictionMessage({
         predictionId: "p1",

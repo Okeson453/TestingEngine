@@ -33,9 +33,29 @@ dashboard — the dashboard is the read-only view and never imports Telegram).
 | Variable | Required? | Purpose |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | For notifications | The token from BotFather |
-| `TELEGRAM_CHAT_ID` | For notifications | The numeric chat id from step 2 |
+| `TELEGRAM_CHAT_ID` | For notifications (or one of the two below) | The numeric chat id from step 2 (primary 1:1 chat) |
+| `TELEGRAM_GROUP_CHAT_ID` | No | A second chat id — typically a group/supergroup/channel you also want the bot to post into |
+| `TELEGRAM_EXTRA_CHAT_IDS` | No | A comma-separated list of additional chat ids (e.g. `12345,-10067890,-10067891`). Trimmed, deduped, order-preserved. |
 | `PREDICTION_POLL_MS` | No (default `3000`) | Override the 3-second default poll interval; do **not** go below `2000` |
 | `PREDICTION_PENDING_POLL_MS` | No (default `10000`) | Coarser poll used while a prediction is pending (see § Adaptive Polling) |
+
+### Multi-destination delivery
+
+The bot is "configured" when the token is present AND at least one of the
+three chat-id env vars is non-empty. Every message is fanned out to **all**
+configured chat ids (primary, then group, then extras in input order). Each
+destination is an independent HTTP request with its own `AbortController`,
+so a slow or failing chat never delays or blocks the others.
+
+The `SendResult` returned by `sendTelegramMessage()` is an **array** with
+one entry per destination, in the same order as the configured chat ids.
+The worker collapses this to a single error string for the dashboard
+(`"<chatId>:<error>;<chatId>:<error>"` for the first failure per
+destination; empty string when every destination succeeded).
+
+To add a group chat without losing the 1:1 chat, set both `TELEGRAM_CHAT_ID`
+(personal) and `TELEGRAM_GROUP_CHAT_ID` (group). To deliver to N additional
+groups, put their chat ids (comma-separated) in `TELEGRAM_EXTRA_CHAT_IDS`.
 
 Railway injects these into `process.env` at runtime. The worker reads them at
 the moment of send, so changes take effect on the next message — no redeploy
@@ -116,11 +136,11 @@ propagating to the prediction cycle:
 
 | Failure | What happens |
 |---|---|
-| Missing `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` | Send returns `not_configured`; the worker continues normally. No logs. |
-| Telegram API down | Send returns `{ ok: false, error }`; worker continues. |
-| Telegram API hangs (>5s) | AbortController fires; send returns `timeout_5000ms`; worker continues. |
+| Missing `TELEGRAM_BOT_TOKEN` or every chat id (`TELEGRAM_CHAT_ID` + `TELEGRAM_GROUP_CHAT_ID` + `TELEGRAM_EXTRA_CHAT_IDS`) | Send returns `not_configured`; the worker continues normally. No logs. |
+| Telegram API down | Send returns `{ ok: false, error }`; worker continues. Per-chat — a failing chat does not affect the others. |
+| Telegram API hangs (>5s) | Per-chat `AbortController` fires; send returns `timeout_5000ms`; worker continues. |
 | Bot token revoked (401/403) | `description` captured; worker continues; dashboard shows `telegram_last_error`. |
-| Wrong chat id (400 `chat not found`) | Same as above. |
+| Wrong chat id (400 `chat not found`) | Same as above. If only one of several destinations is wrong, the other destinations still get the message. |
 | Network failure | Send returns `network_error`; worker continues. |
 | Worker restart mid-send | Lost message. The prediction is still in `pending_predictions` and will resolve in the dashboard. |
 

@@ -8,6 +8,8 @@ import assert from "node:assert/strict";
  *   - Telegram delivery is fire-and-forget from the worker's perspective.
  *   - A Telegram failure NEVER causes the prediction/validation cycle to fail.
  *   - The cycle's `ok: true` is independent of Telegram delivery success.
+ *   - Multi-destination delivery (primary + group + extras) fans out
+ *     independently to every configured chat.
  *
  * The actual `fireTelegram` is module-private; we exercise the public surface
  * (`sendTelegramMessage` + the formatter pair) using the same code paths the
@@ -88,8 +90,10 @@ describe("worker → telegram fan-out contract", () => {
               lastRoundMultiplier: 1.24,
               generatedAt: "2026-01-01T00:00:00.000Z",
             });
-            const res = await sendTelegramMessage(text);
-            assert.equal(res.ok, true);
+            const results = await sendTelegramMessage(text);
+            assert.equal(results.length, 1);
+            assert.equal(results[0]!.ok, true);
+            assert.equal(results[0]!.chatId, "-1001");
           },
         );
       },
@@ -119,7 +123,9 @@ describe("worker → telegram fan-out contract", () => {
               result: "WIN",
               resolvedAt: "2026-01-01T00:00:00.000Z",
             });
-            await sendTelegramMessage(text);
+            const results = await sendTelegramMessage(text);
+            assert.equal(results.length, 1);
+            assert.equal(results[0]!.ok, true);
           },
         );
       },
@@ -149,23 +155,66 @@ describe("worker → telegram fan-out contract", () => {
               result: "LOSS",
               resolvedAt: "2026-01-01T00:00:00.000Z",
             });
-            await sendTelegramMessage(text);
+            const results = await sendTelegramMessage(text);
+            assert.equal(results.length, 1);
+            assert.equal(results[0]!.ok, true);
           },
         );
       },
     );
   });
 
-  it("telegram outage: send returns ok:false, never throws, never blocks the cycle", async () => {
+  it("multi-chat fan-out: primary + group + extras each get the message", async () => {
+    await stubEnv(
+      {
+        TELEGRAM_BOT_TOKEN: "123:abc",
+        TELEGRAM_CHAT_ID: "100",
+        TELEGRAM_GROUP_CHAT_ID: "-200",
+        TELEGRAM_EXTRA_CHAT_IDS: "-300,-301",
+      },
+      async () => {
+        const seenChats: string[] = [];
+        await withStubbedFetch(
+          async (_url, body) => {
+            const parsed = JSON.parse(body ?? "{}");
+            seenChats.push(String(parsed.chat_id));
+            return okJson({ ok: true, result: { message_id: seenChats.length } });
+          },
+          async () => {
+            const text = formatPredictionMessage({
+              predictionId: "p1",
+              targetMultiplier: 1.3,
+              probability: 0.62,
+              confidence: 0.74,
+              regimeName: "momentum-cool",
+              lastRoundMultiplier: 1.24,
+              generatedAt: "2026-01-01T00:00:00.000Z",
+            });
+            const results = await sendTelegramMessage(text);
+            assert.equal(results.length, 4);
+            assert.deepEqual(
+              results.map((r) => r.chatId),
+              ["100", "-200", "-300", "-301"],
+            );
+            for (const r of results) assert.equal(r.ok, true);
+            assert.deepEqual(seenChats, ["100", "-200", "-300", "-301"]);
+          },
+        );
+      },
+    );
+  });
+
+  it("telegram outage: send returns ok:false per chat, never throws, never blocks the cycle", async () => {
     await stubEnv(
       { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-1001" },
       async () => {
         await withStubbedFetch(
           async () => new Response("upstream down", { status: 503 }),
           async () => {
-            const res = await sendTelegramMessage("hello");
-            assert.equal(res.ok, false);
-            assert.equal(res.status, 503);
+            const results = await sendTelegramMessage("hello");
+            assert.equal(results.length, 1);
+            assert.equal(results[0]!.ok, false);
+            assert.equal(results[0]!.status, 503);
           },
         );
       },
@@ -192,9 +241,10 @@ describe("worker → telegram fan-out contract", () => {
             return new Response("{}", { status: 200 });
           },
           async () => {
-            const res = await sendTelegramMessage("hello");
-            assert.equal(res.ok, false);
-            assert.equal(res.error, "not_configured");
+            const results = await sendTelegramMessage("hello");
+            assert.equal(results.length, 1);
+            assert.equal(results[0]!.ok, false);
+            assert.equal(results[0]!.error, "not_configured");
           },
         );
       },
@@ -214,7 +264,9 @@ describe("worker → telegram fan-out contract", () => {
             return okJson({ ok: true, result: { message_id: 1 } });
           },
           async () => {
-            await sendTelegramMessage("hello");
+            const results = await sendTelegramMessage("hello");
+            assert.equal(results.length, 1);
+            assert.equal(results[0]!.ok, true);
           },
         );
       },
