@@ -12,6 +12,13 @@ import {
   getDailyTarget,
 } from "./service.ts";
 import { getLogger } from "@/lib/observability/logger";
+import {
+  formatPredictionMessage,
+  formatValidationMessage,
+  sendTelegramMessage,
+  telegramConfigured,
+  type SendResult,
+} from "@/lib/notifications/telegram.ts";
 
 const logger = getLogger("prediction-worker");
 
@@ -68,6 +75,12 @@ export type WorkerStatus = {
   resolvedToday: number;
   dailyTarget: number;
   remainingToday: number;
+  /** Whether TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are configured. */
+  telegramEnabled: boolean;
+  /** ISO timestamp of the last send attempt (empty until the first attempt). */
+  telegramLastSentAt: string | null;
+  /** Telegram's description / error code on the last failure (empty on success). */
+  telegramLastError: string | null;
 };
 
 export interface WorkerCycleResult {
@@ -162,6 +175,52 @@ async function readStateMap(sql: Sql): Promise<Map<string, string>> {
   const m = new Map<string, string>();
   for (const r of rows) if (r.value != null) m.set(r.key, r.value);
   return m;
+}
+
+/* ── Telegram notifications (fire-and-forget side channel) ──────────────── */
+
+/**
+ * Best-effort write of delivery health to `worker_state` so the dashboard can
+ * surface notification status. Failures are logged but NEVER propagated — a
+ * state-write failure must not affect the prediction cycle.
+ */
+async function recordTelegramResult(sql: Sql, outcome: SendResult): Promise<void> {
+  try {
+    const nowIso = new Date().toISOString();
+    await setState(sql, STATE.TELEGRAM_ENABLED, telegramConfigured() ? "1" : "0");
+    await setState(sql, STATE.TELEGRAM_LAST_SENT_AT, nowIso);
+    await setState(
+      sql,
+      STATE.TELEGRAM_LAST_ERROR,
+      outcome.ok ? "" : outcome.error ?? `status_${outcome.status}`,
+    );
+  } catch (e: unknown) {
+    logger.error(
+      { component: "PredictionWorker", error: e },
+      "telegram state-write failed (non-fatal)",
+    );
+  }
+}
+
+/**
+ * Fire-and-forget Telegram delivery. Wraps `sendTelegramMessage` in a voided
+ * promise with `.then/.catch` so the worker cycle NEVER awaits Telegram or
+ * lets a delivery failure propagate into the prediction/validation lifecycle.
+ */
+function fireTelegram(text: string, sql: Sql): void {
+  void sendTelegramMessage(text)
+    .then((outcome) => void recordTelegramResult(sql, outcome))
+    .catch((e: unknown) => {
+      logger.warn(
+        { component: "PredictionWorker", error: e },
+        "telegram notification path rejected (non-fatal)",
+      );
+      void recordTelegramResult(sql, {
+        ok: false,
+        status: 0,
+        error: e instanceof Error ? e.message : "unexpected_error",
+      });
+    });
 }
 
 /* ── The core prediction/validate cycle (no lock management) ───────────── */
@@ -264,6 +323,21 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     try {
       const outcome = await validateAgainstNewRounds(insertedRounds);
       result.resolved = outcome.resolved;
+      for (const pair of outcome.pairs) {
+        if (pair.targetMultiplier === 0) continue; // recovery pass — skip, no duplicate notify
+        fireTelegram(
+          formatValidationMessage({
+            predictionId: pair.predictionId,
+            gameId: pair.gameId,
+            targetMultiplier: pair.targetMultiplier,
+            actualMultiplier: pair.actualMultiplier,
+            probability: pair.probability,
+            result: pair.result,
+            resolvedAt: pair.resolvedAt,
+          }),
+          sql,
+        );
+      }
     } catch (e: unknown) {
       fail((e as Error)?.message ?? String(e));
     }
@@ -278,8 +352,22 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     try {
       const [today, pending] = await Promise.all([getTodayStats(), getPendingStatus()]);
       if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0) {
-        const signal = await generateAndQueuePrediction().catch((_e: unknown) => null);
-        if (signal) result.generated = signal.predictionId;
+        const queued = await generateAndQueuePrediction().catch(() => null);
+        if (queued) {
+          result.generated = queued.signal.predictionId;
+          fireTelegram(
+            formatPredictionMessage({
+              predictionId: queued.signal.predictionId,
+              targetMultiplier: Number(queued.signal.target ?? 1.3),
+              probability: queued.signal.probability,
+              confidence: queued.signal.confidence,
+              regimeName: queued.signal.regimeId ?? null,
+              lastRoundMultiplier: queued.lastRound?.multiplier ?? null,
+              generatedAt: new Date().toISOString(),
+            }),
+            sql,
+          );
+        }
       }
     } catch (e: unknown) {
       fail((e as Error)?.message ?? String(e));
@@ -363,6 +451,9 @@ export async function getWorkerStatus(): Promise<WorkerStatus> {
     resolvedToday: today.total,
     dailyTarget: target.dailyTarget,
     remainingToday: today.remaining,
+    telegramEnabled: state.get(STATE.TELEGRAM_ENABLED) === "1",
+    telegramLastSentAt: state.get(STATE.TELEGRAM_LAST_SENT_AT) ?? null,
+    telegramLastError: state.get(STATE.TELEGRAM_LAST_ERROR) ?? null,
   };
 }
 
@@ -403,7 +494,13 @@ export function startWorker(): WorkerHandle {
   if (handle.running) return handle;
   handle.running = true;
   handle.ownerId = randomUUID();
-  logger.info({ component: "PredictionWorker" }, "worker starting");
+  logger.info(
+    {
+      component: "PredictionWorker",
+      telegram: telegramConfigured() ? "enabled" : "disabled (no env)",
+    },
+    "worker starting",
+  );
   void run(handle);
   return handle;
 }
@@ -452,13 +549,24 @@ async function run(handle: WorkerHandle): Promise<void> {
 
   try {
     while (handle.running) {
+      let cycleResult: WorkerCycleResult;
       try {
-        await runCycleWork(sql);
+        cycleResult = await runCycleWork(sql);
       } catch (e: unknown) {
         logger.error(
           { component: "PredictionWorker", error: e },
           "cycle body threw",
         );
+        cycleResult = {
+          ran: true,
+          fetched: 0,
+          inserted: 0,
+          onlinePlayers: null,
+          resolved: 0,
+          generated: null,
+          error: e instanceof Error ? e.message : String(e),
+          ok: false,
+        };
       }
       // Keep the lock alive between cycles (also covers the poll sleep window).
       ours = await heartbeat(sql, handle.ownerId);
@@ -469,7 +577,19 @@ async function run(handle: WorkerHandle): Promise<void> {
         );
         break;
       }
-      await sleep(handle, POLL_INTERVAL_MS);
+      // Adaptive poll: while a prediction is awaiting resolution the outstanding
+      // round's outcome is the only thing that matters — back off to reduce
+      // upstream BC.Game load. Resume the configured cadence once it resolves.
+      let sleepMs = POLL_INTERVAL_MS;
+      if (cycleResult.error == null) {
+        try {
+          const ps = await getPendingStatus();
+          if (ps.hasPending) sleepMs = POLL_INTERVAL_AWAITING_MS;
+        } catch {
+          /* keep normal cadence on query failure */
+        }
+      }
+      await sleep(handle, sleepMs);
     }
   } finally {
     await releaseLock(sql, handle.ownerId);
