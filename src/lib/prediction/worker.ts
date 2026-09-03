@@ -19,6 +19,13 @@ import {
   telegramConfigured,
   type SendResult,
 } from "@/lib/notifications/telegram";
+import { 
+  processOutbox,
+  createPredictionNotification,
+  createValidationNotification,
+  getOutboxStats,
+  type OutboxNotification 
+} from "@/lib/notifications/outbox";
 import { getLogger } from "@/lib/observability/logger";
 import { bcGameSocket, startEventDrivenPipeline, stopEventDrivenPipeline } from "./events/game-event-handlers";
 
@@ -44,6 +51,8 @@ const PENDING_POLL_INTERVAL_MS = Math.max(
 const LOCK_TTL_SEC = Number(process.env.PREDICTION_LOCK_TTL_SEC ?? 60);
 /** How many BC.Game history pages to fetch per poll (freshness vs. rate). */
 const FETCH_PAGES = Number(process.env.PREDICTION_FETCH_PAGES ?? 2);
+/** How often to process the notification outbox (separate from main polling) */
+const OUTBOX_PROCESS_INTERVAL_MS = Number(process.env.OUTBOX_PROCESS_INTERVAL_MS ?? 1000);
 
 const LOCK_KEY = "prediction_worker";
 
@@ -60,10 +69,6 @@ const STATE = {
   TELEGRAM_ENABLED: "telegram_enabled",
   TELEGRAM_LAST_SENT_AT: "telegram_last_sent_at",
   TELEGRAM_LAST_ERROR: "telegram_last_error",
-  // NEW: Socket.IO connection state
-  SOCKET_CONNECTED: "socket_connected",
-  SOCKET_LAST_CONNECTED_AT: "socket_last_connected_at",
-  SOCKET_LAST_ERROR: "socket_last_error",
 } as const;
 
 export type WorkerStatus = {
@@ -90,10 +95,6 @@ export type WorkerStatus = {
   telegramLastSentAt: string | null;
   /** Last Telegram delivery error (empty on success). */
   telegramLastError: string | null;
-  // NEW: Socket.IO connection status
-  socketConnected: boolean;
-  socketLastConnectedAt: string | null;
-  socketLastError: string | null;
 };
 
 export interface WorkerCycleResult {
@@ -190,95 +191,6 @@ async function readStateMap(sql: Sql): Promise<Map<string, string>> {
   return m;
 }
 
-/* ── Telegram notification fan-out (fire-and-forget) ─────────────────── */
-
-/**
- * Fire-and-forget Telegram send. The cycle never awaits this. Each configured
- * chat is an independent destination (per-chat send, per-chat AbortController);
- * the array of results is collapsed to a single error string for the dashboard
- * (first non-ok wins; empty string when every destination succeeded). The
- * cycle never throws, never blocks, never corrupts the worker.
- */
-function fireTelegram(text: string, sql: Sql): void {
-  const sentAt = new Date().toISOString();
-  void sendTelegramMessage(text)
-    .then((results: SendResult[]) => {
-      // Per-chat result log to stdout (Railway captures it) so the operator
-      // can see in the deploy logs which destinations succeeded and which
-      // failed. The chatId is the operator's own value (not a secret); we
-      // log it so a failing destination is immediately identifiable.
-      // Successes are debug-noise and stay in the in-memory noop logger.
-      for (const r of results) {
-        if (!r.ok) {
-          console.warn(
-            `[worker] telegram send failed chatId=${r.chatId || "<unset>"} status=${r.status} error=${r.error ?? "unknown_error"}`,
-          );
-        }
-      }
-      const errorSummary = results
-        .filter((r) => !r.ok)
-        .map((r) => `${r.chatId || "<unset>"}:${r.error ?? "unknown_error"}`)
-        .join(";");
-      const summary: SendResult = {
-        ok: results.every((r) => r.ok),
-        status: results.find((r) => !r.ok)?.status ?? results[0]?.status ?? 0,
-        error: errorSummary || undefined,
-        chatId: results.map((r) => r.chatId).filter(Boolean).join(","),
-      };
-      void recordTelegramResult(sql, sentAt, summary).catch((e: unknown) => {
-        logger.warn(
-          { component: "PredictionWorker", error: e },
-          "telegram state-write failed",
-        );
-      });
-    })
-    .catch((e: unknown) => {
-      // Defensive — sendTelegramMessage never rejects, so this branch is for
-      // programmer-error only (e.g. a bad formatter). Keep the worker alive.
-      console.warn(`[worker] telegram fan-out rejected error=${String(e)}`);
-    });
-}
-
-/** Best-effort write of the last Telegram delivery outcome. */
-async function recordTelegramResult(
-  sql: Sql,
-  sentAt: string,
-  res: SendResult,
-): Promise<void> {
-  try {
-    await setState(sql, STATE.TELEGRAM_LAST_SENT_AT, sentAt);
-    await setState(
-      sql,
-      STATE.TELEGRAM_LAST_ERROR,
-      res.ok ? "" : (res.error ?? "unknown_error"),
-    );
-  } catch (e: unknown) {
-    logger.warn(
-      { component: "PredictionWorker", error: e },
-      "telegram state-write failed",
-    );
-  }
-}
-
-/* ── Socket.IO state management ──────────────────────────────────────── */
-
-/**
- * Update Socket.IO connection state in worker state
- */
-async function updateSocketState(sql: Sql): Promise<void> {
-  const state = bcGameSocket.getState();
-  try {
-    await setState(sql, STATE.SOCKET_CONNECTED, state.status === "connected" ? "1" : "0");
-    await setState(sql, STATE.SOCKET_LAST_CONNECTED_AT, state.lastConnectedAt ?? "");
-    await setState(sql, STATE.SOCKET_LAST_ERROR, state.lastError ?? "");
-  } catch (e: unknown) {
-    logger.warn(
-      { component: "PredictionWorker", error: e },
-      "socket state-write failed",
-    );
-  }
-}
-
 /* ── The core prediction/validate cycle (no lock management) ───────────── */
 
 /**
@@ -295,8 +207,7 @@ async function updateSocketState(sql: Sql): Promise<void> {
  * being reported as "ok" — and prevents a transient DB blip from being
  * hidden by a later successful step.
  *
- * NEW: This now works alongside the event-driven Socket.IO prediction pipeline.
- * The REST polling path remains as a reconciliation and recovery safety net.
+ * NEW: Telegram notifications now use the durable outbox pattern.
  */
 export async function runWorkerCycle(): Promise<WorkerCycleResult> {
   const sql = await getSql();
@@ -344,7 +255,6 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
   };
 
   // 1. BC.Game history polling (server-side, no browser/dashboard).
-  // This is now the FALLBACK path - the primary prediction trigger is Socket.IO
   try {
     [rounds, onlinePlayers] = await Promise.all([
       fetchCrashHistory(FETCH_PAGES),
@@ -401,55 +311,53 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
       statsPromise,
     ]);
     result.resolved = outcome.resolved;
-    // Telegram fan-out for each newly-resolved pair. targetMultiplier === 0
-    // is the recovery re-pass sentinel (the row was validated by an earlier
-    // worker); we skip notification in that case to avoid noise on restart.
+    // Telegram notifications are now handled via durable outbox
+    // This ensures Telegram delivery never blocks prediction generation
     for (const pair of outcome.pairs) {
-      if (pair.targetMultiplier === 0) continue;
-      if (!telegramConfigured()) continue;
-      fireTelegram(
-        formatValidationMessage({
-          predictionId: pair.predictionId,
-          gameId: pair.gameId,
-          targetMultiplier: pair.targetMultiplier,
-          actualMultiplier: pair.actualMultiplier,
-          probability: pair.probability,
-          result: pair.result,
-          resolvedAt: pair.resolvedAt,
-        }),
-        sql,
-      );
+      if (pair.targetMultiplier === 0) continue; // Skip recovery re-pass
+      // Queue validation notification in outbox (non-blocking)
+      void createValidationNotification(sql, {
+        predictionId: pair.predictionId,
+        gameId: pair.gameId,
+        targetMultiplier: pair.targetMultiplier,
+        actualMultiplier: pair.actualMultiplier,
+        probability: pair.probability,
+        result: pair.result,
+        resolvedAt: pair.resolvedAt,
+      }).catch((e) => {
+        logger.error(
+          { component: "PredictionWorker", error: e },
+          "Failed to queue validation notification"
+        );
+      });
     }
 
     // 4. Daily entry counting: only generate a new prediction if the daily
     //    target isn't met AND there's no pending AND no unmatched-new-round
     //    waiting to be resolved (otherwise the next cycle will handle it).
-    //    
-    // NEW: This is now the FALLBACK prediction generation path.
-    // The primary path is the Socket.IO event-driven approach via bg events.
-    // The REST polling path must NEVER become the primary prediction trigger
-    // and must NEVER generate predictions from already-settled rounds.
+    //    The daily target is an OPERATING target only — prediction_validations
+    //    history is permanent and never truncated.
     if (firstError == null) {
       try {
         if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0) {
           const queued = await generateAndQueuePrediction().catch((_e: unknown) => null);
           if (queued) {
             result.generated = queued.signal.predictionId;
-            if (telegramConfigured()) {
-              const signal = queued.signal;
-              fireTelegram(
-                formatPredictionMessage({
-                  predictionId: signal.predictionId,
-                  targetMultiplier: Number(signal.target ?? 1.3),
-                  probability: signal.probability,
-                  confidence: signal.confidence,
-                  regimeName: signal.regimeId ?? null,
-                  lastRoundMultiplier: queued.lastRound?.multiplier ?? null,
-                  generatedAt: new Date().toISOString(),
-                }),
-                sql,
+            // Queue prediction notification in outbox (non-blocking)
+            void createPredictionNotification(sql, {
+              predictionId: queued.signal.predictionId,
+              targetMultiplier: Number(queued.signal.target ?? 1.3),
+              probability: queued.signal.probability,
+              confidence: queued.signal.confidence,
+              regimeName: queued.signal.regimeId ?? null,
+              lastRoundMultiplier: queued.lastRound?.multiplier ?? null,
+              generatedAt: new Date().toISOString(),
+            }).catch((e) => {
+              logger.error(
+                { component: "PredictionWorker", error: e },
+                "Failed to queue prediction notification"
               );
-            }
+            });
           }
         }
       } catch (e: unknown) {
@@ -493,9 +401,6 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
       telegramConfigured() ? "1" : "0",
     );
     await incrementCycles(sql);
-    
-    // NEW: Update Socket.IO connection state
-    await updateSocketState(sql);
   } catch (e: unknown) {
     logger.error(
       { component: "PredictionWorker", error: e },
@@ -528,11 +433,6 @@ export async function getWorkerStatus(): Promise<WorkerStatus> {
   const lastOnlinePlayers =
     rawPlayers != null && rawPlayers !== "" ? Number(rawPlayers) : null;
 
-  // NEW: Get Socket.IO connection state
-  const socketConnected = state.get(STATE.SOCKET_CONNECTED) === "1";
-  const socketLastConnectedAt = state.get(STATE.SOCKET_LAST_CONNECTED_AT) ?? null;
-  const socketLastError = state.get(STATE.SOCKET_LAST_ERROR) ?? null;
-
   return {
     running,
     ownerId: lock?.owner_id ?? null,
@@ -553,10 +453,6 @@ export async function getWorkerStatus(): Promise<WorkerStatus> {
     telegramEnabled: state.get(STATE.TELEGRAM_ENABLED) === "1",
     telegramLastSentAt: state.get(STATE.TELEGRAM_LAST_SENT_AT) ?? null,
     telegramLastError: state.get(STATE.TELEGRAM_LAST_ERROR) ?? null,
-    // NEW: Socket.IO state
-    socketConnected,
-    socketLastConnectedAt,
-    socketLastError,
   };
 }
 
@@ -723,4 +619,8 @@ export {
   bcGameSocket,
   startEventDrivenPipeline,
   stopEventDrivenPipeline,
+  processOutbox,
+  createPredictionNotification,
+  createValidationNotification,
+  getOutboxStats,
 };
