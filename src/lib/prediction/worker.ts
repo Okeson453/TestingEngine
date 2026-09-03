@@ -14,6 +14,7 @@ import {
 import {
   formatPredictionMessage,
   formatValidationMessage,
+  getConfiguredChatIds,
   sendTelegramMessage,
   telegramConfigured,
   type SendResult,
@@ -193,6 +194,18 @@ function fireTelegram(text: string, sql: Sql): void {
   const sentAt = new Date().toISOString();
   void sendTelegramMessage(text)
     .then((results: SendResult[]) => {
+      // Per-chat result log to stdout (Railway captures it) so the operator
+      // can see in the deploy logs which destinations succeeded and which
+      // failed. The chatId is the operator's own value (not a secret); we
+      // log it so a failing destination is immediately identifiable.
+      // Successes are debug-noise and stay in the in-memory noop logger.
+      for (const r of results) {
+        if (!r.ok) {
+          console.warn(
+            `[worker] telegram send failed chatId=${r.chatId || "<unset>"} status=${r.status} error=${r.error ?? "unknown_error"}`,
+          );
+        }
+      }
       const errorSummary = results
         .filter((r) => !r.ok)
         .map((r) => `${r.chatId || "<unset>"}:${r.error ?? "unknown_error"}`)
@@ -213,10 +226,7 @@ function fireTelegram(text: string, sql: Sql): void {
     .catch((e: unknown) => {
       // Defensive — sendTelegramMessage never rejects, so this branch is for
       // programmer-error only (e.g. a bad formatter). Keep the worker alive.
-      logger.warn(
-        { component: "PredictionWorker", error: e },
-        "telegram fan-out rejected",
-      );
+      console.warn(`[worker] telegram fan-out rejected error=${String(e)}`);
     });
 }
 
@@ -540,15 +550,19 @@ export function startWorker(): WorkerHandle {
   if (handle.running) return handle;
   handle.running = true;
   handle.ownerId = randomUUID();
-  logger.info(
-    {
-      component: "PredictionWorker",
-      telegram: telegramConfigured() ? "enabled" : "disabled (no env)",
-      pollIntervalMs: POLL_INTERVAL_MS,
-      pendingPollIntervalMs: PENDING_POLL_INTERVAL_MS,
-    },
-    "worker starting",
-  );
+  const chatIds = getConfiguredChatIds();
+  // Log to stdout/stderr (not the in-memory noop logger) so Railway captures
+  // the line. We log the count, not the ids — chat ids are operator-controlled
+  // but enumerating them on every boot is noisy; the per-chat result after
+  // each send tells the operator which id (if any) is failing.
+  const bootMsg = `[worker] starting telegram=${
+    telegramConfigured() ? "enabled" : "disabled (no env)"
+  } telegramChatCount=${chatIds.length} pollIntervalMs=${POLL_INTERVAL_MS} pendingPollIntervalMs=${PENDING_POLL_INTERVAL_MS}`;
+  if (telegramConfigured()) {
+    console.log(bootMsg);
+  } else {
+    console.warn(bootMsg);
+  }
   void run(handle);
   return handle;
 }
