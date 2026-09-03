@@ -1,3 +1,8 @@
 {
-  "_comment": "Vercel deployment hosts only the read-only dashboard (Vite SSR + Nitro). The continuous ~10s prediction/validation worker runs on Railway as a separate persistent background service (see railway.toml) because Vercel Hobby Cron cannot reliably run sub-minute polling or preserve warm state across invocations."
+  "crons": [
+    {
+      "path": "/worker",
+      "schedule": "*/5 * * * *"
+    }
+  ]
 }
