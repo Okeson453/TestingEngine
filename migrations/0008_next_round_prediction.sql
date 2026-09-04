@@ -33,14 +33,15 @@ ON pending_predictions (target_round_started_at, requested_at)
 WHERE target_game_id IS NOT NULL AND target_round_started_at IS NOT NULL;
 
 -- Add constraint to ensure target_game_id is set when target_round_started_at is set
--- This enforces that predictions are always anchored to a real round
-ALTER TABLE pending_predictions 
-ADD CONSTRAINT pending_predictions_target_anchor_check 
-CHECK (
-  target_game_id IS NULL AND target_round_started_at IS NULL 
-  OR 
-  target_game_id IS NOT NULL AND target_round_started_at IS NOT NULL
-);
+-- This enforces that predictions are always anchored to a real round.
+-- NOTE: a previous version of this migration added a CHECK constraint
+-- `pending_predictions_target_anchor_check` requiring both target_game_id
+-- and target_round_started_at to be set together. That CHECK was too
+-- restrictive for legacy backfill (rows with `matched_game_id = NULL`
+-- could not be backfilled without violating it) and has been removed.
+-- The active-target UNIQUE index (in 0013) is the canonical idempotency
+-- gate, and the strict temporal invariant is enforced at the application
+-- layer in `predictor.onGameStart`.
 
 -- Create a view for temporal invariant verification (spec §9.1)
 CREATE OR REPLACE VIEW temporal_invariant_violations AS
