@@ -1,18 +1,17 @@
 /**
  * Synchronous-on-event predictor.
  *
- * Spec: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §7.2
+ * Spec: TestingEngine_Comprehensive_Diagnosis_and_Solution.md §5–§7
  *
- * `onGameStart` is the single function that creates a `pending_predictions`
- * row in the new architecture. It is called from the Socket.IO `bg` (begin)
- * event handler and writes the prediction, the outbox rows, and the
- * `live_event_log` row in one transaction. The strict temporal invariant
- * (`prediction_generated_at < target_round_began_at`) holds at the commit
- * of this transaction.
+ * PRIMARY production path (ahead-of-time N+1):
+ *   ED(N) → onGameEndPredict → persist pending for N+1 with generated_at
+ *   BG(N+1) → backfill target_round_started_at only (never creates prediction)
  *
- * The function NEVER throws to the caller; every error is logged and
- * recorded in `worker_state.last_error`. The next `bg` event retries
- * idempotently via the partial unique index on `target_game_id`.
+ * Hard temporal invariant:
+ *   prediction_generated_at < target_round_started_at < target_round_crashed_at
+ *
+ * `onGameStart` is retained only for tests / emergency recovery. Production
+ * Socket.IO handlers must NOT call it to create predictions.
  */
 import { randomUUID } from "node:crypto";
 import { getSql, type Sql } from "@/lib/db";
@@ -583,12 +582,27 @@ export async function onGameEndPredict(
       return { predictionId: null, targetGameId, kind: "insufficient_history" };
     }
 
+    const tPredict0 = performance.now();
     const signal = predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET);
+    const predictionLatencyMs = Math.round(performance.now() - tPredict0);
+    try {
+      const { predictionGenerationMs, edToPredictMs } = await import(
+        "@/lib/observability/performance/latency"
+      );
+      predictionGenerationMs.observe(predictionLatencyMs);
+      const sinceCrash = Date.now() - new Date(crashedAt).getTime();
+      if (Number.isFinite(sinceCrash) && sinceCrash >= 0) {
+        edToPredictMs.observe(sinceCrash);
+      }
+    } catch {
+      /* metrics optional */
+    }
 
     // Insert with conflict tolerance: prediction_id unique + partial unique
     // on (target_game_id) WHERE status='PENDING'. Either race returns
     // duplicate rather than throwing.
     try {
+      const tPersist0 = performance.now();
       await sql`
         INSERT INTO pending_predictions (
           prediction_id, target_multiplier, probability, confidence,
@@ -604,6 +618,39 @@ export async function onGameEndPredict(
         )
         ON CONFLICT (prediction_id) DO NOTHING
       `;
+      const persistMs = Math.round(performance.now() - tPersist0);
+      try {
+        const { predictionPersistMs } = await import(
+          "@/lib/observability/performance/latency"
+        );
+        predictionPersistMs.observe(persistMs);
+      } catch {
+        /* metrics optional */
+      }
+      // Record PREDICT event for ED-path latency dashboard
+      try {
+        await sql`
+          INSERT INTO live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) VALUES (
+            ${correlationId}::text, 'PREDICT', ${targetGameId},
+            ${JSON.stringify({
+              sourceGameId: gameId,
+              predictionId: signal.predictionId,
+              predictionLatencyMs,
+              persistMs,
+              generatedAt,
+            })},
+            ${generatedAt}::timestamptz, now(),
+            ${predictionLatencyMs + persistMs},
+            ${predictionLatencyMs + persistMs > 500}
+          )
+          ON CONFLICT DO NOTHING
+        `;
+      } catch {
+        /* non-fatal */
+      }
     } catch (insertErr) {
       // Partial unique index race (target_game_id PENDING) surfaces as
       // a unique_violation that ON CONFLICT (prediction_id) cannot absorb.

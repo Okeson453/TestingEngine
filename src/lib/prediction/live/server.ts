@@ -19,68 +19,56 @@ import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("live-server");
 
-/** The §9.1 strict invariant query.
+/** Strict temporal invariant (Diagnosis §4 / §20).
  *
- *  Spec: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §9.1, §10.1
+ *  Hard requirement for ED-driven N+1 predictions:
+ *    prediction_generated_at < target_round_started_at
+ *    (and when crashed_at is known: started_at < crashed_at)
  *
- *  The strict temporal inequality in the spec is:
- *    `prediction_generated_at < target_round_started_at < target_round.crashed_at`
+ *  Production path: ED(N) → onGameEndPredict writes generated_at with
+ *  target_round_started_at NULL; BG(N+1) only backfills started_at.
+ *  Therefore when started_at is present, generated_at MUST be strictly earlier.
  *
- *  This is provable from persisted data ONLY for predictions where
- *  the bg event arrived BEFORE the round's authoritative beginTime
- *  (clock skew / replay / future-dated payload case). For the normal
- *  in-flight case, the strict `<` does not hold because the bg event
- *  arrives after the round began (network latency). The realistic
- *  invariant in the normal case is:
- *    `target_round_started_at <= prediction_generated_at < target_round.crashed_at`
- *  i.e. we predict after the round began, but well before it ends.
- *
- *  This function counts rows where `prediction_generated_at` is more
- *  than 5 seconds AFTER `target_round_started_at` AND the round
- *  has already crashed — that is the violation case the spec calls out.
+ *  Rows still PENDING with NULL started_at are excluded (not yet measurable).
+ *  A 5-second "grace" is intentionally NOT applied — that weakened the gate.
  */
 export async function getInvariantStatus(): Promise<{
   violations: number;
   total: number;
+  measurable: number;
   measuredAt: string;
 }> {
   const sql = await getSql();
-  const rows = await sql<{ violations: number; total: number }>`
+  const rows = await sql<{ violations: number; total: number; measurable: number }>`
     select
       count(*) filter (
-        where pp.requested_at > pp.target_round_started_at + interval '5 seconds'
-          and cr.crashed_at is not null
-          and pp.requested_at > cr.crashed_at
+        where pp.target_round_started_at is not null
+          and coalesce(pp.generated_at, pp.requested_at) >= pp.target_round_started_at
       )::int as violations,
-      count(*)::int as total
+      count(*)::int as total,
+      count(*) filter (
+        where pp.target_round_started_at is not null
+      )::int as measurable
     from pending_predictions pp
-    left join crash_rounds cr on cr.game_id = pp.target_game_id
-    where pp.requested_at > now() - interval '24 hours'
-      and pp.matched = false
+    where coalesce(pp.generated_at, pp.requested_at) > now() - interval '24 hours'
       and pp.target_game_id is not null
   `;
   return {
     violations: rows[0]?.violations ?? 0,
     total: rows[0]?.total ?? 0,
+    measurable: rows[0]?.measurable ?? 0,
     measuredAt: new Date().toISOString(),
   };
 }
 
 /**
- * Spec §6 (TestingEngine_Deep_Diagnosis.md) verification query — the
- * strict form, gated by a 5-second SLA lag tolerance.
+ * Strict temporal violation listing (Diagnosis §4 / §20).
  *
- * The diagnosis' exact query uses a strict `>` (`pp.generated_at >=
- * pp.target_round_started_at`) but in normal operation the bg event
- * arrives *after* the round began (by network latency), so the strict
- * `<` form would fire on every healthy prediction. We use the same
- * 5-second tolerance that the §9.1 `getInvariantStatus` helper uses,
- * which is the realistic spec interpretation:
+ * A violation is any prediction where:
+ *   coalesce(generated_at, requested_at) >= target_round_started_at
+ * or started_at >= crashed_at when both exist.
  *
- *   `prediction_generated_at - target_round_started_at > 5s` (late)
- *   OR `target_round_started_at >= target_round.crashed_at` (impossible)
- *
- * Returns at most `limit` rows (default 100) to keep the payload bounded.
+ * No 5-second grace — that allowed "predict after start" to report clean.
  */
 export async function getInvariantViolations(opts: { limit?: number } = {}): Promise<
   Array<{
@@ -107,23 +95,26 @@ export async function getInvariantViolations(opts: { limit?: number } = {}): Pro
     select
       pp.prediction_id,
       pp.target_game_id,
-      pp.requested_at as generated_at,
+      coalesce(pp.generated_at, pp.requested_at) as generated_at,
       pp.target_round_started_at,
       cr.crashed_at as target_crashed_at,
-      (extract(epoch from (pp.requested_at - pp.target_round_started_at)) * 1000)::int as lag_ms,
+      (extract(epoch from (
+        coalesce(pp.generated_at, pp.requested_at) - pp.target_round_started_at
+      )) * 1000)::int as lag_ms,
       case
-        when pp.requested_at > pp.target_round_started_at + interval '5 seconds'
+        when coalesce(pp.generated_at, pp.requested_at) >= pp.target_round_started_at
           then 'generated_after_started'::text
         else 'started_after_crashed'::text
       end as reason
     from pending_predictions pp
     left join crash_rounds cr on cr.game_id = pp.target_game_id
     where pp.target_game_id is not null
+      and pp.target_round_started_at is not null
       and (
-        pp.requested_at > pp.target_round_started_at + interval '5 seconds'
+        coalesce(pp.generated_at, pp.requested_at) >= pp.target_round_started_at
         or (cr.crashed_at is not null and pp.target_round_started_at >= cr.crashed_at)
       )
-    order by pp.requested_at desc
+    order by coalesce(pp.generated_at, pp.requested_at) desc
     limit ${limit}
   `;
   return rows.map((r) => ({
@@ -224,7 +215,8 @@ export async function reEnqueuePrediction(input: z.infer<typeof ReEnqueueInput>)
 
 export async function getLatencyDashboard() {
   const sql = await getSql();
-  const rows = await sql<{
+  // BG backfill lag (observability only — not the prediction critical path)
+  const bg = await sql<{
     p50_ms: number | null;
     p95_ms: number | null;
     p99_ms: number | null;
@@ -237,6 +229,43 @@ export async function getLatencyDashboard() {
     where event_kind = 'BG'
       and received_at > now() - interval '1 hour'
   `;
+  // ED critical path: processor_latency on ED events
+  const ed = await sql<{
+    p50_ms: number | null;
+    p95_ms: number | null;
+    p99_ms: number | null;
+  }>`
+    select
+      percentile_cont(0.5) within group (order by processor_latency_ms) as p50_ms,
+      percentile_cont(0.95) within group (order by processor_latency_ms) as p95_ms,
+      percentile_cont(0.99) within group (order by processor_latency_ms) as p99_ms
+    from live_event_log
+    where event_kind in ('ED', 'PREDICT')
+      and received_at > now() - interval '1 hour'
+  `;
+  // Ahead-of-time window: started_at - generated_at (positive = good)
+  const windows = await sql<{
+    p50_ms: number | null;
+    p95_ms: number | null;
+    neg_rate: number | null;
+    n: number;
+  }>`
+    select
+      percentile_cont(0.5) within group (
+        order by extract(epoch from (pp.target_round_started_at - coalesce(pp.generated_at, pp.requested_at))) * 1000
+      ) as p50_ms,
+      percentile_cont(0.95) within group (
+        order by extract(epoch from (pp.target_round_started_at - coalesce(pp.generated_at, pp.requested_at))) * 1000
+      ) as p95_ms,
+      avg(
+        case when coalesce(pp.generated_at, pp.requested_at) >= pp.target_round_started_at
+          then 1.0 else 0.0 end
+      ) as neg_rate,
+      count(*)::int as n
+    from pending_predictions pp
+    where pp.target_round_started_at is not null
+      and coalesce(pp.generated_at, pp.requested_at) > now() - interval '24 hours'
+  `;
   const outbox = await sql<{ total: number; delivered: number; pending: number; dead: number }>`
     select
       count(*)::int as total,
@@ -246,11 +275,32 @@ export async function getLatencyDashboard() {
     from notification_outbox
     where created_at > now() - interval '24 hours'
   `;
+  const round = (v: number | null | undefined) =>
+    v != null && Number.isFinite(Number(v)) ? Math.round(Number(v)) : null;
   return {
+    budgetMs: {
+      edIngest: 100,
+      predictionGeneration: 50,
+      persistence: 20,
+      outboxQueue: 250,
+      telegramDelivery: 2000,
+      totalPipeline: 500,
+    },
     bg: {
-      p50Ms: rows[0]?.p50_ms != null ? Math.round(rows[0].p50_ms) : null,
-      p95Ms: rows[0]?.p95_ms != null ? Math.round(rows[0].p95_ms) : null,
-      p99Ms: rows[0]?.p99_ms != null ? Math.round(rows[0].p99_ms) : null,
+      p50Ms: round(bg[0]?.p50_ms),
+      p95Ms: round(bg[0]?.p95_ms),
+      p99Ms: round(bg[0]?.p99_ms),
+    },
+    ed: {
+      p50Ms: round(ed[0]?.p50_ms),
+      p95Ms: round(ed[0]?.p95_ms),
+      p99Ms: round(ed[0]?.p99_ms),
+    },
+    aheadOfTimeWindow: {
+      p50Ms: round(windows[0]?.p50_ms),
+      p95Ms: round(windows[0]?.p95_ms),
+      lateRate: windows[0]?.neg_rate != null ? Number(windows[0].neg_rate) : null,
+      sampleSize: windows[0]?.n ?? 0,
     },
     outbox: outbox[0] ?? { total: 0, delivered: 0, pending: 0, dead: 0 },
   };
