@@ -283,28 +283,29 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     result.inserted = 0;
   }
 
-  // 3+4. WIN/LOSS validation (durable 1:1) and daily-stats/pending read
-  //     can run concurrently — the read-only stats queries are independent of
-  //     the validate step (which itself short-circuits when
-  //     `insertedRounds.length === 0`, the common case). This is the safe
-  //     Tier-1 pipeline parallelization from design §10.1.
+  // 3. WIN/LOSS validation (durable 1:1) — sequential, the read-only
+  //    stats queries run AFTER validation commits so `pending.hasPending`
+  //    reflects the post-validation state (Fix 2: race-condition repair).
+  //    The previous `Promise.all([validatePromise, statsPromise])` could
+  //    see the pre-validation snapshot under PostgreSQL READ COMMITTED,
+  //    which made `pending.hasPending` incorrectly true and skipped
+  //    generation.
   if (firstError == null) {
-    const validatePromise =
+    const outcome =
       insertedRounds.length > 0
-        ? validateAgainstNewRounds(insertedRounds).catch((e: unknown) => {
+        ? await validateAgainstNewRounds(insertedRounds).catch((e: unknown) => {
             fail((e as Error)?.message ?? String(e));
             return { resolved: 0, insertedRounds: 0, pairs: [] };
           })
-        : Promise.resolve({
-            resolved: 0,
-            insertedRounds: 0,
-            pairs: [] as Array<never>,
-          });
-    const statsPromise = Promise.all([getTodayStats(), getPendingStatus()]);
-    const [outcome, [today, pending]] = await Promise.all([
-      validatePromise,
-      statsPromise,
+        : { resolved: 0, insertedRounds: 0, pairs: [] as Array<never> };
+
+    // Stats queries run AFTER validation so the pending check sees the
+    // post-validation state (Fix 2).
+    const [today, pending] = await Promise.all([
+      getTodayStats(),
+      getPendingStatus(),
     ]);
+
     result.resolved = outcome.resolved;
     // Telegram notifications are now handled via durable outbox
     // This ensures Telegram delivery never blocks prediction generation
@@ -322,26 +323,47 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
       }).catch((e) => {
         logger.error(
           { component: "PredictionWorker", error: e },
-          "Failed to queue validation notification"
+          "Failed to queue validation notification",
         );
       });
     }
 
-    // 4. Daily entry counting: only generate a new prediction if the daily
-    //    target isn't met AND there's no pending AND no unmatched-new-round
-    //    waiting to be resolved (otherwise the next cycle will handle it).
-    //    The daily target is an OPERATING target only — prediction_validations
-    //    history is permanent and never truncated.
+    // 4. Daily entry counting: generate a new prediction if the daily
+    //    target isn't met AND there's no pending. (Fix 1: starvation
+    //    gate REMOVED.) The previous `&& insertedRounds.length === 0`
+    //    clause caused the worker to skip generation in continuous
+    //    play because rounds complete every 2–8s and the worker polls
+    //    every 3s — `insertedRounds.length` was almost always > 0.
+    //    Removing the gate lets generation run immediately after
+    //    validation clears the pending queue.
     if (firstError == null) {
-      // Spec §7.10: the cycle guard
-      //   `if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0)`
-      // is REMOVED. Predictions are now event-driven (`onGameStart` on the
-      // bg event), not poll-driven. The REST poll is the safety net for
-      // backfilling crash_rounds and detecting missed-bg, not for
-      // generating predictions. The `BC_PREDICTION_V2_PHASE1` flag
-      // remains for the dual-running rollout window; when it is unset
-      // the legacy path is fully disabled.
-      // No-op: the cycle no longer generates predictions.
+      if (today.remaining > 0 && !pending.hasPending) {
+        try {
+          const queued = await generateAndQueuePrediction(sql).catch(
+            (_e: unknown) => null,
+          );
+          if (queued) {
+            result.generated = queued.signal.predictionId;
+            // Queue prediction notification in outbox (non-blocking)
+            void createPredictionNotification(sql, {
+              predictionId: queued.signal.predictionId,
+              targetMultiplier: Number(queued.signal.target ?? 1.3),
+              probability: queued.signal.probability,
+              confidence: queued.signal.confidence,
+              regimeName: queued.signal.regimeId ?? null,
+              lastRoundMultiplier: queued.lastRound?.multiplier ?? null,
+              generatedAt: new Date().toISOString(),
+            }).catch((e) => {
+              logger.error(
+                { component: "PredictionWorker", error: e },
+                "Failed to queue prediction notification",
+              );
+            });
+          }
+        } catch (e: unknown) {
+          fail((e as Error)?.message ?? String(e));
+        }
+      }
     }
   } else {
     // Fetch already failed; skip validate/generate but still persist heartbeat.
