@@ -473,3 +473,170 @@ export async function onGameStart(
     outboxEnqueued,
   };
 }
+
+
+/**
+ * CRITICAL (TestingEngine_Deep_Diagnosis.md §3.2): Generate prediction for
+ * Round N+1 immediately after Round N ends. This is the ONLY correct trigger
+ * point for ahead-of-time prediction so that
+ *   prediction_generated_at < target_round_started_at
+ * always holds (target_round_started_at is backfilled later on the bg event).
+ */
+export interface OnGameEndPredictResult {
+  predictionId: string | null;
+  targetGameId: string;
+  kind: "predicted" | "duplicate" | "too_late" | "insufficient_history" | "error";
+}
+
+export async function onGameEndPredict(
+  gameId: string,
+  crashedAt: string,
+  multiplier: number,
+  correlationId: string,
+  deps: PredictorDeps = {},
+): Promise<OnGameEndPredictResult> {
+  const getSqlFn = deps.getSqlFn ?? getSql;
+  const predictFn = deps.predictFn ?? defaultPredictFn;
+  const sql = await getSqlFn();
+  const targetGameId = (BigInt(gameId) + 1n).toString();
+  const generatedAt = new Date().toISOString();
+
+  try {
+    const existing = await sql<{ prediction_id: string }>`
+      SELECT prediction_id FROM pending_predictions
+      WHERE target_game_id = ${targetGameId} AND status = 'PENDING'
+      LIMIT 1
+    `;
+    if (existing.length > 0) {
+      logger.info(
+        { targetGameId, existingPredictionId: existing[0]!.prediction_id },
+        "Prediction for N+1 already exists",
+      );
+      return {
+        predictionId: existing[0]!.prediction_id,
+        targetGameId,
+        kind: "duplicate",
+      };
+    }
+
+    const alreadyCrashed = await sql<{ game_id: string }>`
+      SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
+    `;
+    if (alreadyCrashed.length > 0) {
+      logger.warn({ targetGameId }, "Target round N+1 already crashed — too late to predict");
+      return { predictionId: null, targetGameId, kind: "too_late" };
+    }
+
+    const rows = await sql<{
+      game_id: string;
+      multiplier: string | number;
+      began_at: string | Date | null;
+      crashed_at: string | Date;
+    }>`
+      SELECT game_id, multiplier, began_at, crashed_at
+      FROM crash_rounds
+      WHERE crashed_at <= ${crashedAt}::timestamptz
+        AND crashed_at IS NOT NULL
+      ORDER BY crashed_at DESC, game_id DESC
+      LIMIT ${MAX_HISTORY}
+    `;
+    const rounds = rows.reverse().map(mapRowToHistorical);
+    if (rounds.length < MIN_HISTORY) {
+      logger.info(
+        { targetGameId, availableHistory: rounds.length },
+        "Insufficient history for N+1 prediction",
+      );
+      return { predictionId: null, targetGameId, kind: "insufficient_history" };
+    }
+
+    const signal = predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET);
+
+    await sql`
+      INSERT INTO pending_predictions (
+        prediction_id, target_multiplier, probability, confidence,
+        regime_name, regime_confidence, reasoning, feature_summary,
+        model_version, requested_at, target_game_id, source_round_id,
+        source_game_id, target_round_started_at, correlation_id, generated_at, status, matched
+      ) VALUES (
+        ${signal.predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
+        ${signal.confidence}, ${signal.regimeId ?? null}, ${signal.regimeId ? 0.5 : null},
+        ${signal.reasoning ?? []}, ${JSON.stringify(signal.featureSummary ?? {})},
+        ${signal.modelVersion ?? "live-v2"}, ${generatedAt}::timestamptz, ${targetGameId}, ${gameId},
+        ${gameId}, NULL, ${correlationId}, ${generatedAt}::timestamptz, 'PENDING', false
+      )
+      ON CONFLICT (prediction_id) DO NOTHING
+    `;
+
+    const inserted = await sql<{ prediction_id: string }>`
+      SELECT prediction_id FROM pending_predictions
+      WHERE target_game_id = ${targetGameId} AND status = 'PENDING'
+      LIMIT 1
+    `;
+    if (inserted.length === 0) {
+      return { predictionId: null, targetGameId, kind: "duplicate" };
+    }
+    const predictionId = inserted[0]!.prediction_id;
+
+    logger.info(
+      {
+        predictionId,
+        targetGameId,
+        sourceGameId: gameId,
+        correlationId,
+        probability: signal.probability,
+      },
+      "Generated ahead-of-time prediction for N+1",
+    );
+
+    try {
+      const { createPredictionNotification } = await import("@/lib/notifications/outbox");
+      await createPredictionNotification(sql, {
+        predictionId,
+        targetMultiplier: Number(DEFAULT_TARGET),
+        probability: signal.probability,
+        confidence: signal.confidence,
+        regimeName: signal.regimeId ?? null,
+        lastRoundMultiplier: rounds[rounds.length - 1]?.crashPoint ?? null,
+        generatedAt,
+      });
+    } catch (notifErr) {
+      logger.warn(
+        { predictionId, error: String(notifErr) },
+        "Failed to enqueue prediction notification; prediction still persisted",
+      );
+    }
+
+    try {
+      await sql`
+        INSERT INTO live_event_log (
+          correlation_id, event_kind, game_id, payload, received_at, processed_at,
+          processor_latency_ms, sla_violated
+        ) VALUES (
+          ${correlationId}::text, 'PREDICT', ${targetGameId},
+          ${JSON.stringify({ sourceGameId: gameId, probability: signal.probability, multiplier })},
+          ${generatedAt}::timestamptz, now(), 0, false
+        )
+        ON CONFLICT DO NOTHING
+      `;
+    } catch {
+      /* ignore */
+    }
+
+    return { predictionId, targetGameId, kind: "predicted" };
+  } catch (e) {
+    logger.error(
+      { gameId, targetGameId, error: String(e) },
+      "onGameEndPredict failed",
+    );
+    try {
+      await sql`
+        INSERT INTO worker_state (key, value)
+        VALUES ('last_error', ${String(e)})
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
+      `;
+    } catch {
+      /* ignore */
+    }
+    return { predictionId: null, targetGameId, kind: "error" };
+  }
+}

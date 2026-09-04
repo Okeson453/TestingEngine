@@ -1,29 +1,29 @@
 /**
  * Poll worker — REST safety net.
  *
- * Spec: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §7.5
+ * Spec: TestingEngine_Deep_Diagnosis.md §3.5 / §4.2
  *
- * The poll worker NEVER initiates a prediction. It is the safety net that
- * fills in `crash_rounds` rows that the Socket.IO subscription missed
- * during a disconnect, and that marks any rounds whose `bg` was missed
- * (i.e. they exist in `crash_rounds` but have no `pending_predictions`
- * row) as observability warnings — without ever back-generating
- * predictions.
+ * The poll worker does NOT generate predictions itself. It:
+ *   1. Fetches history and inserts missed crash_rounds
+ *   2. Calls live/validator.onGameEnd for each newly discovered round
+ *      (which validates any pending prediction and triggers N+1 prediction)
+ *   3. Logs stuck / orphaned predictions
  */
 import { getSql, type Sql } from "@/lib/db";
 import { fetchCrashHistory, type FetchedRound } from "@/lib/crash/fetch-bc";
 import { insertNewRounds } from "@/lib/crash/ingest";
+import { onGameEnd } from "@/lib/prediction/live/validator";
 import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("poll-worker");
 
 export const POLL_INTERVAL_MS = Number(process.env.POLL_WORKER_MS ?? 60_000);
-/** Stale threshold: a PREDICTED row older than this is observable as stuck. */
 export const STALE_PREDICTED_MS = 15 * 60 * 1_000;
 
 export interface PollTickResult {
   fetched: number;
   inserted: number;
+  validated: number;
   missedRounds: number;
   stuckPredicted: number;
   error: string | null;
@@ -60,12 +60,12 @@ export class PollWorker {
     }
   }
 
-  /** Run a single reconciliation pass. Returns the result for testability. */
   async tickOnce(): Promise<PollTickResult> {
     const sql = await this.getSqlFn();
     const result: PollTickResult = {
       fetched: 0,
       inserted: 0,
+      validated: 0,
       missedRounds: 0,
       stuckPredicted: 0,
       error: null,
@@ -76,25 +76,32 @@ export class PollWorker {
       if (rounds.length > 0) {
         const ins = await insertNewRounds(rounds);
         result.inserted = ins.inserted;
+
         for (const r of ins.rounds) {
-          const pending = await sql<{ count: number }>`
-            select count(*)::int as count
-            from pending_predictions
-            where target_game_id = ${r.gameId}
-          `;
-          if ((pending[0]?.count ?? 0) === 0) {
-            result.missedRounds += 1;
+          const crashedAt =
+            r.crashedAt instanceof Date
+              ? r.crashedAt.toISOString()
+              : String(r.crashedAt ?? new Date().toISOString());
+          try {
+            const vr = await onGameEnd({
+              gameId: r.gameId,
+              endTime: crashedAt,
+              multiplier: Number(r.multiplier),
+              receivedAt: new Date().toISOString(),
+            });
+            if (vr.kind === "resolved") result.validated += 1;
+            if (vr.kind === "orphaned" || vr.kind === "bg_arrived_late") {
+              result.missedRounds += 1;
+            }
+          } catch (ve) {
             logger.warn(
-              {
-                component: "poll-worker",
-                gameId: r.gameId,
-                missedRound: true,
-              },
-              "reconciled round has no prediction; socket was likely offline during bg",
+              { component: "poll-worker", gameId: r.gameId, error: String(ve) },
+              "validation during poll failed",
             );
           }
         }
       }
+
       const stuck = await sql<{ count: number }>`
         select count(*)::int as count from pending_predictions
         where matched = false

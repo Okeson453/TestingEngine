@@ -1,21 +1,17 @@
 /**
  * BC.Game Socket.IO → live prediction pipeline bridge.
  *
- * Wires the BC.Game Socket.IO events directly into the production-grade
- * live pipeline:
+ * Spec: TestingEngine_Deep_Diagnosis.md §3.4
  *
- *   bg  →  onGameStart (live/predictor)         // predict the just-begun round
- *   ed  →  onGameEnd   (live/validator)         // validate the just-ended round
- *   pg  →  observability only                   // live crash progress
- *
- * The `handleGameStartEvent` / `handleGameEndEvent` / `handleGameProgressEvent`
- * helpers in the previous (pre-v2) implementation have been removed: they
- * were either dead code or duplicated the (correct) logic in live/predictor
- * and live/validator. The new file is a thin adapter.
+ *   bg  →  observability only + backfill target_round_started_at
+ *          (NEVER generate predictions — the round has already started)
+ *   ed  →  live/validator.onGameEnd (validate Round N + trigger N+1 prediction)
+ *   pg  →  observability only
  */
+import { randomUUID } from "node:crypto";
 import { bcGameSocket } from "@/lib/crash/socket-client";
+import { getSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
-import { onGameStart } from "@/lib/prediction/live/predictor";
 import { onGameEnd } from "@/lib/prediction/live/validator";
 
 const logger = getLogger("game-event-handlers");
@@ -43,10 +39,8 @@ function extractLastGameId(payload: unknown): string | null {
 }
 
 /**
- * bg event: a new round has just begun. The live predictor runs the strict
- * causal window against history whose `crashed_at < $beganAt` and writes
- * a `pending_predictions` row, the `live_event_log` row, and (when
- * configured) the Telegram outbox rows in one transaction.
+ * bg event is only for observability and backfilling target_round_started_at.
+ * NEVER generate predictions here — the round has already started.
  */
 async function onBgEvent(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
@@ -55,35 +49,43 @@ async function onBgEvent(payload: unknown): Promise<void> {
     return;
   }
   const p = (payload ?? {}) as Record<string, unknown>;
-  const beginTime = toIsoString((p.beganAt ?? p.beginTime) as number | string | undefined);
-  if (!beginTime) {
+  const beganAt = toIsoString((p.beganAt ?? p.beginTime) as number | string | undefined);
+  if (!beganAt) {
     logger.warn({ event: "bg", gameId }, "bg event missing beginTime; ignoring");
     return;
   }
-  const receivedAt = new Date().toISOString();
+
   try {
-    const result = await onGameStart({
-      gameId,
-      beginTime,
-      hash: typeof p.hash === "string" ? p.hash : null,
-      salt: typeof p.salt === "string" ? p.salt : null,
-      sourceRoundGameId: null,
-      receivedAt,
-    });
-    logger.info(
-      { event: "bg", gameId, kind: result.kind },
-      `bg processed (${result.kind})`,
-    );
-  } catch (e) {
-    logger.error({ event: "bg", gameId, error: String(e) }, "bg handler threw");
+    const sql = await getSql();
+
+    await sql`
+      UPDATE pending_predictions
+      SET target_round_started_at = ${beganAt}::timestamptz
+      WHERE target_game_id = ${gameId}
+        AND status = 'PENDING'
+        AND target_round_started_at IS NULL
+    `;
+
+    await sql`
+      INSERT INTO live_event_log (
+        correlation_id, event_kind, game_id, payload, received_at, processed_at,
+        processor_latency_ms, sla_violated
+      ) VALUES (
+        ${randomUUID()}::text, 'BG', ${gameId},
+        ${JSON.stringify({ beganAt })},
+        ${beganAt}::timestamptz, now(), 0, false
+      )
+      ON CONFLICT DO NOTHING
+    `;
+
+    logger.info({ event: "bg", gameId, beganAt }, "bg observability + backfill complete");
+  } catch (error) {
+    logger.error({ event: "bg", gameId, error: String(error) }, "bg observability failed");
   }
 }
 
 /**
- * ed event: the just-ended round has a known multiplier. The live validator
- * upserts `crash_rounds`, locks the pending prediction FOR UPDATE SKIP LOCKED,
- * writes a `prediction_validations` row, and enqueues a validation
- * notification. All in one transaction.
+ * ed event: validate Round N + trigger prediction for N+1 (via validator → predictor).
  */
 async function onEdEvent(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
@@ -124,10 +126,6 @@ async function onEdEvent(payload: unknown): Promise<void> {
   }
 }
 
-/**
- * pg event: live crash progress. Observed for diagnostic / observability
- * purposes only — never triggers prediction or validation.
- */
 function onPgEvent(payload: unknown): void {
   const gameId = extractLastGameId(payload);
   const p = (payload ?? {}) as Record<string, unknown>;
@@ -140,9 +138,6 @@ function onPgEvent(payload: unknown): void {
   logger.debug({ event: "pg", gameId, multiplier }, "pg received");
 }
 
-/**
- * Register all socket event handlers. Idempotent — re-calling is a no-op.
- */
 export function initializeEventHandlers(): void {
   bcGameSocket.on("bg", async (payload) => {
     await onBgEvent(payload);
@@ -153,13 +148,12 @@ export function initializeEventHandlers(): void {
   bcGameSocket.on("pg", async (payload) => {
     onPgEvent(payload);
   });
-  logger.info({ component: "game-event-handlers" }, "event handlers wired to live/predictor + live/validator");
+  logger.info(
+    { component: "game-event-handlers" },
+    "event handlers wired: bg=observability, ed=validate+predict-N+1",
+  );
 }
 
-/**
- * Start the event-driven prediction pipeline. Connects the socket and
- * (re-)initializes the handlers.
- */
 export async function startEventDrivenPipeline(): Promise<void> {
   initializeEventHandlers();
   await bcGameSocket.connect();

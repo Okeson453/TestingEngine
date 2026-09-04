@@ -20,6 +20,7 @@ import { getSql, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
+import { onGameEndPredict } from "@/lib/prediction/live/predictor";
 
 const logger = getLogger("live-validator");
 
@@ -256,6 +257,21 @@ export async function onGameEnd(
     },
     "round validated",
   );
+  // Spec §3.3: after successful validation, trigger prediction for N+1
+  // immediately (non-blocking). Validation must never wait on prediction.
+  const corr = state.pending.correlation_id ?? randomUUID();
+  void onGameEndPredict(
+    evt.gameId,
+    evt.endTime,
+    evt.multiplier,
+    corr,
+  ).catch((e) => {
+    logger.error(
+      { gameId: evt.gameId, error: String(e) },
+      "Failed to generate N+1 prediction after validation",
+    );
+  });
+
   return {
     kind: "resolved",
     predictionId: state.pending.prediction_id,
@@ -266,6 +282,6 @@ export async function onGameEnd(
     resolvedAt: new Date(now()).toISOString(),
     alreadyValidated: false,
     outboxEnqueued: getChatIds().length,
-    correlationId: state.pending.correlation_id ?? "",
+    correlationId: corr,
   };
 }
