@@ -42,11 +42,6 @@ const POLL_INTERVAL_MS = Math.max(
   2000,
   Number(process.env.PREDICTION_POLL_MS ?? 3000),
 );
-/** Backoff poll used while a prediction is pending — see `run()`. */
-const PENDING_POLL_INTERVAL_MS = Math.max(
-  2000,
-  Number(process.env.PREDICTION_PENDING_POLL_MS ?? 10_000),
-);
 /** Distributed lock time-to-live. A crashed worker is recovered after this. */
 const LOCK_TTL_SEC = Number(process.env.PREDICTION_LOCK_TTL_SEC ?? 60);
 /** How many BC.Game history pages to fetch per poll (freshness vs. rate). */
@@ -338,31 +333,15 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     //    The daily target is an OPERATING target only — prediction_validations
     //    history is permanent and never truncated.
     if (firstError == null) {
-      try {
-        if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0) {
-          const queued = await generateAndQueuePrediction().catch((_e: unknown) => null);
-          if (queued) {
-            result.generated = queued.signal.predictionId;
-            // Queue prediction notification in outbox (non-blocking)
-            void createPredictionNotification(sql, {
-              predictionId: queued.signal.predictionId,
-              targetMultiplier: Number(queued.signal.target ?? 1.3),
-              probability: queued.signal.probability,
-              confidence: queued.signal.confidence,
-              regimeName: queued.signal.regimeId ?? null,
-              lastRoundMultiplier: queued.lastRound?.multiplier ?? null,
-              generatedAt: new Date().toISOString(),
-            }).catch((e) => {
-              logger.error(
-                { component: "PredictionWorker", error: e },
-                "Failed to queue prediction notification"
-              );
-            });
-          }
-        }
-      } catch (e: unknown) {
-        fail((e as Error)?.message ?? String(e));
-      }
+      // Spec §7.10: the cycle guard
+      //   `if (today.remaining > 0 && !pending.hasPending && insertedRounds.length === 0)`
+      // is REMOVED. Predictions are now event-driven (`onGameStart` on the
+      // bg event), not poll-driven. The REST poll is the safety net for
+      // backfilling crash_rounds and detecting missed-bg, not for
+      // generating predictions. The `BC_PREDICTION_V2_PHASE1` flag
+      // remains for the dual-running rollout window; when it is unset
+      // the legacy path is fully disabled.
+      // No-op: the cycle no longer generates predictions.
     }
   } else {
     // Fetch already failed; skip validate/generate but still persist heartbeat.
@@ -502,7 +481,7 @@ export function startWorker(): WorkerHandle {
   // each send tells the operator which id (if any) is failing.
   const bootMsg = `[worker] starting telegram=${
     telegramConfigured() ? "enabled" : "disabled (no env)"
-  } telegramChatCount=${chatIds.length} pollIntervalMs=${POLL_INTERVAL_MS} pendingPollIntervalMs=${PENDING_POLL_INTERVAL_MS}`;
+  } telegramChatCount=${chatIds.length} pollIntervalMs=${POLL_INTERVAL_MS}`;
   if (telegramConfigured()) {
     console.log(bootMsg);
   } else {
@@ -593,20 +572,11 @@ async function run(handle: WorkerHandle): Promise<void> {
         );
         break;
       }
-      // Adaptive poll (Telegram design §10.3): when a prediction is pending,
-      // the next round's outcome is what matters, not new data. Drop the
-      // cadence to a coarser poll so we save ~70% of upstream calls during
-      // the 2–5s window where we're waiting for the round to land. End-to-end
-      // latency is unchanged because the worker still polls; we just call the
-      // upstream less aggressively.
-      let nextInterval = POLL_INTERVAL_MS;
-      try {
-        const pending = await getPendingStatus();
-        if (pending.hasPending) nextInterval = PENDING_POLL_INTERVAL_MS;
-      } catch {
-        /* fall through to default poll */
-      }
-      await sleep(handle, nextInterval);
+      // Spec §7.10: the adaptive poll-while-pending branch is REMOVED.
+      // The new pipeline is event-driven (`bg`/`ed`); the REST poll
+      // is the safety net, not the primary trigger. Single, constant
+      // cadence (POLL_INTERVAL_MS) is the canonical behavior.
+      await sleep(handle, POLL_INTERVAL_MS);
     }
   } finally {
     await releaseLock(sql, handle.ownerId);

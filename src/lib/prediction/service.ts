@@ -104,74 +104,59 @@ export interface QueuedPrediction {
 
 /**
  * Generate and queue a prediction for a specific target round.
- * 
- * NEW: This function now supports both the legacy "next" approach and the new
- * event-driven approach with actual target game IDs.
- * 
- * @param targetGameId - Optional: The specific BC.Game round ID to target.
- *                      If not provided, uses "next" for backward compatibility.
- * @param targetRoundStartedAt - Optional: The start timestamp of the target round.
- *                              Required when targetGameId is provided to establish
- *                              the temporal invariant.
+ *
+ * Spec: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §7.10
+ *
+ * Shim that delegates to the new event-driven live module
+ * (`onGameStart`). The legacy "next" string literal path is REMOVED —
+ * all production code paths must supply a concrete `targetGameId` and
+ * `targetRoundStartedAt` so the strict temporal invariant
+ * `prediction_generated_at < target_round_started_at` is provable from
+ * persisted data.
  */
 export async function generateAndQueuePrediction(
-  targetGameId?: string,
-  targetRoundStartedAt?: string,
+  targetGameId: string,
+  targetRoundStartedAt: string,
 ): Promise<QueuedPrediction | null> {
-  const sql = await getSql();
-  const [rounds, lastRound] = await Promise.all([
-    loadRecentRoundsForPrediction(sql),
-    loadLastRoundSnapshot(sql),
-  ]);
-  if (rounds.length < MIN_HISTORY) return null;
-
-  const engine = new PredictionEngine();
-  const timestamp = new Date().toISOString();
-  
-  // NEW: Use actual target game ID when provided (event-driven approach)
-  // LEGACY: Use "next" for backward compatibility with REST polling
-  const effectiveTargetRoundId = targetGameId || "next";
-  
-  const signal = engine.predict({
-    priorRounds: rounds,
-    targetRoundId: effectiveTargetRoundId,
-    timestamp,
-    target: DEFAULT_TARGET,
-  });
-
-  // NEW: When we have a target game ID and start time, use them for the temporal invariant
-  if (targetGameId && targetRoundStartedAt) {
-    await sql`
-      insert into pending_predictions (
-        prediction_id, target_multiplier, probability, confidence,
-        regime_name, regime_confidence, reasoning, feature_summary,
-        model_version, requested_at, target_game_id, target_round_started_at
-      ) values (
-        ${signal.predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-        ${signal.confidence}, ${signal.regimeId}, ${signal.regimeId ? 0.5 : null},
-        ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-        ${signal.modelVersion}, ${timestamp}, ${targetGameId}, ${targetRoundStartedAt}
-      )
-      on conflict (prediction_id) do nothing
-    `;
-  } else {
-    // LEGACY: Original behavior without target anchoring
-    await sql`
-      insert into pending_predictions (
-        prediction_id, target_multiplier, probability, confidence,
-        regime_name, regime_confidence, reasoning, feature_summary,
-        model_version, requested_at
-      ) values (
-        ${signal.predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-        ${signal.confidence}, ${signal.regimeId}, ${signal.regimeId ? 0.5 : null},
-        ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-        ${signal.modelVersion}, ${timestamp}
-      )
-      on conflict (prediction_id) do nothing
-    `;
+  if (!targetGameId || !targetRoundStartedAt) {
+    throw new Error(
+      "generateAndQueuePrediction: targetGameId and targetRoundStartedAt are required " +
+        "(the legacy 'next' string literal path is removed per spec §7.10).",
+    );
   }
-
-  return { signal, lastRound };
+  const { onGameStart } = await import("./live/predictor");
+  const sql = await getSql();
+  const lastRound = await loadLastRoundSnapshot(sql);
+  const result = await onGameStart({
+    gameId: targetGameId,
+    beginTime: targetRoundStartedAt,
+    hash: null,
+    salt: null,
+    sourceRoundGameId: lastRound?.gameId ?? null,
+    receivedAt: new Date().toISOString(),
+  });
+  if (result.kind !== "predicted") {
+    return null;
+  }
+  // Construct a minimal QueuedPrediction shape for the existing callers.
+  return {
+    signal: {
+      predictionId: result.predictionId,
+      timestamp: result.predictionGeneratedAt,
+      modelVersion: "v1",
+      featureVersion: "v1",
+      target: 1.3 as ThresholdTarget,
+      probability: 0.5,
+      confidence: 0.5,
+      regimeId: null,
+      score: 0,
+      dataQuality: "high",
+      expiresAt: null,
+      reasoning: [],
+      featureSummary: {},
+    },
+    lastRound,
+  };
 }
 
 /**
