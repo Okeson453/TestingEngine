@@ -12,33 +12,24 @@ import {
   getDailyTarget,
 } from "./service.ts";
 import {
-  formatPredictionMessage,
-  formatValidationMessage,
   getConfiguredChatIds,
-  sendTelegramMessage,
   telegramConfigured,
-  type SendResult,
 } from "@/lib/notifications/telegram";
 import {
   processOutbox,
   createPredictionNotification,
   createValidationNotification,
   getOutboxStats,
-  type OutboxNotification,
 } from "@/lib/notifications/outbox";
 import { getLogger } from "@/lib/observability/logger";
 import { bcGameSocket, startEventDrivenPipeline, stopEventDrivenPipeline } from "./events/game-event-handlers";
+import { withGenerationLock } from "./generation-lock";
 
 const logger = getLogger("prediction-worker");
 
-const POLL_INTERVAL_MS = Math.max(
-  2000,
-  Number(process.env.PREDICTION_POLL_MS ?? 3000),
-);
+const POLL_INTERVAL_MS = Math.max(2000, Number(process.env.PREDICTION_POLL_MS ?? 3000));
 const LOCK_TTL_SEC = Number(process.env.PREDICTION_LOCK_TTL_SEC ?? 60);
 const FETCH_PAGES = Number(process.env.PREDICTION_FETCH_PAGES ?? 2);
-const OUTBOX_PROCESS_INTERVAL_MS = Number(process.env.OUTBOX_PROCESS_INTERVAL_MS ?? 1000);
-
 const LOCK_KEY = "prediction_worker";
 
 const STATE = {
@@ -92,14 +83,14 @@ async function acquireLock(sql: Sql, ownerId: string): Promise<boolean> {
   const ttl = LOCK_TTL_SEC;
   await sql.query(
     `insert into worker_locks (lock_key, owner_id, acquired_at, expires_at, heartbeat_at)
-       values ($1, $2, now(), now() + interval '${ttl} seconds', now())
+       values ($1, $2, now(), now() + make_interval(secs => $3), now())
      on conflict (lock_key) do update
        set owner_id = $2,
            acquired_at = now(),
-           expires_at = now() + interval '${ttl} seconds',
+           expires_at = now() + make_interval(secs => $3),
            heartbeat_at = now()
        where worker_locks.expires_at < now()`,
-    [LOCK_KEY, ownerId],
+    [LOCK_KEY, ownerId, ttl],
   );
   const rows = await sql<{ mine: boolean }>`
     select owner_id = ${ownerId} as mine from worker_locks where lock_key = ${LOCK_KEY}
@@ -112,9 +103,9 @@ async function heartbeat(sql: Sql, ownerId: string): Promise<boolean> {
   try {
     await sql.query(
       `update worker_locks
-          set expires_at = now() + interval '${ttl} seconds', heartbeat_at = now()
+          set expires_at = now() + make_interval(secs => $3), heartbeat_at = now()
         where lock_key = $1 and owner_id = $2`,
-      [LOCK_KEY, ownerId],
+      [LOCK_KEY, ownerId, ttl],
     );
     const rows = await sql<{ owner_id: string }>`
       select owner_id from worker_locks where lock_key = ${LOCK_KEY}
@@ -170,16 +161,7 @@ export async function runWorkerCycle(): Promise<WorkerCycleResult> {
   const ownerId = randomUUID();
   const acquired = await acquireLock(sql, ownerId);
   if (!acquired) {
-    return {
-      ran: false,
-      fetched: 0,
-      inserted: 0,
-      onlinePlayers: null,
-      resolved: 0,
-      generated: null,
-      error: null,
-      ok: true,
-    };
+    return { ran: false, fetched: 0, inserted: 0, onlinePlayers: null, resolved: 0, generated: null, error: null, ok: true };
   }
   try {
     return await runCycleWork(sql);
@@ -190,16 +172,8 @@ export async function runWorkerCycle(): Promise<WorkerCycleResult> {
 
 async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
   const result: WorkerCycleResult = {
-    ran: true,
-    fetched: 0,
-    inserted: 0,
-    onlinePlayers: null,
-    resolved: 0,
-    generated: null,
-    error: null,
-    ok: true,
+    ran: true, fetched: 0, inserted: 0, onlinePlayers: null, resolved: 0, generated: null, error: null, ok: true,
   };
-
   let rounds: FetchedRound[] = [];
   let insertedRounds: CrashRound[] = [];
   let onlinePlayers: number | null = null;
@@ -248,12 +222,9 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
           })
         : { resolved: 0, insertedRounds: 0, pairs: [] as Array<never> };
 
-    const [today, pending] = await Promise.all([
-      getTodayStats(),
-      getPendingStatus(),
-    ]);
-
+    const [today, pending] = await Promise.all([getTodayStats(), getPendingStatus()]);
     result.resolved = outcome.resolved;
+
     for (const pair of outcome.pairs) {
       if (pair.targetMultiplier === 0) continue;
       void createValidationNotification(sql, {
@@ -265,38 +236,26 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
         result: pair.result,
         resolvedAt: pair.resolvedAt,
       }).catch((e) => {
-        logger.error(
-          { component: "PredictionWorker", error: e },
-          "Failed to queue validation notification",
-        );
+        logger.error({ component: "PredictionWorker", error: e }, "Failed to queue validation notification");
       });
     }
 
     if (firstError == null) {
       if (today.remaining <= 0) {
-        console.log(
-          `[worker] skip generate: daily target met (resolvedToday=${today.total} remaining=0)`,
-        );
+        console.log(`[worker] skip generate: daily target met (resolvedToday=${today.total} remaining=0)`);
       } else if (pending.hasPending) {
-        console.log(
-          `[worker] skip generate: pending already exists (count=${pending.pendingCount})`,
-        );
+        console.log(`[worker] skip generate: pending already exists (count=${pending.pendingCount})`);
       } else {
         try {
-          const queued = await generateAndQueuePrediction(sql).catch(
+          const queued = await withGenerationLock(() => generateAndQueuePrediction(sql)).catch(
             (e: unknown) => {
-              console.error(
-                "[worker] generateAndQueuePrediction threw:",
-                (e as Error)?.message ?? e,
-              );
+              console.error("[worker] generateAndQueuePrediction threw:", (e as Error)?.message ?? e);
               return null;
             },
           );
           if (queued) {
             result.generated = queued.signal.predictionId;
-            console.log(
-              `[worker] generated prediction=${queued.signal.predictionId} target=${queued.signal.target ?? 1.3}`,
-            );
+            console.log(`[worker] generated prediction=${queued.signal.predictionId} target=${queued.signal.target ?? 1.3}`);
             try {
               await createPredictionNotification(sql, {
                 predictionId: queued.signal.predictionId,
@@ -308,19 +267,10 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
                 generatedAt: new Date().toISOString(),
               });
             } catch (e) {
-              logger.error(
-                { component: "PredictionWorker", error: e },
-                "Failed to queue prediction notification",
-              );
-              console.error(
-                "[worker] createPredictionNotification failed:",
-                (e as Error)?.message ?? e,
-              );
+              console.error("[worker] createPredictionNotification failed:", (e as Error)?.message ?? e);
             }
           } else {
-            console.log(
-              "[worker] skip generate: generateAndQueuePrediction returned null (insufficient history, target already exists, or race)",
-            );
+            console.log("[worker] skip generate: generateAndQueuePrediction returned null");
           }
         } catch (e: unknown) {
           fail((e as Error)?.message ?? String(e));
@@ -330,10 +280,7 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
   }
 
   if (firstError) {
-    logger.error(
-      { component: "PredictionWorker", error: firstError },
-      "cycle error",
-    );
+    logger.error({ component: "PredictionWorker", error: firstError }, "cycle error");
   }
 
   const nowIso = new Date().toISOString();
@@ -344,23 +291,12 @@ async function runCycleWork(sql: Sql): Promise<WorkerCycleResult> {
     await setState(sql, STATE.LAST_ERROR, result.ok ? "" : result.error ?? firstError ?? "");
     await setStateNum(sql, STATE.LAST_FETCH_COUNT, result.fetched);
     await setStateNum(sql, STATE.LAST_INSERTED_COUNT, result.inserted);
-    await setState(
-      sql,
-      STATE.LAST_ONLINE_PLAYERS,
-      onlinePlayers == null ? "" : String(onlinePlayers),
-    );
+    await setState(sql, STATE.LAST_ONLINE_PLAYERS, onlinePlayers == null ? "" : String(onlinePlayers));
     if (latest) await setState(sql, STATE.LAST_SEEN_GAME_ID, latest.gameId);
-    await setState(
-      sql,
-      STATE.TELEGRAM_ENABLED,
-      telegramConfigured() ? "1" : "0",
-    );
+    await setState(sql, STATE.TELEGRAM_ENABLED, telegramConfigured() ? "1" : "0");
     await incrementCycles(sql);
   } catch (e: unknown) {
-    logger.error(
-      { component: "PredictionWorker", error: e },
-      "state-write failed (cycle result still valid)",
-    );
+    logger.error({ component: "PredictionWorker", error: e }, "state-write failed");
   }
 
   return result;
@@ -377,15 +313,11 @@ export async function getWorkerStatus(): Promise<WorkerStatus> {
     getPendingStatus(),
     getDailyTarget(),
   ]);
-
   const lock = lockRows[0];
   const now = Date.now();
   const running = !!lock && new Date(lock.expires_at).getTime() > now;
-
   const rawPlayers = state.get(STATE.LAST_ONLINE_PLAYERS);
-  const lastOnlinePlayers =
-    rawPlayers != null && rawPlayers !== "" ? Number(rawPlayers) : null;
-
+  const lastOnlinePlayers = rawPlayers != null && rawPlayers !== "" ? Number(rawPlayers) : null;
   return {
     running,
     ownerId: lock?.owner_id ?? null,
@@ -413,6 +345,7 @@ type WorkerHandle = {
   running: boolean;
   ownerId: string;
   sleepTimer: ReturnType<typeof setTimeout> | null;
+  hbTimer?: ReturnType<typeof setInterval> | null;
 };
 
 const globalRef = globalThis as typeof globalThis & {
@@ -421,38 +354,42 @@ const globalRef = globalThis as typeof globalThis & {
 
 function getHandle(): WorkerHandle {
   if (!globalRef.__predictionWorkerHandle__) {
-    globalRef.__predictionWorkerHandle__ = {
-      running: false,
-      ownerId: "",
-      sleepTimer: null,
-    };
+    globalRef.__predictionWorkerHandle__ = { running: false, ownerId: "", sleepTimer: null };
   }
   return globalRef.__predictionWorkerHandle__;
 }
 
 export function startWorker(): WorkerHandle {
-  if (typeof window !== "undefined") {
-    throw new Error("startWorker() is server-only");
-  }
+  if (typeof window !== "undefined") throw new Error("startWorker() is server-only");
   const handle = getHandle();
   if (handle.running) return handle;
   handle.running = true;
   handle.ownerId = randomUUID();
   const chatIds = getConfiguredChatIds();
-  const bootMsg = `[worker] starting telegram=${
-    telegramConfigured() ? "enabled" : "disabled (no env)"
-  } telegramChatCount=${chatIds.length} pollIntervalMs=${POLL_INTERVAL_MS}`;
-  if (telegramConfigured()) {
-    console.log(bootMsg);
-  } else {
-    console.warn(bootMsg);
-  }
+  const bootMsg = `[worker] starting telegram=${telegramConfigured() ? "enabled" : "disabled (no env)"} telegramChatCount=${chatIds.length} pollIntervalMs=${POLL_INTERVAL_MS}`;
+  if (telegramConfigured()) console.log(bootMsg);
+  else console.warn(bootMsg);
 
   try {
     void startEventDrivenPipeline();
   } catch (e) {
     logger.warn({ component: "PredictionWorker", error: e }, "event pipeline start failed");
   }
+
+  // Independent heartbeat so a long sync prediction cannot starve the lock TTL.
+  const heartbeatEveryMs = Math.min(15_000, Math.max(5_000, Math.floor(LOCK_TTL_SEC * 1000 / 3)));
+  handle.hbTimer = setInterval(() => {
+    if (!handle.running) return;
+    void (async () => {
+      try {
+        const sql = await getSql();
+        await heartbeat(sql, handle.ownerId);
+      } catch (e) {
+        console.warn("[worker] independent heartbeat failed:", (e as Error)?.message ?? e);
+      }
+    })();
+  }, heartbeatEveryMs);
+  if (!process.env.DATABASE_URL?.trim()) handle.hbTimer.unref?.();
 
   void run(handle);
   return handle;
@@ -465,19 +402,18 @@ export async function stopWorker(): Promise<void> {
     clearTimeout(handle.sleepTimer);
     handle.sleepTimer = null;
   }
+  if (handle.hbTimer) {
+    clearInterval(handle.hbTimer);
+    handle.hbTimer = null;
+  }
   try {
     const sql = await getSql();
     await releaseLock(sql, handle.ownerId);
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   try {
     await stopEventDrivenPipeline();
   } catch (error) {
-    logger.warn(
-      { component: "PredictionWorker", error },
-      "Error stopping event-driven pipeline",
-    );
+    logger.warn({ component: "PredictionWorker", error }, "Error stopping event-driven pipeline");
   }
   logger.info({ component: "PredictionWorker" }, "worker stopped");
 }
@@ -485,24 +421,15 @@ export async function stopWorker(): Promise<void> {
 function sleep(handle: WorkerHandle, ms: number): Promise<void> {
   return new Promise((res) => {
     handle.sleepTimer = setTimeout(res, ms);
-    // Only unref in embedded/dev mode. Standalone Railway worker must keep
-    // the poll timer referenced or Node exits after the first sleep.
-    if (!process.env.DATABASE_URL?.trim()) {
-      handle.sleepTimer.unref?.();
-    }
+    if (!process.env.DATABASE_URL?.trim()) handle.sleepTimer.unref?.();
   });
 }
 
 async function run(handle: WorkerHandle): Promise<void> {
   const sql = await getSql();
-
   let ours = await acquireLock(sql, handle.ownerId);
   if (!ours) {
     console.warn("[worker] lock held by another instance; backing off");
-    logger.debug(
-      { component: "PredictionWorker" },
-      "lock held by another instance; backing off",
-    );
     await sleep(handle, Math.max(POLL_INTERVAL_MS, LOCK_TTL_SEC * 1000));
     if (handle.running) void run(handle);
     return;
@@ -516,16 +443,9 @@ async function run(handle: WorkerHandle): Promise<void> {
           `[worker] cycle ok=${cycle.ok} fetched=${cycle.fetched} inserted=${cycle.inserted} resolved=${cycle.resolved} generated=${cycle.generated ?? "-"} error=${cycle.error ?? "-"}`,
         );
       } catch (e: unknown) {
-        logger.error(
-          { component: "PredictionWorker", error: e },
-          "cycle body threw",
-        );
         console.error("[worker] cycle threw:", (e as Error)?.message ?? e);
       }
 
-      // CRITICAL: deliver queued Telegram notifications. Without this call,
-      // createPredictionNotification only inserts into the outbox and signals
-      // never reach Telegram.
       try {
         const out = await processOutbox(sql);
         if (out.processed > 0) {
@@ -539,10 +459,7 @@ async function run(handle: WorkerHandle): Promise<void> {
 
       ours = await heartbeat(sql, handle.ownerId);
       if (!ours) {
-        logger.warn(
-          { component: "PredictionWorker" },
-          "lock lost to another instance; yielding",
-        );
+        console.warn("[worker] lock lost; yielding");
         break;
       }
       await sleep(handle, POLL_INTERVAL_MS);
