@@ -44,7 +44,11 @@ export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
 };
 
 export class StrategyLayer {
-  constructor(private readonly policy: StrategyPolicy = HIGH_FREQUENCY_STRATEGY_POLICY) {}
+  private readonly policy: StrategyPolicy;
+
+  constructor(policy: StrategyPolicy = HIGH_FREQUENCY_STRATEGY_POLICY) {
+    this.policy = policy;
+  }
 
   evaluate(ctx: StrategyDecisionContext): StrategyDecision {
     const { probability, evidence, calibrationError, uncertainty, riskState, regime } = ctx;

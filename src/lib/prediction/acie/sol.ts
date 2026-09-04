@@ -25,7 +25,7 @@ export class SequentialOutcomeLearner {
   private readonly records: SOLRecord[] = [];
   private readonly maxInMemory: number;
 
-  constructor(maxInMemory = 5000) {
+  constructor(maxInMemory = 2000) {
     this.maxInMemory = maxInMemory;
   }
 

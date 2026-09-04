@@ -92,7 +92,7 @@ export async function saveAcieStateToDb(
       version: 1,
       savedAt: new Date().toISOString(),
       online: snap.online,
-      crashPoints: snap.crashPoints.slice(-2000),
+      crashPoints: snap.crashPoints.slice(-2000), // ACIE_MAX_HISTORY default
       consecutiveLosses: snap.consecutiveLosses,
     };
     const sql = await getSqlFn();

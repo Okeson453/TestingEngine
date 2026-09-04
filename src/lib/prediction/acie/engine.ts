@@ -109,7 +109,8 @@ export class ACIEEngine {
     });
     this.entitlement = new EntitlementGate();
     this.heavyEvery = opts.heavyValidationEvery ?? 50;
-    this.evidenceMaxN = Number(process.env.ACIE_EVIDENCE_MAX_N ?? 1000);
+    // Evidence window derives from unified history (§7.3).
+    this.evidenceMaxN = Number(process.env.ACIE_EVIDENCE_MAX_N ?? Math.min(1000, ACIE_MAX_HISTORY));
     this.ewmaAlpha = opts.ewmaAlpha ?? 0.05;
   }
 
@@ -134,7 +135,7 @@ export class ACIEEngine {
   } {
     return {
       online: { ...this.online },
-      crashPoints: this.crashPoints.slice(-2000),
+      crashPoints: this.crashPoints.slice(-ACIE_MAX_HISTORY),
       consecutiveLosses: this.consecutiveLosses,
     };
   }
@@ -372,8 +373,8 @@ export class ACIEEngine {
 
     // 2) UPDATE SEQUENCE + REGIME (TPL) after appending crash
     this.crashPoints.push(round.crashPoint);
-    if (this.crashPoints.length > 2000) {
-      this.crashPoints = this.crashPoints.slice(-2000);
+    if (this.crashPoints.length > ACIE_MAX_HISTORY) {
+      this.crashPoints = this.crashPoints.slice(-ACIE_MAX_HISTORY);
     }
     const sequenceState = this.tpl.computeSequenceState(this.crashPoints);
     const regime = this.tpl.detectRegime(sequenceState);

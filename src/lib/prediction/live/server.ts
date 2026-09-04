@@ -328,3 +328,45 @@ export async function cancelStalePrediction(input: z.infer<typeof CancelInput>) 
   `;
   return { ok: rows.length > 0, predictionId: parsed.predictionId };
 }
+
+/**
+ * §6.2 Surface per-model performance (read-only).
+ * Returns recent win-rate proxies, EWMA metrics, suppression heuristic.
+ * Does not mutate prediction state.
+ */
+export async function getModelPerformanceSummary(): Promise<{
+  measuredAt: string;
+  models: Array<{
+    modelName: string;
+    count: number;
+    ewmaBrier: number;
+    ewmaLogLoss: number;
+    recentWinRate: number | null;
+    suppressed: boolean;
+  }>;
+}> {
+  const { globalModelPerformance } = await import("../ensemble/model-performance.ts");
+  const all = globalModelPerformance.all();
+  const models: Array<{
+    modelName: string;
+    count: number;
+    ewmaBrier: number;
+    ewmaLogLoss: number;
+    recentWinRate: number | null;
+    suppressed: boolean;
+  }> = [];
+  for (const [name, p] of all) {
+    const recentWinRate = p.recentTotal > 0 ? p.recentCorrect / p.recentTotal : null;
+    const suppressed = p.count >= 50 && p.ewmaBrier > 0.28;
+    models.push({
+      modelName: name,
+      count: p.count,
+      ewmaBrier: p.ewmaBrier,
+      ewmaLogLoss: p.ewmaLogLoss,
+      recentWinRate,
+      suppressed,
+    });
+  }
+  models.sort((a, b) => a.modelName.localeCompare(b.modelName));
+  return { measuredAt: new Date().toISOString(), models };
+}
