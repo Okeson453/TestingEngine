@@ -519,6 +519,23 @@ export async function onGameEndPredict(
       };
     }
 
+    // Diagnosis §6: prefer live_round_state over crash_rounds existence.
+    // REST backfill must not be mistaken for "target already started".
+    try {
+      const { hasTargetStarted } = await import(
+        "@/lib/prediction/live/live-round-state"
+      );
+      if (await hasTargetStarted(targetGameId, sql)) {
+        logger.warn(
+          { targetGameId },
+          "Target round N+1 already started (live state) — too late to predict",
+        );
+        return { predictionId: null, targetGameId, kind: "too_late" };
+      }
+    } catch {
+      /* live_round_state table may not exist yet during migration window */
+    }
+
     const alreadyCrashed = await sql<{ game_id: string }>`
       SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
     `;

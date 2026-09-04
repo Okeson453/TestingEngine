@@ -47,6 +47,12 @@ export interface GameEndEvent {
   endTime: string;
   multiplier: number;
   receivedAt: string;
+  /**
+   * When true (poll recovery path), validation runs but N+1 prediction is
+   * NOT auto-triggered. Poll worker decides at most one newest-round attempt.
+   * Spec: Diagnosis §3 — eliminate poll-batch prediction cascade.
+   */
+  skipPredict?: boolean;
 }
 
 export type OnGameEndResult =
@@ -261,8 +267,11 @@ export async function onGameEnd(
 
   if (state.pending == null) {
     // Even without a pending prediction for N, generate N+1 so cold-start
-    // and missed-bg recovery still produce the next prediction.
-    triggerNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
+    // and missed-bg recovery still produce the next prediction — unless
+    // the caller (poll worker) explicitly suppressed cascade.
+    if (!evt.skipPredict) {
+      triggerNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
+    }
     if (state.crashRow && state.crashRow.began_at == null) {
       return { kind: "orphaned", targetGameId: evt.gameId };
     }
@@ -282,12 +291,15 @@ export async function onGameEnd(
     "round validated",
   );
   // Spec §2/§3.2: trigger N+1 prediction after Round N is processed.
-  triggerNextPrediction(
-    evt.gameId,
-    evt.endTime,
-    evt.multiplier,
-    state.pending.correlation_id,
-  );
+  // Poll recovery path sets skipPredict to prevent historical cascade.
+  if (!evt.skipPredict) {
+    triggerNextPrediction(
+      evt.gameId,
+      evt.endTime,
+      evt.multiplier,
+      state.pending.correlation_id,
+    );
+  }
 
   return {
     kind: "resolved",

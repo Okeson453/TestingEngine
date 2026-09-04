@@ -370,3 +370,72 @@ export async function getModelPerformanceSummary(): Promise<{
   models.sort((a, b) => a.modelName.localeCompare(b.modelName));
   return { measuredAt: new Date().toISOString(), models };
 }
+
+/** Diagnosis §2 / §14 — socket connection health for operator dashboard. */
+export async function getSocketHealth() {
+  try {
+    const { bcGameSocket } = await import("@/lib/crash/socket-client");
+    return bcGameSocket.getState();
+  } catch {
+    return {
+      status: "stopped" as const,
+      lastError: "socket module unavailable",
+      lastConnectedAt: null,
+      lastDisconnectedAt: null,
+      reconnectAttempts: 0,
+      socketId: null,
+      transport: null,
+      lastEdAt: null,
+      lastBgAt: null,
+      lastEventAt: null,
+      lastEventKind: null,
+      eventLagMs: null,
+      totalReconnects: 0,
+    };
+  }
+}
+
+/**
+ * Diagnosis §12 — inter-round prediction window vs actual pipeline latency.
+ * prediction_window_ms = target_round_started_at - source crash time (approx via requested_at).
+ */
+export async function getPredictionWindows(limit = 50) {
+  const sql = await getSql();
+  const rows = await sql<{
+    target_game_id: string;
+    generated_at: string | Date | null;
+    target_round_started_at: string | Date | null;
+    window_ms: number | null;
+    too_late: boolean;
+  }>`
+    SELECT
+      pp.target_game_id,
+      pp.generated_at,
+      pp.target_round_started_at,
+      CASE
+        WHEN pp.generated_at IS NOT NULL AND pp.target_round_started_at IS NOT NULL
+        THEN EXTRACT(EPOCH FROM (pp.target_round_started_at - pp.generated_at)) * 1000
+        ELSE NULL
+      END AS window_ms,
+      CASE
+        WHEN pp.generated_at IS NOT NULL AND pp.target_round_started_at IS NOT NULL
+             AND pp.generated_at >= pp.target_round_started_at
+        THEN true
+        ELSE false
+      END AS too_late
+    FROM pending_predictions pp
+    WHERE pp.generated_at IS NOT NULL
+    ORDER BY pp.requested_at DESC
+    LIMIT ${limit}
+  `;
+  return rows.map((r) => ({
+    targetGameId: r.target_game_id,
+    generatedAt: r.generated_at ? new Date(r.generated_at).toISOString() : null,
+    targetStartedAt: r.target_round_started_at
+      ? new Date(r.target_round_started_at).toISOString()
+      : null,
+    windowMs: r.window_ms != null ? Math.round(Number(r.window_ms)) : null,
+    tooLate: r.too_late,
+  }));
+}
+

@@ -36,6 +36,7 @@ const REQUIRED_TABLES = [
   "worker_locks",
   "worker_state",
   "acie_online_state",
+  "live_round_state",
 ] as const;
 
 export async function validateSchema(sql: Sql): Promise<void> {

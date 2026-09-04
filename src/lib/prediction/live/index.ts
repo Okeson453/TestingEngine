@@ -19,6 +19,21 @@ export { PollWorker, POLL_INTERVAL_MS, STALE_PREDICTED_MS } from "./poll-worker"
 export { ClockSkewMonitor, SKEW_INTERVAL_MS } from "./clock-skew-monitor";
 export { startLiveBoot, stopLiveBoot, getLiveBoot, validateSchema } from "./boot";
 export {
+  getLiveRound,
+  hasTargetStarted,
+  markLiveRoundStarted,
+  markLiveRoundEnded,
+  upsertLiveRoundFromHistory,
+  markReconciled,
+  type LiveLifecycle,
+  type LiveRoundRow,
+} from "./live-round-state";
+export {
+  reconcileStuckPredictions,
+  STALE_MS as STUCK_STALE_MS,
+  type StuckRecoveryResult,
+} from "./stuck-recovery";
+export {
   getInvariantStatus,
   getInvariantViolations,
   retryDeadNotifications,
@@ -28,4 +43,6 @@ export {
   getSlaViolations,
   getStuckPredictions,
   cancelStalePrediction,
+  getSocketHealth,
+  getPredictionWindows,
 } from "./server";

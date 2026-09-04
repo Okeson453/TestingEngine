@@ -57,6 +57,20 @@ async function onBgEvent(payload: unknown): Promise<void> {
 
   try {
     const sql = await getSql();
+    const corr = randomUUID();
+
+    // Explicit live lifecycle (Diagnosis §6)
+    try {
+      const { markLiveRoundStarted } = await import(
+        "@/lib/prediction/live/live-round-state"
+      );
+      await markLiveRoundStarted(gameId, beganAt, "socket", corr, sql);
+    } catch (le) {
+      logger.debug(
+        { event: "bg", gameId, error: String(le) },
+        "live_round_state update skipped",
+      );
+    }
 
     await sql`
       UPDATE pending_predictions
@@ -71,7 +85,7 @@ async function onBgEvent(payload: unknown): Promise<void> {
         correlation_id, event_kind, game_id, payload, received_at, processed_at,
         processor_latency_ms, sla_violated
       ) VALUES (
-        ${randomUUID()}::text, 'BG', ${gameId},
+        ${corr}::text, 'BG', ${gameId},
         ${JSON.stringify({ beganAt })},
         ${beganAt}::timestamptz, now(), 0, false
       )
@@ -111,6 +125,25 @@ async function onEdEvent(payload: unknown): Promise<void> {
   }
   const receivedAt = new Date().toISOString();
   try {
+    // Explicit live lifecycle end (Diagnosis §6)
+    try {
+      const { markLiveRoundEnded } = await import(
+        "@/lib/prediction/live/live-round-state"
+      );
+      await markLiveRoundEnded(
+        gameId,
+        endTime ?? receivedAt,
+        multiplier,
+        undefined,
+        "socket",
+      );
+    } catch (le) {
+      logger.debug(
+        { event: "ed", gameId, error: String(le) },
+        "live_round_state end update skipped",
+      );
+    }
+
     const result = await onGameEnd({
       gameId,
       endTime: endTime ?? receivedAt,
