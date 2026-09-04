@@ -45,4 +45,7 @@ export {
   cancelStalePrediction,
   getSocketHealth,
   getPredictionWindows,
+  getSocketDiagnostics,
 } from "./server";
+export { runSocketDiagnostics } from "@/lib/crash/socket-diagnostics";
+export type { TemporalValidity } from "./predictor";

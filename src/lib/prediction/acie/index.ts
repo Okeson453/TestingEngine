@@ -40,6 +40,8 @@ export type { OnlineAdaptiveState, DriftSnapshot, OnlineModelName } from './onli
 
 export {
   loadAcieStateFromDb,
+  type AcieRestoreResult,
+  type AcieRestoreReason,
   saveAcieStateToDb,
   scheduleAcieStateSave,
   type AciePersistedSnapshot,

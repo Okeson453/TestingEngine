@@ -190,6 +190,12 @@ export function initializeEventHandlers(): void {
 export async function startEventDrivenPipeline(): Promise<void> {
   initializeEventHandlers();
   await bcGameSocket.connect();
+  // P0-3: probe path immediately so operators see Cloudflare/WAF vs other failures
+  try {
+    const { runSocketDiagnostics } = await import("@/lib/crash/socket-diagnostics");
+    // fire-and-forget; do not block boot
+    void runSocketDiagnostics().catch(() => undefined);
+  } catch { /* optional */ }
   logger.info({ component: "game-event-handlers" }, "event-driven pipeline started");
 }
 

@@ -219,12 +219,57 @@ export class OutboxDispatcher {
         where id = ${row.id}
       `;
       this.stats.dead += 1;
+      // Rich diagnostics for operators (Diagnosis P0-6)
+      let telegramChatId: string | null = null;
+      let predictionId: string | null = null;
+      let targetGameId: string | null = null;
+      try {
+        const meta = row.metadata ?? {};
+        const contentRaw = row.content;
+        const content =
+          typeof contentRaw === "string"
+            ? (() => {
+                try {
+                  return JSON.parse(contentRaw) as Record<string, unknown>;
+                } catch {
+                  return {} as Record<string, unknown>;
+                }
+              })()
+            : typeof contentRaw === "object" && contentRaw
+              ? (contentRaw as Record<string, unknown>)
+              : {};
+        telegramChatId =
+          (meta.chatId as string) ??
+          (meta.chat_id as string) ??
+          (content.chatId as string) ??
+          null;
+        predictionId =
+          (meta.predictionId as string) ??
+          (meta.prediction_id as string) ??
+          (content.predictionId as string) ??
+          null;
+        targetGameId =
+          (meta.targetGameId as string) ??
+          (meta.target_game_id as string) ??
+          (content.targetGameId as string) ??
+          null;
+      } catch { /* ignore */ }
       logger.warn(
         {
           component: "outbox-dispatcher",
+          outboxId: row.id,
           notificationId: row.notification_id,
+          predictionId,
+          targetGameId,
           attempts,
-          lastError,
+          httpStatus: firstFailure?.status ?? null,
+          providerError: lastError,
+          errorCode:
+            typeof firstFailure?.status === "number"
+              ? `http_${firstFailure.status}`
+              : "send_failed",
+          telegramChatId,
+          isPermanent,
         },
         isPermanent ? "permanent failure; dead-lettering" : "max attempts reached; dead-lettering",
       );

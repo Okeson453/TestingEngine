@@ -34,50 +34,121 @@ export type AcieSnapshotSource = {
   }) => void;
 };
 
-/** Load the most recent snapshot into the engine. Returns true if restored. */
+export type AcieRestoreReason =
+  | "restored"
+  | "state_missing"
+  | "state_corrupt"
+  | "schema_mismatch"
+  | "db_error"
+  | "deserialization_error";
+
+export interface AcieRestoreResult {
+  restored: boolean;
+  reason: AcieRestoreReason;
+  observationCount?: number;
+  crashPoints?: number;
+  error?: string;
+}
+
+/** Load the most recent snapshot. Always returns a classified reason. */
 export async function loadAcieStateFromDb(
   acie: AcieSnapshotSource,
   getSqlFn: () => Promise<Sql> = getSql,
-): Promise<boolean> {
+): Promise<AcieRestoreResult> {
   try {
     const sql = await getSqlFn();
-    const rows = await sql<{
-      payload: AciePersistedSnapshot | string;
-      observation_count: number;
-    }>`
-      SELECT payload, observation_count
-      FROM acie_online_state
-      ORDER BY created_at DESC
-      LIMIT 1
-    `;
+    let rows: Array<{ payload: AciePersistedSnapshot | string; observation_count: number }>;
+    try {
+      rows = await sql<{
+        payload: AciePersistedSnapshot | string;
+        observation_count: number;
+      }>`
+        SELECT payload, observation_count
+        FROM acie_online_state
+        ORDER BY created_at DESC
+        LIMIT 1
+      `;
+    } catch (e) {
+      const msg = String(e);
+      const reason: AcieRestoreReason =
+        msg.includes("does not exist") || msg.includes("relation") || msg.includes("42P01")
+          ? "schema_mismatch"
+          : "db_error";
+      logger.warn(
+        { component: "acie-state-persistence", reason, error: msg },
+        `ACIE state load failed (${reason})`,
+      );
+      return { restored: false, reason, error: msg };
+    }
     if (rows.length === 0) {
-      logger.info({ component: "acie-state-persistence" }, "no prior ACIE snapshot");
-      return false;
+      logger.info(
+        { component: "acie-state-persistence", reason: "state_missing" },
+        "no prior ACIE snapshot (state_missing)",
+      );
+      return { restored: false, reason: "state_missing" };
     }
     const raw = rows[0]!.payload;
-    const snap: AciePersistedSnapshot =
-      typeof raw === "string" ? (JSON.parse(raw) as AciePersistedSnapshot) : raw;
-    if (!snap?.online) return false;
-    acie.importSnapshot({
-      online: snap.online,
-      crashPoints: snap.crashPoints ?? [],
-      consecutiveLosses: snap.consecutiveLosses ?? 0,
-    });
+    let snap: AciePersistedSnapshot;
+    try {
+      snap =
+        typeof raw === "string" ? (JSON.parse(raw) as AciePersistedSnapshot) : raw;
+    } catch (e) {
+      logger.warn(
+        {
+          component: "acie-state-persistence",
+          reason: "deserialization_error",
+          error: String(e),
+        },
+        "ACIE snapshot JSON parse failed",
+      );
+      return { restored: false, reason: "deserialization_error", error: String(e) };
+    }
+    if (!snap?.online || typeof snap.online !== "object") {
+      logger.warn(
+        { component: "acie-state-persistence", reason: "state_corrupt" },
+        "ACIE snapshot missing online payload",
+      );
+      return { restored: false, reason: "state_corrupt" };
+    }
+    try {
+      acie.importSnapshot({
+        online: snap.online,
+        crashPoints: snap.crashPoints ?? [],
+        consecutiveLosses: snap.consecutiveLosses ?? 0,
+      });
+    } catch (e) {
+      logger.warn(
+        {
+          component: "acie-state-persistence",
+          reason: "state_corrupt",
+          error: String(e),
+        },
+        "ACIE importSnapshot rejected payload",
+      );
+      return { restored: false, reason: "state_corrupt", error: String(e) };
+    }
+    const observationCount = rows[0]!.observation_count;
+    const crashPoints = snap.crashPoints?.length ?? 0;
     logger.info(
       {
         component: "acie-state-persistence",
-        observationCount: rows[0]!.observation_count,
-        crashPoints: snap.crashPoints?.length ?? 0,
+        reason: "restored",
+        observationCount,
+        crashPoints,
       },
       "ACIE online state restored from Postgres",
     );
-    return true;
+    return { restored: true, reason: "restored", observationCount, crashPoints };
   } catch (e) {
     logger.warn(
-      { component: "acie-state-persistence", error: String(e) },
-      "ACIE state load failed; continuing with fresh state",
+      {
+        component: "acie-state-persistence",
+        reason: "db_error",
+        error: String(e),
+      },
+      "ACIE state load failed (db_error)",
     );
-    return false;
+    return { restored: false, reason: "db_error", error: String(e) };
   }
 }
 

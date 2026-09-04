@@ -147,21 +147,37 @@ class LiveBoot {
       try {
         const { ACIEEngine } = await import("@/lib/prediction/acie/engine");
         const eng = new ACIEEngine();
-        const restored = await loadAcieStateFromDb(eng);
-        logger.info(
-          { component: "live-boot", restored },
-          restored ? "ACIE online state restored" : "ACIE starting fresh (no prior snapshot)",
-        );
+        const result = await loadAcieStateFromDb(eng);
+        if (result.restored) {
+          logger.info(
+            {
+              component: "live-boot",
+              reason: result.reason,
+              observationCount: result.observationCount,
+              crashPoints: result.crashPoints,
+            },
+            "ACIE online state restored (warm)",
+          );
+        } else {
+          logger.warn(
+            {
+              component: "live-boot",
+              reason: result.reason,
+              error: result.error ?? null,
+            },
+            `ACIE starting cold — restore reason: ${result.reason}`,
+          );
+        }
         (globalThis as { __acieEngine__?: typeof eng }).__acieEngine__ = eng;
       } catch (e) {
-        // Log full error so operators can distinguish import vs DB vs schema issues
         logger.warn(
           {
             component: "live-boot",
+            reason: "db_error",
             error: String(e),
             stack: e instanceof Error ? e.stack : undefined,
           },
-          "ACIE state restore skipped — continuing without warm state",
+          "ACIE state restore threw — continuing cold",
         );
       }
     } catch (e) {

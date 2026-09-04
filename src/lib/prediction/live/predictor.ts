@@ -482,10 +482,27 @@ export async function onGameStart(
  *   prediction_generated_at < target_round_started_at
  * always holds (target_round_started_at is backfilled later on the bg event).
  */
+export type TemporalValidity = "TEMPORALLY_VALID" | "TEMPORALLY_UNVERIFIED" | "TEMPORALLY_INVALID";
+
 export interface OnGameEndPredictResult {
   predictionId: string | null;
   targetGameId: string;
-  kind: "predicted" | "duplicate" | "too_late" | "insufficient_history" | "error";
+  kind:
+    | "predicted"
+    | "duplicate"
+    | "too_late"
+    | "insufficient_history"
+    | "error"
+    | "temporally_invalid";
+  /** Proven only when targetStartedAt is known and remainingBeforeTargetMs > 0 */
+  temporalValidity?: TemporalValidity;
+  sourceGameId?: string;
+  sourceCrashAt?: string;
+  targetStartedAt?: string | null;
+  predictionGeneratedAt?: string;
+  predictionLatencyMs?: number;
+  availableWindowMs?: number | null;
+  remainingBeforeTargetMs?: number | null;
 }
 
 export async function onGameEndPredict(
@@ -617,16 +634,75 @@ export async function onGameEndPredict(
     }
     const predictionId = inserted[0]!.prediction_id;
 
+    // Temporal telemetry — never claim "ahead-of-time" without targetStartedAt.
+    // At ED(N) time, targetStartedAt is typically still NULL (filled on BG).
+    // Classification:
+    //   TEMPORALLY_UNVERIFIED — target start unknown (normal at ED time)
+    //   TEMPORALLY_VALID      — generated_at < target_started_at
+    //   TEMPORALLY_INVALID    — generated_at >= target_started_at
+    const sourceCrashMs = new Date(crashedAt).getTime();
+    const generatedMs = new Date(generatedAt).getTime();
+    const predictionLatencyMs = Number.isFinite(sourceCrashMs)
+      ? Math.max(0, generatedMs - sourceCrashMs)
+      : undefined;
+
+    let targetStartedAt: string | null = null;
+    try {
+      const live = await sql<{ began_at: string | Date | null }>`
+        SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+      `.catch(() => [] as { began_at: string | Date | null }[]);
+      if (live[0]?.began_at) {
+        targetStartedAt = new Date(live[0].began_at).toISOString();
+      }
+    } catch { /* ignore */ }
+
+    let temporalValidity: TemporalValidity = "TEMPORALLY_UNVERIFIED";
+    let availableWindowMs: number | null = null;
+    let remainingBeforeTargetMs: number | null = null;
+    if (targetStartedAt) {
+      const startedMs = new Date(targetStartedAt).getTime();
+      availableWindowMs = Number.isFinite(sourceCrashMs)
+        ? startedMs - sourceCrashMs
+        : null;
+      remainingBeforeTargetMs = startedMs - generatedMs;
+      temporalValidity =
+        remainingBeforeTargetMs > 0 ? "TEMPORALLY_VALID" : "TEMPORALLY_INVALID";
+    }
+
     logger.info(
       {
         predictionId,
-        targetGameId,
         sourceGameId: gameId,
+        targetGameId,
+        sourceCrashAt: crashedAt,
+        targetStartedAt,
+        predictionGeneratedAt: generatedAt,
+        predictionLatencyMs,
+        availableWindowMs,
+        remainingBeforeTargetMs,
+        temporalValidity,
         correlationId,
         probability: signal.probability,
       },
-      "Generated ahead-of-time prediction for N+1",
+      temporalValidity === "TEMPORALLY_VALID"
+        ? "Prediction TEMPORALLY_VALID (generated before target start)"
+        : temporalValidity === "TEMPORALLY_INVALID"
+          ? "Prediction TEMPORALLY_INVALID (generated at/after target start)"
+          : "Prediction generated (TEMPORALLY_UNVERIFIED — target start not yet known)",
     );
+
+    if (temporalValidity === "TEMPORALLY_INVALID") {
+      // Mark reasoning so operators can filter; keep row for audit but do not
+      // pretend it was ahead-of-time. Downstream may still resolve on crash.
+      try {
+        await sql`
+          UPDATE pending_predictions
+          SET reasoning = COALESCE(reasoning, ARRAY[]::text[]) ||
+            ARRAY['TEMPORALLY_INVALID: generated_at >= target_started_at']::text[]
+          WHERE prediction_id = ${predictionId}
+        `;
+      } catch { /* non-critical */ }
+    }
 
     try {
       const { createPredictionNotification } = await import("@/lib/notifications/outbox");
@@ -654,8 +730,17 @@ export async function onGameEndPredict(
           processor_latency_ms, sla_violated
         ) VALUES (
           ${correlationId}::text, 'PREDICT', ${targetGameId},
-          ${JSON.stringify({ sourceGameId: gameId, probability: signal.probability, multiplier })},
-          ${generatedAt}::timestamptz, now(), 0, false
+          ${JSON.stringify({
+            sourceGameId: gameId,
+            probability: signal.probability,
+            multiplier,
+            temporalValidity,
+            predictionLatencyMs,
+            availableWindowMs,
+            remainingBeforeTargetMs,
+            targetStartedAt,
+          })},
+          ${generatedAt}::timestamptz, now(), ${predictionLatencyMs ?? 0}, false
         )
         ON CONFLICT DO NOTHING
       `;
@@ -663,7 +748,19 @@ export async function onGameEndPredict(
       /* ignore */
     }
 
-    return { predictionId, targetGameId, kind: "predicted" };
+    return {
+      predictionId,
+      targetGameId,
+      kind: temporalValidity === "TEMPORALLY_INVALID" ? "temporally_invalid" : "predicted",
+      temporalValidity,
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
+      targetStartedAt,
+      predictionGeneratedAt: generatedAt,
+      predictionLatencyMs,
+      availableWindowMs,
+      remainingBeforeTargetMs,
+    };
   } catch (e) {
     logger.error(
       { gameId, targetGameId, error: String(e) },

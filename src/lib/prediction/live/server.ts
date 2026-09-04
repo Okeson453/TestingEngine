@@ -439,3 +439,8 @@ export async function getPredictionWindows(limit = 50) {
   }));
 }
 
+/** Diagnosis P0-3 — full path probe for Socket.IO / Cloudflare. */
+export async function getSocketDiagnostics() {
+  const { runSocketDiagnostics } = await import("@/lib/crash/socket-diagnostics");
+  return runSocketDiagnostics();
+}
