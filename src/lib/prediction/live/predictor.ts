@@ -551,21 +551,44 @@ export async function onGameEndPredict(
 
     const signal = predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET);
 
-    await sql`
-      INSERT INTO pending_predictions (
-        prediction_id, target_multiplier, probability, confidence,
-        regime_name, regime_confidence, reasoning, feature_summary,
-        model_version, requested_at, target_game_id, source_round_id,
-        source_game_id, target_round_started_at, correlation_id, generated_at, status, matched
-      ) VALUES (
-        ${signal.predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-        ${signal.confidence}, ${signal.regimeId ?? null}, ${signal.regimeId ? 0.5 : null},
-        ${signal.reasoning ?? []}, ${JSON.stringify(signal.featureSummary ?? {})},
-        ${signal.modelVersion ?? "live-v2"}, ${generatedAt}::timestamptz, ${targetGameId}, ${gameId},
-        ${gameId}, NULL, ${correlationId}, ${generatedAt}::timestamptz, 'PENDING', false
-      )
-      ON CONFLICT (prediction_id) DO NOTHING
-    `;
+    // Insert with conflict tolerance: prediction_id unique + partial unique
+    // on (target_game_id) WHERE status='PENDING'. Either race returns
+    // duplicate rather than throwing.
+    try {
+      await sql`
+        INSERT INTO pending_predictions (
+          prediction_id, target_multiplier, probability, confidence,
+          regime_name, regime_confidence, reasoning, feature_summary,
+          model_version, requested_at, target_game_id, source_round_id,
+          source_game_id, target_round_started_at, correlation_id, generated_at, status, matched
+        ) VALUES (
+          ${signal.predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
+          ${signal.confidence}, ${signal.regimeId ?? null}, ${signal.regimeId ? 0.5 : null},
+          ${signal.reasoning ?? []}, ${JSON.stringify(signal.featureSummary ?? {})},
+          ${signal.modelVersion ?? "live-v2"}, ${generatedAt}::timestamptz, ${targetGameId}, ${gameId},
+          ${gameId}, NULL, ${correlationId}, ${generatedAt}::timestamptz, 'PENDING', false
+        )
+        ON CONFLICT (prediction_id) DO NOTHING
+      `;
+    } catch (insertErr) {
+      // Partial unique index race (target_game_id PENDING) surfaces as
+      // a unique_violation that ON CONFLICT (prediction_id) cannot absorb.
+      const msg = String(insertErr);
+      if (msg.includes("unique") || msg.includes("duplicate") || msg.includes("23505")) {
+        logger.info({ targetGameId }, "N+1 prediction race lost to concurrent writer");
+        const raced = await sql<{ prediction_id: string }>`
+          SELECT prediction_id FROM pending_predictions
+          WHERE target_game_id = ${targetGameId} AND status = 'PENDING'
+          LIMIT 1
+        `;
+        return {
+          predictionId: raced[0]?.prediction_id ?? null,
+          targetGameId,
+          kind: "duplicate",
+        };
+      }
+      throw insertErr;
+    }
 
     const inserted = await sql<{ prediction_id: string }>`
       SELECT prediction_id FROM pending_predictions
@@ -598,6 +621,7 @@ export async function onGameEndPredict(
         regimeName: signal.regimeId ?? null,
         lastRoundMultiplier: rounds[rounds.length - 1]?.crashPoint ?? null,
         generatedAt,
+        correlationId,
       });
     } catch (notifErr) {
       logger.warn(

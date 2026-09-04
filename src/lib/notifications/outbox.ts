@@ -356,6 +356,7 @@ export async function createPredictionNotification(
     regimeName: string | null;
     lastRoundMultiplier: number | null;
     generatedAt: string;
+    correlationId?: string;
   },
 ): Promise<string> {
   const content = formatPredictionMessageForOutbox(options);
@@ -370,6 +371,8 @@ export async function createPredictionNotification(
       confidence: options.confidence,
       regimeName: options.regimeName,
       lastRoundMultiplier: options.lastRoundMultiplier,
+      correlationId: options.correlationId ?? null,
+      generatedAt: options.generatedAt,
     },
     priority: HIGH_PRIORITY_THRESHOLD, // Predictions are high priority
   });

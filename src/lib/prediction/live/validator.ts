@@ -24,6 +24,24 @@ import { onGameEndPredict } from "@/lib/prediction/live/predictor";
 
 const logger = getLogger("live-validator");
 
+/** Spec §2 / §3.2: always attempt N+1 prediction after Round N is known.
+ *  Non-blocking; failures never affect validation. Enables cold-start first
+ *  prediction when there was no prior pending row for N. */
+function triggerNextPrediction(
+  gameId: string,
+  endTime: string,
+  multiplier: number,
+  correlationId: string | null | undefined,
+): void {
+  const corr = correlationId ?? randomUUID();
+  void onGameEndPredict(gameId, endTime, multiplier, corr).catch((e) => {
+    logger.error(
+      { gameId, error: String(e) },
+      "Failed to generate N+1 prediction after ed processing",
+    );
+  });
+}
+
 export interface GameEndEvent {
   gameId: string;
   endTime: string;
@@ -174,7 +192,10 @@ export async function onGameEnd(
       if (!alreadyValidated) {
         await tx`
           update pending_predictions
-          set matched = true, matched_game_id = ${evt.gameId}, matched_at = ${resolvedAt}
+          set matched = true,
+              matched_game_id = ${evt.gameId},
+              matched_at = ${resolvedAt},
+              status = 'MATCHED'
           where prediction_id = ${state.pending!.prediction_id}
         `;
         const chatIds = getChatIds();
@@ -239,6 +260,9 @@ export async function onGameEnd(
   }
 
   if (state.pending == null) {
+    // Even without a pending prediction for N, generate N+1 so cold-start
+    // and missed-bg recovery still produce the next prediction.
+    triggerNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
     if (state.crashRow && state.crashRow.began_at == null) {
       return { kind: "orphaned", targetGameId: evt.gameId };
     }
@@ -257,20 +281,13 @@ export async function onGameEnd(
     },
     "round validated",
   );
-  // Spec §3.3: after successful validation, trigger prediction for N+1
-  // immediately (non-blocking). Validation must never wait on prediction.
-  const corr = state.pending.correlation_id ?? randomUUID();
-  void onGameEndPredict(
+  // Spec §2/§3.2: trigger N+1 prediction after Round N is processed.
+  triggerNextPrediction(
     evt.gameId,
     evt.endTime,
     evt.multiplier,
-    corr,
-  ).catch((e) => {
-    logger.error(
-      { gameId: evt.gameId, error: String(e) },
-      "Failed to generate N+1 prediction after validation",
-    );
-  });
+    state.pending.correlation_id,
+  );
 
   return {
     kind: "resolved",
@@ -282,6 +299,6 @@ export async function onGameEnd(
     resolvedAt: new Date(now()).toISOString(),
     alreadyValidated: false,
     outboxEnqueued: getChatIds().length,
-    correlationId: corr,
+    correlationId: state.pending.correlation_id ?? "",
   };
 }

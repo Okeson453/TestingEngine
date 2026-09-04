@@ -78,10 +78,11 @@ export class PollWorker {
         result.inserted = ins.inserted;
 
         for (const r of ins.rounds) {
+          const rawCrash = r.crashedAt as Date | string | null | undefined;
           const crashedAt =
-            r.crashedAt instanceof Date
-              ? r.crashedAt.toISOString()
-              : String(r.crashedAt ?? new Date().toISOString());
+            rawCrash instanceof Date
+              ? rawCrash.toISOString()
+              : String(rawCrash ?? new Date().toISOString());
           try {
             const vr = await onGameEnd({
               gameId: r.gameId,

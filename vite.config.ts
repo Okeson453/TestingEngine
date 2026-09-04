@@ -75,23 +75,19 @@ function predictionWorkerPlugin(): Plugin {
         const liveMod = await server.ssrLoadModule(
           "/src/lib/prediction/live/boot.ts",
         );
-        if (typeof liveMod.startLiveBoot === "function") {
-          await liveMod.startLiveBoot({
-            startSubscriber: async () => {
-              const events = await server.ssrLoadModule(
-                "/src/lib/prediction/events/game-event-handlers.ts",
-              );
-              if (typeof events.startEventDrivenPipeline === "function") {
-                await events.startEventDrivenPipeline();
-              }
-            },
-          });
-          return;
+        if (typeof liveMod.startLiveBoot !== "function") {
+          throw new Error("live/boot.ts must export startLiveBoot");
         }
-        const mod = await server.ssrLoadModule("/src/lib/prediction/worker.ts");
-        if (typeof mod.startWorker === "function") {
-          mod.startWorker();
-        }
+        await liveMod.startLiveBoot({
+          startSubscriber: async () => {
+            const events = await server.ssrLoadModule(
+              "/src/lib/prediction/events/game-event-handlers.ts",
+            );
+            if (typeof events.startEventDrivenPipeline === "function") {
+              await events.startEventDrivenPipeline();
+            }
+          },
+        });
       } catch (err) {
         console.error("[app-builder] prediction worker failed to start:", err);
       }
