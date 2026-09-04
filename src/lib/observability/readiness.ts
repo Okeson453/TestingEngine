@@ -1,8 +1,12 @@
 /**
  * Production readiness / liveness probes.
  *
- * Previously always returned true — fake health.
- * Checks: DB reachability, worker lock freshness, outbox depth (optional).
+ * `isReadyForLive()` — quick synchronous check used at boot. Returns true
+ * when the database is reachable (the only hard dependency for the live
+ * prediction pipeline).
+ *
+ * `getReadinessReport()` — full async report covering DB, worker lock,
+ * and outbox depth. Used by /healthz-style endpoints and operator dashboards.
  */
 
 import { getSql, dbSource } from "@/lib/db";
@@ -24,6 +28,22 @@ export type ReadinessReport = {
   };
   checkedAt: string;
 };
+
+/**
+ * Quick liveness predicate. Returns true if a SELECT against the active
+ * database backend succeeds. Safe to call repeatedly; the underlying
+ * connection pool reuses established sockets.
+ */
+export async function isReadyForLive(): Promise<boolean> {
+  try {
+    const sql = await getSql();
+    await sql`select 1 as ok`;
+    return true;
+  } catch (e) {
+    logger.warn({ error: String(e) }, "isReadyForLive: db check failed");
+    return false;
+  }
+}
 
 export async function getReadinessReport(): Promise<ReadinessReport> {
   const checkedAt = new Date().toISOString();
@@ -98,11 +118,13 @@ export async function getReadinessReport(): Promise<ReadinessReport> {
   return { ready, live, checks, checkedAt };
 }
 
-export function isReadyForLive(): boolean {
+/**
+ * Backwards-compatible synchronous shim. The old signature was
+ * `isReadyForLive(): boolean`; some callers (vite config) want the value
+ * immediately. Returns true when DATABASE_URL is configured (operator
+ * should run the worker with a real DB). For the async deep check use
+ * `await isReadyForLive()`.
+ */
+export function isReadyForLiveSync(): boolean {
   return typeof process !== "undefined" && Boolean(process.env.DATABASE_URL?.trim());
-}
-
-export async function isReadyAsync(): Promise<boolean> {
-  const r = await getReadinessReport();
-  return r.ready;
 }

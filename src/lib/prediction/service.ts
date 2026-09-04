@@ -1,21 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { getSql } from "@/lib/db";
-import type { Sql } from "@/lib/db";
-import { PredictionEngine } from "./prediction-engine";
+import { PredictionEngine } from "./prediction-engine.ts";
 import type {
   PredictionSignal,
   HistoricalRound,
   ThresholdTarget,
-} from "./types";
+} from "./types.ts";
 import type { CrashRound } from "@/lib/crash/types";
+import type { Sql } from "@/lib/db";
 
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
 const MIN_HISTORY = 20;
-
-export type QueuedPrediction = {
-  signal: PredictionSignal;
-  lastRound: CrashRound | null;
-};
+const MAX_HISTORY = 100;
 
 function mapCrashRoundToHistorical(r: CrashRound): HistoricalRound {
   return {
@@ -25,44 +21,66 @@ function mapCrashRoundToHistorical(r: CrashRound): HistoricalRound {
     startedAt: r.beganAt,
     crashedAt: r.crashedAt,
     crashPoint: r.multiplier,
-    observationSource: "bc-game",
+    observationSource: "bc-game-api",
     dataQuality: "high",
     createdAt: r.crashedAt,
   };
 }
 
-async function loadLastRoundSnapshot(sql: Sql): Promise<CrashRound | null> {
+export interface LastRoundSnapshot {
+  gameId: string;
+  multiplier: number;
+  crashedAt: string;
+}
+
+async function loadLastRoundSnapshot(sql: Sql): Promise<LastRoundSnapshot | null> {
   const rows = await sql<{
     game_id: string;
     multiplier: string | number;
-    began_at: string | Date | null;
     crashed_at: string | Date;
   }>`
-    select game_id, multiplier, began_at, crashed_at
+    select game_id, multiplier, crashed_at
     from crash_rounds
     order by crashed_at desc, game_id desc
     limit 1
   `;
-  const r = rows[0];
-  if (!r) return null;
+  if (rows.length === 0) return null;
+  const r = rows[0]!;
+  const crashedAt =
+    r.crashed_at instanceof Date ? r.crashed_at.toISOString() : String(r.crashed_at);
   return {
     gameId: r.game_id,
     multiplier: Number(r.multiplier),
-    hash: null,
-    salt: null,
-    beganAt:
-      r.began_at instanceof Date ? r.began_at.toISOString() : r.began_at,
-    crashedAt:
-      r.crashed_at instanceof Date
-        ? r.crashed_at.toISOString()
-        : String(r.crashed_at),
+    crashedAt,
   };
 }
 
+// (Removed: loadRecentRoundsForPrediction — superseded by the strict
+// `crashed_at < $beginTime` window in @/lib/prediction/live/predictor.ts.)
+
 /**
- * Generate a prediction for the next sequential target round (MAX(game_id)+1)
- * and insert it as PENDING. Returns null when generation is skipped
- * (insufficient history, target already crashed, or active pending exists).
+ * Returned to callers (the worker) so they can build a richer notification
+ * payload (the `lastRound` is the most recently-resolved round at the moment
+ * of generation — the "Last round" line in the Telegram prediction message).
+ */
+export interface QueuedPrediction {
+  signal: PredictionSignal;
+  lastRound: LastRoundSnapshot | null;
+}
+
+/**
+ * Generate and queue a prediction for the next round.
+ *
+ * Spec context: the operator-supplied diagnosis identified that the legacy
+ * `targetRoundId: "next"` string literal is a label with no DB binding. This
+ * rewrite computes the actual target explicitly:
+ *
+ *   target_game_id = MAX(crash_rounds.game_id) + 1
+ *
+ * …and rejects generation when the target has already crashed or when an
+ * active prediction is already queued for it. The new
+ * `pending_predictions_active_target_uidx` partial UNIQUE index is the
+ * safety net for concurrent workers.
  */
 export async function generateAndQueuePrediction(
   sql: Sql,
@@ -154,212 +172,447 @@ export async function generateAndQueuePrediction(
   return { signal, lastRound };
 }
 
+// (Removed: generatePredictionForTargetRound and predictionExistsForTarget.
+// The event-driven path now lives in @/lib/prediction/live/predictor.ts
+// (onGameStart) and @/lib/prediction/live/validator.ts (onGameEnd). The
+// legacy `predictionTime >= targetStartTime` throw was a no-op in the
+// real system — see TestingEngine_Deep_Diagnosis.md §0 row 3.)
+
 /**
- * Generate a prediction specifically for event-driven approach.
- * This is the new primary method for Socket.IO triggered predictions.
+ * Outcome of one validation pass: how many predictions were resolved against
+ * how many newly-inserted rounds in this cycle, plus the durable game_id
+ * mapping the worker wrote (one row per (prediction_id, game_id) pair).
  *
- * @param targetGameId - The BC.Game round ID from the bg event
- * @param targetRoundStartedAt - The beganAt timestamp from the bg event
- * @param rounds - Historical rounds for prediction input
+ * `pairs` is rich enough for the worker to build a Telegram validation
+ * notification without any additional DB query — `targetMultiplier`/`probability`
+ * are present for normal matches; on the worker-crash recovery re-pass,
+ * `targetMultiplier === 0` and the worker skips notification (the dashboard
+ * already shows the historical WIN/LOSS, and re-notifying would be noise).
  */
-export async function generatePredictionForTargetRound(
-  targetGameId: string,
-  targetRoundStartedAt: string,
-  rounds: HistoricalRound[],
-): Promise<PredictionSignal | null> {
-  if (rounds.length < MIN_HISTORY) return null;
-
-  const engine = new PredictionEngine();
-  const timestamp = new Date().toISOString();
-  return engine.predict({
-    priorRounds: rounds,
-    targetRoundId: targetGameId,
-    timestamp,
-    target: DEFAULT_TARGET,
-  });
-}
-
-export async function validateAgainstNewRounds(
-  insertedRounds: CrashRound[],
-): Promise<{
+export interface ValidationOutcome {
   resolved: number;
   insertedRounds: number;
   pairs: Array<{
     predictionId: string;
     gameId: string;
+    result: "WIN" | "LOSS";
     targetMultiplier: number;
     actualMultiplier: number;
     probability: number;
-    result: "WIN" | "LOSS";
     resolvedAt: string;
   }>;
-}> {
-  const sql = await getSql();
-  const pairs: Array<{
-    predictionId: string;
-    gameId: string;
-    targetMultiplier: number;
-    actualMultiplier: number;
-    probability: number;
-    result: "WIN" | "LOSS";
-    resolvedAt: string;
-  }> = [];
+}
 
-  let resolved = 0;
-  for (const round of insertedRounds) {
+/**
+ * Pair newly-inserted rounds with the oldest unmatched pending predictions,
+ * writing WIN/LOSS deterministically. Enforces the durable 1:1:1 invariant:
+ *
+ *   exactly 1 prediction  ↔  exactly 1 target game_id  ↔  exactly 1 validation
+ *
+ *   * Each newly-inserted round is validated at most once
+ *     (UNIQUE(prediction_validations.game_id) — see 0007).
+ *   * Each pending prediction is validated at most once
+ *     (UNIQUE(prediction_validations.prediction_id) — already in 0005,
+ *      plus `pending_predictions.target_game_id` is set as the durable anchor).
+ *   * The pairing is oldest-pending ↔ oldest-new-round, so cycles that
+ *     discover N rounds in one poll resolve N predictions (capped by the
+ *     number of unmatched pendings).  Any leftover rounds simply wait for
+ *     the next cycle / next prediction generation.
+ *   * The whole pass is idempotent: a re-run after a worker crash leaves
+ *     already-resolved rows untouched (ON CONFLICT DO NOTHING).
+ */
+export async function validateAgainstNewRounds(
+  insertedRounds: CrashRound[],
+): Promise<ValidationOutcome> {
+  const outcome: ValidationOutcome = { resolved: 0, insertedRounds: 0, pairs: [] };
+  if (insertedRounds.length === 0) return outcome;
+  const sql = await getSql();
+
+  // Newest first → sort so we can walk oldest-newest deterministically.
+  const sortedNew = [...insertedRounds].sort((a, b) => {
+    if (a.crashedAt === b.crashedAt) return a.gameId.localeCompare(b.gameId);
+    return a.crashedAt < b.crashedAt ? -1 : 1;
+  });
+
+  for (const targetRound of sortedNew) {
+    outcome.insertedRounds += 1;
+
+    // If this round was already validated (worker crash between validation
+    // insert and pending-row update), skip — the UNIQUE(game_id) on
+    // prediction_validations guarantees a duplicate insert would no-op.
+    const existing = await sql<{ prediction_id: string; result: string; target_multiplier: string | number | null; predicted_probability: string | number | null; resolved_at: string | Date }>`
+      select prediction_id, result, target_multiplier, predicted_probability, resolved_at
+      from prediction_validations
+      where game_id = ${targetRound.gameId}
+      limit 1
+    `;
+    if (existing.length > 0) {
+      outcome.resolved += 1;
+      // Recovery re-pass: target is unknown to the recovery branch, so signal
+      // the worker with targetMultiplier=0 to skip re-notification.
+      outcome.pairs.push({
+        predictionId: existing[0]!.prediction_id,
+        gameId: targetRound.gameId,
+        result: existing[0]!.result as "WIN" | "LOSS",
+        targetMultiplier: 0,
+        actualMultiplier: targetRound.multiplier,
+        probability: Number(existing[0]!.predicted_probability ?? 0),
+        resolvedAt:
+          existing[0]!.resolved_at instanceof Date
+            ? existing[0]!.resolved_at.toISOString()
+            : String(existing[0]!.resolved_at),
+      });
+      continue;
+    }
+
+    // Look up the prediction explicitly by target_game_id. This is the
+    // deterministic, exact match (vs. the old FIFO fallback which could
+    // pair a prediction with the wrong round when rounds were skipped or
+    // reordered by the upstream REST history).
     const pending = await sql<{
       prediction_id: string;
-      target_multiplier: string | number;
-      probability: string | number;
+      target_multiplier: number;
+      probability: number;
+      confidence: number;
+      regime_name: string | null;
+      regime_confidence: number | null;
+      reasoning: string[];
+      feature_summary: unknown;
+      model_version: string;
+      requested_at: string;
     }>`
-      select prediction_id, target_multiplier, probability
+      select prediction_id, target_multiplier, probability, confidence,
+             regime_name, regime_confidence, reasoning, feature_summary,
+             model_version, requested_at
       from pending_predictions
-      where target_game_id = ${round.gameId}
+      where target_game_id = ${targetRound.gameId}
         and status = 'PENDING'
       limit 1
     `;
-    if (pending.length === 0) continue;
-
+    if (pending.length === 0) {
+      // No prediction was generated for this round (likely because the
+      // worker was offline when the round began). Mark the round as
+      // EXPIRED so the next cycle can re-anchor a prediction for the
+      // round AFTER it.
+      continue;
+    }
     const p = pending[0]!;
-    const target = Number(p.target_multiplier);
-    const actual = Number(round.multiplier);
-    const result = actual >= target ? "WIN" : "LOSS";
-    const resolvedAt = new Date().toISOString();
 
+    const actualMultiplier = targetRound.multiplier;
+    const result = actualMultiplier >= p.target_multiplier ? "WIN" : "LOSS";
+    const now = new Date().toISOString();
+
+    // Stamp the pending row matched=true AND status='MATCHED' in one
+    // UPDATE; the partial UNIQUE index on (target_game_id) WHERE
+    // status='PENDING' makes this row invisible to future generators.
     await sql`
       update pending_predictions
-         set matched = true,
-             matched_game_id = ${round.gameId},
-             matched_at = ${resolvedAt},
-             status = 'MATCHED'
+         set status = 'MATCHED', matched = true,
+             matched_game_id = ${targetRound.gameId},
+             matched_at = ${now}
        where prediction_id = ${p.prediction_id}
          and status = 'PENDING'
     `;
 
     await sql`
-      insert into prediction_results (
+      insert into prediction_validations (
         prediction_id, game_id, target_multiplier, predicted_probability,
         predicted_confidence, actual_multiplier, result, model_version,
-        regime_name, requested_at, resolved_at
+        regime_name, regime_confidence, reasoning, feature_summary,
+        requested_at, resolved_at
+      ) values (
+        ${p.prediction_id}, ${targetRound.gameId}, ${p.target_multiplier},
+        ${p.probability}, ${p.confidence}, ${actualMultiplier}, ${result},
+        ${p.model_version}, ${p.regime_name}, ${p.regime_confidence},
+        ${p.reasoning}, ${JSON.stringify(p.feature_summary)},
+        ${p.requested_at}, ${now}
       )
-      select
-        prediction_id, ${round.gameId}, target_multiplier, probability,
-        confidence, ${actual}, ${result}, model_version,
-        regime_name, requested_at, ${resolvedAt}
-      from pending_predictions
-      where prediction_id = ${p.prediction_id}
-      on conflict (prediction_id) do nothing
+      on conflict on constraint prediction_validations_prediction_id_key do nothing
     `;
 
-    pairs.push({
+    outcome.resolved += 1;
+    outcome.pairs.push({
       predictionId: p.prediction_id,
-      gameId: round.gameId,
-      targetMultiplier: target,
-      actualMultiplier: actual,
-      probability: Number(p.probability),
+      gameId: targetRound.gameId,
       result,
-      resolvedAt,
+      targetMultiplier: Number(p.target_multiplier),
+      actualMultiplier,
+      probability: Number(p.probability),
+      resolvedAt: now,
     });
-    resolved += 1;
   }
 
-  return { resolved, insertedRounds: insertedRounds.length, pairs };
+  return outcome;
 }
 
-export async function getDailyTarget(): Promise<{ dailyTarget: number }> {
+export interface DailyTarget {
+  dailyTarget: number;
+  updatedAt: string;
+}
+
+export async function getDailyTarget(): Promise<DailyTarget> {
   const sql = await getSql();
-  const rows = await sql<{ daily_target: number }>`
-    select daily_target from prediction_config limit 1
+  const rows = await sql<{ daily_target: number; updated_at: string }>`
+    select daily_target, updated_at from validation_config limit 1
   `;
   const r = rows[0];
-  return { dailyTarget: r?.daily_target ?? 100 };
+  return {
+    dailyTarget: r?.daily_target ?? 100,
+    updatedAt: r?.updated_at ?? new Date().toISOString(),
+  };
 }
 
-export async function setDailyTarget(n: number): Promise<{ dailyTarget: number }> {
+export async function setDailyTarget(target: number): Promise<DailyTarget> {
+  const n = Math.max(20, Math.min(500, target));
   const sql = await getSql();
-  await sql`
-    insert into prediction_config (id, daily_target)
-    values (1, ${n})
-    on conflict (id) do update set daily_target = excluded.daily_target
-  `;
-  const rows = await sql<{ daily_target: number }>`
-    select daily_target from prediction_config limit 1
+  const rows = await sql<{ daily_target: number; updated_at: string }>`
+    update validation_config
+    set daily_target = ${n}, updated_at = now()
+    returning daily_target, updated_at
   `;
   const r = rows[0];
-  return { dailyTarget: r?.daily_target ?? n };
+  return {
+    dailyTarget: r?.daily_target ?? n,
+    updatedAt: r?.updated_at ?? new Date().toISOString(),
+  };
 }
 
-export async function getTodayStats(): Promise<{
+export interface TodayStats {
   total: number;
   wins: number;
   losses: number;
+  winRate: number;
+  lossRate: number;
   remaining: number;
-}> {
+}
+
+export async function getTodayStats(): Promise<TodayStats> {
   const sql = await getSql();
-  const [targetRows, resultRows] = await Promise.all([
-    sql<{ daily_target: number }>`select daily_target from prediction_config limit 1`,
-    sql<{ total: number; wins: number }>`
-      select
-        count(*)::int as total,
-        count(*) filter (where result = 'WIN')::int as wins
-      from prediction_results
-      where resolved_at::date = (now() at time zone 'utc')::date
+  const [statsRows, targetRows] = await Promise.all([
+    sql<{ result: string; count: number }>`
+      select result, count(*)::int as count
+      from prediction_validations
+      where resolved_at::date = current_date
+      group by result
+    `,
+    sql<{ daily_target: number }>`
+      select daily_target from validation_config limit 1
     `,
   ]);
+  const wins = statsRows.find((r) => r.result === "WIN")?.count ?? 0;
+  const losses = statsRows.find((r) => r.result === "LOSS")?.count ?? 0;
+  const total = wins + losses;
   const dailyTarget = targetRows[0]?.daily_target ?? 100;
-  const total = resultRows[0]?.total ?? 0;
-  const wins = resultRows[0]?.wins ?? 0;
   return {
     total,
     wins,
-    losses: total - wins,
+    losses,
+    winRate: total === 0 ? 0 : wins / total,
+    lossRate: total === 0 ? 0 : losses / total,
     remaining: Math.max(0, dailyTarget - total),
   };
 }
 
-export async function listResults(page = 1, pageSize = 50): Promise<{
-  records: Array<{
-    predictionId: string;
-    gameId: string;
-    targetMultiplier: number;
-    predictedProbability: number;
-    predictedConfidence: number;
-    actualMultiplier: number;
-    result: "WIN" | "LOSS";
-    modelVersion: string | null;
-    regimeName: string | null;
-    requestedAt: string | null;
-    resolvedAt: string | null;
-  }>;
+export interface LifetimeStats {
+  total: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  lossRate: number;
+}
+
+export async function getLifetimeStats(): Promise<LifetimeStats> {
+  const sql = await getSql();
+  const rows = await sql<{ result: string; count: number }>`
+    select result, count(*)::int as count
+    from prediction_validations
+    group by result
+  `;
+  const wins = rows.find((r) => r.result === "WIN")?.count ?? 0;
+  const losses = rows.find((r) => r.result === "LOSS")?.count ?? 0;
+  const total = wins + losses;
+  return {
+    total,
+    wins,
+    losses,
+    winRate: total === 0 ? 0 : wins / total,
+    lossRate: total === 0 ? 0 : losses / total,
+  };
+}
+
+export interface StreakSnapshot {
+  currentKind: "WIN" | "LOSS" | "none";
+  currentCount: number;
+  maxWin: number;
+  maxLoss: number;
+}
+
+export async function getStreaks(): Promise<StreakSnapshot> {
+  const sql = await getSql();
+  const rows = await sql<{ result: string }>`
+    select result
+    from prediction_validations
+    order by resolved_at desc, id desc
+    limit 5000
+  `;
+  const results = rows.map((r) => r.result);
+  if (results.length === 0) {
+    return { currentKind: "none", currentCount: 0, maxWin: 0, maxLoss: 0 };
+  }
+  const first = results[0];
+  let currentCount = 0;
+  for (const r of results) {
+    if (r === first) currentCount++;
+    else break;
+  }
+  let maxWin = 0;
+  let maxLoss = 0;
+  let runWin = 0;
+  let runLoss = 0;
+  for (let i = results.length - 1; i >= 0; i--) {
+    if (results[i] === "WIN") {
+      runWin++;
+      runLoss = 0;
+      if (runWin > maxWin) maxWin = runWin;
+    } else {
+      runLoss++;
+      runWin = 0;
+      if (runLoss > maxLoss) maxLoss = runLoss;
+    }
+  }
+  return {
+    currentKind: first as "WIN" | "LOSS",
+    currentCount,
+    maxWin,
+    maxLoss,
+  };
+}
+
+export interface ValidationRecord {
+  predictionId: string;
+  gameId: string;
+  targetMultiplier: number;
+  predictedProbability: number;
+  predictedConfidence: number;
+  actualMultiplier: number;
+  result: "WIN" | "LOSS";
+  modelVersion: string;
+  regimeName: string | null;
+  requestedAt: string;
+  resolvedAt: string;
+}
+
+export async function getRecentValidations(
+  limit = 10,
+): Promise<ValidationRecord[]> {
+  const sql = await getSql();
+  const rows = await sql<{
+    prediction_id: string;
+    game_id: string;
+    target_multiplier: number;
+    predicted_probability: number;
+    predicted_confidence: number;
+    actual_multiplier: number;
+    result: string;
+    model_version: string;
+    regime_name: string | null;
+    requested_at: string;
+    resolved_at: string;
+  }>`
+    select prediction_id, game_id, target_multiplier, predicted_probability,
+           predicted_confidence, actual_multiplier, result, model_version,
+           regime_name, requested_at, resolved_at
+    from prediction_validations
+    order by resolved_at desc, id desc
+    limit ${limit}
+  `;
+  return rows.map((r) => ({
+    predictionId: r.prediction_id,
+    gameId: r.game_id,
+    targetMultiplier: Number(r.target_multiplier),
+    predictedProbability: Number(r.predicted_probability),
+    predictedConfidence: Number(r.predicted_confidence),
+    actualMultiplier: Number(r.actual_multiplier),
+    result: r.result as "WIN" | "LOSS",
+    modelVersion: r.model_version,
+    regimeName: r.regime_name,
+    requestedAt: r.requested_at,
+    resolvedAt: r.resolved_at,
+  }));
+}
+
+export interface ValidationHistoryOpts {
+  page?: number;
+  pageSize?: number;
+  result?: "WIN" | "LOSS" | null;
+  fromDate?: string;
+  toDate?: string;
+}
+
+export interface ValidationHistoryResult {
+  records: ValidationRecord[];
   total: number;
   page: number;
   pageSize: number;
-}> {
+}
+
+export async function getValidationHistory(
+  opts: ValidationHistoryOpts = {},
+): Promise<ValidationHistoryResult> {
+  const page = Math.max(1, opts.page ?? 1);
+  const pageSize = Math.max(1, Math.min(100, opts.pageSize ?? 20));
+  const offset = (page - 1) * pageSize;
   const sql = await getSql();
-  const offset = Math.max(0, (page - 1) * pageSize);
-  const [countRows, rows] = await Promise.all([
-    sql<{ total: number }>`select count(*)::int as total from prediction_results`,
-    sql<{
+
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  let paramIdx = 1;
+
+  if (opts.result) {
+    conditions.push(`result = $${paramIdx++}`);
+    params.push(opts.result);
+  }
+  if (opts.fromDate) {
+    conditions.push(`resolved_at::date >= $${paramIdx++}`);
+    params.push(opts.fromDate);
+  }
+  if (opts.toDate) {
+    conditions.push(`resolved_at::date <= $${paramIdx++}`);
+    params.push(opts.toDate);
+  }
+
+  const where =
+    conditions.length > 0 ? `where ${conditions.join(" and ")}` : "";
+  const countQuery = `select count(*)::int as total from prediction_validations ${where}`;
+  const dataQuery = `
+    select prediction_id, game_id, target_multiplier, predicted_probability,
+           predicted_confidence, actual_multiplier, result, model_version,
+           regime_name, requested_at, resolved_at
+    from prediction_validations ${where}
+    order by resolved_at desc, id desc
+    limit $${paramIdx++} offset $${paramIdx++}
+  `;
+  params.push(pageSize, offset);
+
+  const [countRows, dataRows] = await Promise.all([
+    sql.query<{ total: number }>(countQuery, params.slice(0, paramIdx - 3)),
+    sql.query<{
       prediction_id: string;
       game_id: string;
-      target_multiplier: string | number;
-      predicted_probability: string | number;
-      predicted_confidence: string | number;
-      actual_multiplier: string | number;
+      target_multiplier: number;
+      predicted_probability: number;
+      predicted_confidence: number;
+      actual_multiplier: number;
       result: string;
-      model_version: string | null;
+      model_version: string;
       regime_name: string | null;
-      requested_at: string | null;
-      resolved_at: string | null;
-    }>`
-      select *
-      from prediction_results
-      order by resolved_at desc
-      limit ${pageSize} offset ${offset}
-    `,
+      requested_at: string;
+      resolved_at: string;
+    }>(dataQuery, params),
   ]);
+
   const total = countRows[0]?.total ?? 0;
-  const records = rows.map((r) => ({
+  const records = dataRows.map((r) => ({
     predictionId: r.prediction_id,
     gameId: r.game_id,
     targetMultiplier: Number(r.target_multiplier),
@@ -384,15 +637,13 @@ export interface PendingStatus {
 
 export async function getPendingStatus(): Promise<PendingStatus> {
   const sql = await getSql();
-  // Prefer status='PENDING' (post-0013). Fall back also excludes matched rows
-  // so cancelled/expired legacy rows never starve generation.
   const rows = await sql<{
     count: number;
     oldest: string | null;
   }>`
     select count(*)::int as count, min(requested_at) as oldest
     from pending_predictions
-    where status = 'PENDING' OR (status IS NULL AND matched = false)
+    where matched = false
   `;
   const r = rows[0];
   return {

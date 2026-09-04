@@ -28,7 +28,7 @@ import { globalCalibrationState } from './calibration/calibration-state.ts';
 import { RoundRepository } from '../persistence/repositories/round-repo.ts';
 import { ACIEEngine } from './acie/engine.ts';
 import { globalLiveDivergence } from './validation/live-divergence-monitor.ts';
-import { isReadyForLive } from '../observability/readiness.ts';
+import { isReadyForLiveSync as isReadyForLive } from '../observability/readiness.ts';
 import { saveSnapshotToFile } from './state/state-persistence.ts';
 import { onlineMeanCalibrationError } from './acie/online-state.ts';
 import type { CrashLearningResult } from './acie/engine.ts';

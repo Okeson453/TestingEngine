@@ -19,8 +19,38 @@ import { OutboxDispatcher } from "./notification-worker";
 import { PollWorker } from "./poll-worker";
 import { ClockSkewMonitor } from "./clock-skew-monitor";
 import { getLogger } from "@/lib/observability/logger";
+import { getSql, type Sql } from "@/lib/db";
 
 const logger = getLogger("live-boot");
+
+/** Spec §3.10 — startup schema validation. Verifies every required table
+ *  exists before any worker role is started. A missing table is a hard
+ *  failure: the worker would otherwise fail in an arbitrary place. */
+const REQUIRED_TABLES = [
+  "crash_rounds",
+  "pending_predictions",
+  "prediction_validations",
+  "notification_outbox",
+  "live_event_log",
+  "worker_locks",
+  "worker_state",
+] as const;
+
+export async function validateSchema(sql: Sql): Promise<void> {
+  for (const table of REQUIRED_TABLES) {
+    const rows = await sql<{ exists: boolean }>`
+      select exists (
+        select 1 from information_schema.tables
+        where table_schema = 'public' and table_name = ${table}
+      ) as exists
+    `;
+    if (!rows[0]?.exists) {
+      throw new Error(
+        `Required table missing: ${table}. Run migrations before starting the worker.`,
+      );
+    }
+  }
+}
 
 export interface BootResult {
   seed: SeedResult;
@@ -58,10 +88,28 @@ class LiveBoot {
     this.clockMonitor = clockMonitor;
 
     const seed = await seeder();
+    const sql = await getSql();
     logger.info(
       { component: "live-boot", seed, bootStartedAt },
       "cold-start seeder complete; starting dispatcher / subscriber / poll / monitor",
     );
+
+    // Spec §3.10 — schema validation. Run after the seeder so the seeder
+    // has a chance to populate the table list; run before dispatcher /
+    // poll so a missing migration fails the boot fast.
+    try {
+      await validateSchema(sql);
+      logger.info(
+        { component: "live-boot" },
+        "schema validation passed; all required tables present",
+      );
+    } catch (e) {
+      logger.error(
+        { component: "live-boot", error: String(e) },
+        "schema validation failed; aborting boot",
+      );
+      throw e;
+    }
 
     await dispatcher.start();
     if (deps.startSubscriber) {

@@ -1,516 +1,174 @@
 /**
- * BC.Game Event Handlers for Prediction Pipeline
- * Implements the event-driven prediction generation and validation
- * 
- * Specification: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §4, §7, §8
+ * BC.Game Socket.IO → live prediction pipeline bridge.
+ *
+ * Wires the BC.Game Socket.IO events directly into the production-grade
+ * live pipeline:
+ *
+ *   bg  →  onGameStart (live/predictor)         // predict the just-begun round
+ *   ed  →  onGameEnd   (live/validator)         // validate the just-ended round
+ *   pg  →  observability only                   // live crash progress
+ *
+ * The `handleGameStartEvent` / `handleGameEndEvent` / `handleGameProgressEvent`
+ * helpers in the previous (pre-v2) implementation have been removed: they
+ * were either dead code or duplicated the (correct) logic in live/predictor
+ * and live/validator. The new file is a thin adapter.
  */
-
-import { getSql } from "@/lib/db";
-import type { Sql } from "@/lib/db";
 import { bcGameSocket } from "@/lib/crash/socket-client";
-import { PredictionEngine } from "@/lib/prediction/prediction-engine";
-import type {
-  PredictionSignal,
-  HistoricalRound,
-  ThresholdTarget,
-} from "@/lib/prediction/types";
-import type { CrashRound } from "@/lib/crash/types";
 import { getLogger } from "@/lib/observability/logger";
-import { randomUUID } from "node:crypto";
+import { onGameStart } from "@/lib/prediction/live/predictor";
+import { onGameEnd } from "@/lib/prediction/live/validator";
 
 const logger = getLogger("game-event-handlers");
 
-// Configuration
-const DEFAULT_TARGET: ThresholdTarget = 1.3;
-const MIN_HISTORY = 20;
-const MAX_HISTORY = 100;
-const SLA_GATE_MS = 100; // Must generate prediction within 100ms of bg event
-const MAX_PREDICTION_LATENCY_MS = 5000; // Maximum allowed prediction latency
-
-// Track the last bg event to prevent duplicate processing
-let lastProcessedBgEvent: { gameId: string; timestamp: number } | null = null;
-
-/**
- * Convert BC.Game event timestamp to ISO string
- */
 function toIsoString(timestamp: number | string | undefined): string | null {
   if (!timestamp) return null;
-  
   if (typeof timestamp === "string") {
     const date = new Date(timestamp);
-    if (!isNaN(date.getTime())) return date.toISOString();
-    return null;
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
   }
-  
   if (typeof timestamp === "number") {
-    // Handle both milliseconds and seconds
     const date = new Date(timestamp < 1e10 ? timestamp * 1000 : timestamp);
-    if (!isNaN(date.getTime())) return date.toISOString();
-    return null;
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
   }
-  
+  return null;
+}
+
+function extractLastGameId(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const p = payload as Record<string, unknown>;
+  const id = p.gameId ?? p.id;
+  if (typeof id === "string" && /^\d+$/.test(id)) return id;
+  if (typeof id === "number" && Number.isFinite(id)) return String(id);
   return null;
 }
 
 /**
- * Map crash round to historical round format
+ * bg event: a new round has just begun. The live predictor runs the strict
+ * causal window against history whose `crashed_at < $beganAt` and writes
+ * a `pending_predictions` row, the `live_event_log` row, and (when
+ * configured) the Telegram outbox rows in one transaction.
  */
-function mapCrashRoundToHistorical(r: CrashRound): HistoricalRound {
-  return {
-    id: r.gameId,
-    externalRoundId: r.gameId,
-    sessionId: null,
-    startedAt: r.beganAt,
-    crashedAt: r.crashedAt,
-    crashPoint: r.multiplier,
-    observationSource: "bc-game-socket",
-    dataQuality: "high",
-    createdAt: r.crashedAt,
-  };
-}
-
-/**
- * Load recent rounds for prediction from database
- * Only includes rounds whose outcome is fully known (crashed_at <= now)
- */
-async function loadRecentRoundsForPrediction(
-  sql: Sql,
-  limit = MAX_HISTORY,
-): Promise<HistoricalRound[]> {
-  const rows = await sql<{
-    game_id: string;
-    multiplier: string | number;
-    began_at: string | Date | null;
-    crashed_at: string | Date;
-  }>`
-    select game_id, multiplier, began_at, crashed_at
-    from crash_rounds
-    where crashed_at <= now()
-    order by crashed_at desc, game_id desc
-    limit ${limit}
-  `;
-  
-  return rows.reverse().map((row) =>
-    mapCrashRoundToHistorical({
-      gameId: row.game_id,
-      multiplier: Number(row.multiplier),
-      hash: null,
-      salt: null,
-      beganAt:
-        row.began_at instanceof Date
-          ? row.began_at.toISOString()
-          : row.began_at,
-      crashedAt:
-        row.crashed_at instanceof Date
-          ? row.crashed_at.toISOString()
-          : row.crashed_at,
-    }),
-  );
-}
-
-/**
- * Check if we can generate a prediction (SLA gate)
- * Returns true if we're within the SLA window
- */
-function canGeneratePrediction(bgEventTimestamp: number | string | undefined): boolean {
-  if (!bgEventTimestamp) return false;
-  
-  const bgTime = typeof bgEventTimestamp === "string" 
-    ? new Date(bgEventTimestamp).getTime() 
-    : typeof bgEventTimestamp === "number" 
-      ? bgEventTimestamp < 1e10 ? bgEventTimestamp * 1000 : bgEventTimestamp
-      : 0;
-  
-  if (bgTime === 0) return false;
-  
-  const now = Date.now();
-  const latency = now - bgTime;
-  
-  return latency <= MAX_PREDICTION_LATENCY_MS;
-}
-
-/**
- * Generate a prediction for a specific target round
- * This is the core function that replaces the old "next" target approach
- */
-async function generatePredictionForTarget(
-  targetGameId: string,
-  targetRoundStartedAt: string | null,
-  rounds: HistoricalRound[],
-): Promise<PredictionSignal | null> {
-  if (rounds.length < MIN_HISTORY) {
-    logger.info(
-      { component: "GameEventHandlers", targetGameId, availableHistory: rounds.length },
-      "Insufficient history for prediction"
-    );
-    return null;
-  }
-
-  const engine = new PredictionEngine();
-  const timestamp = new Date().toISOString();
-  
-  const signal = engine.predict({
-    priorRounds: rounds,
-    // Use the actual target gameId from the bg event
-    targetRoundId: targetGameId,
-    timestamp,
-    target: DEFAULT_TARGET,
-  });
-
-  return signal;
-}
-
-/**
- * Store prediction in database with target round anchoring
- * This establishes the temporal invariant: prediction_generated_at < target_round_started_at
- */
-async function storePredictionWithTarget(
-  sql: Sql,
-  signal: PredictionSignal,
-  targetGameId: string,
-  targetRoundStartedAt: string | null,
-): Promise<string> {
-  const predictionId = signal.predictionId || randomUUID();
-  const timestamp = new Date().toISOString();
-  
-  // Ensure we have the target round started timestamp
-  if (!targetRoundStartedAt) {
-    throw new Error(`Missing target_round_started_at for prediction ${predictionId}`);
-  }
-  
-  // Verify temporal invariant before insertion
-  const predictionTime = new Date(timestamp).getTime();
-  const targetStartTime = new Date(targetRoundStartedAt).getTime();
-  
-  if (predictionTime >= targetStartTime) {
-    logger.error(
-      { 
-        component: "GameEventHandlers", 
-        predictionId,
-        predictionTime,
-        targetStartTime,
-        targetGameId 
-      },
-      "TEMPORAL INVARIANT VIOLATION: prediction_generated_at >= target_round_started_at"
-    );
-    throw new Error("Temporal invariant violation: prediction generated after round start");
-  }
-
-  await sql`
-    insert into pending_predictions (
-      prediction_id, target_multiplier, probability, confidence,
-      regime_name, regime_confidence, reasoning, feature_summary,
-      model_version, requested_at, target_game_id, target_round_started_at
-    ) values (
-      ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-      ${signal.confidence}, ${signal.regimeId}, ${signal.regimeId ? 0.5 : null},
-      ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-      ${signal.modelVersion}, ${timestamp}, ${targetGameId}, ${targetRoundStartedAt}
-    )
-    on conflict (prediction_id) do nothing
-  `;
-
-  logger.info(
-    { 
-      component: "GameEventHandlers", 
-      predictionId,
-      targetGameId,
-      targetRoundStartedAt,
-      probability: signal.probability 
-    },
-    "Stored prediction with target round anchoring"
-  );
-
-  return predictionId;
-}
-
-/**
- * Check if a prediction already exists for this target game
- * This prevents duplicate predictions for the same round
- */
-async function predictionExistsForTarget(sql: Sql, targetGameId: string): Promise<boolean> {
-  const rows = await sql<{ count: number }>`
-    select count(*)::int as count
-    from pending_predictions
-    where target_game_id = ${targetGameId}
-  `;
-  return (rows[0]?.count ?? 0) > 0;
-}
-
-/**
- * Handle bg (begin) event - PRIMARY PREDICTION TRIGGER
- * This is where genuine ahead-of-time prediction happens
- */
-export async function handleGameStartEvent(
-  payload: { gameId: string; beganAt?: number | string },
-  event: string
-): Promise<void> {
-  // Prevent duplicate processing of the same bg event
-  const eventId = `${payload.gameId}:${payload.beganAt}`;
-  const eventTimestamp = payload.beganAt ? 
-    typeof payload.beganAt === "string" 
-      ? new Date(payload.beganAt).getTime() 
-      : payload.beganAt < 1e10 ? payload.beganAt * 1000 : payload.beganAt
-    : Date.now();
-  
-  if (lastProcessedBgEvent && 
-      lastProcessedBgEvent.gameId === payload.gameId &&
-      Math.abs(lastProcessedBgEvent.timestamp - eventTimestamp) < 1000) {
-    logger.debug(
-      { component: "GameEventHandlers", gameId: payload.gameId },
-      "Duplicate bg event detected, skipping"
-    );
+async function onBgEvent(payload: unknown): Promise<void> {
+  const gameId = extractLastGameId(payload);
+  if (!gameId) {
+    logger.warn({ event: "bg" }, "bg event missing numeric gameId; ignoring");
     return;
   }
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const beginTime = toIsoString((p.beganAt ?? p.beginTime) as number | string | undefined);
+  if (!beginTime) {
+    logger.warn({ event: "bg", gameId }, "bg event missing beginTime; ignoring");
+    return;
+  }
+  const receivedAt = new Date().toISOString();
+  try {
+    const result = await onGameStart({
+      gameId,
+      beginTime,
+      hash: typeof p.hash === "string" ? p.hash : null,
+      salt: typeof p.salt === "string" ? p.salt : null,
+      sourceRoundGameId: null,
+      receivedAt,
+    });
+    logger.info(
+      { event: "bg", gameId, kind: result.kind },
+      `bg processed (${result.kind})`,
+    );
+  } catch (e) {
+    logger.error({ event: "bg", gameId, error: String(e) }, "bg handler threw");
+  }
+}
 
-  lastProcessedBgEvent = {
-    gameId: payload.gameId,
-    timestamp: eventTimestamp,
-  };
-
-  // SLA gate check
-  if (!canGeneratePrediction(payload.beganAt)) {
+/**
+ * ed event: the just-ended round has a known multiplier. The live validator
+ * upserts `crash_rounds`, locks the pending prediction FOR UPDATE SKIP LOCKED,
+ * writes a `prediction_validations` row, and enqueues a validation
+ * notification. All in one transaction.
+ */
+async function onEdEvent(payload: unknown): Promise<void> {
+  const gameId = extractLastGameId(payload);
+  if (!gameId) {
+    logger.warn({ event: "ed" }, "ed event missing numeric gameId; ignoring");
+    return;
+  }
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const endTime = toIsoString((p.crashedAt ?? p.endTime) as number | string | undefined);
+  const multiplierRaw = (p.multiplier ?? p.rate) as number | string | undefined;
+  const multiplier =
+    typeof multiplierRaw === "number"
+      ? multiplierRaw
+      : typeof multiplierRaw === "string"
+        ? Number.parseFloat(multiplierRaw)
+        : 0;
+  if (!Number.isFinite(multiplier) || multiplier <= 0) {
     logger.warn(
-      { component: "GameEventHandlers", gameId: payload.gameId, beganAt: payload.beganAt },
-      "SLA gate: bg event too old for prediction generation"
+      { event: "ed", gameId, multiplier: multiplierRaw },
+      "ed event missing/invalid multiplier; ignoring",
     );
     return;
   }
-
+  const receivedAt = new Date().toISOString();
   try {
-    const sql = await getSql();
-    
-    // Check if prediction already exists for this target
-    const exists = await predictionExistsForTarget(sql, payload.gameId);
-    if (exists) {
-      logger.info(
-        { component: "GameEventHandlers", gameId: payload.gameId },
-        "Prediction already exists for this target round"
-      );
-      return;
-    }
-
-    // Load recent history for prediction
-    const rounds = await loadRecentRoundsForPrediction(sql);
-    
-    if (rounds.length < MIN_HISTORY) {
-      logger.info(
-        { component: "GameEventHandlers", gameId: payload.gameId, available: rounds.length },
-        "Insufficient history for prediction"
-      );
-      return;
-    }
-
-    // Generate prediction for this specific target round
-    const targetRoundStartedAt = toIsoString(payload.beganAt);
-    const signal = await generatePredictionForTarget(
-      payload.gameId,
-      targetRoundStartedAt,
-      rounds
-    );
-
-    if (!signal) {
-      logger.warn(
-        { component: "GameEventHandlers", gameId: payload.gameId },
-        "Failed to generate prediction signal"
-      );
-      return;
-    }
-
-    // Store prediction with target round anchoring
-    const predictionId = await storePredictionWithTarget(
-      sql,
-      signal,
-      payload.gameId,
-      targetRoundStartedAt
-    );
-
+    const result = await onGameEnd({
+      gameId,
+      endTime: endTime ?? receivedAt,
+      multiplier,
+      receivedAt,
+    });
     logger.info(
-      { 
-        component: "GameEventHandlers", 
-        predictionId,
-        targetGameId: payload.gameId,
-        targetRoundStartedAt 
-      },
-      "Generated and stored ahead-of-time prediction for target round"
+      { event: "ed", gameId, kind: result.kind },
+      `ed processed (${result.kind})`,
     );
-
-  } catch (error) {
-    logger.error(
-      { 
-        component: "GameEventHandlers", 
-        gameId: payload.gameId,
-        error: error as Error 
-      },
-      "Failed to handle bg event"
-    );
-    throw error;
+  } catch (e) {
+    logger.error({ event: "ed", gameId, error: String(e) }, "ed handler threw");
   }
 }
 
 /**
- * Handle ed (end) event - for validation and cleanup
+ * pg event: live crash progress. Observed for diagnostic / observability
+ * purposes only — never triggers prediction or validation.
  */
-export async function handleGameEndEvent(
-  payload: { gameId: string; crashedAt?: number | string; multiplier?: number },
-  event: string
-): Promise<void> {
-  try {
-    const sql = await getSql();
-    
-    // Check if there's a pending prediction for this game
-    const pendingRows = await sql<{
-      prediction_id: string;
-      target_game_id: string;
-      target_round_started_at: string | null;
-    }>`
-      select prediction_id, target_game_id, target_round_started_at
-      from pending_predictions
-      where target_game_id = ${payload.gameId} and matched = false
-      limit 1
-    `;
-
-    if (pendingRows.length > 0) {
-      const pending = pendingRows[0];
-      
-      // Verify temporal invariant: target_round_started_at < crashed_at
-      if (pending.target_round_started_at) {
-        const startedAt = new Date(pending.target_round_started_at).getTime();
-        const crashedAt = payload.crashedAt ? 
-          typeof payload.crashedAt === "string" 
-            ? new Date(payload.crashedAt).getTime() 
-            : payload.crashedAt < 1e10 ? payload.crashedAt * 1000 : payload.crashedAt
-          : Date.now();
-        
-        if (startedAt >= crashedAt) {
-          logger.error(
-            { 
-              component: "GameEventHandlers",
-              predictionId: pending.prediction_id,
-              targetGameId: payload.gameId,
-              startedAt,
-              crashedAt 
-            },
-            "TEMPORAL INVARIANT VIOLATION: target_round_started_at >= crashed_at"
-          );
-        }
-      }
-
-      logger.info(
-        { 
-          component: "GameEventHandlers", 
-          predictionId: pending.prediction_id,
-          gameId: payload.gameId,
-          multiplier: payload.multiplier 
-        },
-        "Received ed event for round with pending prediction"
-      );
-    }
-
-    // Note: The actual validation is handled by the existing validateAgainstNewRounds
-    // function which is called by the worker when it ingests the REST history
-    // The Socket.IO ed events are primarily for observability and potential optimization
-
-  } catch (error) {
-    logger.error(
-      { 
-        component: "GameEventHandlers", 
-        gameId: payload.gameId,
-        error: error as Error 
-      },
-      "Failed to handle ed event"
-    );
-    throw error;
-  }
+function onPgEvent(payload: unknown): void {
+  const gameId = extractLastGameId(payload);
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const multiplier =
+    typeof p.multiplier === "number"
+      ? p.multiplier
+      : typeof p.current === "number"
+        ? p.current
+        : null;
+  logger.debug({ event: "pg", gameId, multiplier }, "pg received");
 }
 
 /**
- * Handle pg (progress) event - for monitoring
- * These events provide real-time progress of the current round
- */
-export async function handleGameProgressEvent(
-  payload: { gameId: string; multiplier?: number },
-  event: string
-): Promise<void> {
-  // pg events are primarily for monitoring and don't trigger predictions
-  // They can be used for debugging and observability
-  logger.debug(
-    { component: "GameEventHandlers", gameId: payload.gameId, multiplier: payload.multiplier },
-    "Received game progress event"
-  );
-}
-
-/**
- * Initialize event handlers with the Socket.IO client
- * This sets up the event-driven prediction pipeline
+ * Register all socket event handlers. Idempotent — re-calling is a no-op.
  */
 export function initializeEventHandlers(): void {
-  // Register bg (begin) event handler - PRIMARY PREDICTION TRIGGER
-  bcGameSocket.on("bg", async (payload, event) => {
-    try {
-      await handleGameStartEvent(payload as { gameId: string; beganAt?: number | string }, event);
-    } catch (error) {
-      logger.error(
-        { component: "EventHandlers", event, error: error as Error },
-        "Error in bg event handler"
-      );
-    }
+  bcGameSocket.on("bg", async (payload) => {
+    await onBgEvent(payload);
   });
-
-  // Register ed (end) event handler - for validation
-  bcGameSocket.on("ed", async (payload, event) => {
-    try {
-      await handleGameEndEvent(payload as { gameId: string; crashedAt?: number | string; multiplier?: number }, event);
-    } catch (error) {
-      logger.error(
-        { component: "EventHandlers", event, error: error as Error },
-        "Error in ed event handler"
-      );
-    }
+  bcGameSocket.on("ed", async (payload) => {
+    await onEdEvent(payload);
   });
-
-  // Register pg (progress) event handler - for monitoring
-  bcGameSocket.on("pg", async (payload, event) => {
-    try {
-      await handleGameProgressEvent(payload as { gameId: string; multiplier?: number }, event);
-    } catch (error) {
-      logger.error(
-        { component: "EventHandlers", event, error: error as Error },
-        "Error in pg event handler"
-      );
-    }
+  bcGameSocket.on("pg", async (payload) => {
+    onPgEvent(payload);
   });
-
-  logger.info({ component: "EventHandlers" }, "Initialized BC.Game event handlers");
+  logger.info({ component: "game-event-handlers" }, "event handlers wired to live/predictor + live/validator");
 }
 
 /**
- * Start the event-driven prediction pipeline
- * This connects the Socket.IO client and initializes handlers
+ * Start the event-driven prediction pipeline. Connects the socket and
+ * (re-)initializes the handlers.
  */
 export async function startEventDrivenPipeline(): Promise<void> {
-  // Initialize event handlers
   initializeEventHandlers();
-  
-  // Connect to BC.Game Socket.IO
   await bcGameSocket.connect();
-  
-  logger.info({ component: "EventHandlers" }, "Event-driven prediction pipeline started");
+  logger.info({ component: "game-event-handlers" }, "event-driven pipeline started");
 }
 
-/**
- * Stop the event-driven prediction pipeline
- */
 export async function stopEventDrivenPipeline(): Promise<void> {
   bcGameSocket.disconnect();
-  lastProcessedBgEvent = null;
-  
-  logger.info({ component: "EventHandlers" }, "Event-driven prediction pipeline stopped");
+  logger.info({ component: "game-event-handlers" }, "event-driven pipeline stopped");
 }
 
-export {
-  bcGameSocket,
-  handleGameStartEvent as onGameStart,
-  handleGameEndEvent as onGameEnd,
-  handleGameProgressEvent as onGameProgress,
-};
+export { bcGameSocket, onBgEvent as onGameStartLegacy, onEdEvent as onGameEndLegacy };

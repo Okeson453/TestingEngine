@@ -1,9 +1,11 @@
 /**
  * Structured production logger.
  *
- * Previously a complete no-op — production was operationally blind.
  * Emits JSON lines to stdout/stderr so Railway / Vercel capture them.
  * Levels: debug < info < warn < error. Controlled by LOG_LEVEL (default: info).
+ * The `child(meta)` factory produces a derived logger with bound context
+ * (e.g. `{ component: "live-predictor" }`) — every line emitted by the child
+ * merges that context into the JSON envelope.
  */
 
 export interface Logger {
@@ -57,7 +59,7 @@ function emit(
   let message = "";
   const rest: unknown[] = [];
 
-  for (let i = 0; i < args.length; i++) {
+  for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
     if (i === 0 && a && typeof a === "object" && !(a instanceof Error) && !Array.isArray(a)) {
       meta = { ...meta, ...(a as Record<string, unknown>) };
@@ -78,8 +80,10 @@ function emit(
   });
 
   if (level === "error" || level === "warn") {
+    // eslint-disable-next-line no-console
     console.error(line);
   } else {
+    // eslint-disable-next-line no-console
     console.log(line);
   }
 }
