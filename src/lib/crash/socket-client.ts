@@ -169,20 +169,31 @@ export class BcGameSocketClient {
     try {
       this.cleanupSocket(/* intentional */ false);
 
+      // BC.Game enforces WebSocket-only (see streaming investigation).
+      // Production logs showed "xhr poll error" when polling was preferred.
+      // Polling only when BCGAME_SOCKET_ALLOW_POLLING=1.
+      const allowPolling = process.env.BCGAME_SOCKET_ALLOW_POLLING === "1";
+      const transports: ("websocket" | "polling")[] = allowPolling
+        ? ["websocket", "polling"]
+        : ["websocket"];
+
       const socketOptions: Partial<ManagerOptions & SocketOptions> = {
         path: SOCKET_PATH,
         reconnection: false, // manual lifecycle
         timeout: CONNECTION_TIMEOUT_MS,
         autoConnect: false,
-        // Diagnosis P0: allow polling fallback; pure websocket fails behind some WAFs
-        transports: ["polling", "websocket"],
-        withCredentials: true,
+        transports,
+        // Node workers are not browsers; withCredentials is optional.
+        withCredentials: process.env.BCGAME_SOCKET_WITH_CREDENTIALS === "1",
         extraHeaders: {
           "User-Agent":
+            process.env.BCGAME_SOCKET_UA ??
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Origin: "https://bc.game",
-          Referer: "https://bc.game/game/crash",
+          Origin: process.env.BCGAME_SOCKET_ORIGIN ?? "https://bc.game",
+          Referer: process.env.BCGAME_SOCKET_REFERER ?? "https://bc.game/game/crash",
         },
+        upgrade: allowPolling,
+        rememberUpgrade: true,
       };
 
       this.socket = io(SOCKET_URL, socketOptions);

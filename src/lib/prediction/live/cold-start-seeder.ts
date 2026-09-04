@@ -56,7 +56,47 @@ export async function runColdStartSeeder(opts?: {
   const now = opts?.now ?? Date.now;
   const t0 = now();
 
-  const sql = await getSql();
+  // Retry DB acquisition — Neon can take >5s after idle; pool timeout is 30s.
+  let sql;
+  let lastDbErr: unknown;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try {
+      sql = await getSql();
+      // probe with a lightweight query
+      await sql`select 1`;
+      lastDbErr = null;
+      break;
+    } catch (e) {
+      lastDbErr = e;
+      const delay = Math.min(2000 * attempt, 8000);
+      logger.warn(
+        {
+          component: "ColdStartSeeder",
+          attempt,
+          delayMs: delay,
+          error: String(e),
+        },
+        "DB not ready during cold-start; retrying",
+      );
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  if (!sql) {
+    logger.error(
+      { component: "ColdStartSeeder", error: String(lastDbErr) },
+      "cold-start aborted: database unreachable after retries",
+    );
+    return {
+      alreadySeeded: false,
+      initialCount: 0,
+      finalCount: 0,
+      insertedTotal: 0,
+      pagesFetched: 0,
+      elapsedMs: now() - t0,
+      timedOut: true,
+    };
+  }
+
   const initialRows = await sql<{ count: number }>`
     select count(*)::int as count from crash_rounds
   `;

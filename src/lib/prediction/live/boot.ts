@@ -90,8 +90,45 @@ class LiveBoot {
     this.pollWorker = pollWorker;
     this.clockMonitor = clockMonitor;
 
-    const seed = await seeder();
-    const sql = await getSql();
+    // Cold-start must not crash the worker process on a transient DB timeout.
+    // Railway will otherwise restart-loop while Neon is waking.
+    let seed: SeedResult;
+    try {
+      seed = await seeder();
+    } catch (e) {
+      logger.error(
+        { component: "live-boot", error: String(e) },
+        "cold-start seeder threw; continuing with empty seed result",
+      );
+      seed = {
+        alreadySeeded: false,
+        initialCount: 0,
+        finalCount: 0,
+        insertedTotal: 0,
+        pagesFetched: 0,
+        elapsedMs: 0,
+        timedOut: true,
+      };
+    }
+
+    let sql;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      try {
+        sql = await getSql();
+        await sql`select 1`;
+        break;
+      } catch (e) {
+        logger.warn(
+          { component: "live-boot", attempt, error: String(e) },
+          "DB not ready after cold-start; retrying",
+        );
+        await new Promise((r) => setTimeout(r, Math.min(2000 * attempt, 8000)));
+      }
+    }
+    if (!sql) {
+      throw new Error("Database unreachable after cold-start retries — aborting boot");
+    }
+
     logger.info(
       { component: "live-boot", seed, bootStartedAt },
       "cold-start seeder complete; starting dispatcher / subscriber / poll / monitor",

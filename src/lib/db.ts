@@ -65,7 +65,9 @@ function createNeonSql(): Promise<Sql> {
     const poolMax = Math.max(1, Number(process.env.PG_POOL_MAX ?? 8) || 8);
     const poolMin = Math.max(0, Number(process.env.PG_POOL_MIN ?? 1) || 1);
     const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 10000) || 10000;
-    const connectionTimeoutMillis = Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 5000) || 5000;
+    // Neon / managed Postgres often needs >5s on cold start from Railway.
+    const connectionTimeoutMillis =
+      Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 30_000) || 30_000;
     const pool = new Pool({
       connectionString: databaseUrl,
       max: poolMax,
@@ -73,6 +75,8 @@ function createNeonSql(): Promise<Sql> {
       idleTimeoutMillis,
       connectionTimeoutMillis,
       allowExitOnIdle: true,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10_000,
     });
     // eslint-disable-next-line no-console
     console.log(`[db] Pool configured max=${poolMax} min=${Math.min(poolMin, poolMax)} idleMs=${idleTimeoutMillis}`);
