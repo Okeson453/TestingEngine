@@ -596,12 +596,12 @@ export async function onGameEndPredict(
 
     const tPredict0 = performance.now();
     const signal = predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET);
-    const predictionLatencyMs = Math.round(performance.now() - tPredict0);
+    const generationLatencyMs = Math.round(performance.now() - tPredict0);
     try {
       const { predictionGenerationMs, edToPredictMs } = await import(
         "@/lib/observability/performance/latency"
       );
-      predictionGenerationMs.observe(predictionLatencyMs);
+      predictionGenerationMs.observe(generationLatencyMs);
       const sinceCrash = Date.now() - new Date(crashedAt).getTime();
       if (Number.isFinite(sinceCrash) && sinceCrash >= 0) {
         edToPredictMs.observe(sinceCrash);
@@ -650,13 +650,13 @@ export async function onGameEndPredict(
             ${JSON.stringify({
               sourceGameId: gameId,
               predictionId: signal.predictionId,
-              predictionLatencyMs,
+              generationLatencyMs,
               persistMs,
               generatedAt,
             })},
             ${generatedAt}::timestamptz, now(),
-            ${predictionLatencyMs + persistMs},
-            ${predictionLatencyMs + persistMs > 500}
+            ${generationLatencyMs + persistMs},
+            ${generationLatencyMs + persistMs > 500}
           )
           ON CONFLICT DO NOTHING
         `;
