@@ -3,6 +3,9 @@ node_modules/
 .github_repo
 .env
 .env.*
+.vercel/
+/tmp/
+/dist/
 
 # PGLite embedded DB data directory (persisted for worker restart recovery).
 data/

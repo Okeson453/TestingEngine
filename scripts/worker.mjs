@@ -1,27 +1,29 @@
 #!/usr/bin/env node
 /**
- * Standalone background worker process for the prediction/validation engine.
+ * Standalone background worker process entry point.
+ *
+ * Spec: TestingEngine_Deep_Diagnosis.md §3.1
+ *       UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §7.7
  *
  * Run in production with a remote database (Neon / DATABASE_URL set):
  *
  *   npm run worker
  *
- * The worker owns the full lifecycle server-side:
- *   BC.Game polling -> new-round detection -> prediction generation ->
- *   WIN/LOSS validation -> permanent DB persistence -> daily entry counting.
- *
- * It is fully independent of the dashboard/browser (no React effects, no
- * client timers, no refreshDashboard dependency). A DB-backed distributed lock
- * guarantees only one instance ever generates/validates at a time, and all
- * mutations are idempotent so a restart never duplicates records.
- *
  * Local/preview mode (no DATABASE_URL) uses PGLite in-process inside the dev
- * server — the dev server already launches the worker at boot, so this CLI is
- * intentionally a no-op there (running two PGLite instances on one data dir
- * is not safe).
+ * server — the dev server already launches the live boot at boot, so this
+ * CLI is intentionally a no-op there (running two PGLite instances on one
+ * data dir is not safe).
  *
  * Requires running via the alias loader so `@/` resolves:
  *   node --experimental-strip-types --import ./scripts/paths-loader.mjs scripts/worker.mjs
+ *
+ * The single production entry point is `startLiveBoot` from
+ * `src/lib/prediction/live/boot.ts`, which wires, in order:
+ *   1. ColdStartSeeder — backfill crash_rounds if empty
+ *   2. OutboxDispatcher — drain queued Telegram notifications
+ *   3. EventDrivenPipeline — subscribe to BC.Game's Socket.IO bg/ed events
+ *   4. PollWorker — REST safety net
+ *   5. ClockSkewMonitor — periodic skew measurement
  */
 import { pathToFileURL } from "node:url";
 
@@ -35,14 +37,40 @@ if (!process.env.DATABASE_URL) {
   process.exit(0);
 }
 
-const mod = await import("@/lib/prediction/worker");
-const { startWorker, stopWorker } = mod;
+const liveBoot = await import("@/lib/prediction/live/boot");
+const events = await import("@/lib/prediction/events/game-event-handlers");
 
-startWorker();
+const result = await liveBoot.startLiveBoot({
+  startSubscriber: async () => {
+    await events.startEventDrivenPipeline();
+  },
+});
+
+console.log(
+  JSON.stringify({
+    level: "info",
+    time: new Date().toISOString(),
+    component: "worker-entry",
+    msg: "live prediction pipeline started",
+    seed: result.seed,
+  }),
+);
+
+process.on("uncaughtException", (err) => {
+  console.error("[worker] uncaughtException:", err?.stack ?? err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[worker] unhandledRejection:", reason);
+});
 
 const shutdown = async () => {
   try {
-    await stopWorker();
+    await events.stopEventDrivenPipeline();
+  } catch {
+    /* best effort */
+  }
+  try {
+    await liveBoot.stopLiveBoot();
   } catch {
     /* best effort */
   }
@@ -51,6 +79,5 @@ const shutdown = async () => {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-// Flush the import so relative path errors surface immediately.
 void pathToFileURL(import.meta.url);
-console.log("[worker] background prediction worker running (DATABASE_URL)");
+console.log("[worker] background prediction worker running (DATABASE_URL) — live pipeline booted");

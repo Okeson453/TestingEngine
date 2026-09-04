@@ -98,28 +98,18 @@ export class OutboxDispatcher {
     requeued: number;
   }> {
     this.stats.tickCount += 1;
-    let recovered = 0;
+    const recovered = 0;
     let delivered = 0;
     let dead = 0;
     let requeued = 0;
 
     const sql = await this.getSqlFn();
 
-    // Step 1: recover stale INFLIGHT rows.
-    const rec = await sql<{ count: number }>`
-      with updated as (
-        update notification_outbox
-        set status = 'pending',
-            last_error = coalesce(last_error, '') || ' [recovered from inflight]'
-        where status = 'pending'::text
-          and last_error like '%recovered from inflight%'
-        returning 1
-      )
-      select 0 as count
-    `;
-    void rec;
+    // Stale-row recovery is performed by `recoverStale()` which is called
+    // by the runOneTick loop *before* tickOnce; tickOnce itself only
+    // claims + sends.
 
-    // Step 2: claim a batch. SELECT FOR UPDATE SKIP LOCKED → mark inflight → COMMIT.
+    // Step 1: claim a batch. SELECT FOR UPDATE SKIP LOCKED → mark inflight → COMMIT.
     const claimed = await runInTransaction(sql, async (tx) => {
       const rows = await tx<OutboxRow>`
         select id, notification_id, type, content, metadata, status, attempt_count, next_attempt_at

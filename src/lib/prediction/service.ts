@@ -55,43 +55,8 @@ async function loadLastRoundSnapshot(sql: Sql): Promise<LastRoundSnapshot | null
   };
 }
 
-async function loadRecentRoundsForPrediction(
-  sql: Sql,
-  limit = MAX_HISTORY,
-): Promise<HistoricalRound[]> {
-  // Temporal-integrity guard: only include rounds whose outcome is fully known
-  // at the moment we generate the prediction (crashed_at <= now). This is the
-  // existing MAX_HISTORY cap (model input budget), plus an explicit cutoff
-  // that defends against any future-dated rows from the upstream ingest path.
-  const rows = await sql<{
-    game_id: string;
-    multiplier: string | number;
-    began_at: string | Date | null;
-    crashed_at: string | Date;
-  }>`
-    select game_id, multiplier, began_at, crashed_at
-    from crash_rounds
-    where crashed_at <= now()
-    order by crashed_at desc, game_id desc
-    limit ${limit}
-  `;
-  return rows.reverse().map((row) =>
-    mapCrashRoundToHistorical({
-      gameId: row.game_id,
-      multiplier: Number(row.multiplier),
-      hash: null,
-      salt: null,
-      beganAt:
-        row.began_at instanceof Date
-          ? row.began_at.toISOString()
-          : row.began_at,
-      crashedAt:
-        row.crashed_at instanceof Date
-          ? row.crashed_at.toISOString()
-          : row.crashed_at,
-    }),
-  );
-}
+// (Removed: loadRecentRoundsForPrediction — superseded by the strict
+// `crashed_at < $beginTime` window in @/lib/prediction/live/predictor.ts.)
 
 /**
  * Returned to callers (the worker) so they can build a richer notification
@@ -207,78 +172,11 @@ export async function generateAndQueuePrediction(
   return { signal, lastRound };
 }
 
-/**
- * Generate a prediction specifically for event-driven approach.
- * This is the new primary method for Socket.IO triggered predictions.
- * 
- * @param targetGameId - The BC.Game round ID from the bg event
- * @param targetRoundStartedAt - The beganAt timestamp from the bg event
- * @param rounds - Historical rounds for prediction input
- */
-export async function generatePredictionForTargetRound(
-  targetGameId: string,
-  targetRoundStartedAt: string,
-  rounds: HistoricalRound[],
-): Promise<QueuedPrediction | null> {
-  const sql = await getSql();
-  const lastRound = await loadLastRoundSnapshot(sql);
-  
-  if (rounds.length < MIN_HISTORY) return null;
-
-  const engine = new PredictionEngine();
-  const timestamp = new Date().toISOString();
-  
-  // Verify temporal invariant: prediction must be generated before target round starts
-  const predictionTime = new Date(timestamp).getTime();
-  const targetStartTime = new Date(targetRoundStartedAt).getTime();
-  
-  if (predictionTime >= targetStartTime) {
-    throw new Error(
-      `Temporal invariant violation: prediction_generated_at (${predictionTime}) >= ` +
-      `target_round_started_at (${targetStartTime}) for game ${targetGameId}`
-    );
-  }
-
-  const signal = engine.predict({
-    priorRounds: rounds,
-    targetRoundId: targetGameId,  // Use actual game ID
-    timestamp,
-    target: DEFAULT_TARGET,
-  });
-
-  // Store with target anchoring for temporal invariant
-  await sql`
-    insert into pending_predictions (
-      prediction_id, target_multiplier, probability, confidence,
-      regime_name, regime_confidence, reasoning, feature_summary,
-      model_version, requested_at, target_game_id, target_round_started_at
-    ) values (
-      ${signal.predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-      ${signal.confidence}, ${signal.regimeId}, ${signal.regimeId ? 0.5 : null},
-      ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-      ${signal.modelVersion}, ${timestamp}, ${targetGameId}, ${targetRoundStartedAt}
-    )
-    on conflict (prediction_id) do nothing
-  `;
-
-  return { signal, lastRound };
-}
-
-/**
- * Check if a prediction already exists for a specific target game.
- * Used to prevent duplicate predictions in the event-driven approach.
- */
-export async function predictionExistsForTarget(
-  sql: Sql,
-  targetGameId: string,
-): Promise<boolean> {
-  const rows = await sql<{ count: number }>`
-    select count(*)::int as count
-    from pending_predictions
-    where target_game_id = ${targetGameId}
-  `;
-  return (rows[0]?.count ?? 0) > 0;
-}
+// (Removed: generatePredictionForTargetRound and predictionExistsForTarget.
+// The event-driven path now lives in @/lib/prediction/live/predictor.ts
+// (onGameStart) and @/lib/prediction/live/validator.ts (onGameEnd). The
+// legacy `predictionTime >= targetStartTime` throw was a no-op in the
+// real system — see TestingEngine_Deep_Diagnosis.md §0 row 3.)
 
 /**
  * Outcome of one validation pass: how many predictions were resolved against

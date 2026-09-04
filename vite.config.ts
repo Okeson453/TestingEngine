@@ -67,6 +67,27 @@ function predictionWorkerPlugin(): Plugin {
     apply: "serve",
     async configureServer(server) {
       try {
+        // Prefer the spec-defined live boot (live/boot.ts) which wires the
+        // cold-start seeder, outbox dispatcher, socket subscriber, poll
+        // safety net, and clock-skew monitor in one place. Fall back to
+        // the legacy worker.ts if the live module is not yet present in
+        // the build (transitional branches).
+        const liveMod = await server.ssrLoadModule(
+          "/src/lib/prediction/live/boot.ts",
+        );
+        if (typeof liveMod.startLiveBoot === "function") {
+          await liveMod.startLiveBoot({
+            startSubscriber: async () => {
+              const events = await server.ssrLoadModule(
+                "/src/lib/prediction/events/game-event-handlers.ts",
+              );
+              if (typeof events.startEventDrivenPipeline === "function") {
+                await events.startEventDrivenPipeline();
+              }
+            },
+          });
+          return;
+        }
         const mod = await server.ssrLoadModule("/src/lib/prediction/worker.ts");
         if (typeof mod.startWorker === "function") {
           mod.startWorker();

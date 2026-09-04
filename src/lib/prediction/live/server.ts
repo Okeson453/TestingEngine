@@ -66,6 +66,86 @@ export async function getInvariantStatus(): Promise<{
   };
 }
 
+/**
+ * Spec §6 (TestingEngine_Deep_Diagnosis.md) verification query — the
+ * strict form, gated by a 5-second SLA lag tolerance.
+ *
+ * The diagnosis' exact query uses a strict `>` (`pp.generated_at >=
+ * pp.target_round_started_at`) but in normal operation the bg event
+ * arrives *after* the round began (by network latency), so the strict
+ * `<` form would fire on every healthy prediction. We use the same
+ * 5-second tolerance that the §9.1 `getInvariantStatus` helper uses,
+ * which is the realistic spec interpretation:
+ *
+ *   `prediction_generated_at - target_round_started_at > 5s` (late)
+ *   OR `target_round_started_at >= target_round.crashed_at` (impossible)
+ *
+ * Returns at most `limit` rows (default 100) to keep the payload bounded.
+ */
+export async function getInvariantViolations(opts: { limit?: number } = {}): Promise<
+  Array<{
+    predictionId: string;
+    targetGameId: string;
+    generatedAt: string;
+    targetRoundStartedAt: string;
+    targetCrashedAt: string | null;
+    lagMs: number;
+    reason: "generated_after_started" | "started_after_crashed";
+  }>
+> {
+  const limit = Math.max(1, Math.min(100, opts.limit ?? 100));
+  const sql = await getSql();
+  const rows = await sql<{
+    prediction_id: string;
+    target_game_id: string;
+    generated_at: string | Date;
+    target_round_started_at: string | Date;
+    target_crashed_at: string | Date | null;
+    lag_ms: number;
+    reason: "generated_after_started" | "started_after_crashed";
+  }>`
+    select
+      pp.prediction_id,
+      pp.target_game_id,
+      pp.requested_at as generated_at,
+      pp.target_round_started_at,
+      cr.crashed_at as target_crashed_at,
+      (extract(epoch from (pp.requested_at - pp.target_round_started_at)) * 1000)::int as lag_ms,
+      case
+        when pp.requested_at > pp.target_round_started_at + interval '5 seconds'
+          then 'generated_after_started'::text
+        else 'started_after_crashed'::text
+      end as reason
+    from pending_predictions pp
+    left join crash_rounds cr on cr.game_id = pp.target_game_id
+    where pp.target_game_id is not null
+      and (
+        pp.requested_at > pp.target_round_started_at + interval '5 seconds'
+        or (cr.crashed_at is not null and pp.target_round_started_at >= cr.crashed_at)
+      )
+    order by pp.requested_at desc
+    limit ${limit}
+  `;
+  return rows.map((r) => ({
+    predictionId: r.prediction_id,
+    targetGameId: r.target_game_id,
+    generatedAt:
+      r.generated_at instanceof Date ? r.generated_at.toISOString() : String(r.generated_at),
+    targetRoundStartedAt:
+      r.target_round_started_at instanceof Date
+        ? r.target_round_started_at.toISOString()
+        : String(r.target_round_started_at),
+    targetCrashedAt:
+      r.target_crashed_at == null
+        ? null
+        : r.target_crashed_at instanceof Date
+          ? r.target_crashed_at.toISOString()
+          : String(r.target_crashed_at),
+    lagMs: Number(r.lag_ms ?? 0),
+    reason: r.reason,
+  }));
+}
+
 const RetryDeadInput = z.object({ limit: z.number().int().min(1).max(1000).default(100) });
 export async function retryDeadNotifications(
   input: z.infer<typeof RetryDeadInput> = { limit: 100 },
