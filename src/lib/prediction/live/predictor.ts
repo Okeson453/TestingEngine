@@ -325,7 +325,8 @@ export async function onGameStart(
   let predictionGeneratedAt = timestamp;
   let outboxEnqueued = 0;
 
-  const chatIds = getChatIds();
+  // chat fan-out is handled by sendTelegramMessage, not per-row inserts
+  void getChatIds;
 
   try {
     await runInTransaction(sql, async (tx) => {
@@ -371,34 +372,45 @@ export async function onGameStart(
       predictionId = ins[0]!.prediction_id;
       predictionGeneratedAt = String(ins[0]!.requested_at);
 
-      // Outbox rows: one per configured chat id. SKIPPED entirely when
-      // slaViolated is true so the operator does not see a "predicts the
-      // past" message during transient WAF/socket stalls.
+      // ONE outbox row per prediction. sendTelegramMessage fans out to all
+      // chats — per-chat rows caused duplicate deliveries.
+      // SKIP when slaViolated so operators do not see "predicts the past".
       if (!slaViolated) {
-        for (const chatId of chatIds) {
-          await tx`
-            insert into notification_outbox (
-              notification_id, type, content, metadata, status, priority
-            ) values (
-              ${randomUUID()}::uuid, 'prediction',
-              ${`[bg→prediction] target=${evt.gameId} mult=${DEFAULT_TARGET} prob=${signal.probability}`},
-              ${JSON.stringify({
-                predictionId,
-                correlationId,
-                targetGameId: evt.gameId,
-                targetBeganAt: evt.beginTime,
-                targetMultiplier: Number(DEFAULT_TARGET),
-                probability: signal.probability,
-                confidence: signal.confidence,
-                regimeName: signal.regimeId,
-                slaViolated: false,
-                kind: "prediction",
-              })},
-              'pending', 2
-            )
-          `;
-          outboxEnqueued += 1;
-        }
+        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
+        const predictionContent = [
+          `🎯 NEW PREDICTION${regimeText}`,
+          ``,
+          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
+          `Probability: ${(signal.probability * 100).toFixed(1)}%`,
+          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
+          ``,
+          `Prediction ID: ${predictionId}`,
+          `Generated: ${predictionGeneratedAt}`,
+        ].join("\n");
+        await tx`
+          insert into notification_outbox (
+            notification_id, type, content, metadata, status, priority,
+            attempt_count, next_attempt_at
+          ) values (
+            ${randomUUID()}::uuid, 'prediction',
+            ${predictionContent},
+            ${JSON.stringify({
+              predictionId,
+              correlationId,
+              targetGameId: evt.gameId,
+              targetBeganAt: evt.beginTime,
+              targetMultiplier: Number(DEFAULT_TARGET),
+              probability: signal.probability,
+              confidence: signal.confidence,
+              regimeName: signal.regimeId,
+              slaViolated: false,
+              kind: "prediction",
+            })},
+            'pending', 2,
+            0, now()
+          )
+        `;
+        outboxEnqueued = 1;
       }
 
       // live_event_log row: append-only observability.

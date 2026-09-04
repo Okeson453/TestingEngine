@@ -204,30 +204,50 @@ export async function onGameEnd(
               status = 'MATCHED'
           where prediction_id = ${state.pending!.prediction_id}
         `;
-        const chatIds = getChatIds();
-        for (const chatId of chatIds) {
-          await tx`
-            insert into notification_outbox (
-              notification_id, type, content, metadata, status, priority
-            ) values (
-              ${randomUUID()}::uuid, 'validation',
-              ${`[ed→validation] target=${evt.gameId} actual=${evt.multiplier} result=${result}`},
-              ${JSON.stringify({
-                predictionId: state.pending!.prediction_id,
-                gameId: evt.gameId,
-                correlationId: state.pending!.correlation_id,
-                targetMultiplier: target,
-                actualMultiplier: evt.multiplier,
-                probability: Number(state.pending!.probability),
-                result,
-                resolvedAt,
-                slaViolated: false,
-                kind: "validation",
-              })},
-              'pending', 2
-            )
-          `;
-        }
+        // ONE outbox row per validation event.
+        // sendTelegramMessage() broadcasts to all configured chats — do NOT
+        // insert one row per chat (that caused N×M duplicate deliveries).
+        // Use the same WIN/LOSS formatter as createValidationNotification.
+        const resultEmoji = result === "WIN" ? "🎉" : "💥";
+        const multiplierText =
+          evt.multiplier >= target
+            ? `Actual: ${evt.multiplier.toFixed(2)}x`
+            : `Crashed: ${evt.multiplier.toFixed(2)}x`;
+        const validationContent = [
+          `${resultEmoji} PREDICTION ${result}`,
+          ``,
+          `Target: ${target.toFixed(2)}x`,
+          multiplierText,
+          `Probability: ${(Number(state.pending!.probability) * 100).toFixed(1)}%`,
+          ``,
+          `Game ID: ${evt.gameId}`,
+          `Prediction ID: ${state.pending!.prediction_id}`,
+          `Resolved: ${resolvedAt}`,
+        ].join("\n");
+
+        await tx`
+          insert into notification_outbox (
+            notification_id, type, content, metadata, status, priority,
+            attempt_count, next_attempt_at
+          ) values (
+            ${randomUUID()}::uuid, 'validation',
+            ${validationContent},
+            ${JSON.stringify({
+              predictionId: state.pending!.prediction_id,
+              gameId: evt.gameId,
+              correlationId: state.pending!.correlation_id,
+              targetMultiplier: target,
+              actualMultiplier: evt.multiplier,
+              probability: Number(state.pending!.probability),
+              result,
+              resolvedAt,
+              slaViolated: false,
+              kind: "validation",
+            })},
+            'pending', 2,
+            0, now()
+          )
+        `;
       }
 
       await tx`
@@ -310,7 +330,7 @@ export async function onGameEnd(
     actualMultiplier: evt.multiplier,
     resolvedAt: new Date(now()).toISOString(),
     alreadyValidated: false,
-    outboxEnqueued: getChatIds().length,
+    outboxEnqueued: 1, // one row; sendTelegramMessage fans out to all chats
     correlationId: state.pending.correlation_id ?? "",
   };
 }
