@@ -30,6 +30,7 @@ import { ACIEEngine } from './acie/engine.ts';
 import { globalLiveDivergence } from './validation/live-divergence-monitor.ts';
 import { isReadyForLiveSync as isReadyForLive } from '../observability/readiness.ts';
 import { saveSnapshotToFile } from './state/state-persistence.ts';
+import { loadAcieStateFromDb, scheduleAcieStateSave } from './acie/state-persistence.ts';
 import { onlineMeanCalibrationError } from './acie/online-state.ts';
 import type { CrashLearningResult } from './acie/engine.ts';
 import type { StrategyRiskState } from './acie/types.ts';
@@ -112,6 +113,10 @@ export class EntryDecisionService {
     this.riskEngine = opts?.riskEngine ?? new RiskEngine();
     this.predictionRepo = opts?.predictionRepo ?? new InMemoryPredictionRepository();
     this.acie = opts?.acie ?? new ACIEEngine();
+    // Best-effort restore from Postgres (async; does not block construction).
+    if (!opts?.acie) {
+      void loadAcieStateFromDb(this.acie).catch(() => undefined);
+    }
     this.preferAcie = opts?.preferAcie ?? true;
     this.sheathMode = opts?.sheathMode ?? null;
     this.usePipeline = opts?.usePipeline ?? true;

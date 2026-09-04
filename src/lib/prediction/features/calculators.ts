@@ -94,5 +94,44 @@ export function computeFeatures(priorRounds: HistoricalRound[], predictionTimest
       : 0,
     hour_utc: hourOfDay(predictionTimestamp),
     dow_utc: dayOfWeek(predictionTimestamp),
+    // §6.3 Phase A temporal features (no leakage — only prior rounds + clock)
+    seconds_since_prev: (() => {
+      if (priorRounds.length < 1) return 0;
+      const last = priorRounds[priorRounds.length - 1];
+      const tLast = Date.parse(last.crashedAt ?? last.startedAt ?? last.createdAt ?? "");
+      const tNow = Date.parse(predictionTimestamp);
+      if (!Number.isFinite(tLast) || !Number.isFinite(tNow)) return 0;
+      return Math.max(0, Math.min(600, (tNow - tLast) / 1000));
+    })(),
+    rounds_per_hour_est: (() => {
+      if (priorRounds.length < 5) return 0;
+      const window = priorRounds.slice(-20);
+      const t0 = Date.parse(window[0]!.crashedAt ?? window[0]!.startedAt ?? "");
+      const t1 = Date.parse(
+        window[window.length - 1]!.crashedAt ?? window[window.length - 1]!.startedAt ?? "",
+      );
+      if (!Number.isFinite(t0) || !Number.isFinite(t1) || t1 <= t0) return 0;
+      const hours = (t1 - t0) / 3_600_000;
+      return hours > 0 ? window.length / hours : 0;
+    })(),
+    time_since_hit_1_30_sec: (() => {
+      for (let i = priorRounds.length - 1; i >= 0; i--) {
+        if (priorRounds[i]!.crashPoint >= 1.3) {
+          const t = Date.parse(
+            priorRounds[i]!.crashedAt ?? priorRounds[i]!.startedAt ?? "",
+          );
+          const tNow = Date.parse(predictionTimestamp);
+          if (Number.isFinite(t) && Number.isFinite(tNow)) {
+            return Math.max(0, (tNow - t) / 1000);
+          }
+          return priorRounds.length - 1 - i;
+        }
+      }
+      return priorRounds.length;
+    })(),
+    // Player activity: 0 unless caller injects via meta; safe default.
+    online_players: 0,
+    online_players_ewma: 0,
+    high_activity: 0,
   };
 }

@@ -37,3 +37,11 @@ export {
   MODEL_NAMES,
 } from './online-state.ts';
 export type { OnlineAdaptiveState, DriftSnapshot, OnlineModelName } from './online-state.ts';
+
+export {
+  loadAcieStateFromDb,
+  saveAcieStateToDb,
+  scheduleAcieStateSave,
+  type AciePersistedSnapshot,
+} from './state-persistence.ts';
+export { ACIE_MAX_HISTORY } from './engine.ts';

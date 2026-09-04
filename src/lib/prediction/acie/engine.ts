@@ -37,6 +37,14 @@ import {
   StrategyRiskState,
 } from './types.ts';
 import { acieHeavyEvidenceLatencyMs } from '../metrics-acie.ts';
+import { PlattCalibrator } from '../calibration/platt-calibrator.ts';
+import { scheduleAcieStateSave } from './state-persistence.ts';
+import { getLogger } from '../../observability/logger.ts';
+
+const logger = getLogger('acie-engine');
+
+/** Unified history limit (§7.3). Evidence window derives from this. */
+export const ACIE_MAX_HISTORY = Number(process.env.ACIE_MAX_HISTORY ?? 2000);
 
 export interface ACIEEngineOptions {
   strategyPolicy?: Partial<StrategyPolicy>;
@@ -72,6 +80,12 @@ export class ACIEEngine {
   private crashPoints: number[] = [];
   private online: OnlineAdaptiveState = createInitialOnlineState();
   private consecutiveLosses = 0;
+  /** Live Platt calibrator — fit incrementally from online pairs. */
+  private platt = new PlattCalibrator();
+  /** Rolling raw vs calibrated Brier for gate. */
+  private rawBrierEwma = 0.25;
+  private calBrierEwma = 0.25;
+  private preferCalibrated = false;
   private readonly processedRoundIds = new Set<string>();
   private pendingContext: PredictionContext | null = null;
   private lastEvidence: EvidenceReport | null = null;
@@ -84,7 +98,7 @@ export class ACIEEngine {
   private lastRiskState: Partial<StrategyRiskState> = {};
 
   constructor(opts: ACIEEngineOptions = {}) {
-    this.sol = new SequentialOutcomeLearner(opts.maxHistory ?? 5000);
+    this.sol = new SequentialOutcomeLearner(opts.maxHistory ?? ACIE_MAX_HISTORY);
     this.tpl = new TemporalPatternLearner();
     this.psi = new PredictiveSequenceIntelligence(this.tpl);
     this.evidenceEngine = new EvidenceEngine();
@@ -101,7 +115,7 @@ export class ACIEEngine {
 
   /** Seed historical crashes — each point still goes through lightweight online updates. */
   seedHistory(rounds: ACIERoundInput[]): void {
-    for (const r of rounds.slice(-2000)) {
+    for (const r of rounds.slice(-ACIE_MAX_HISTORY)) {
       this.ingestCrash(r, { skipDecision: true });
     }
     // One decision state ready after seed
@@ -160,7 +174,59 @@ export class ACIEEngine {
     riskState?: Partial<StrategyRiskState>
   ): CrashLearningResult {
     if (riskState) this.lastRiskState = riskState;
-    return this.ingestCrash(round, { skipDecision: false, riskState: this.lastRiskState });
+    const result = this.ingestCrash(round, { skipDecision: false, riskState: this.lastRiskState });
+    // §5.1 Persist online state asynchronously — never blocks the hot path.
+    scheduleAcieStateSave(this);
+    // §5.2 Update Platt from the outcome just observed.
+    this.observeCalibrationPair(round.crashPoint >= ACIE_TARGET ? 1 : 0);
+    return result;
+  }
+
+  /** Incremental calibrator update (O(1) path; refit when enough pairs). */
+  private observeCalibrationPair(actual: 0 | 1): void {
+    const raw = this.online.lastPsiProbability;
+    if (!Number.isFinite(raw) || raw <= 0) return;
+    const q = Math.min(0.999, Math.max(0.001, raw));
+    const brRaw = (q - actual) ** 2;
+    this.rawBrierEwma = 0.05 * brRaw + 0.95 * this.rawBrierEwma;
+    if (this.platt.fitted) {
+      const cq = Math.min(0.999, Math.max(0.001, this.platt.calibrate(q)));
+      const brCal = (cq - actual) ** 2;
+      this.calBrierEwma = 0.05 * brCal + 0.95 * this.calBrierEwma;
+      this.preferCalibrated = this.calBrierEwma < this.rawBrierEwma - 0.002;
+    }
+    // Lightweight pair buffer on online state via refit every 25 obs
+    if (this.online.observationCount > 0 && this.online.observationCount % 25 === 0) {
+      try {
+        const pairs = this.collectRecentPairs();
+        if (pairs.length >= 20) {
+          this.platt.fit(pairs);
+          logger.debug(
+            {
+              component: 'acie-engine',
+              fitted: this.platt.fitted,
+              preferCalibrated: this.preferCalibrated,
+              rawBrier: this.rawBrierEwma,
+              calBrier: this.calBrierEwma,
+            },
+            'Platt calibrator refit',
+          );
+        }
+      } catch {
+        /* non-critical */
+      }
+    }
+  }
+
+  private collectRecentPairs(): Array<{ p: number; y: 0 | 1 }> {
+    const records = this.sol.getRecords().slice(-200);
+    const pairs: Array<{ p: number; y: 0 | 1 }> = [];
+    for (const r of records) {
+      if (typeof r.psiProbability === 'number') {
+        pairs.push({ p: r.psiProbability, y: r.reached130 ? 1 : 0 });
+      }
+    }
+    return pairs;
   }
 
   /**
@@ -393,9 +459,16 @@ export class ACIEEngine {
       balance: riskState?.balance ?? 0,
     };
 
+    // §5.2 Wire calibration: apply Platt when it improves rolling Brier.
+    const rawP = psi.estimatedProbability;
+    const calP = this.platt.fitted ? this.platt.calibrate(rawP) : rawP;
+    const clampedCal = Math.min(0.99, Math.max(0.01, calP));
+    const useCalibrated = this.preferCalibrated && this.platt.fitted;
+    const decisionProbability = useCalibrated ? clampedCal : rawP;
+
     const strategy = this.strategy.evaluate({
       target: ACIE_TARGET,
-      probability: psi.estimatedProbability,
+      probability: decisionProbability,
       confidenceInterval: psi.confidenceInterval,
       calibrationError: calErr,
       evidence: evidenceStatus,
@@ -422,7 +495,7 @@ export class ACIEEngine {
       sequenceState,
       regime,
       regimeDuration: this.online.regimeDuration,
-      psiProbability: psi.estimatedProbability,
+      psiProbability: decisionProbability,
       psiConfidence: 1 - Math.min(1, psi.modelUncertainty + psi.dataUncertainty),
       prediction: strategy.isOpportunity,
     };
@@ -434,16 +507,18 @@ export class ACIEEngine {
     ) {
       signal = {
         target: ACIE_TARGET,
-        probability: psi.estimatedProbability,
+        probability: decisionProbability,
         confidenceInterval: psi.confidenceInterval,
         evidence: evidenceStatus,
         regime,
         action: strategy.action,
         stake: strategy.stake,
-        reason: strategy.reason,
+        reason:
+          strategy.reason +
+          (useCalibrated ? ' [calibrated]' : ' [raw]'),
         confidence: strategy.confidence,
         timestamp: new Date().toISOString(),
-        psi,
+        psi: { ...psi, estimatedProbability: decisionProbability },
         evidenceReport: { ...evidence, status: evidenceStatus },
       };
     }

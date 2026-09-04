@@ -160,3 +160,39 @@ export const predictionGetPending = createServerFn({ method: "GET" }).handler(ge
 
 export const predictionGetWorkerStatus = createServerFn({ method: "GET" }).handler(getWorkerStatus);
 
+
+
+/** §6.2 Per-model performance for dashboard (read-only). */
+export type ModelPerformanceRow = {
+  name: string;
+  ewmaLogLoss: number;
+  ewmaBrier: number;
+  count: number;
+  recentWinRate: number | null;
+  suppressed: boolean;
+};
+
+export const predictionGetModelPerformance = createServerFn({ method: "GET" }).handler(
+  async (): Promise<ModelPerformanceRow[]> => {
+    try {
+      const { globalModelPerformance } = await import("./prediction/ensemble/model-performance.ts");
+      const all = globalModelPerformance.all();
+      const rows: ModelPerformanceRow[] = [];
+      for (const [name, perf] of all.entries()) {
+        rows.push({
+          name,
+          ewmaLogLoss: perf.ewmaLogLoss,
+          ewmaBrier: perf.ewmaBrier,
+          count: perf.count,
+          recentWinRate:
+            perf.recentTotal > 0 ? perf.recentCorrect / perf.recentTotal : null,
+          suppressed: perf.ewmaBrier > 0.3 && perf.count > 50,
+        });
+      }
+      rows.sort((a, b) => a.ewmaBrier - b.ewmaBrier);
+      return rows;
+    } catch {
+      return [];
+    }
+  },
+);

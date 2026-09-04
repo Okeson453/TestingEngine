@@ -20,6 +20,7 @@ import { PollWorker } from "./poll-worker";
 import { ClockSkewMonitor } from "./clock-skew-monitor";
 import { getLogger } from "@/lib/observability/logger";
 import { getSql, type Sql } from "@/lib/db";
+import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
 
 const logger = getLogger("live-boot");
 
@@ -34,6 +35,7 @@ const REQUIRED_TABLES = [
   "live_event_log",
   "worker_locks",
   "worker_state",
+  "acie_online_state",
 ] as const;
 
 export async function validateSchema(sql: Sql): Promise<void> {
@@ -103,6 +105,23 @@ class LiveBoot {
         { component: "live-boot" },
         "schema validation passed; all required tables present",
       );
+      // §5.1 Restore ACIE online state so warm-up is not required after restart.
+      try {
+        const { ACIEEngine } = await import("@/lib/prediction/acie/engine");
+        const eng = new ACIEEngine();
+        const restored = await loadAcieStateFromDb(eng);
+        logger.info(
+          { component: "live-boot", restored },
+          restored ? "ACIE online state restored" : "ACIE starting fresh",
+        );
+        // Keep a process-global for other consumers
+        (globalThis as { __acieEngine__?: typeof eng }).__acieEngine__ = eng;
+      } catch (e) {
+        logger.warn(
+          { component: "live-boot", error: String(e) },
+          "ACIE state restore skipped",
+        );
+      }
     } catch (e) {
       logger.error(
         { component: "live-boot", error: String(e) },

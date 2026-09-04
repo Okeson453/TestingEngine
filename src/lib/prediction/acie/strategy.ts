@@ -5,6 +5,7 @@
  * without hard-blocking on mild evidence degradation.
  */
 
+import { fractionalKellyStake } from '../stake/kelly-sizer.ts';
 import {
   StrategyDecision,
   StrategyDecisionContext,
@@ -125,17 +126,61 @@ export class StrategyLayer {
       };
     }
 
+    const sized = this.sizeStake(effectiveProb, evidence, riskState, p.defaultStake);
     return {
       action: 'ENTRY',
-      stake: p.defaultStake,
+      stake: sized.stake,
       reason:
         `P=${(effectiveProb * 100).toFixed(1)}% ≥ ${(threshold * 100).toFixed(0)}%` +
         ` | evidence=${evidence}` +
         (usingFallback ? ' | frequency_fallback' : '') +
-        ` | regime=${regime} policy ok.`,
+        ` | regime=${regime} policy ok.` +
+        ` | ${sized.reason}`,
       confidence: effectiveProb,
       isOpportunity: true,
     };
+  }
+
+  /**
+   * §6.4 Fractional-Kelly stake sizing. Falls back to defaultStake when
+   * edge ≤ 0, evidence is weak, or Kelly is disabled via env.
+   */
+  private sizeStake(
+    probability: number,
+    evidence: StrategyDecisionContext['evidence'],
+    riskState: StrategyDecisionContext['riskState'],
+    defaultStake: number,
+  ): { stake: number; reason: string } {
+    if (process.env.ACIE_KELLY_ENABLED === '0') {
+      return { stake: defaultStake, reason: 'kelly-disabled' };
+    }
+    const evidenceQuality =
+      evidence === 'SUPPORTED' ? 1 : evidence === 'WEAK' ? 0.55 : 0.2;
+    if (evidenceQuality < 0.3) {
+      return { stake: defaultStake, reason: 'fixed-stake-weak-evidence' };
+    }
+    const bankroll = riskState.balance > 0 ? riskState.balance : defaultStake * 20;
+    const result = fractionalKellyStake({
+      calibratedProbability: probability,
+      target: 1.3,
+      bankroll,
+      fraction: Number(process.env.ACIE_KELLY_FRACTION ?? 0.25),
+      maxBankrollFraction: Number(process.env.ACIE_KELLY_MAX_FRAC ?? 0.05),
+      sampleConfidence: Math.min(1, probability),
+      calibrationConfidence: 0.8,
+      evidenceQuality,
+      modelAgreement: 0.8,
+      drawdownPressure: Math.min(1, riskState.consecutiveLosses / 10),
+    });
+    if (result.stake <= 0) {
+      return { stake: defaultStake, reason: result.reason };
+    }
+    // Blend with default so we never jump more than 2x default in one step.
+    const stake = Math.max(
+      1,
+      Math.min(defaultStake * 2, Math.round(0.5 * result.stake + 0.5 * defaultStake)),
+    );
+    return { stake, reason: result.reason };
   }
 
   withPolicy(partial: Partial<StrategyPolicy> & { mode?: StrategyPolicyMode }): StrategyLayer {
