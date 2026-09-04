@@ -40,6 +40,15 @@ const { startWorker, stopWorker } = mod;
 
 startWorker();
 
+// Surface silent deaths — without these, an unhandled rejection after the
+// boot log can exit the process with no further Railway output.
+process.on("uncaughtException", (err) => {
+  console.error("[worker] uncaughtException:", err?.stack ?? err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[worker] unhandledRejection:", reason);
+});
+
 const shutdown = async () => {
   try {
     await stopWorker();
