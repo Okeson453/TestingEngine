@@ -132,17 +132,23 @@ async function acquireLock(sql: Sql, ownerId: string): Promise<boolean> {
 /** Extend the lock TTL. Returns false if ownership was lost to another worker. */
 async function heartbeat(sql: Sql, ownerId: string): Promise<boolean> {
   const ttl = LOCK_TTL_SEC;
-  await sql.query(
-    `update worker_locks
-        set expires_at = now() + interval '${ttl} seconds', heartbeat_at = now()
-      where lock_key = $1 and owner_id = $2`,
-    [LOCK_KEY, ownerId],
-  );
-  // Confirm we still own it (the update is a no-op if another worker stole it).
-  const rows = await sql<{ owner_id: string }>`
-    select owner_id from worker_locks where lock_key = ${LOCK_KEY}
-  `;
-  return rows.length > 0 && rows[0]!.owner_id === ownerId;
+  try {
+    await sql.query(
+      `update worker_locks
+          set expires_at = now() + interval '${ttl} seconds', heartbeat_at = now()
+        where lock_key = $1 and owner_id = $2`,
+      [LOCK_KEY, ownerId],
+    );
+    // Confirm we still own it (the update is a no-op if another worker stole it).
+    const rows = await sql<{ owner_id: string }>`
+      select owner_id from worker_locks where lock_key = ${LOCK_KEY}
+    `;
+    return rows.length > 0 && rows[0]!.owner_id === ownerId;
+  } catch (e) {
+    // Non-fatal: pooler saturation / transient disconnects must not kill the loop.
+    console.warn("[worker] heartbeat failed:", (e as Error).message);
+    return true; // assume still owned; next cycle re-checks via acquire
+  }
 }
 
 async function releaseLock(sql: Sql, ownerId: string): Promise<void> {
@@ -510,22 +516,20 @@ export function startWorker(): WorkerHandle {
     console.warn(bootMsg);
   }
   
-  // NEW: Start the event-driven prediction pipeline
-  void startEventDrivenPipeline().catch((error) => {
-    logger.error(
-      { component: "PredictionWorker", error },
-      "Failed to start event-driven prediction pipeline"
-    );
-  });
-  
+  // Start event-driven pipeline (Socket.IO) if available; fall back to poll.
+  try {
+    void startEventDrivenPipeline();
+  } catch (e) {
+    logger.warn({ component: "PredictionWorker", error: e }, "event pipeline start failed");
+  }
+
   void run(handle);
   return handle;
 }
 
-/** Stop the worker and release its lock. Best-effort on the lock release. */
+/** Stop the worker loop and release the lock (best-effort). */
 export async function stopWorker(): Promise<void> {
   const handle = getHandle();
-  if (!handle.running) return;
   handle.running = false;
   if (handle.sleepTimer) {
     clearTimeout(handle.sleepTimer);
