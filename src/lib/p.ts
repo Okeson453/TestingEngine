@@ -10,7 +10,40 @@ import {
   getPendingStatus,
   type ValidationHistoryOpts,
 } from "./prediction/service.ts";
-import { getWorkerStatus, type WorkerStatus } from "./prediction/worker";
+import { getSql } from "./db";
+
+export type WorkerStatus = {
+  running: boolean;
+  ownerId: string | null;
+  heartbeatAgeMs: number | null;
+  lastError: string | null;
+};
+
+async function getWorkerStatus(): Promise<WorkerStatus> {
+  try {
+    const sql = await getSql();
+    const rows = await sql<{ owner_id: string; heartbeat_at: string | Date }>`
+      select owner_id, heartbeat_at from worker_locks where lock_key = 'prediction_worker' limit 1
+    `;
+    if (rows.length === 0) {
+      return { running: false, ownerId: null, heartbeatAgeMs: null, lastError: null };
+    }
+    const hb = rows[0]!.heartbeat_at;
+    const hbMs = hb instanceof Date ? hb.getTime() : new Date(String(hb)).getTime();
+    const age = Number.isFinite(hbMs) ? Date.now() - hbMs : null;
+    const errRows = await sql<{ value: string }>`
+      select value from worker_state where key = 'last_error' limit 1
+    `;
+    return {
+      running: age != null && age < 120_000,
+      ownerId: rows[0]!.owner_id,
+      heartbeatAgeMs: age,
+      lastError: errRows[0]?.value ?? null,
+    };
+  } catch (e) {
+    return { running: false, ownerId: null, heartbeatAgeMs: null, lastError: String(e) };
+  }
+}
 
 export const predictionGetDailyTarget = createServerFn({ method: "GET" }).handler(getDailyTarget);
 
@@ -58,4 +91,4 @@ export const predictionGetHistory = createServerFn({ method: "POST" })
 export const predictionGetPending = createServerFn({ method: "GET" }).handler(getPendingStatus);
 
 export const predictionGetWorkerStatus = createServerFn({ method: "GET" }).handler(getWorkerStatus);
-export type { WorkerStatus } from "./prediction/worker";
+export type { WorkerStatus };
