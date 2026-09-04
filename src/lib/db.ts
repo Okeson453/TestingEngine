@@ -113,6 +113,21 @@ function createNeonSql(): Promise<Sql> {
     types.setTypeParser(OID_DATE, identity);
     types.setTypeParser(OID_INTERVAL, identity);
     const pool = new Pool({ connectionString: databaseUrl });
+
+    // Prevent unhandled 'error' events from crashing the process. Connection
+    // poolers (e.g. layerbase / pgBouncer-style front-ends) aggressively
+    // close idle connections; when that happens, `pg` emits an 'error'
+    // event on the Pool. Without a listener, Node treats it as unhandled
+    // and crashes the worker process. The pool transparently replaces the
+    // dead connection on the next acquire, so this is purely observability.
+    pool.on("error", (err: Error) => {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[db] Pool connection error (non-fatal):",
+        err.message,
+      );
+    });
+
     return toSql(async <T>(text: string, params: unknown[]) => {
       const res = await pool.query(text, params);
       return res.rows as T[];
