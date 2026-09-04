@@ -25,6 +25,7 @@ import {
   upsertLiveRoundFromHistory,
   markLiveRoundEnded,
 } from "@/lib/prediction/live/live-round-state";
+import { bcGameSocket } from "@/lib/crash/socket-client";
 
 const logger = getLogger("poll-worker");
 
@@ -304,6 +305,32 @@ export class PollWorker {
   private async runOneTick(): Promise<void> {
     if (!this.running) return;
     await this.tickOnce();
-    this.scheduleNext(POLL_INTERVAL_MS);
+    this.scheduleNext(this.nextIntervalMs());
+  }
+
+  /**
+   * Adaptive poll interval: when Socket.IO is blocked/degraded (Cloudflare),
+   * poll more aggressively so N+1 predictions stay ahead of the round.
+   * Cap at 2s minimum to avoid hammering BC.Game REST.
+   */
+  private nextIntervalMs(): number {
+    const base = POLL_INTERVAL_MS;
+    try {
+      const st = bcGameSocket.getState().status;
+      // When live socket is unavailable (Cloudflare WAF common on Railway),
+      // poll at 2–3s so N+1 predictions stay ahead of the inter-round gap.
+      if (
+        st === "waf_blocked" ||
+        st === "degraded" ||
+        st === "reconnecting" ||
+        st === "stopped" ||
+        st === "connecting"
+      ) {
+        return Math.max(2_000, Math.min(base, 3_000));
+      }
+    } catch {
+      /* socket optional in pure unit tests */
+    }
+    return base;
   }
 }

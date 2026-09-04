@@ -150,14 +150,18 @@ class LiveBoot {
         const restored = await loadAcieStateFromDb(eng);
         logger.info(
           { component: "live-boot", restored },
-          restored ? "ACIE online state restored" : "ACIE starting fresh",
+          restored ? "ACIE online state restored" : "ACIE starting fresh (no prior snapshot)",
         );
-        // Keep a process-global for other consumers
         (globalThis as { __acieEngine__?: typeof eng }).__acieEngine__ = eng;
       } catch (e) {
+        // Log full error so operators can distinguish import vs DB vs schema issues
         logger.warn(
-          { component: "live-boot", error: String(e) },
-          "ACIE state restore skipped",
+          {
+            component: "live-boot",
+            error: String(e),
+            stack: e instanceof Error ? e.stack : undefined,
+          },
+          "ACIE state restore skipped — continuing without warm state",
         );
       }
     } catch (e) {

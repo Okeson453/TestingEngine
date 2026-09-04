@@ -21,7 +21,7 @@ const SOCKET_PATH = process.env.BCGAME_SOCKET_PATH ?? "/socket.io";
 const RECONNECT_DELAY_MS = 1_000;
 const RECONNECT_DELAY_MAX_MS = 30_000;
 const CONNECTION_TIMEOUT_MS = 20_000;
-const WAF_BACKOFF_MS = 5 * 60 * 1_000;
+const WAF_BACKOFF_MS = Number(process.env.BCGAME_SOCKET_WAF_BACKOFF_MS ?? 60_000) || 60_000;
 const DEGRADED_AFTER_MS = 45_000; // no ED/BG within this window → DEGRADED
 
 export type BcGameEvent = "bg" | "pg" | "ed" | string;
@@ -301,11 +301,29 @@ export class BcGameSocketClient {
 
   private handleConnectError(error: Error): void {
     this.handleError(error, "connect_error");
+    const msg = (error.message || String(error)).toLowerCase();
+    const desc = String((error as Error & { description?: unknown }).description ?? "").toLowerCase();
+    const combined = `${msg} ${desc}`;
+    // Cloudflare bot challenge on socketv4.bc.game — common from datacenter IPs.
     if (
-      error.message.includes("403") ||
-      error.message.includes("Forbidden") ||
-      error.message.toLowerCase().includes("waf")
+      combined.includes("403") ||
+      combined.includes("forbidden") ||
+      combined.includes("waf") ||
+      combined.includes("cloudflare") ||
+      combined.includes("cf-") ||
+      combined.includes("just a moment") ||
+      combined.includes("websocket error") ||
+      combined.includes("xhr poll error") ||
+      combined.includes("transport error")
     ) {
+      logger.warn(
+        {
+          component: "BcGameSocketClient",
+          error: error.message,
+          description: (error as Error & { description?: unknown }).description,
+        },
+        "Socket connect blocked (likely Cloudflare). Poll worker remains primary recovery path.",
+      );
       this.handleWafBlock();
     } else {
       this.updateState({
