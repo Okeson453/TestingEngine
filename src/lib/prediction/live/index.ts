@@ -5,10 +5,12 @@
  */
 export {
   onGameStart,
+  onGameEndPredict,
   SLA_LAG_MS,
   TEMPORAL_TOLERANCE_MS,
   type GameStartEvent,
   type OnGameStartResult,
+  type OnGameEndPredictResult,
 } from "./predictor";
 export { onGameEnd, type GameEndEvent, type OnGameEndResult } from "./validator";
 export { runColdStartSeeder, MIN_HISTORY, MAX_PAGES, SEED_TIMEOUT_MS } from "./cold-start-seeder";
