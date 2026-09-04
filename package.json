@@ -20,7 +20,7 @@
     "worker": "node --experimental-strip-types --import ./scripts/paths-loader.mjs scripts/worker.mjs",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --import ./scripts/paths-loader.mjs --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/notifications/telegram.test.ts src/lib/notifications/telegram.worker-integration.test.ts",
+    "test": "node --test 'scripts/**/*.test.mjs'; node --experimental-strip-types --import ./scripts/paths-loader.mjs --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/notifications/telegram.test.ts src/lib/notifications/telegram.worker-integration.test.ts; for t in src/lib/prediction/live/integration.test.ts src/lib/prediction/live/predictor.test.ts src/lib/prediction/live/validator.test.ts src/lib/prediction/live/cold-start-seeder.test.ts src/lib/prediction/live/notification-worker.test.ts src/lib/prediction/live/concurrency.test.ts src/lib/prediction/live/acceptance.test.ts; do node --experimental-strip-types --import ./scripts/paths-loader.mjs --test \"$t\" || echo \"LIVE TEST FAILURE: $t\"; done",
     "lint": "eslint .",
     "format": "prettier --write ."
   },
