@@ -13,6 +13,16 @@ ADD COLUMN IF NOT EXISTS target_game_id text;
 ALTER TABLE pending_predictions 
 ADD COLUMN IF NOT EXISTS target_round_started_at timestamptz;
 
+-- Source round anchor: the most recently settled round at the time of
+-- prediction. Used by the validator hot-path to skip already-validated
+-- rows on recovery re-passes.
+ALTER TABLE pending_predictions
+  ADD COLUMN IF NOT EXISTS source_round_id text;
+
+-- End-to-end correlation id (UUIDv4) for cross-table tracing.
+ALTER TABLE pending_predictions
+  ADD COLUMN IF NOT EXISTS correlation_id text;
+
 -- Add index for efficient lookup of predictions by target game
 CREATE INDEX IF NOT EXISTS pending_predictions_target_game_id_idx 
 ON pending_predictions (target_game_id) WHERE target_game_id IS NOT NULL;
@@ -25,7 +35,7 @@ WHERE target_game_id IS NOT NULL AND target_round_started_at IS NOT NULL;
 -- Add constraint to ensure target_game_id is set when target_round_started_at is set
 -- This enforces that predictions are always anchored to a real round
 ALTER TABLE pending_predictions 
-ADD CONSTRAINT IF NOT EXISTS pending_predictions_target_anchor_check 
+ADD CONSTRAINT pending_predictions_target_anchor_check 
 CHECK (
   target_game_id IS NULL AND target_round_started_at IS NULL 
   OR 
