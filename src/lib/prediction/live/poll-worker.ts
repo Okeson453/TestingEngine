@@ -35,6 +35,24 @@ const logger = getLogger("poll-worker");
 export const POLL_INTERVAL_MS = Number(
   process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 1_500,
 );
+/**
+ * Hard lower bound on the poll interval, in milliseconds.
+ *
+ * Architecture limits that prevent lowering this below 1000ms:
+ *   1. BC.Game REST history endpoint: 12s timeout per page × 2 pages (default)
+ *      per tick — a single tick can already exceed a sub-second interval.
+ *   2. DB pool is capped at PG_POOL_MAX=3 (scripts/worker.mjs); each tick
+ *      issues a fetch + sequential per-round live-state upserts + up to 4
+ *      parallel validations + stuck-recovery + maybePredictNewest queries.
+ *   3. Cloudflare WAF on bc.game actively rate-limits aggressive polling;
+ *      the adaptive logic already backs off when `waf_blocked` is observed.
+ *   4. Inter-round gaps on crash are typically 5–15s, so 1s is well below
+ *      the natural cadence and tightens to the floor only adaptively.
+ */
+export const MIN_POLL_INTERVAL_MS = 1_000;
+/** Hard upper bound on the adaptive poll interval (kept in sync with the
+ *  optimized target range). */
+export const MAX_POLL_INTERVAL_MS = 1_500;
 export const STALE_PREDICTED_MS = Number(process.env.STUCK_STALE_MS ?? 5 * 60 * 1_000);
 
 export interface PollTickResult {
@@ -431,14 +449,22 @@ export class PollWorker {
             ? 0.3
             : 0.5;
         const adaptive = Math.round(med * multiplier);
-        return Math.max(1_000, Math.min(1_500, adaptive));
+        return this.clampInterval(adaptive);
       }
       // No median available: use base, clamped to 1-1.5s
-      return Math.max(1_000, Math.min(1_500, base));
+      return this.clampInterval(base);
     } catch {
       /* socket optional in pure unit tests */
     }
     // Fallback: clamp base to 1-1.5s
-    return Math.max(1_000, Math.min(1_500, base));
+    return this.clampInterval(base);
+  }
+
+  /** Clamp any candidate interval to the safe [MIN, MAX] range. */
+  private clampInterval(candidate: number): number {
+    return Math.max(
+      MIN_POLL_INTERVAL_MS,
+      Math.min(MAX_POLL_INTERVAL_MS, candidate),
+    );
   }
 }
