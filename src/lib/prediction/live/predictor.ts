@@ -912,15 +912,10 @@ export async function onGameEndPredict(
 
     try {
       await runInTransaction(sql, async (tx) => {
-        // Anchor the target crash_rounds row for N+1 so consumers can find it
-        // even before prediction is committed. Uses UPSERT for idempotency.
-        await tx`
-          insert into crash_rounds (game_id, began_at)
-          values (${targetGameId}, null)
-          on conflict (game_id) do nothing
-        `;
-
+        // Do NOT pre-insert crash_rounds for N+1: multiplier + crashed_at are
+        // NOT NULL and only arrive on the later ed event (validator upserts).
         predictionGeneratedAt = generatedAt;
+        const generatedAtDate = new Date(generatedAt);
         const ins = await tx<{ prediction_id: string; requested_at: string }>`
           insert into pending_predictions (
             prediction_id, target_multiplier, probability, confidence,
@@ -933,7 +928,7 @@ export async function onGameEndPredict(
             ${signal.confidence}, ${signal.regimeId},
             ${signal.regimeId ? 0.5 : null},
             ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-            ${signal.modelVersion}, ${generatedAt},
+            ${signal.modelVersion}, ${generatedAtDate},
             ${targetGameId}, null, ${gameId},
             ${correlationId}
           )

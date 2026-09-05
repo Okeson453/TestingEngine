@@ -98,11 +98,13 @@ export async function markLiveRoundStarted(
   sql?: Sql,
 ): Promise<void> {
   const db = sql ?? (await getSql());
+  const began = new Date(beganAt);
+  const beganParam = Number.isNaN(began.getTime()) ? null : began;
   await db`
     INSERT INTO live_round_state (
       game_id, lifecycle, began_at, source, correlation_id, updated_at
     ) VALUES (
-      ${gameId}, 'STARTED', ${beganAt}::timestamptz, ${source},
+      ${gameId}, 'STARTED', ${beganParam}, ${source},
       ${correlationId ?? null}, now()
     )
     ON CONFLICT (game_id) DO UPDATE SET
@@ -130,11 +132,13 @@ export async function markLiveRoundEnded(
   source: LiveSource = "socket",
 ): Promise<void> {
   const db = sql ?? (await getSql());
+  const crashed = new Date(crashedAt);
+  const crashedParam = Number.isNaN(crashed.getTime()) ? null : crashed;
   await db`
     INSERT INTO live_round_state (
       game_id, lifecycle, crashed_at, multiplier, source, updated_at
     ) VALUES (
-      ${gameId}, 'ENDED', ${crashedAt}::timestamptz, ${multiplier}, ${source}, now()
+      ${gameId}, 'ENDED', ${crashedParam}, ${multiplier}, ${source}, now()
     )
     ON CONFLICT (game_id) DO UPDATE SET
       lifecycle = CASE
@@ -152,18 +156,24 @@ export async function upsertLiveRoundFromHistory(
   sql?: Sql,
 ): Promise<void> {
   const db = sql ?? (await getSql());
-  const began =
+  // Pass JS Date (or null) so node-pg binds timestamptz natively.
+  // Avoid `${isoString}::timestamptz` which can surface as text under some binders.
+  const beganAt: Date | null =
     round.beganAt instanceof Date
-      ? round.beganAt.toISOString()
+      ? round.beganAt
       : round.beganAt
-        ? String(round.beganAt)
+        ? new Date(round.beganAt)
         : null;
-  const crashed =
+  const crashedAt: Date | null =
     round.crashedAt instanceof Date
-      ? round.crashedAt.toISOString()
+      ? round.crashedAt
       : round.crashedAt
-        ? String(round.crashedAt)
+        ? new Date(round.crashedAt)
         : null;
+  const began =
+    beganAt && !Number.isNaN(beganAt.getTime()) ? beganAt : null;
+  const crashed =
+    crashedAt && !Number.isNaN(crashedAt.getTime()) ? crashedAt : null;
   const lifecycle: LiveLifecycle = crashed ? "ENDED" : began ? "STARTED" : "DISCOVERED";
   try {
     await db`
@@ -172,8 +182,8 @@ export async function upsertLiveRoundFromHistory(
       ) VALUES (
         ${round.gameId},
         ${lifecycle},
-        ${began}::timestamptz,
-        ${crashed}::timestamptz,
+        ${began},
+        ${crashed},
         ${Number(round.multiplier)},
         'history',
         now()

@@ -115,16 +115,23 @@ export async function onGameEnd(
       // yet (the predictor doesn't pre-insert crash_rounds because the
       // schema requires multiplier+crashed_at to be NOT NULL — both
       // arrive on this ed event). Use UPSERT for idempotency.
-      await tx`
-        insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
-        values (${evt.gameId}, ${evt.multiplier}, null, null,
-                coalesce(${evt.endTime}::timestamptz - interval '3 seconds', now() - interval '3 seconds'),
-                ${evt.endTime}::timestamptz)
-        on conflict (game_id) do update
-          set crashed_at = excluded.crashed_at,
-              multiplier = excluded.multiplier
-          where crash_rounds.crashed_at is null
-      `;
+      {
+        const endDate = new Date(evt.endTime);
+        const crashedParam = Number.isNaN(endDate.getTime()) ? new Date() : endDate;
+        const beganParam = new Date(crashedParam.getTime() - 3_000);
+        await tx`
+          insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
+          values (
+            ${evt.gameId}, ${evt.multiplier}, null, null,
+            ${beganParam},
+            ${crashedParam}
+          )
+          on conflict (game_id) do update
+            set crashed_at = excluded.crashed_at,
+                multiplier = excluded.multiplier
+            where crash_rounds.crashed_at is null
+        `;
+      }
       const fetched = await tx<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
         select began_at, crashed_at
         from crash_rounds
