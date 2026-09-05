@@ -8,7 +8,15 @@
  * - estimate() runs models once (estimateModels shares the same path)
  */
 
-import { ACIE_TARGET, PSIOutput, SequenceState, RegimeLabel, SOLRecord } from './types.ts';
+import {
+  ACIE_TARGET,
+} from './types.ts';
+import type {
+  PSIOutput,
+  SequenceState,
+  RegimeLabel,
+  SOLRecord,
+} from './types.ts';
 import { TemporalPatternLearner } from './tpl.ts';
 import { MODEL_NAMES } from './online-state.ts';
 

@@ -3,7 +3,11 @@
  * Calibration across all probability bins + Brier / log-loss vs baseline.
  */
 
-import { SOLRecord, CalibrationReport, CalibrationBin } from './types.ts';
+import type {
+  SOLRecord,
+  CalibrationReport,
+  CalibrationBin,
+} from './types.ts';
 
 
 export class SelfAdaptiveForecastingEngine {

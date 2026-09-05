@@ -5,6 +5,8 @@
 
 import {
   ACIE_TARGET,
+} from './types.ts';
+import type {
   SOLRecord,
   SequenceState,
   RegimeLabel,

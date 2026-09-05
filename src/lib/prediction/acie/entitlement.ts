@@ -3,7 +3,10 @@
  * Sits after Strategy; ACIE remains tier-agnostic.
  */
 
-import { EntitlementCheck, EntitlementResult } from './types.ts';
+import type {
+  EntitlementCheck,
+  EntitlementResult,
+} from './types.ts';
 
 export class EntitlementGate {
   check(ctx: EntitlementCheck): EntitlementResult {

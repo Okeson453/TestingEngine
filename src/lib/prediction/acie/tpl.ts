@@ -3,7 +3,14 @@
  * Learns conditional P(crash ≥ 1.30 | sequence state) vs baseline — empirical, not hard-coded rules.
  */
 
-import { ACIE_TARGET, SequenceState, SOLRecord, RegimeLabel } from './types.ts';
+import {
+  ACIE_TARGET,
+} from './types.ts';
+import type {
+  SequenceState,
+  SOLRecord,
+  RegimeLabel,
+} from './types.ts';
 
 function mean(xs: number[]): number {
   if (xs.length === 0) return 0;

@@ -20,10 +20,12 @@ import {
   createInitialOnlineState,
   onlineMeanCalibrationError,
   onlineCalibrationBins,
-  OnlineAdaptiveState,
 } from './online-state.ts';
+import type { OnlineAdaptiveState } from './online-state.ts';
 import {
   ACIE_TARGET,
+} from './types.ts';
+import type {
   ACIEEvaluationResult,
   ACIERoundInput,
   EntrySignal,

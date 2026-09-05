@@ -332,6 +332,14 @@ class LiveBoot {
           },
           "ACIE state restore threw — continuing cold",
         );
+        // Still register a cold engine so feedback/live path can observeRound
+        try {
+          const { ACIEEngine } = await import("@/lib/prediction/acie/engine");
+          const cold = new ACIEEngine();
+          (globalThis as { __acieEngine__?: typeof cold }).__acieEngine__ = cold;
+        } catch {
+          /* ACIE optional */
+        }
       }
     } catch (e) {
       logger.error(

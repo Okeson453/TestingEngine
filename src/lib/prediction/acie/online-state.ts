@@ -7,7 +7,13 @@
  *   Scheduled/async: full model refresh hooks (optional)
  */
 
-import { ACIE_TARGET, RegimeLabel, SequenceState } from './types.ts';
+import {
+  ACIE_TARGET,
+} from './types.ts';
+import type {
+  RegimeLabel,
+  SequenceState,
+} from './types.ts';
 
 export interface OnlineCalibrationBucket {
   sumPredicted: number;

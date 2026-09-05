@@ -6,7 +6,7 @@
  */
 
 import { fractionalKellyStake } from '../stake/kelly-sizer.ts';
-import {
+import type {
   StrategyDecision,
   StrategyDecisionContext,
   StrategyPolicy,

@@ -243,17 +243,26 @@ export async function processResolvedPredictionFeedback(
 
   // 5. ACIE observeRound (SOL/TPL/PSI/SAFE via engine)
   try {
-    const eng = (
-      globalThis as {
-        __acieEngine__?: {
-          observeRound: (r: {
-            roundId: string;
-            crashPoint: number;
-            timestamp?: string;
-          }) => unknown;
-        };
+    const g = globalThis as {
+      __acieEngine__?: {
+        observeRound: (r: {
+          roundId: string;
+          crashPoint: number;
+          timestamp?: string;
+        }) => unknown;
+      };
+    };
+    let eng = g.__acieEngine__;
+    // If boot restore failed or tests, lazily construct and cache engine
+    if (!eng || typeof eng.observeRound !== "function") {
+      try {
+        const { ACIEEngine } = await import("@/lib/prediction/acie/engine");
+        eng = new ACIEEngine();
+        g.__acieEngine__ = eng;
+      } catch {
+        eng = undefined;
       }
-    ).__acieEngine__;
+    }
     if (eng && typeof eng.observeRound === "function") {
       eng.observeRound({
         roundId: input.targetGameId,

@@ -3,7 +3,11 @@
  * Status: SUPPORTED | WEAK | INSUFFICIENT | DEGRADED (operational, not philosophical).
  */
 
-import { SOLRecord, EvidenceReport, EvidenceStatus } from './types.ts';
+import type {
+  SOLRecord,
+  EvidenceReport,
+  EvidenceStatus,
+} from './types.ts';
 import { SelfAdaptiveForecastingEngine } from './safe.ts';
 
 const MIN_SAMPLE = 500;
