@@ -33,6 +33,7 @@ const globalRef = globalThis as typeof globalThis & {
   __pgliteInstance__?: Promise<import("@electric-sql/pglite").PGlite>;
   __pgliteMigrateChain__?: Promise<void>;
   __pgPoolEnding__?: Promise<void>;
+  __poolExhaustionAlerted__?: boolean;
 };
 
 const OID_INT8 = 20;
@@ -106,6 +107,34 @@ function createNeonSql(): Promise<Sql> {
         "testingengine-worker",
     });
 
+    // P2.16: Add Pool Exhaustion Alert
+    // Track pool stats and alert when approaching exhaustion
+    const checkPoolExhaustion = (): void => {
+      const stats = getPoolStats();
+      if (!stats) return;
+      
+      const utilization = stats.totalCount / stats.max;
+      const waiting = stats.waitingCount;
+      
+      // Alert when pool is at 80% utilization or has waiting connections
+      if (utilization > 0.8 || waiting > 0) {
+        if (!globalRef.__poolExhaustionAlerted__) {
+          globalRef.__poolExhaustionAlerted__ = true;
+          console.error(
+            `[db] POOL EXHAUSTION ALERT: utilization=${utilization.toFixed(2)} ` +
+            `total=${stats.totalCount} idle=${stats.idleCount} waiting=${waiting} max=${stats.max}`,
+          );
+        }
+      } else {
+        // Reset alert flag when pool recovers
+        globalRef.__poolExhaustionAlerted__ = false;
+      }
+    };
+    
+    // Check every 5 seconds
+    const poolMonitorInterval = setInterval(checkPoolExhaustion, 5000);
+    poolMonitorInterval.unref?.();
+
     // eslint-disable-next-line no-console
     console.log(
       `[db] Pool configured max=${poolMax} min=${poolMin} idleMs=${idleTimeoutMillis} connTimeoutMs=${connectionTimeoutMillis}`,
@@ -114,6 +143,16 @@ function createNeonSql(): Promise<Sql> {
     pool.on("error", (err: Error) => {
       // eslint-disable-next-line no-console
       console.error("[db] Pool idle client error (non-fatal):", err.message);
+      // P2.16: Also check for connection errors that indicate exhaustion
+      if (
+        err.message.includes("max_client_conn") ||
+        err.message.includes("too many clients") ||
+        err.message.includes("remaining connection slots")
+      ) {
+        console.error(
+          `[db] POOL EXHAUSTION: ${err.message} | pool total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
+        );
+      }
     });
 
     globalRef.__pgPool__ = pool;
@@ -132,9 +171,9 @@ function createNeonSql(): Promise<Sql> {
           msg.includes("Connection terminated") ||
           msg.includes("timeout exceeded when trying to connect")
         ) {
-          // eslint-disable-next-line no-console
+          // P2.16: Enhanced pool exhaustion logging
           console.error(
-            `[db] connection pressure: ${msg} | pool total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
+            `[db] POOL EXHAUSTION: ${msg} | pool total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${poolMax}`,
           );
         }
         throw err;
