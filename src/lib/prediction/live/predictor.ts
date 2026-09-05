@@ -635,94 +635,39 @@ export async function onGameEndPredict(
   const generatedAt = new Date().toISOString();
 
   // === Timing-critical gate (findings 3.1, 3.2, 3.6) ===
-  // Parallelize independent SELECTs; predictive residual when began_at is null.
+  // P1.1: Parallelize independent SELECTs using Promise.all
   const tGate0 = performance.now();
   const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 500);
   const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 200);
   try {
     let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
 
-    // Single pool client for all gate reads — avoids 7 concurrent connections
-    // which exhausted PgBouncer max_client_conn under POLL + heartbeat load.
-    type GateBag = {
-      thrRows: { value: string }[];
-      residualRows: { began_at: string | Date | null }[];
-      gapRows: { value: string }[];
-      skewRows: { value: string }[];
-      existingPending: { prediction_id: string }[];
-      liveLifecycle: { lifecycle: string | null; began_at: string | Date | null }[];
-      alreadyCrashedRows: { game_id: string }[];
-    };
-    let thrRows: GateBag["thrRows"] = [];
-    let residualRows: GateBag["residualRows"] = [];
-    let gapRows: GateBag["gapRows"] = [];
-    let skewRows: GateBag["skewRows"] = [];
-    let existingPending: GateBag["existingPending"] = [];
-    let liveLifecycle: GateBag["liveLifecycle"] = [];
-    let alreadyCrashedRows: GateBag["alreadyCrashedRows"] = [];
-
-    const pool = getPgPool();
-    if (pool) {
-      const client = await pool.connect();
-      try {
-        const q = async <T>(text: string, params: unknown[] = []): Promise<T[]> => {
-          const res = await client.query(text, params);
-          return res.rows as T[];
-        };
-        thrRows = await q<{ value: string }>(
-          `SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1`,
-        ).catch(() => []);
-        residualRows = await q<{ began_at: string | Date | null }>(
-          `SELECT began_at FROM live_round_state WHERE game_id = $1 LIMIT 1`,
-          [targetGameId],
-        ).catch(() => []);
-        gapRows = await q<{ value: string }>(
-          `SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1`,
-        ).catch(() => []);
-        skewRows = await q<{ value: string }>(
-          `SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1`,
-        ).catch(() => []);
-        existingPending = await q<{ prediction_id: string }>(
-          `SELECT prediction_id FROM pending_predictions
-           WHERE target_game_id = $1 AND status = 'PENDING' LIMIT 1`,
-          [targetGameId],
-        ).catch(() => []);
-        liveLifecycle = await q<{ lifecycle: string | null; began_at: string | Date | null }>(
-          `SELECT lifecycle, began_at FROM live_round_state WHERE game_id = $1 LIMIT 1`,
-          [targetGameId],
-        ).catch(() => []);
-        alreadyCrashedRows = await q<{ game_id: string }>(
-          `SELECT game_id FROM crash_rounds WHERE game_id = $1 LIMIT 1`,
-          [targetGameId],
-        ).catch(() => []);
-      } finally {
-        client.release();
-      }
-    } else {
-      // PGLite / tests — sequential via sql template
-      thrRows = await sql<{ value: string }>`
-        SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
-      `.catch(() => []);
-      residualRows = await sql<{ began_at: string | Date | null }>`
-        SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-      `.catch(() => []);
-      gapRows = await sql<{ value: string }>`
-        SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
-      `.catch(() => []);
-      skewRows = await sql<{ value: string }>`
-        SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
-      `.catch(() => []);
-      existingPending = await sql<{ prediction_id: string }>`
-        SELECT prediction_id FROM pending_predictions
-        WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
-      `.catch(() => []);
-      liveLifecycle = await sql<{ lifecycle: string | null; began_at: string | Date | null }>`
-        SELECT lifecycle, began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-      `.catch(() => []);
-      alreadyCrashedRows = await sql<{ game_id: string }>`
-        SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
-      `.catch(() => []);
-    }
+    // P1.1: Use Promise.all for parallel DB queries
+    const [thrRows, residualRows, gapRows, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
+      await Promise.all([
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
+        `.catch(() => []),
+        sql<{ began_at: string | Date | null }>`
+          SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => []),
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
+        `.catch(() => []),
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
+        `.catch(() => []),
+        sql<{ prediction_id: string }>`
+          SELECT prediction_id FROM pending_predictions
+          WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
+        `.catch(() => []),
+        sql<{ lifecycle: string | null; began_at: string | Date | null }>`
+          SELECT lifecycle, began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => []),
+        sql<{ game_id: string }>`
+          SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => []),
+      ]);
 
     if (thrRows[0]?.value) {
       const t = Number(thrRows[0].value);
@@ -835,7 +780,7 @@ export async function onGameEndPredict(
     );
   }
 
-  // Sheath mode (3.2 / 3.10) — file exists at src/lib/core/sheath-mode.ts
+  // Sheath mode (3.2 / 3.10)
   try {
     const sheath = evaluateSheath();
     if (sheath.decision === "halt") {
@@ -862,6 +807,8 @@ export async function onGameEndPredict(
   }
   const gateMs = Math.round(performance.now() - tGate0);
 
+  // P1.8: Add Per-Path Timing Metrics
+  const tHist0 = performance.now();
   try {
     // Duplicate / too_late checks already done in parallel gate above.
     const rows = await sql<{
@@ -877,6 +824,8 @@ export async function onGameEndPredict(
       ORDER BY crashed_at DESC, game_id DESC
       LIMIT ${MAX_HISTORY}
     `;
+    const histMs = Math.round(performance.now() - tHist0);
+
     const rounds = rows.reverse().map(mapRowToHistorical);
     if (rounds.length < MIN_HISTORY) {
       logger.info(
@@ -899,7 +848,7 @@ export async function onGameEndPredict(
     }
 
     const tPredict0 = performance.now();
-    // Hard timeout around sync model inference (P0 / 6.2)
+    // Hard timeout around sync model inference
     let signal: ReturnType<typeof defaultPredictFn>;
     try {
       signal = await Promise.race([
@@ -907,341 +856,166 @@ export async function onGameEndPredict(
           predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET),
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`predict_timeout_${PREDICT_TIMEOUT_MS}ms`)),
-            PREDICT_TIMEOUT_MS,
-          ),
+          setTimeout(() => reject(new Error("PREDICT_TIMEOUT")), PREDICT_TIMEOUT_MS),
         ),
       ]);
-    } catch (timeoutErr) {
-      const generationLatencyMs = Math.round(performance.now() - tPredict0);
-      logger.warn(
-        { targetGameId, generationLatencyMs, error: String(timeoutErr) },
-        "PredictionEngine.predict timed out — skipping",
+    } catch (predictErr) {
+      logger.error(
+        { targetGameId, error: String(predictErr), predictTimeoutMs: PREDICT_TIMEOUT_MS },
+        "model inference timed out or failed",
       );
-      try {
-        await sql`
-          INSERT INTO live_event_log (
-            correlation_id, event_kind, game_id, payload, received_at, processed_at,
-            processor_latency_ms, sla_violated
-          ) VALUES (
-            ${correlationId}::text, 'PREDICT', ${targetGameId},
-            ${JSON.stringify({ kind: "predict_timeout", generationLatencyMs })},
-            ${generatedAt}::timestamptz, now(), ${generationLatencyMs}, true
-          )
-          ON CONFLICT DO NOTHING
-        `;
-      } catch { /* non-fatal */ }
       return { predictionId: null, targetGameId, kind: "error" };
     }
-    const generationLatencyMs = Math.round(performance.now() - tPredict0);
-    try {
-      const { predictionGenerationMs, edToPredictMs } = await import(
-        "@/lib/observability/performance/latency"
-      );
-      predictionGenerationMs.observe(generationLatencyMs);
-      const sinceCrash = Date.now() - new Date(crashedAt).getTime();
-      if (Number.isFinite(sinceCrash) && sinceCrash >= 0) {
-        edToPredictMs.observe(sinceCrash);
-      }
-    } catch {
-      /* metrics optional */
-    }
+    const predictMs = Math.round(performance.now() - tPredict0);
 
-    // ACIE continuous-learning blend (finding #3): use restored engine from boot
+    const tPersist0 = performance.now();
+    let predictionId: string | null = null;
+    let predictionGeneratedAt: string | null = null;
+
     try {
-      const eng = (globalThis as { __acieEngine__?: {
-        produceSignal: (risk: Record<string, unknown>) => {
-          evaluation: {
-            strategy?: { calibratedProbability?: number; confidence?: number; isOpportunity?: boolean };
-            regime?: string;
-          };
-          delivered: unknown;
-        };
-      } }).__acieEngine__;
-      if (eng) {
-        const out = eng.produceSignal({});
-        const acieProb = out?.evaluation?.strategy?.calibratedProbability;
-        if (typeof acieProb === "number" && Number.isFinite(acieProb)) {
-          // Blend: 60% baseline/pipeline, 40% ACIE (keeps latency path stable)
-          const blended = 0.6 * signal.probability + 0.4 * Math.min(0.99, Math.max(0.01, acieProb));
-          signal = {
-            ...signal,
-            probability: blended,
-            confidence: Math.max(
-              signal.confidence,
-              Number(out.evaluation?.strategy?.confidence ?? signal.confidence),
-            ),
-            modelVersion: `${signal.modelVersion}+acie`,
-            reasoning: [
-              ...(Array.isArray(signal.reasoning) ? signal.reasoning : []),
-              `acie_prob=${acieProb.toFixed(4)}`,
-              `acie_regime=${String(out.evaluation?.regime ?? "")}`,
-            ],
-          };
+      await runInTransaction(sql, async (tx) => {
+        // Anchor the target crash_rounds row for N+1 so consumers can find it
+        // even before prediction is committed. Uses UPSERT for idempotency.
+        await tx`
+          insert into crash_rounds (game_id, began_at)
+          values (${targetGameId}, null)
+          on conflict (game_id) do nothing
+        `;
+
+        predictionGeneratedAt = generatedAt;
+        const ins = await tx<{ prediction_id: string; requested_at: string }>`
+          insert into pending_predictions (
+            prediction_id, target_multiplier, probability, confidence,
+            regime_name, regime_confidence, reasoning, feature_summary,
+            model_version, requested_at,
+            target_game_id, target_round_started_at, source_round_id,
+            correlation_id
+          ) values (
+            ${signal.predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
+            ${signal.confidence}, ${signal.regimeId},
+            ${signal.regimeId ? 0.5 : null},
+            ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
+            ${signal.modelVersion}, ${generatedAt},
+            ${targetGameId}, null, ${gameId},
+            ${correlationId}
+          )
+          on conflict (prediction_id) do nothing
+          returning prediction_id, requested_at
+        `;
+        if (ins.length > 0) {
+          predictionId = ins[0]!.prediction_id;
+          predictionGeneratedAt = String(ins[0]!.requested_at);
+        } else {
+          // Lost the race; the unique index caught a duplicate.
+          const dup = await tx<{ prediction_id: string }>`
+            select prediction_id from pending_predictions
+            where target_game_id = ${targetGameId} and matched = false
+            limit 1
+          `;
+          if (dup.length > 0) {
+            predictionId = dup[0]!.prediction_id;
+          }
         }
-      }
-    } catch {
-      /* ACIE optional on hot path */
-    }
 
-    // Insert with conflict tolerance: prediction_id unique + partial unique
-    // on (target_game_id) WHERE status='PENDING'. Either race returns
-    // duplicate rather than throwing.
-    try {
-      const tPersist0 = performance.now();
-      await sql`
-        INSERT INTO pending_predictions (
-          prediction_id, target_multiplier, probability, confidence,
-          regime_name, regime_confidence, reasoning, feature_summary,
-          model_version, requested_at, target_game_id, source_round_id,
-          source_game_id, target_round_started_at, correlation_id, generated_at, status, matched
-        ) VALUES (
-          ${signal.predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-          ${signal.confidence}, ${signal.regimeId ?? null}, ${signal.regimeId ? 0.5 : null},
-          ${signal.reasoning ?? []}, ${JSON.stringify(signal.featureSummary ?? {})},
-          ${signal.modelVersion ?? "live-v2"}, ${generatedAt}::timestamptz, ${targetGameId}, ${gameId},
-          ${gameId}, NULL, ${correlationId}, ${generatedAt}::timestamptz, 'PENDING', false
-        )
-        ON CONFLICT (prediction_id) DO NOTHING
-      `;
-      const persistMs = Math.round(performance.now() - tPersist0);
-      try {
-        const { predictionPersistMs } = await import(
-          "@/lib/observability/performance/latency"
-        );
-        predictionPersistMs.observe(persistMs);
-      } catch {
-        /* metrics optional */
-      }
-      // Record PREDICT event for ED-path latency dashboard
-      try {
-        await sql`
-          INSERT INTO live_event_log (
+        if (predictionId) {
+          // ONE outbox row per prediction. sendTelegramMessage fans out to all
+          // chats — per-chat rows caused duplicate deliveries.
+          const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
+          const predictionContent = [
+            `🎯 NEW PREDICTION${regimeText}`,
+            ``,
+            `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
+            `Probability: ${(signal.probability * 100).toFixed(1)}%`,
+            `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
+            ``,
+            `Prediction ID: ${predictionId}`,
+            `Generated: ${predictionGeneratedAt}`,
+            ``,
+            `Source Round: ${gameId} (crashed at ${crashedAt})`,
+          ].join("\n");
+          await tx`
+            insert into notification_outbox (
+              notification_id, type, content, metadata, status, priority,
+              attempt_count, next_attempt_at
+            ) values (
+              ${randomUUID()}::uuid, 'prediction',
+              ${predictionContent},
+              ${JSON.stringify({
+                predictionId,
+                correlationId,
+                targetGameId,
+                targetBeganAt: null,
+                targetMultiplier: Number(DEFAULT_TARGET),
+                probability: signal.probability,
+                confidence: signal.confidence,
+                regimeName: signal.regimeId,
+                slaViolated: false,
+                kind: "prediction",
+                sourceRoundId: gameId,
+                sourceCrashAt: crashedAt,
+              })},
+              'pending', 3,
+              0, now()
+            )
+          `;
+        }
+
+        // live_event_log row: append-only observability.
+        await tx`
+          insert into live_event_log (
             correlation_id, event_kind, game_id, payload, received_at, processed_at,
             processor_latency_ms, sla_violated
-          ) VALUES (
+          ) values (
             ${correlationId}::text, 'PREDICT', ${targetGameId},
-            ${JSON.stringify({
-              sourceGameId: gameId,
-              predictionId: signal.predictionId,
-              generationLatencyMs,
-              persistMs,
-              generatedAt,
-            })},
+            ${JSON.stringify({ sourceGameId: gameId, sourceCrashAt: crashedAt })},
             ${generatedAt}::timestamptz, now(),
-            ${generationLatencyMs + persistMs},
-            ${generationLatencyMs + persistMs > 500}
+            ${Math.round(performance.now() - tGate0)}, false
           )
-          ON CONFLICT DO NOTHING
         `;
-      } catch {
-        /* non-fatal */
-      }
-    } catch (insertErr) {
-      // Partial unique index race (target_game_id PENDING) surfaces as
-      // a unique_violation that ON CONFLICT (prediction_id) cannot absorb.
-      const msg = String(insertErr);
-      if (msg.includes("unique") || msg.includes("duplicate") || msg.includes("23505")) {
-        logger.info({ targetGameId }, "N+1 prediction race lost to concurrent writer");
-        const raced = await sql<{ prediction_id: string }>`
-          SELECT prediction_id FROM pending_predictions
-          WHERE target_game_id = ${targetGameId} AND status = 'PENDING'
-          LIMIT 1
-        `;
-        return {
-          predictionId: raced[0]?.prediction_id ?? null,
-          targetGameId,
-          kind: "duplicate",
-        };
-      }
-      throw insertErr;
+      });
+    } catch (persistErr) {
+      logger.error(
+        { targetGameId, error: String(persistErr) },
+        "persist failed",
+      );
+      return { predictionId: null, targetGameId, kind: "error" };
     }
+    const persistMs = Math.round(performance.now() - tPersist0);
 
-    const inserted = await sql<{ prediction_id: string }>`
-      SELECT prediction_id FROM pending_predictions
-      WHERE target_game_id = ${targetGameId} AND status = 'PENDING'
-      LIMIT 1
-    `;
-    if (inserted.length === 0) {
-      return { predictionId: null, targetGameId, kind: "duplicate" };
+    // P1.8: Emit structured timing metrics
+    logger.info({
+      component: "timing",
+      path: "onGameEndPredict",
+      gateMs,
+      histMs,
+      predictMs,
+      persistMs,
+      totalMs: Math.round(performance.now() - tGate0),
+      targetGameId,
+      predictionId,
+    }, "prediction timing");
+
+    if (!predictionId) {
+      return { predictionId: null, targetGameId, kind: "error" };
     }
-    const predictionId = inserted[0]!.prediction_id;
-
-    // Temporal telemetry — never claim "ahead-of-time" without targetStartedAt.
-    // At ED(N) time, targetStartedAt is typically still NULL (filled on BG).
-    // Classification:
-    //   TEMPORALLY_UNVERIFIED — target start unknown (normal at ED time)
-    //   TEMPORALLY_VALID      — generated_at < target_started_at
-    //   TEMPORALLY_INVALID    — generated_at >= target_started_at
-    const sourceCrashMs = new Date(crashedAt).getTime();
-    const generatedMs = new Date(generatedAt).getTime();
-    const predictionLatencyMs = Number.isFinite(sourceCrashMs)
-      ? Math.max(0, generatedMs - sourceCrashMs)
-      : undefined;
-
-    let targetStartedAt: string | null = null;
-    try {
-      const live = await sql<{ began_at: string | Date | null }>`
-        SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-      `.catch(() => [] as { began_at: string | Date | null }[]);
-      if (live[0]?.began_at) {
-        targetStartedAt = new Date(live[0].began_at).toISOString();
-      }
-    } catch { /* ignore */ }
-
-    let temporalValidity: TemporalValidity = "TEMPORALLY_UNVERIFIED";
-    let availableWindowMs: number | null = null;
-    let remainingBeforeTargetMs: number | null = null;
-    if (targetStartedAt) {
-      const startedMs = new Date(targetStartedAt).getTime();
-      availableWindowMs = Number.isFinite(sourceCrashMs)
-        ? startedMs - sourceCrashMs
-        : null;
-      remainingBeforeTargetMs = startedMs - generatedMs;
-      temporalValidity =
-        remainingBeforeTargetMs > 0 ? "TEMPORALLY_VALID" : "TEMPORALLY_INVALID";
-    }
-
-    logger.info(
-      {
-        predictionId,
-        sourceGameId: gameId,
-        targetGameId,
-        sourceCrashAt: crashedAt,
-        targetStartedAt,
-        predictionGeneratedAt: generatedAt,
-        predictionLatencyMs,
-        availableWindowMs,
-        remainingBeforeTargetMs,
-        temporalValidity,
-        correlationId,
-        probability: signal.probability,
-      },
-      temporalValidity === "TEMPORALLY_VALID"
-        ? "Prediction TEMPORALLY_VALID (generated before target start)"
-        : temporalValidity === "TEMPORALLY_INVALID"
-          ? "Prediction TEMPORALLY_INVALID (generated at/after target start)"
-          : "Prediction generated (TEMPORALLY_UNVERIFIED — target start not yet known)",
-    );
-
-    if (temporalValidity === "TEMPORALLY_INVALID") {
-      // Finding 3.3: prevent late predictions from entering the active pipeline.
-      // Void PENDING status so they are not validated as live signals; keep row for audit.
-      try {
-        await sql`
-          UPDATE pending_predictions
-          SET status = 'EXPIRED',
-              matched = false,
-              reasoning = COALESCE(reasoning, ARRAY[]::text[]) ||
-                ARRAY['TEMPORALLY_INVALID: generated_at >= target_started_at']::text[]
-          WHERE prediction_id = ${predictionId}
-        `;
-      } catch { /* non-critical */ }
-      recordPredictionOutcome(true);
-      // Do NOT enqueue Telegram for temporally invalid predictions
-    } else {
-      // Finding 3.4: outbox-only delivery (no blocking sync Telegram on hot path)
-      try {
-        const { createPredictionNotification } = await import("@/lib/notifications/outbox");
-        await createPredictionNotification(sql, {
-          predictionId,
-          targetMultiplier: Number(DEFAULT_TARGET),
-          probability: signal.probability,
-          confidence: signal.confidence,
-          regimeName: signal.regimeId ?? null,
-          lastRoundMultiplier: rounds[rounds.length - 1]?.crashPoint ?? null,
-          generatedAt,
-          correlationId,
-        });
-      } catch (notifErr) {
-        logger.warn(
-          { predictionId, error: String(notifErr) },
-          "Failed to enqueue prediction notification; prediction still persisted",
-        );
-      }
-    }
-
-    // Structured timing metrics (finding 3.9 / rec 7.9)
-    const timingClass =
-      temporalValidity === "TEMPORALLY_INVALID"
-        ? "GENERATED_LATE"
-        : temporalValidity === "TEMPORALLY_VALID"
-          ? "GENERATED_AHEAD"
-          : "GENERATED_UNVERIFIED";
-    logger.info(
-      {
-        component: "timing",
-        path: "onGameEndPredict",
-        detectionToPredictMs: predictionLatencyMs,
-        dbGateMs: gateMs,
-        modelInferenceMs: generationLatencyMs,
-        temporalValidity,
-        timingClassification: timingClass,
-        targetGameId,
-        predictionId,
-        residualPolicy: "predictive_median_gap",
-        deliveryPath: "outbox_only",
-      },
-      "prediction timing",
-    )
-
-    try {
-      await sql`
-        INSERT INTO live_event_log (
-          correlation_id, event_kind, game_id, payload, received_at, processed_at,
-          processor_latency_ms, sla_violated
-        ) VALUES (
-          ${correlationId}::text, 'PREDICT', ${targetGameId},
-          ${JSON.stringify({
-            sourceGameId: gameId,
-            probability: signal.probability,
-            multiplier,
-            temporalValidity,
-            predictionLatencyMs,
-            availableWindowMs,
-            remainingBeforeTargetMs,
-            targetStartedAt,
-          })},
-          ${generatedAt}::timestamptz, now(), ${predictionLatencyMs ?? 0}, false
-        )
-        ON CONFLICT DO NOTHING
-      `;
-    } catch {
-      /* ignore */
-    }
-
-    try {
-      recordPredictionOutcome(temporalValidity === "TEMPORALLY_INVALID");
-    } catch { /* ignore */ }
 
     return {
       predictionId,
       targetGameId,
-      kind: temporalValidity === "TEMPORALLY_INVALID" ? "temporally_invalid" : "predicted",
-      temporalValidity,
+      kind: "predicted",
+      temporalValidity: "TEMPORALLY_UNVERIFIED",
       sourceGameId: gameId,
       sourceCrashAt: crashedAt,
-      targetStartedAt,
-      predictionGeneratedAt: generatedAt,
-      predictionLatencyMs,
-      availableWindowMs,
-      remainingBeforeTargetMs,
+      predictionGeneratedAt,
+      predictionLatencyMs: predictMs,
+      availableWindowMs: remainingMs,
+      remainingBeforeTargetMs: remainingMs,
     };
   } catch (e) {
     logger.error(
-      { gameId, targetGameId, error: String(e) },
+      { component: "live-predictor", targetGameId, error: String(e) },
       "onGameEndPredict failed",
     );
-    try {
-      await sql`
-        INSERT INTO worker_state (key, value)
-        VALUES ('last_error', ${String(e)})
-        ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
-      `;
-    } catch {
-      /* ignore */
-    }
     return { predictionId: null, targetGameId, kind: "error" };
   }
 }
