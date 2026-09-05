@@ -31,16 +31,21 @@ const logger = getLogger("live-predictor");
 /** Prediction-related constants. */
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
 const MIN_HISTORY = 20;
-const MAX_HISTORY = 100;
+/** Reduced 100→50: halves history query cost on the hot ED path while
+ *  remaining well above MIN_HISTORY for model stability. */
+const MAX_HISTORY = 50;
 /** SLA gate: if the bg payload's `beginTime` is older than this, the
  *  prediction is still persisted (correctness preserved) but the Telegram
  *  outbox writes are skipped to avoid the "predicts the past" operator
  *  symptom. */
 export const SLA_LAG_MS = Number(process.env.SLA_LAG_MS ?? 2_000);
-/** Residual window below which we skip prediction entirely (no row written). */
-export const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 800);
-/** Stronger short-circuit: if residual is below this, skip even earlier. */
-export const SKIP_BELOW_MS = Number(process.env.SKIP_BELOW_MS ?? 500);
+/** Residual window below which we skip prediction entirely (no row written).
+ *  Lowered 800→250: prior floor systematically skipped hot-ED predictions when
+ *  elapsedSinceEd + gate latency consumed a normal 3–5s inter-round gap,
+ *  forcing poll recovery 1–3 rounds later (the observed signal lag). */
+export const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 250);
+/** Stronger short-circuit: only abandon when the window is truly gone. */
+export const SKIP_BELOW_MS = Number(process.env.SKIP_BELOW_MS ?? 150);
 /** Hard timeout for PredictionEngine.predict (ms). */
 export const PREDICT_TIMEOUT_MS = Number(process.env.PREDICT_TIMEOUT_MS ?? 80);
 /** DB-level CHECK constraint cap: a bg payload whose `beginTime` is in the
@@ -646,8 +651,10 @@ export async function onGameEndPredict(
   // === Timing-critical gate (findings 3.1, 3.2, 3.6) ===
   // P1.1: Parallelize independent SELECTs using Promise.all
   const tGate0 = performance.now();
-  const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 500);
-  const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 200);
+  // Measured hot-path costs: predict ~20–80ms, persist ~30–80ms, outbox tick 50ms.
+  // Prior 500+200 budgets made effectiveFloor ≥700ms and caused mass skipped_late.
+  const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 150);
+  const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 100);
   try {
     let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
 
@@ -745,9 +752,16 @@ export async function onGameEndPredict(
       remainingMs = remainingMs - skew;
     }
 
-    // Predictive deadline: need generation + delivery budget inside residual
+    // Predictive deadline gate — only hard-skip when residual is gone or
+    // extremely tight. Prefer generating + letting outbox deadline expire
+    // a late signal over skipping generation (which forced multi-round lag
+    // via the poll recovery path).
     const deadlineBudget = GENERATION_BUDGET_MS + DELIVERY_BUDGET_MS;
-    const effectiveFloor = Math.max(skipThreshold, deadlineBudget);
+    // Hard floor is the tighter of SKIP_BELOW / MIN_REQUIRED only.
+    // deadlineBudget is advisory: log but still generate when residual is
+    // between skipThreshold and deadlineBudget so the signal can still land
+    // inside the betting window for many rounds.
+    const effectiveFloor = skipThreshold;
     if (remainingMs != null && Number.isFinite(remainingMs) && remainingMs < effectiveFloor) {
       logger.warn(
         {
@@ -759,7 +773,7 @@ export async function onGameEndPredict(
           elapsedSinceEd,
           recoveryMode,
         },
-        "Skipping prediction: predictive deadline gate",
+        "Skipping prediction: residual window exhausted",
       );
       try {
         await sql`
@@ -781,6 +795,21 @@ export async function onGameEndPredict(
         kind: "skipped_late",
         remainingBeforeTargetMs: remainingMs,
       };
+    }
+    if (
+      remainingMs != null &&
+      Number.isFinite(remainingMs) &&
+      remainingMs < deadlineBudget
+    ) {
+      logger.info(
+        {
+          targetGameId,
+          remainingMs,
+          deadlineBudget,
+          elapsedSinceEd,
+        },
+        "tight residual — generating anyway; outbox may expire if target starts first",
+      );
     }
   } catch (gateErr) {
     logger.warn(

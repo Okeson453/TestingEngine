@@ -30,10 +30,11 @@ import { bcGameSocket } from "@/lib/crash/socket-client";
 
 const logger = getLogger("poll-worker");
 
-/** Optimized polling interval. Canonical env: POLL_WORKER_MS (default 1500).
- *  README previously documented PREDICTION_POLL_MS — that name is unused. */
+/** Optimized polling interval. Canonical env: POLL_WORKER_MS (default 500).
+ *  Lowered 1500→500 so recovery can catch a missed ED within ~1 inter-round
+ *  gap. README previously documented PREDICTION_POLL_MS — that name is unused. */
 export const POLL_INTERVAL_MS = Number(
-  process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 1_500,
+  process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 500,
 );
 export const STALE_PREDICTED_MS = Number(process.env.STUCK_STALE_MS ?? 5 * 60 * 1_000);
 
@@ -324,7 +325,10 @@ export class PollWorker {
           : null) || st.lastEdAt;
       if (st.status === "connected" && lastCrashEd) {
         const lag = Date.now() - new Date(lastCrashEd).getTime();
-        if (lag < 30_000) {
+        // Was 30s — allowed 2–3 full rounds of missed ED predictions before
+        // recovery. 10s is enough to prefer socket while still recovering
+        // within ~1–2 inter-round gaps when residual skips occur.
+        if (lag < 10_000) {
           logger.debug(
             { component: "poll-worker", lagMs: lag },
             "socket healthy — defer prediction to ED path",
@@ -396,7 +400,7 @@ export class PollWorker {
   /**
    * Adaptive poll interval: when Socket.IO is blocked/degraded (Cloudflare),
    * poll more aggressively so N+1 predictions stay ahead of the round.
-   * Optimized target: 1-1.5s for all states, with adaptive fallback.
+   * Target band: 200–1000 ms (was 1–1.5 s).
    */
   private recentGapMs: number[] = [];
 
@@ -417,28 +421,27 @@ export class PollWorker {
     const base = POLL_INTERVAL_MS;
     try {
       const st = bcGameSocket.getState().status;
-      // Adaptive: use 30% of median inter-round gap for unhealthy states,
-      // clamped to 1-1.5s. For healthy states, use 50% of median gap,
-      // clamped to 1-1.5s to maintain responsiveness.
+      // Adaptive: 25% of median inter-round gap, clamped to 200–1000 ms.
+      // Unhealthy states use the same fraction so recovery stays aggressive.
       const med = this.medianGapMs();
       if (med != null) {
-        const multiplier = 
+        const multiplier =
           st === "waf_blocked" ||
           st === "degraded" ||
           st === "reconnecting" ||
           st === "stopped" ||
           st === "connecting"
-            ? 0.3
-            : 0.5;
+            ? 0.25
+            : 0.25;
         const adaptive = Math.round(med * multiplier);
-        return Math.max(1_000, Math.min(1_500, adaptive));
+        return Math.max(200, Math.min(1_000, adaptive));
       }
-      // No median available: use base, clamped to 1-1.5s
-      return Math.max(1_000, Math.min(1_500, base));
+      // No median available: use base, clamped to 200–1000 ms
+      return Math.max(200, Math.min(1_000, base));
     } catch {
       /* socket optional in pure unit tests */
     }
-    // Fallback: clamp base to 1-1.5s
-    return Math.max(1_000, Math.min(1_500, base));
+    // Fallback: clamp base to 200–1000 ms
+    return Math.max(200, Math.min(1_000, base));
   }
 }

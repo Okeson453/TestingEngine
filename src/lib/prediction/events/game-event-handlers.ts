@@ -125,7 +125,7 @@ async function onEdEvent(payload: unknown): Promise<void> {
   }
   const receivedAt = new Date().toISOString();
   try {
-    // Explicit live lifecycle end (Diagnosis §6)
+    // Explicit live lifecycle end (Diagnosis §6) — keep synchronous/fast
     try {
       const { markLiveRoundEnded } = await import(
         "@/lib/prediction/live/live-round-state"
@@ -144,16 +144,31 @@ async function onEdEvent(payload: unknown): Promise<void> {
       );
     }
 
-    const result = await onGameEnd({
-      gameId,
-      endTime: endTime ?? receivedAt,
-      multiplier,
-      receivedAt,
+    // Offload validate+predict to the next microtask so the Socket.IO
+    // event loop is not blocked by DB transactions / model inference.
+    // Errors are still captured; ordering vs subsequent events is preserved
+    // by the sequential nature of the Node event loop.
+    setImmediate(() => {
+      void (async () => {
+        try {
+          const result = await onGameEnd({
+            gameId,
+            endTime: endTime ?? receivedAt,
+            multiplier,
+            receivedAt,
+          });
+          logger.info(
+            { event: "ed", gameId, kind: result.kind },
+            `ed processed (${result.kind})`,
+          );
+        } catch (e) {
+          logger.error(
+            { event: "ed", gameId, error: String(e) },
+            "ed handler threw (async)",
+          );
+        }
+      })();
     });
-    logger.info(
-      { event: "ed", gameId, kind: result.kind },
-      `ed processed (${result.kind})`,
-    );
   } catch (e) {
     logger.error({ event: "ed", gameId, error: String(e) }, "ed handler threw");
   }
