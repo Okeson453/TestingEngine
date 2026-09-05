@@ -41,6 +41,10 @@ export function mapRow(row: RoundRow): CrashRound | null {
  * rounds is a complete no-op, so the worker may poll freely without risk of
  * duplicating data. Recomputes `crash_daily` aggregates for touched dates.
  * Returns only the rows that were genuinely new (the rest were deduped).
+ *
+ * Timestamps are cast to timestamptz explicitly — a prior unnest(…::text[])
+ * batch path produced: column "began_at" is of type timestamptz but
+ * expression is of type text (poll tick hard-fail).
  */
 export async function insertNewRounds(
   rounds: FetchedRound[],
@@ -50,37 +54,52 @@ export async function insertNewRounds(
   const affectedDates = new Set<string>();
   const insertedRounds: CrashRound[] = [];
 
-  // P2.5: Batch INSERT in insertNewRounds
-  // Use single transaction with multi-row INSERT for efficiency
-  if (rounds.length > 0) {
-    const result = await sql<{ game_id: string }>`
-      insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
-      select * from unnest(
-        ${rounds.map(r => `('${r.gameId}', ${r.multiplier}, ${r.hash}, ${r.salt}, ${r.beganAt ? `'${r.beganAt.toISOString()}'` : null}, '${r.crashedAt.toISOString()}')`)}::text[],
-        ${rounds.map(r => r.multiplier)}::numeric[],
-        ${rounds.map(r => r.hash)}::text[],
-        ${rounds.map(r => r.salt)}::text[],
-        ${rounds.map(r => r.beganAt ? `'${r.beganAt.toISOString()}'` : null)}::text[],
-        ${rounds.map(r => `'${r.crashedAt.toISOString()}'`)}::text[]
-      ) as t(game_id, multiplier, hash, salt, began_at, crashed_at)
-      on conflict (game_id) do nothing
-      returning game_id
-    `;
-    
-    const insertedIds = new Set(result.map(r => r.game_id));
-    
-    for (const round of rounds) {
-      if (insertedIds.has(round.gameId)) {
-        affectedDates.add(round.crashedAt.toISOString().slice(0, 10));
-        insertedRounds.push({
-          gameId: round.gameId,
-          multiplier: round.multiplier,
-          hash: round.hash,
-          salt: round.salt,
-          beganAt: round.beganAt ? round.beganAt.toISOString() : null,
-          crashedAt: round.crashedAt.toISOString(),
-        });
-      }
+  // Parallel unnest with proper types (timestamptz[], not text[]).
+  const gameIds = rounds.map((r) => r.gameId);
+  const multipliers = rounds.map((r) => r.multiplier);
+  const hashes = rounds.map((r) => r.hash);
+  const salts = rounds.map((r) => r.salt);
+  const beganAts = rounds.map((r) =>
+    r.beganAt instanceof Date ? r.beganAt.toISOString() : r.beganAt ? String(r.beganAt) : null,
+  );
+  const crashedAts = rounds.map((r) =>
+    r.crashedAt instanceof Date ? r.crashedAt.toISOString() : String(r.crashedAt),
+  );
+
+  const result = await sql<{ game_id: string }>`
+    insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
+    select
+      t.game_id,
+      t.multiplier,
+      t.hash,
+      t.salt,
+      t.began_at::timestamptz,
+      t.crashed_at::timestamptz
+    from unnest(
+      ${gameIds}::text[],
+      ${multipliers}::float8[],
+      ${hashes}::text[],
+      ${salts}::text[],
+      ${beganAts}::text[],
+      ${crashedAts}::text[]
+    ) as t(game_id, multiplier, hash, salt, began_at, crashed_at)
+    on conflict (game_id) do nothing
+    returning game_id
+  `;
+
+  const insertedIds = new Set(result.map((r) => r.game_id));
+
+  for (const round of rounds) {
+    if (insertedIds.has(round.gameId)) {
+      affectedDates.add(round.crashedAt.toISOString().slice(0, 10));
+      insertedRounds.push({
+        gameId: round.gameId,
+        multiplier: round.multiplier,
+        hash: round.hash,
+        salt: round.salt,
+        beganAt: round.beganAt ? round.beganAt.toISOString() : null,
+        crashedAt: round.crashedAt.toISOString(),
+      });
     }
   }
 
