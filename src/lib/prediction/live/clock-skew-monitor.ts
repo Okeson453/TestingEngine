@@ -134,6 +134,23 @@ export class ClockSkewMonitor {
           { component: "clock-skew-monitor", wallClockSkewMs, threshold: WALL_CLOCK_SKEW_WARN_MS },
           "Wall clock skew exceeds threshold — temporal invariant at risk",
         );
+        // Corrective action: raise residual skip threshold and surface operator flag
+        const adjusted = Math.min(
+          3_000,
+          Math.max(800, Math.abs(wallClockSkewMs) + 500),
+        );
+        await sql`
+          insert into worker_state (key, value) values
+            ('clock_skew_action', ${'raise_skip_threshold:' + String(adjusted)}),
+            ('effective_skip_below_ms', ${String(adjusted)})
+          on conflict (key) do update set value = excluded.value, updated_at = now()
+        `;
+        // Tighten sheath warn rate temporarily via env-like state
+        await sql`
+          insert into worker_state (key, value)
+          values ('sheath_force_warn', ${Math.abs(wallClockSkewMs) > 5_000 ? '1' : '0'})
+          on conflict (key) do update set value = excluded.value, updated_at = now()
+        `;
       }
     }
     logger.info(

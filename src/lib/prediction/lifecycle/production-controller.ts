@@ -31,10 +31,15 @@ export interface ProductionStatus {
 export class ProductionController {
   private rolloutShare: RolloutStep = 1.0;
 
+  private readonly lifecycle: ModelLifecycleManager;
+  private readonly divergence: LiveDivergenceMonitor;
   constructor(
-    private readonly lifecycle: ModelLifecycleManager = globalModelLifecycle,
-    private readonly divergence: LiveDivergenceMonitor = globalLiveDivergence
-  ) {}
+    lifecycle: ModelLifecycleManager = globalModelLifecycle,
+    divergence: LiveDivergenceMonitor = globalLiveDivergence,
+  ) {
+    this.lifecycle = lifecycle;
+    this.divergence = divergence;
+  }
 
   status(): ProductionStatus {
     const models = this.lifecycle.list();

@@ -130,6 +130,16 @@ export class PollWorker {
               interRoundGapMs.observe(gap);
             } catch { /* optional */ }
           }
+          const med = this.medianGapMs();
+          if (med != null) {
+            try {
+              await sql`
+                INSERT INTO worker_state (key, value)
+                VALUES ('median_inter_round_gap_ms', ${String(med)})
+                ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
+              `;
+            } catch { /* soft */ }
+          }
         } catch { /* ignore */ }
 
         // Update live-round lifecycle from history (does NOT start predictions)

@@ -6,7 +6,10 @@ import type { OpportunityRecord } from './opportunity-ranker.ts';
 
 export class OpportunityWindow {
   private readonly items: OpportunityRecord[] = [];
-  constructor(private readonly maxSize = 500) {}
+  private readonly maxSize: number;
+  constructor(maxSize = 500) {
+    this.maxSize = maxSize;
+  }
 
   push(rec: OpportunityRecord): void {
     this.items.push(rec);

@@ -26,7 +26,10 @@ export class WalkForwardValidator {
   private readonly validator = new StatisticalValidator();
   private readonly backtestEngine = new BacktestEngine();
 
-  constructor(private readonly modelFactory: () => PredictiveModel = () => new BaselineStatisticalModel()) {}
+  private readonly modelFactory: () => PredictiveModel;
+  constructor(modelFactory: () => PredictiveModel = () => new BaselineStatisticalModel()) {
+    this.modelFactory = modelFactory;
+  }
 
   run(rounds: HistoricalRound[], cfg: WalkForwardConfig): WalkForwardWindow[] {
     const windows: WalkForwardWindow[] = [];

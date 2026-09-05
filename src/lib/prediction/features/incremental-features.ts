@@ -15,7 +15,10 @@ import { featureLatencyMs } from '../../observability/performance/latency.ts';
 export type IncrementalState = IncrementalEngineSnapshot;
 
 export class IncrementalFeatureTracker {
-  constructor(private readonly engine: IncrementalStateEngine = globalIncrementalState) {}
+  private readonly engine: IncrementalStateEngine;
+  constructor(engine: IncrementalStateEngine = globalIncrementalState) {
+    this.engine = engine;
+  }
 
   seed(rounds: HistoricalRound[]): void {
     this.engine.seed(rounds.map((r) => r.crashPoint));

@@ -145,7 +145,7 @@ function getSharedPredictionEngine(): PredictionEngine {
 }
 
 const USE_ADVANCED_PIPELINE =
-  (process.env.USE_ADVANCED_PIPELINE ?? "0") !== "0";
+  (process.env.USE_ADVANCED_PIPELINE ?? "1") !== "0";
 
 type PipelineFn = (input: {
   baseProbability: number;
@@ -628,42 +628,84 @@ export async function onGameEndPredict(
   const targetGameId = (BigInt(gameId) + 1n).toString();
   const generatedAt = new Date().toISOString();
 
-  // P0 deadline-aware gate (before any expensive work / SELECTs beyond residual check)
+  // P0 deadline-aware gate — residual window for target N+1
+  // When BG(N+1) has not arrived, began_at is null; estimate residual from
+  // typical inter-round gap (worker_state / default 4s) so late cascade is caught.
   try {
+    let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
+    try {
+      const thr = await sql<{ value: string }>`
+        SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
+      `;
+      if (thr[0]?.value) {
+        const t = Number(thr[0].value);
+        if (Number.isFinite(t) && t >= 300 && t <= 5_000) {
+          skipThreshold = Math.max(skipThreshold, t);
+        }
+      }
+    } catch { /* optional */ }
+    let remainingMs: number | null = null;
+
     const residualRows = await sql<{ began_at: string | Date | null }>`
       SELECT began_at FROM live_round_state
       WHERE game_id = ${targetGameId}
       LIMIT 1
     `;
     if (residualRows.length > 0 && residualRows[0]!.began_at != null) {
-      const beganMs = new Date(residualRows[0]!.began_at).getTime();
-      const remainingMs = beganMs - Date.now();
-      const skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
-      if (Number.isFinite(remainingMs) && remainingMs < skipThreshold) {
-        logger.warn(
-          { targetGameId, remainingMs, threshold: skipThreshold },
-          "Skipping prediction: insufficient residual window",
-        );
-        try {
-          await sql`
-            INSERT INTO live_event_log (
-              correlation_id, event_kind, game_id, payload, received_at, processed_at,
-              processor_latency_ms, sla_violated
-            ) VALUES (
-              ${correlationId}::text, 'PREDICT', ${targetGameId},
-              ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: skipThreshold })},
-              ${generatedAt}::timestamptz, now(), 0, true
-            )
-            ON CONFLICT DO NOTHING
-          `;
-        } catch { /* non-fatal */ }
-        return {
-          predictionId: null,
-          targetGameId,
-          kind: "skipped_late",
-          remainingBeforeTargetMs: remainingMs,
-        };
+      remainingMs = new Date(residualRows[0]!.began_at).getTime() - Date.now();
+    } else {
+      // Fallback estimate: gap - elapsed since ED(N)
+      let medianGapMs = 4_000;
+      try {
+        const gapRow = await sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
+        `;
+        if (gapRow[0]?.value) {
+          const g = Number(gapRow[0].value);
+          if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;
+        }
+      } catch { /* optional */ }
+      const elapsedSinceEd = Date.now() - new Date(endTime).getTime();
+      remainingMs = medianGapMs - Math.max(0, elapsedSinceEd);
+    }
+
+    // Apply clock-skew correction: if worker clock is ahead of BC.Game, residual is overstated
+    try {
+      const skewRow = await sql<{ value: string }>`
+        SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
+      `;
+      const skew = skewRow[0]?.value != null ? Number(skewRow[0].value) : 0;
+      if (Number.isFinite(skew) && remainingMs != null) {
+        // worker ahead of server → subtract skew from remaining
+        remainingMs = remainingMs - skew;
       }
+    } catch { /* optional */ }
+
+    if (remainingMs != null && Number.isFinite(remainingMs) && remainingMs < skipThreshold) {
+      logger.warn(
+        { targetGameId, remainingMs, threshold: skipThreshold },
+        "Skipping prediction: insufficient residual window",
+      );
+      try {
+        await sql`
+          INSERT INTO live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) VALUES (
+            ${correlationId}::text, 'PREDICT', ${targetGameId},
+            ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: skipThreshold })},
+            ${generatedAt}::timestamptz, now(), 0, true
+          )
+          ON CONFLICT DO NOTHING
+        `;
+      } catch { /* non-fatal */ }
+      recordPredictionOutcome(true);
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "skipped_late",
+        remainingBeforeTargetMs: remainingMs,
+      };
     }
   } catch {
     /* live_round_state may be absent during migration window — proceed */
@@ -806,6 +848,43 @@ export async function onGameEndPredict(
       }
     } catch {
       /* metrics optional */
+    }
+
+    // ACIE continuous-learning blend (finding #3): use restored engine from boot
+    try {
+      const eng = (globalThis as { __acieEngine__?: {
+        produceSignal: (risk: Record<string, unknown>) => {
+          evaluation: {
+            strategy?: { calibratedProbability?: number; confidence?: number; isOpportunity?: boolean };
+            regime?: string;
+          };
+          delivered: unknown;
+        };
+      } }).__acieEngine__;
+      if (eng) {
+        const out = eng.produceSignal({});
+        const acieProb = out?.evaluation?.strategy?.calibratedProbability;
+        if (typeof acieProb === "number" && Number.isFinite(acieProb)) {
+          // Blend: 60% baseline/pipeline, 40% ACIE (keeps latency path stable)
+          const blended = 0.6 * signal.probability + 0.4 * Math.min(0.99, Math.max(0.01, acieProb));
+          signal = {
+            ...signal,
+            probability: blended,
+            confidence: Math.max(
+              signal.confidence,
+              Number(out.evaluation?.strategy?.confidence ?? signal.confidence),
+            ),
+            modelVersion: `${signal.modelVersion}+acie`,
+            reasoning: [
+              ...(Array.isArray(signal.reasoning) ? signal.reasoning : []),
+              `acie_prob=${acieProb.toFixed(4)}`,
+              `acie_regime=${String(out.evaluation?.regime ?? "")}`,
+            ],
+          };
+        }
+      }
+    } catch {
+      /* ACIE optional on hot path */
     }
 
     // Insert with conflict tolerance: prediction_id unique + partial unique

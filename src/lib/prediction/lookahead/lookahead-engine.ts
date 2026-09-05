@@ -26,7 +26,10 @@ export interface LookaheadResult {
 }
 
 export class LookaheadEngine {
-  constructor(private config: LookaheadConfig = { ...DEFAULT_LOOKAHEAD_CONFIG }) {}
+  private config: LookaheadConfig;
+  constructor(config: LookaheadConfig = { ...DEFAULT_LOOKAHEAD_CONFIG }) {
+    this.config = config;
+  }
 
   setEnabled(enabled: boolean): void {
     this.config.enabled = enabled;

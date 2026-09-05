@@ -60,9 +60,10 @@ export class EnsembleOrchestrator {
   private readonly logger = getLogger();
   private flags: EnsembleFlags = { ...DEFAULT_ENSEMBLE_FLAGS };
 
-  constructor(
-    private readonly performance: ModelPerformanceTracker = globalModelPerformance
-  ) {}
+  private readonly performance: ModelPerformanceTracker;
+  constructor(performance: ModelPerformanceTracker = globalModelPerformance) {
+    this.performance = performance;
+  }
 
   setFlags(flags: Partial<EnsembleFlags>): void {
     this.flags = { ...this.flags, ...flags };

@@ -322,15 +322,19 @@ export async function validateAgainstNewRounds(
       on conflict on constraint prediction_validations_prediction_id_key do nothing
     `;
 
-    // Online learning feedback (same path as live validator)
+    // Online learning feedback (aligned with live validator path)
     try {
+      const actual: 0 | 1 = result === "WIN" ? 1 : 0;
+      const predicted = Number(p.probability);
       const { feedbackPredictionPipeline } = await import(
         "@/lib/prediction/prediction-pipeline"
       );
-      feedbackPredictionPipeline(
-        Number(p.probability),
-        result === "WIN" ? 1 : 0,
+      feedbackPredictionPipeline(predicted, actual);
+      const { globalModelPerformance } = await import(
+        "@/lib/prediction/ensemble/model-performance"
       );
+      globalModelPerformance.observe(String(p.model_version ?? "baseline"), predicted, actual);
+      globalModelPerformance.observe("live", predicted, actual);
     } catch {
       /* soft */
     }

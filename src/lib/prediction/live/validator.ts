@@ -311,9 +311,7 @@ export async function onGameEnd(
     "round validated",
   );
 
-  // Learning feedback loop (soft): dynamic import so worker boot is not blocked
-  // by advanced pipeline modules that use TS parameter properties incompatible
-  // with node --experimental-strip-types.
+  // Learning feedback: pipeline + model performance tracker + ACIE observeRound
   try {
     const predicted = Number(state.pending.probability);
     const actual: 0 | 1 = result === "WIN" ? 1 : 0;
@@ -327,13 +325,42 @@ export async function onGameEnd(
           }
         })
         .catch(() => {
-          /* pipeline unavailable under strip-types — baseline still works */
+          /* pipeline soft */
         });
+
+      void import("@/lib/prediction/ensemble/model-performance")
+        .then((mod) => {
+          try {
+            const name = String(state.pending!.model_version ?? "baseline");
+            mod.globalModelPerformance.observe(name, predicted, actual);
+            mod.globalModelPerformance.observe("live", predicted, actual);
+          } catch {
+            /* soft */
+          }
+        })
+        .catch(() => {
+          /* soft */
+        });
+    }
+
+    // ACIE continuous learning on resolved crash
+    try {
+      const eng = (globalThis as { __acieEngine__?: {
+        observeRound: (r: { roundId: string; crashPoint: number }) => unknown;
+      } }).__acieEngine__;
+      if (eng) {
+        eng.observeRound({
+          roundId: evt.gameId,
+          crashPoint: evt.multiplier,
+        });
+      }
+    } catch {
+      /* soft */
     }
   } catch (fbErr) {
     logger.debug(
       { component: "live-validator", error: String(fbErr) },
-      "feedbackPredictionPipeline soft-failed",
+      "learning feedback soft-failed",
     );
   }
 

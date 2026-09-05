@@ -22,7 +22,10 @@ import { computeFeatures as computeLegacy } from './calculators.ts';
 export class FeatureEngineV2 {
   readonly featureVersion = FEATURE_VERSION_V2;
 
-  constructor(private readonly engine: IncrementalStateEngine = globalIncrementalState) {}
+  private readonly engine: IncrementalStateEngine;
+  constructor(engine: IncrementalStateEngine = globalIncrementalState) {
+    this.engine = engine;
+  }
 
   /** O(1) snapshot from incremental state (critical path). */
   snapshotFromState(

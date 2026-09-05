@@ -43,7 +43,10 @@ export const DEFAULT_MULTI_TARGET_POLICY: MultiTargetPolicy = {
 };
 
 export class MultiTargetEngine {
-  constructor(private readonly policy: MultiTargetPolicy = DEFAULT_MULTI_TARGET_POLICY) {}
+  private readonly policy: MultiTargetPolicy;
+  constructor(policy: MultiTargetPolicy = DEFAULT_MULTI_TARGET_POLICY) {
+    this.policy = policy;
+  }
 
   assess(params: {
     probabilities: Record<MultiTarget, number>;

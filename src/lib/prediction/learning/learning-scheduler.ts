@@ -12,10 +12,15 @@ export interface LearningSchedulerHooks {
 
 export class LearningScheduler {
   private rounds = 0;
+  private readonly hooks: LearningSchedulerHooks;
+  private readonly every: { calibration: number; featureImportance: number; walkForward: number; drift: number };
   constructor(
-    private readonly hooks: LearningSchedulerHooks = {},
-    private readonly every = { calibration: 100, featureImportance: 200, walkForward: 500, drift: 50 }
-  ) {}
+    hooks: LearningSchedulerHooks = {},
+    every = { calibration: 100, featureImportance: 200, walkForward: 500, drift: 50 },
+  ) {
+    this.hooks = hooks;
+    this.every = every;
+  }
 
   /** Call once per completed crash / observation */
   tick(): void {
