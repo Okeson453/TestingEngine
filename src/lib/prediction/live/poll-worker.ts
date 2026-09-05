@@ -143,53 +143,73 @@ export class PollWorker {
         } catch { /* ignore */ }
 
         // Update live-round lifecycle from history (does NOT start predictions)
-        for (const r of ins.rounds) {
-          try {
-            await upsertLiveRoundFromHistory(r, sql);
-            if (r.crashedAt) {
-              await markLiveRoundEnded(
-                r.gameId,
-                r.crashedAt instanceof Date
-                  ? r.crashedAt.toISOString()
-                  : String(r.crashedAt),
-                Number(r.multiplier),
-                sql,
+        // Parallelize upserts — independent per game_id.
+        await Promise.all(
+          ins.rounds.map(async (r) => {
+            try {
+              await upsertLiveRoundFromHistory(r, sql);
+              if (r.crashedAt) {
+                await markLiveRoundEnded(
+                  r.gameId,
+                  r.crashedAt instanceof Date
+                    ? r.crashedAt.toISOString()
+                    : String(r.crashedAt),
+                  Number(r.multiplier),
+                  sql,
+                );
+              }
+            } catch (le) {
+              logger.debug(
+                { component: "poll-worker", gameId: r.gameId, error: String(le) },
+                "live-round state update skipped",
               );
             }
-          } catch (le) {
-            logger.debug(
-              { component: "poll-worker", gameId: r.gameId, error: String(le) },
-              "live-round state update skipped",
-            );
-          }
-        }
+          }),
+        );
 
-        // Validation only for all newly inserted rounds (no N+1 cascade)
-        for (const r of ins.rounds) {
-          const rawCrash = r.crashedAt as Date | string | null | undefined;
-          const crashedAt =
-            rawCrash instanceof Date
-              ? rawCrash.toISOString()
-              : String(rawCrash ?? new Date().toISOString());
-          try {
-            const vr = await onGameEnd({
-              gameId: r.gameId,
-              endTime: crashedAt,
-              multiplier: Number(r.multiplier),
-              receivedAt: new Date().toISOString(),
-              // Poll path: suppress automatic N+1 from validator; we decide below
-              skipPredict: true,
-            });
-            if (vr.kind === "resolved") result.validated += 1;
-            if (vr.kind === "orphaned" || vr.kind === "bg_arrived_late") {
-              result.missedRounds += 1;
-            }
-          } catch (ve) {
-            logger.warn(
-              { component: "poll-worker", gameId: r.gameId, error: String(ve) },
-              "validation during poll failed",
-            );
-          }
+        // Validation for newly inserted rounds (timing 7.10):
+        // bounded parallelism instead of N sequential transactions.
+        // skipPredict=true — N+1 prediction only via maybePredictNewest below.
+        const VALIDATE_CONCURRENCY = Math.max(
+          1,
+          Math.min(8, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 4) || 4),
+        );
+        {
+          let cursor = 0;
+          const workers = Array.from(
+            { length: Math.min(VALIDATE_CONCURRENCY, ins.rounds.length) },
+            async () => {
+              while (cursor < ins.rounds.length) {
+                const idx = cursor;
+                cursor += 1;
+                const r = ins.rounds[idx]!;
+                const rawCrash = r.crashedAt as Date | string | null | undefined;
+                const crashedAt =
+                  rawCrash instanceof Date
+                    ? rawCrash.toISOString()
+                    : String(rawCrash ?? new Date().toISOString());
+                try {
+                  const vr = await onGameEnd({
+                    gameId: r.gameId,
+                    endTime: crashedAt,
+                    multiplier: Number(r.multiplier),
+                    receivedAt: new Date().toISOString(),
+                    skipPredict: true,
+                  });
+                  if (vr.kind === "resolved") result.validated += 1;
+                  if (vr.kind === "orphaned" || vr.kind === "bg_arrived_late") {
+                    result.missedRounds += 1;
+                  }
+                } catch (ve) {
+                  logger.warn(
+                    { component: "poll-worker", gameId: r.gameId, error: String(ve) },
+                    "validation during poll failed",
+                  );
+                }
+              }
+            },
+          );
+          await Promise.all(workers);
         }
 
         // At most one prediction attempt: newest round only, if still eligible

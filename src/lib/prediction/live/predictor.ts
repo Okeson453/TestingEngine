@@ -779,6 +779,7 @@ export async function onGameEndPredict(
   } catch (sheathErr) {
     logger.debug({ error: String(sheathErr) }, "sheath optional");
   }
+  const gateMs = Math.round(performance.now() - tGate0);
 
   try {
     // Duplicate / too_late checks already done in parallel gate above.
@@ -1074,10 +1075,13 @@ export async function onGameEndPredict(
         component: "timing",
         path: "onGameEndPredict",
         detectionToPredictMs: predictionLatencyMs,
+        dbGateMs: gateMs,
         modelInferenceMs: generationLatencyMs,
         temporalValidity,
         targetGameId,
         predictionId,
+        residualPolicy: "predictive_median_gap",
+        deliveryPath: "outbox_only",
       },
       "prediction timing",
     )
