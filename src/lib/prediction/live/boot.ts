@@ -321,14 +321,27 @@ class LiveBoot {
       throw e;
     }
 
-    // P0: distributed single-writer lock
-    const hasLock = await acquireWorkerLock(sql);
+    // P0: distributed single-writer lock — wait for expire/steal instead of
+    // crash-looping during rolling deploys (previous holder may still be draining).
+    let hasLock = await acquireWorkerLock(sql);
+    if (!hasLock) {
+      const waitMs = Number(process.env.WORKER_LOCK_WAIT_MS ?? 45_000);
+      const stepMs = 3_000;
+      const deadline = Date.now() + waitMs;
+      logger.warn(
+        { component: "live-boot", workerId: WORKER_ID, waitMs },
+        "Lock held by another worker — waiting for TTL/steal before aborting",
+      );
+      while (!hasLock && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, stepMs));
+        hasLock = await acquireWorkerLock(sql);
+      }
+    }
     if (!hasLock) {
       logger.error(
         { component: "live-boot", workerId: WORKER_ID },
         "Another worker holds the distributed lock. Refusing to start mutation roles.",
       );
-      // Still allow read-only / outbox recovery? Spec says shut down.
       throw new Error(
         `Worker lock not acquired (another instance holds '${LOCK_KEY}')`,
       );

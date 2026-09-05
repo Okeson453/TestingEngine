@@ -37,7 +37,7 @@ const db = await import("@/lib/db");
 
 let shuttingDown = false;
 
-async function bootWithRetry(maxAttempts = 5) {
+async function bootWithRetry(maxAttempts = 8) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -69,9 +69,14 @@ async function bootWithRetry(maxAttempts = 5) {
         await new Promise((r) => setTimeout(r, Math.min(5_000 * attempt, 20_000)));
         continue;
       }
-      // Lock held by another instance — exit so Railway does not thrash.
+      // Lock held — wait for previous instance TTL then retry (rolling deploy).
       if (msg.includes("Worker lock not acquired")) {
-        throw err;
+        const wait = Math.min(15_000 * attempt, 45_000);
+        console.error(
+          `[worker] lock held by another instance — waiting ${wait}ms before retry`,
+        );
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
       }
       await new Promise((r) => setTimeout(r, Math.min(2_000 * attempt, 10_000)));
     }

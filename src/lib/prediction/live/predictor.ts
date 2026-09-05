@@ -105,6 +105,12 @@ interface PredictorDeps {
   slaLagMs?: number;
   /** Injected for tests. */
   temporalToleranceMs?: number;
+  /**
+   * Poll/recovery path: newest crash may be seconds old. Do not apply the
+   * elapsed-since-ED residual estimate (it always looks "too late"). Hard
+   * checks (target started/crashed/duplicate) still apply.
+   */
+  recoveryMode?: boolean;
 }
 
 interface PriorRow {
@@ -694,16 +700,40 @@ export async function onGameEndPredict(
 
     // Predictive residual window
     let remainingMs: number | null = null;
+    let medianGapMs = 4_000;
+    if (gapRows[0]?.value) {
+      const g = Number(gapRows[0].value);
+      if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;
+    }
+    const elapsedSinceEd = Date.now() - new Date(crashedAt).getTime();
+    const recoveryMode = deps.recoveryMode === true;
+
     if (residualRows.length > 0 && residualRows[0]!.began_at != null) {
+      // Authoritative: target N+1 already has began_at
       remainingMs = new Date(residualRows[0]!.began_at).getTime() - Date.now();
+    } else if (recoveryMode) {
+      // Poll recovery: crashedAt may be many seconds old. Elapsed-based residual
+      // would always be negative and block all predictions while WAF is up.
+      // Hard checks above already rejected started/crashed targets — allow.
+      remainingMs = null;
+      logger.info(
+        {
+          targetGameId,
+          elapsedSinceEd,
+          medianGapMs,
+          recoveryMode: true,
+        },
+        "recoveryMode: residual estimate skipped; hard checks passed",
+      );
+    } else if (Number.isFinite(elapsedSinceEd) && elapsedSinceEd > medianGapMs * 1.5) {
+      // Stale ED path (delayed socket): same as recovery — rely on hard checks
+      remainingMs = null;
+      logger.info(
+        { targetGameId, elapsedSinceEd, medianGapMs },
+        "stale ED: residual estimate skipped; hard checks passed",
+      );
     } else {
-      let medianGapMs = 4_000;
-      if (gapRows[0]?.value) {
-        const g = Number(gapRows[0].value);
-        if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;
-      }
-      // CRITICAL: use crashedAt (param), not endTime (was undefined → gate bypassed)
-      const elapsedSinceEd = Date.now() - new Date(crashedAt).getTime();
+      // Hot ED path: estimate time left until typical N+1 start
       remainingMs = medianGapMs - Math.max(0, elapsedSinceEd);
     }
 
@@ -723,6 +753,8 @@ export async function onGameEndPredict(
           threshold: effectiveFloor,
           generationBudgetMs: GENERATION_BUDGET_MS,
           deliveryBudgetMs: DELIVERY_BUDGET_MS,
+          elapsedSinceEd,
+          recoveryMode,
         },
         "Skipping prediction: predictive deadline gate",
       );
@@ -733,7 +765,7 @@ export async function onGameEndPredict(
             processor_latency_ms, sla_violated
           ) VALUES (
             ${correlationId}::text, 'PREDICT', ${targetGameId},
-            ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: effectiveFloor })},
+            ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: effectiveFloor, recoveryMode })},
             ${generatedAt}::timestamptz, now(), ${Math.round(performance.now() - tGate0)}, true
           )
           ON CONFLICT DO NOTHING

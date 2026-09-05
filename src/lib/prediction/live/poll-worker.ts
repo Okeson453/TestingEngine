@@ -360,6 +360,7 @@ export class PollWorker {
         crashedAt,
         Number(newest.multiplier),
         randomUUID(),
+        { recoveryMode: true },
       );
       return true;
     } catch (e) {
