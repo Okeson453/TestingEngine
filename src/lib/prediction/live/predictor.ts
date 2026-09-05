@@ -36,7 +36,7 @@ const MAX_HISTORY = 100;
  *  prediction is still persisted (correctness preserved) but the Telegram
  *  outbox writes are skipped to avoid the "predicts the past" operator
  *  symptom. */
-export const SLA_LAG_MS = 2_000;
+export const SLA_LAG_MS = Number(process.env.SLA_LAG_MS ?? 2_000);
 /** Residual window below which we skip prediction entirely (no row written). */
 export const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 800);
 /** Stronger short-circuit: if residual is below this, skip even earlier. */
@@ -45,7 +45,8 @@ export const SKIP_BELOW_MS = Number(process.env.SKIP_BELOW_MS ?? 500);
 export const PREDICT_TIMEOUT_MS = Number(process.env.PREDICT_TIMEOUT_MS ?? 80);
 /** DB-level CHECK constraint cap: a bg payload whose `beginTime` is in the
  *  future of the prediction row's `prediction_generated_at` is rejected. */
-export const TEMPORAL_TOLERANCE_MS = 100;
+/** Default 500ms (was 100) — P1 recommendation. */
+export const TEMPORAL_TOLERANCE_MS = Number(process.env.TEMPORAL_TOLERANCE_MS ?? 500);
 
 export interface GameStartEvent {
   gameId: string;
@@ -136,27 +137,113 @@ function mapRowToHistorical(r: PriorRow): HistoricalRound {
   };
 }
 
+/** Singleton PredictionEngine — avoid re-allocating FeatureEngine/RegimeDetector/Registry per call (P1 #5). */
+let cachedEngine: PredictionEngine | null = null;
+function getSharedPredictionEngine(): PredictionEngine {
+  cachedEngine ??= new PredictionEngine();
+  return cachedEngine;
+}
+
+const USE_ADVANCED_PIPELINE =
+  (process.env.USE_ADVANCED_PIPELINE ?? "1") !== "0";
+
+type PipelineFn = (input: {
+  baseProbability: number;
+  regime: string;
+  regimeConfidence?: number;
+  predictionId?: string;
+  modelVersion?: string;
+  baseThreshold?: number;
+}) => {
+  calibratedProbability: number;
+  metaProbability: number;
+  action: string;
+  reason: string;
+  threshold: number;
+};
+
+let cachedPipelineFn: PipelineFn | null | undefined;
+function getPipelineFn(): PipelineFn | null {
+  if (cachedPipelineFn !== undefined) return cachedPipelineFn;
+  try {
+    // Dynamic path so a broken advanced-pipeline dependency cannot take down the live worker.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require("../../prediction/prediction-pipeline.ts") as {
+      runPredictionPipeline: PipelineFn;
+    };
+    cachedPipelineFn = mod.runPredictionPipeline;
+  } catch {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mod = require("@/lib/prediction/prediction-pipeline") as {
+        runPredictionPipeline: PipelineFn;
+      };
+      cachedPipelineFn = mod.runPredictionPipeline;
+    } catch {
+      cachedPipelineFn = null;
+    }
+  }
+  return cachedPipelineFn;
+}
+
 const defaultPredictFn = (
   priorRounds: HistoricalRound[],
   targetRoundId: string,
   timestamp: string,
   target: ThresholdTarget,
 ) => {
-  const engine = new PredictionEngine();
+  const engine = getSharedPredictionEngine();
   const signal = engine.predict({
     priorRounds,
     targetRoundId,
     timestamp,
     target,
   });
+
+  let probability = signal.probability;
+  let confidence = signal.confidence;
+  let modelVersion = signal.modelVersion ?? "live-v2";
+  let reasoning: string[] = Array.isArray(signal.reasoning)
+    ? [...signal.reasoning]
+    : signal.reasoning
+      ? [String(signal.reasoning)]
+      : [];
+
+  // Optional Phases 4–8 (was dead code). Soft-fail keeps baseline signal.
+  if (USE_ADVANCED_PIPELINE) {
+    try {
+      const runPipeline = getPipelineFn();
+      if (!runPipeline) throw new Error("pipeline_unavailable");
+      const pipe = runPipeline({
+        baseProbability: signal.probability,
+        regime: signal.regimeId ?? "unknown",
+        regimeConfidence: 0.6,
+        predictionId: signal.predictionId,
+        modelVersion: signal.modelVersion,
+        baseThreshold: Number(target),
+      });
+      probability =
+        pipe.calibratedProbability ?? pipe.metaProbability ?? probability;
+      confidence = Math.min(1, Math.max(confidence, probability));
+      modelVersion = `${modelVersion}+pipeline`;
+      reasoning.push(
+        `pipeline_action=${pipe.action}`,
+        `pipeline_reason=${pipe.reason}`,
+        `threshold=${pipe.threshold}`,
+      );
+    } catch {
+      /* keep baseline — pipeline may be unavailable in pure unit tests */
+    }
+  }
+
   return {
     predictionId: signal.predictionId,
-    probability: signal.probability,
-    confidence: signal.confidence,
+    probability,
+    confidence,
     regimeId: signal.regimeId,
-    reasoning: signal.reasoning,
+    reasoning,
     featureSummary: signal.featureSummary,
-    modelVersion: signal.modelVersion,
+    modelVersion,
   };
 };
 

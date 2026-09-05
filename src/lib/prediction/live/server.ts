@@ -277,6 +277,25 @@ export async function getLatencyDashboard() {
   `;
   const round = (v: number | null | undefined) =>
     v != null && Number.isFinite(Number(v)) ? Math.round(Number(v)) : null;
+  // Hot-path in-process recorders (P2 #11)
+  let hot: Record<string, number | null> = {};
+  try {
+    const lat = await import("@/lib/observability/performance/latency");
+    hot = {
+      edToPredictP50: lat.edToPredictMs.percentile(50),
+      edToPredictP95: lat.edToPredictMs.percentile(95),
+      predictionGenerationP50: lat.predictionGenerationMs.percentile(50),
+      predictionGenerationP95: lat.predictionGenerationMs.percentile(95),
+      predictionPersistP50: lat.predictionPersistMs.percentile(50),
+      outboxDeliveryP50: lat.outboxDeliveryMs.percentile(50),
+      outboxDeliveryP95: lat.outboxDeliveryMs.percentile(95),
+      interRoundGapP50: lat.interRoundGapMs.percentile(50),
+      poolWaitP95: lat.poolWaitMs.percentile(95),
+    };
+  } catch {
+    /* optional */
+  }
+
   return {
     budgetMs: {
       edIngest: 100,
@@ -303,6 +322,7 @@ export async function getLatencyDashboard() {
       sampleSize: windows[0]?.n ?? 0,
     },
     outbox: outbox[0] ?? { total: 0, delivered: 0, pending: 0, dead: 0 },
+    hotPath: hot,
   };
 }
 

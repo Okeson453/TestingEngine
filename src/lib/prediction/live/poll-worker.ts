@@ -115,6 +115,23 @@ export class PollWorker {
         const ins = await insertNewRounds(sorted);
         result.inserted = ins.inserted;
 
+        // Adaptive poll: observe inter-round gaps from history timestamps
+        try {
+          const withCrash = sorted.filter((r) => r.crashedAt);
+          for (let i = 1; i < withCrash.length; i += 1) {
+            const a = new Date(withCrash[i - 1]!.crashedAt as string | Date).getTime();
+            const b = new Date(withCrash[i]!.crashedAt as string | Date).getTime();
+            const gap = Math.abs(b - a);
+            this.recordInterRoundGap(gap);
+            try {
+              const { interRoundGapMs } = await import(
+                "@/lib/observability/performance/latency"
+              );
+              interRoundGapMs.observe(gap);
+            } catch { /* optional */ }
+          }
+        } catch { /* ignore */ }
+
         // Update live-round lifecycle from history (does NOT start predictions)
         for (const r of ins.rounds) {
           try {
@@ -351,12 +368,25 @@ export class PollWorker {
    * poll more aggressively so N+1 predictions stay ahead of the round.
    * Cap at 2s minimum to avoid hammering BC.Game REST.
    */
+  private recentGapMs: number[] = [];
+
+  /** Record an observed inter-round gap for adaptive polling (P3 #12). */
+  recordInterRoundGap(gapMs: number): void {
+    if (!Number.isFinite(gapMs) || gapMs <= 0 || gapMs > 120_000) return;
+    this.recentGapMs.push(gapMs);
+    if (this.recentGapMs.length > 30) this.recentGapMs.shift();
+  }
+
+  private medianGapMs(): number | null {
+    if (this.recentGapMs.length < 3) return null;
+    const sorted = [...this.recentGapMs].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)]!;
+  }
+
   private nextIntervalMs(): number {
     const base = POLL_INTERVAL_MS;
     try {
       const st = bcGameSocket.getState().status;
-      // When live socket is unavailable (Cloudflare WAF common on Railway),
-      // poll at 2–3s so N+1 predictions stay ahead of the inter-round gap.
       if (
         st === "waf_blocked" ||
         st === "degraded" ||
@@ -364,11 +394,21 @@ export class PollWorker {
         st === "stopped" ||
         st === "connecting"
       ) {
-        // P0: 1–1.5s when socket unhealthy (was 2–3s)
+        // Adaptive: ~30% of median inter-round gap, clamped 1–1.5s when unhealthy
+        const med = this.medianGapMs();
+        if (med != null) {
+          const adaptive = Math.round(med * 0.3);
+          return Math.max(1_000, Math.min(1_500, adaptive));
+        }
         return Math.max(1_000, Math.min(base, 1_500));
       }
     } catch {
       /* socket optional in pure unit tests */
+    }
+    // Healthy socket: still adapt slightly if we know the gap
+    const med = this.medianGapMs();
+    if (med != null) {
+      return Math.max(2_000, Math.min(base, Math.round(med * 0.5)));
     }
     return base;
   }

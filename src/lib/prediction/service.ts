@@ -228,83 +228,75 @@ export async function validateAgainstNewRounds(
   if (insertedRounds.length === 0) return outcome;
   const sql = await getSql();
 
-  // Newest first → sort so we can walk oldest-newest deterministically.
   const sortedNew = [...insertedRounds].sort((a, b) => {
     if (a.crashedAt === b.crashedAt) return a.gameId.localeCompare(b.gameId);
     return a.crashedAt < b.crashedAt ? -1 : 1;
   });
+  outcome.insertedRounds = sortedNew.length;
+  const gameIds = sortedNew.map((r) => r.gameId);
+
+  // Batch preload — eliminates N+1 (3 queries per round → 2 queries total).
+  const existingRows = await sql<{
+    game_id: string;
+    prediction_id: string;
+    result: string;
+    predicted_probability: string | number | null;
+    resolved_at: string | Date;
+  }>`
+    select game_id, prediction_id, result, predicted_probability, resolved_at
+    from prediction_validations
+    where game_id = any(${gameIds}::text[])
+  `;
+  const existingByGame = new Map(existingRows.map((r) => [r.game_id, r]));
+
+  const pendingRows = await sql<{
+    prediction_id: string;
+    target_game_id: string;
+    target_multiplier: number;
+    probability: number;
+    confidence: number;
+    regime_name: string | null;
+    regime_confidence: number | null;
+    reasoning: string[];
+    feature_summary: unknown;
+    model_version: string;
+    requested_at: string;
+  }>`
+    select prediction_id, target_game_id, target_multiplier, probability, confidence,
+           regime_name, regime_confidence, reasoning, feature_summary,
+           model_version, requested_at
+    from pending_predictions
+    where target_game_id = any(${gameIds}::text[])
+      and status = 'PENDING'
+  `;
+  const pendingByGame = new Map(pendingRows.map((r) => [r.target_game_id, r]));
 
   for (const targetRound of sortedNew) {
-    outcome.insertedRounds += 1;
-
-    // If this round was already validated (worker crash between validation
-    // insert and pending-row update), skip — the UNIQUE(game_id) on
-    // prediction_validations guarantees a duplicate insert would no-op.
-    const existing = await sql<{ prediction_id: string; result: string; target_multiplier: string | number | null; predicted_probability: string | number | null; resolved_at: string | Date }>`
-      select prediction_id, result, target_multiplier, predicted_probability, resolved_at
-      from prediction_validations
-      where game_id = ${targetRound.gameId}
-      limit 1
-    `;
-    if (existing.length > 0) {
+    const existing = existingByGame.get(targetRound.gameId);
+    if (existing) {
       outcome.resolved += 1;
-      // Recovery re-pass: target is unknown to the recovery branch, so signal
-      // the worker with targetMultiplier=0 to skip re-notification.
       outcome.pairs.push({
-        predictionId: existing[0]!.prediction_id,
+        predictionId: existing.prediction_id,
         gameId: targetRound.gameId,
-        result: existing[0]!.result as "WIN" | "LOSS",
+        result: existing.result as "WIN" | "LOSS",
         targetMultiplier: 0,
         actualMultiplier: targetRound.multiplier,
-        probability: Number(existing[0]!.predicted_probability ?? 0),
+        probability: Number(existing.predicted_probability ?? 0),
         resolvedAt:
-          existing[0]!.resolved_at instanceof Date
-            ? existing[0]!.resolved_at.toISOString()
-            : String(existing[0]!.resolved_at),
+          existing.resolved_at instanceof Date
+            ? existing.resolved_at.toISOString()
+            : String(existing.resolved_at),
       });
       continue;
     }
 
-    // Look up the prediction explicitly by target_game_id. This is the
-    // deterministic, exact match (vs. the old FIFO fallback which could
-    // pair a prediction with the wrong round when rounds were skipped or
-    // reordered by the upstream REST history).
-    const pending = await sql<{
-      prediction_id: string;
-      target_multiplier: number;
-      probability: number;
-      confidence: number;
-      regime_name: string | null;
-      regime_confidence: number | null;
-      reasoning: string[];
-      feature_summary: unknown;
-      model_version: string;
-      requested_at: string;
-    }>`
-      select prediction_id, target_multiplier, probability, confidence,
-             regime_name, regime_confidence, reasoning, feature_summary,
-             model_version, requested_at
-      from pending_predictions
-      where target_game_id = ${targetRound.gameId}
-        and status = 'PENDING'
-      limit 1
-    `;
-    if (pending.length === 0) {
-      // No prediction was generated for this round (likely because the
-      // worker was offline when the round began). Mark the round as
-      // EXPIRED so the next cycle can re-anchor a prediction for the
-      // round AFTER it.
-      continue;
-    }
-    const p = pending[0]!;
+    const p = pendingByGame.get(targetRound.gameId);
+    if (!p) continue;
 
     const actualMultiplier = targetRound.multiplier;
     const result = actualMultiplier >= p.target_multiplier ? "WIN" : "LOSS";
     const now = new Date().toISOString();
 
-    // Stamp the pending row matched=true AND status='MATCHED' in one
-    // UPDATE; the partial UNIQUE index on (target_game_id) WHERE
-    // status='PENDING' makes this row invisible to future generators.
     await sql`
       update pending_predictions
          set status = 'MATCHED', matched = true,
@@ -329,6 +321,19 @@ export async function validateAgainstNewRounds(
       )
       on conflict on constraint prediction_validations_prediction_id_key do nothing
     `;
+
+    // Online learning feedback (same path as live validator)
+    try {
+      const { feedbackPredictionPipeline } = await import(
+        "@/lib/prediction/prediction-pipeline"
+      );
+      feedbackPredictionPipeline(
+        Number(p.probability),
+        result === "WIN" ? 1 : 0,
+      );
+    } catch {
+      /* soft */
+    }
 
     outcome.resolved += 1;
     outcome.pairs.push({

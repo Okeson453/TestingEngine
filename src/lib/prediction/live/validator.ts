@@ -21,6 +21,7 @@ import { runInTransaction } from "@/lib/prediction/live/tx";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEndPredict } from "@/lib/prediction/live/predictor";
+import { feedbackPredictionPipeline } from "@/lib/prediction/prediction-pipeline";
 
 const logger = getLogger("live-validator");
 
@@ -310,6 +311,22 @@ export async function onGameEnd(
     },
     "round validated",
   );
+
+  // Learning feedback loop (was dead code §10.2): update calibration, meta-model,
+  // concept drift, production controller from resolved WIN/LOSS.
+  try {
+    const predicted = Number(state.pending.probability);
+    const actual: 0 | 1 = result === "WIN" ? 1 : 0;
+    if (Number.isFinite(predicted)) {
+      feedbackPredictionPipeline(predicted, actual);
+    }
+  } catch (fbErr) {
+    logger.debug(
+      { component: "live-validator", error: String(fbErr) },
+      "feedbackPredictionPipeline soft-failed",
+    );
+  }
+
   // Spec §2/§3.2: trigger N+1 prediction after Round N is processed.
   // Poll recovery path sets skipPredict to prevent historical cascade.
   if (!evt.skipPredict) {
