@@ -55,10 +55,17 @@ export class PollWorker {
   private running = false;
   private getSqlFn: () => Promise<Sql> = getSql;
   private fetchImpl: (pages: number) => Promise<FetchedRound[]> = fetchCrashHistory;
-  private pages = 2;
+  /** Default 1 page (50 rounds) — enough for newest-round recovery; was 2. */
+  private pages = Math.max(
+    1,
+    Math.min(5, Number(process.env.PREDICTION_FETCH_PAGES ?? 1) || 1),
+  );
   /** When true, poll may call onGameEnd for the single newest eligible round. */
   private allowNewestPredict = true;
   private tickCount = 0;
+  /** Consecutive failed ticks — drives exponential backoff to avoid pool thrash. */
+  private consecutiveFailures = 0;
+  private lastError: string | null = null;
 
   constructor(opts?: {
     getSqlFn?: () => Promise<Sql>;
@@ -252,10 +259,22 @@ export class PollWorker {
       }
     } catch (e) {
       result.error = String(e);
+      this.consecutiveFailures += 1;
+      this.lastError = String(e);
+      // Put error in the message so Railway/structured sinks that drop fields still show it.
       logger.error(
-        { component: "poll-worker", error: String(e) },
-        "poll tick failed",
+        {
+          component: "poll-worker",
+          error: String(e),
+          consecutiveFailures: this.consecutiveFailures,
+          pages: this.pages,
+        },
+        `poll tick failed: ${String(e)} (failures=${this.consecutiveFailures})`,
       );
+    }
+    if (result.error == null) {
+      this.consecutiveFailures = 0;
+      this.lastError = null;
     }
     return result;
   }
@@ -419,29 +438,41 @@ export class PollWorker {
 
   private nextIntervalMs(): number {
     const base = POLL_INTERVAL_MS;
+    // Exponential backoff on consecutive fetch/DB failures so we do not
+    // thrash the 3-client pool or hammer a WAF-blocked BC.Game API.
+    // Caps at 30s. Success path resets consecutiveFailures to 0.
+    if (this.consecutiveFailures > 0) {
+      const backoff = Math.min(
+        30_000,
+        Math.round(base * Math.pow(2, Math.min(this.consecutiveFailures, 6))),
+      );
+      logger.warn(
+        {
+          component: "poll-worker",
+          consecutiveFailures: this.consecutiveFailures,
+          backoffMs: backoff,
+          lastError: this.lastError,
+        },
+        `poll backoff ${backoff}ms after ${this.consecutiveFailures} failures`,
+      );
+      return backoff;
+    }
     try {
       const st = bcGameSocket.getState().status;
       // Adaptive: 25% of median inter-round gap, clamped to 200–1000 ms.
-      // Unhealthy states use the same fraction so recovery stays aggressive.
       const med = this.medianGapMs();
       if (med != null) {
-        const multiplier =
-          st === "waf_blocked" ||
-          st === "degraded" ||
-          st === "reconnecting" ||
-          st === "stopped" ||
-          st === "connecting"
-            ? 0.25
-            : 0.25;
-        const adaptive = Math.round(med * multiplier);
-        return Math.max(200, Math.min(1_000, adaptive));
+        const adaptive = Math.round(med * 0.25);
+        // When socket is WAF-blocked, poll is the only path — stay in the
+        // fast band but never below 400ms to leave headroom for the pool.
+        const minMs =
+          st === "waf_blocked" || st === "degraded" ? 400 : 200;
+        return Math.max(minMs, Math.min(1_000, adaptive));
       }
-      // No median available: use base, clamped to 200–1000 ms
       return Math.max(200, Math.min(1_000, base));
     } catch {
       /* socket optional in pure unit tests */
     }
-    // Fallback: clamp base to 200–1000 ms
     return Math.max(200, Math.min(1_000, base));
   }
 }

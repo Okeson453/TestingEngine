@@ -109,8 +109,13 @@ async function postJson<T>(url: string, body: unknown, timeoutMs: number): Promi
  * Fetch crash history from BC.Game.
  * Fetches up to `maxPages` (default 20 = 1,000 rounds) to catch recent rounds.
  * Use `fetchCrashHistoryDeep` for full backfill.
+ * @param maxPages pages to fetch (50 rounds each)
+ * @param timeoutMs per-page HTTP timeout (default 5s for poll path; cold-start can pass higher)
  */
-export async function fetchCrashHistory(maxPages = 20): Promise<FetchedRound[]> {
+export async function fetchCrashHistory(
+  maxPages = 20,
+  timeoutMs = Number(process.env.BCGAME_HISTORY_TIMEOUT_MS ?? 5_000) || 5_000,
+): Promise<FetchedRound[]> {
   const rounds: FetchedRound[] = [];
   const seen = new Set<string>();
 
@@ -118,7 +123,7 @@ export async function fetchCrashHistory(maxPages = 20): Promise<FetchedRound[]> 
     const payload = await postJson<HistoryResponse>(
       HISTORY_URL,
       { gameUrl: "crash", page, pageSize: 50 },
-      12_000,
+      timeoutMs,
     );
     if (payload.code !== 0) {
       if (page === 1) {
