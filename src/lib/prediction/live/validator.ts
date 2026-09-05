@@ -291,6 +291,17 @@ export async function onGameEnd(
     return { kind: "bg_arrived_late", targetGameId: evt.gameId };
   }
 
+  // P0.1: Connect Incremental State to Live Data
+  // Update incremental state for EVERY crash, not just when pending==null
+  if (state.pending != null) {
+    try {
+      const { globalIncrementalState } = await import(
+        "@/lib/prediction/state/incremental-state-engine"
+      );
+      globalIncrementalState.update(evt.multiplier);
+    } catch { /* soft */ }
+  }
+
   if (state.pending == null) {
     // Even without a pending prediction for N, generate N+1 so cold-start
     // and missed-bg recovery still produce the next prediction — unless
