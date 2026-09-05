@@ -144,11 +144,14 @@ const grokUserInfoUrl = `${issuerBase}/api/auth/oauth2/userinfo`;
 const database = databaseUrl
   ? new Pool({
       connectionString: databaseUrl,
-      max: 3,
-      min: 1,
-      idleTimeoutMillis: 10000,
-      connectionTimeoutMillis: 5000,
+      // Keep auth pool tiny. Worker does not load this module; dashboard
+      // serverless instances must not open large pools against PgBouncer.
+      max: Number(process.env.AUTH_PG_POOL_MAX ?? 1) || 1,
+      min: 0,
+      idleTimeoutMillis: 5_000,
+      connectionTimeoutMillis: 5_000,
       allowExitOnIdle: true,
+      application_name: "testingengine-auth",
     })
   : { dialect: pgliteDialect(() => getPglite()), type: "postgres" as const };
 

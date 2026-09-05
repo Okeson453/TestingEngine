@@ -32,6 +32,7 @@ const globalRef = globalThis as typeof globalThis & {
   __pgPool__?: import("pg").Pool;
   __pgliteInstance__?: Promise<import("@electric-sql/pglite").PGlite>;
   __pgliteMigrateChain__?: Promise<void>;
+  __pgPoolEnding__?: Promise<void>;
 };
 
 const OID_INT8 = 20;
@@ -55,50 +56,97 @@ function toSql(run: Run): Sql {
   return sql;
 }
 
+/**
+ * Neon / PgBouncer friendly defaults.
+ * max_client_conn errors are almost always from:
+ *   - default max too high (was 8) across worker + serverless instances
+ *   - abandoned pools after failed init (no pool.end())
+ *   - a second Pool in auth/server.ts
+ * Keep the worker pool small; prefer queueing over opening new clients.
+ */
+function readPoolMax(): number {
+  const raw = Number(process.env.PG_POOL_MAX ?? 3);
+  return Math.max(1, Math.min(Number.isFinite(raw) ? raw : 3, 10));
+}
+
 function createNeonSql(): Promise<Sql> {
   globalRef.__pgSqlPromise__ ??= (async () => {
+    // If a previous pool is mid-shutdown, wait so we never open a second one.
+    if (globalRef.__pgPoolEnding__) {
+      await globalRef.__pgPoolEnding__.catch(() => undefined);
+    }
     const { Pool, types } = await import("pg");
     types.setTypeParser(OID_INT8, Number);
     types.setTypeParser(OID_DATE, identity);
     types.setTypeParser(OID_INTERVAL, identity);
-    // Pool size is env-configurable. Default 8 for production headroom;
-    // set PG_POOL_MAX=3 on tight poolers (e.g. small pgBouncer / Layerbase).
-    const poolMax = Math.max(1, Number(process.env.PG_POOL_MAX ?? 8) || 8);
-    const poolMin = Math.max(0, Number(process.env.PG_POOL_MIN ?? 1) || 1);
-    const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 10000) || 10000;
-    // Neon / managed Postgres often needs >5s on cold start from Railway.
+
+    const poolMax = readPoolMax();
+    const poolMin = Math.min(
+      poolMax,
+      Math.max(0, Number(process.env.PG_POOL_MIN ?? 0) || 0),
+    );
+    const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 5_000) || 5_000;
+    // Fail fast on exhaustion instead of hanging the worker loop for 30s.
     const connectionTimeoutMillis =
-      Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 30_000) || 30_000;
+      Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 8_000) || 8_000;
+
     const pool = new Pool({
       connectionString: databaseUrl,
       max: poolMax,
-      min: Math.min(poolMin, poolMax),
+      min: poolMin,
       idleTimeoutMillis,
       connectionTimeoutMillis,
       allowExitOnIdle: true,
       keepAlive: true,
       keepAliveInitialDelayMillis: 10_000,
+      application_name:
+        process.env.PG_APP_NAME ||
+        process.env.RAILWAY_SERVICE_NAME ||
+        "testingengine-worker",
     });
+
     // eslint-disable-next-line no-console
-    console.log(`[db] Pool configured max=${poolMax} min=${Math.min(poolMin, poolMax)} idleMs=${idleTimeoutMillis}`);
+    console.log(
+      `[db] Pool configured max=${poolMax} min=${poolMin} idleMs=${idleTimeoutMillis} connTimeoutMs=${connectionTimeoutMillis}`,
+    );
 
     pool.on("error", (err: Error) => {
       // eslint-disable-next-line no-console
-      console.error("[db] Pool connection error (non-fatal):", err.message);
+      console.error("[db] Pool idle client error (non-fatal):", err.message);
     });
 
-    // Expose the pool so runInTransaction can pin a single client for
-    // true atomic multi-statement transactions on Neon (pool.query alone
-    // does not guarantee connection affinity across BEGIN/COMMIT).
     globalRef.__pgPool__ = pool;
 
     return toSql(async <T>(text: string, params: unknown[]) => {
-      const res = await pool.query(text, params);
-      return res.rows as T[];
+      try {
+        const res = await pool.query(text, params);
+        return res.rows as T[];
+      } catch (err) {
+        const msg = String((err as Error)?.message ?? err);
+        // Surface pooler saturation clearly for operators / Railway logs.
+        if (
+          msg.includes("max_client_conn") ||
+          msg.includes("too many clients") ||
+          msg.includes("remaining connection slots") ||
+          msg.includes("Connection terminated") ||
+          msg.includes("timeout exceeded when trying to connect")
+        ) {
+          // eslint-disable-next-line no-console
+          console.error(
+            `[db] connection pressure: ${msg} | pool total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
+          );
+        }
+        throw err;
+      }
     });
   })().catch((err) => {
+    // Do not abandon a half-open pool — end it so slots return to PgBouncer.
+    const leaked = globalRef.__pgPool__;
     globalRef.__pgSqlPromise__ = undefined;
     globalRef.__pgPool__ = undefined;
+    if (leaked) {
+      void leaked.end().catch(() => undefined);
+    }
     throw err;
   });
   return globalRef.__pgSqlPromise__;
@@ -111,6 +159,50 @@ function createNeonSql(): Promise<Sql> {
  */
 export function getPgPool(): import("pg").Pool | null {
   return globalRef.__pgPool__ ?? null;
+}
+
+export interface PoolStats {
+  totalCount: number;
+  idleCount: number;
+  waitingCount: number;
+  max: number;
+}
+
+export function getPoolStats(): PoolStats | null {
+  const pool = globalRef.__pgPool__;
+  if (!pool) return null;
+  return {
+    totalCount: pool.totalCount,
+    idleCount: pool.idleCount,
+    waitingCount: pool.waitingCount,
+    max: readPoolMax(),
+  };
+}
+
+/**
+ * Gracefully close the singleton pool. Safe to call multiple times.
+ * Must be invoked on worker SIGTERM so PgBouncer slots are released.
+ */
+export async function endPgPool(): Promise<void> {
+  const pool = globalRef.__pgPool__;
+  if (!pool) {
+    globalRef.__pgSqlPromise__ = undefined;
+    return;
+  }
+  if (globalRef.__pgPoolEnding__) {
+    await globalRef.__pgPoolEnding__;
+    return;
+  }
+  globalRef.__pgPoolEnding__ = (async () => {
+    try {
+      await pool.end();
+    } finally {
+      globalRef.__pgPool__ = undefined;
+      globalRef.__pgSqlPromise__ = undefined;
+      globalRef.__pgPoolEnding__ = undefined;
+    }
+  })();
+  await globalRef.__pgPoolEnding__;
 }
 
 async function createPgliteSql(): Promise<Sql> {

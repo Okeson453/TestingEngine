@@ -334,7 +334,15 @@ export class PollWorker {
 
   private async runOneTick(): Promise<void> {
     if (!this.running) return;
-    await this.tickOnce();
+    try {
+      await this.tickOnce();
+    } catch (e) {
+      logger.error(
+        { component: "poll-worker", error: String(e) },
+        "tick error — rescheduling (worker stays online)",
+      );
+    }
+    // Always reschedule so a single DB/network failure cannot stop the loop.
     this.scheduleNext(this.nextIntervalMs());
   }
 

@@ -64,19 +64,76 @@ async function heartbeatWorkerLock(sql: Sql): Promise<void> {
   `;
 }
 
+async function writeWorkerHealth(sql: Sql, cycle: number): Promise<void> {
+  let poolInfo = "";
+  try {
+    const { getPoolStats } = await import("@/lib/db");
+    const s = getPoolStats();
+    if (s) {
+      poolInfo = `total=${s.totalCount} idle=${s.idleCount} waiting=${s.waitingCount} max=${s.max}`;
+    }
+  } catch {
+    /* optional */
+  }
+  const payload = JSON.stringify({
+    workerId: WORKER_ID,
+    cycle,
+    at: new Date().toISOString(),
+    pool: poolInfo,
+    pid: process.pid,
+  });
+  await sql`
+    INSERT INTO worker_state (key, value, updated_at)
+    VALUES ('worker_heartbeat', ${payload}, now())
+    ON CONFLICT (key) DO UPDATE
+    SET value = EXCLUDED.value, updated_at = now()
+  `;
+  await sql`
+    INSERT INTO worker_state (key, value, updated_at)
+    VALUES ('worker_status', 'online', now())
+    ON CONFLICT (key) DO UPDATE
+    SET value = EXCLUDED.value, updated_at = now()
+  `;
+}
+
+async function releaseWorkerLock(sql: Sql): Promise<void> {
+  await sql`
+    DELETE FROM worker_locks
+    WHERE lock_key = ${LOCK_KEY} AND owner_id = ${WORKER_ID}
+  `;
+  await sql`
+    INSERT INTO worker_state (key, value, updated_at)
+    VALUES ('worker_status', 'stopped', now())
+    ON CONFLICT (key) DO UPDATE
+    SET value = EXCLUDED.value, updated_at = now()
+  `;
+}
+
 function startLockHeartbeat(getSqlFn: () => Promise<Sql>): void {
   if (lockHeartbeatTimer) return;
+  let cycle = 0;
   lockHeartbeatTimer = setInterval(() => {
+    cycle += 1;
     void getSqlFn()
-      .then((sql) => heartbeatWorkerLock(sql))
+      .then(async (sql) => {
+        await heartbeatWorkerLock(sql);
+        await writeWorkerHealth(sql, cycle);
+      })
       .catch((e) => {
         logger.warn(
-          { component: "live-boot", error: String(e) },
-          "worker lock heartbeat failed",
+          { component: "live-boot", error: String(e), cycle },
+          "worker lock/health heartbeat failed — will retry next interval",
         );
       });
   }, 10_000);
   lockHeartbeatTimer.unref?.();
+}
+
+function stopLockHeartbeat(): void {
+  if (lockHeartbeatTimer) {
+    clearInterval(lockHeartbeatTimer);
+    lockHeartbeatTimer = null;
+  }
 }
 
 
@@ -283,9 +340,25 @@ class LiveBoot {
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
-    if (this.dispatcher) await this.dispatcher.stop();
-    if (this.pollWorker) await this.pollWorker.stop();
-    if (this.clockMonitor) await this.clockMonitor.stop();
+    stopLockHeartbeat();
+    if (this.dispatcher) {
+      try { await this.dispatcher.stop(); } catch { /* best effort */ }
+    }
+    if (this.pollWorker) {
+      try { await this.pollWorker.stop(); } catch { /* best effort */ }
+    }
+    if (this.clockMonitor) {
+      try { await this.clockMonitor.stop(); } catch { /* best effort */ }
+    }
+    try {
+      const sql = await getSql();
+      await releaseWorkerLock(sql);
+    } catch (e) {
+      logger.warn(
+        { component: "live-boot", error: String(e) },
+        "failed to release worker lock on stop",
+      );
+    }
   }
 }
 

@@ -2,28 +2,11 @@
 /**
  * Standalone background worker process entry point.
  *
- * Spec: TestingEngine_Deep_Diagnosis.md §3.1
- *       UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §7.7
- *
- * Run in production with a remote database (Neon / DATABASE_URL set):
- *
- *   npm run worker
- *
- * Local/preview mode (no DATABASE_URL) uses PGLite in-process inside the dev
- * server — the dev server already launches the live boot at boot, so this
- * CLI is intentionally a no-op there (running two PGLite instances on one
- * data dir is not safe).
- *
- * Requires running via the alias loader so `@/` resolves:
- *   node --experimental-strip-types --import ./scripts/paths-loader.mjs scripts/worker.mjs
- *
- * The single production entry point is `startLiveBoot` from
- * `src/lib/prediction/live/boot.ts`, which wires, in order:
- *   1. ColdStartSeeder — backfill crash_rounds if empty
- *   2. OutboxDispatcher — drain queued Telegram notifications
- *   3. EventDrivenPipeline — subscribe to BC.Game's Socket.IO bg/ed events
- *   4. PollWorker — REST safety net
- *   5. ClockSkewMonitor — periodic skew measurement
+ * Production: DATABASE_URL must be set (Neon / Postgres).
+ * Ensures:
+ *   - Single live boot
+ *   - Graceful SIGTERM/SIGINT with pool.end() so PgBouncer slots free
+ *   - Uncaught errors are logged but do not leave abandoned DB clients
  */
 import { pathToFileURL } from "node:url";
 
@@ -37,14 +20,66 @@ if (!process.env.DATABASE_URL) {
   process.exit(0);
 }
 
+// Prefer a small pool on the worker process unless operator overrides.
+if (!process.env.PG_POOL_MAX) {
+  process.env.PG_POOL_MAX = "3";
+}
+if (!process.env.PG_POOL_MIN) {
+  process.env.PG_POOL_MIN = "0";
+}
+if (!process.env.PG_APP_NAME) {
+  process.env.PG_APP_NAME = "testingengine-worker";
+}
+
 const liveBoot = await import("@/lib/prediction/live/boot");
 const events = await import("@/lib/prediction/events/game-event-handlers");
+const db = await import("@/lib/db");
 
-const result = await liveBoot.startLiveBoot({
-  startSubscriber: async () => {
-    await events.startEventDrivenPipeline();
-  },
-});
+let shuttingDown = false;
+
+async function bootWithRetry(maxAttempts = 5) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await liveBoot.startLiveBoot({
+        startSubscriber: async () => {
+          await events.startEventDrivenPipeline();
+        },
+      });
+      return result;
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message ?? err);
+      console.error(
+        `[worker] boot attempt ${attempt}/${maxAttempts} failed: ${msg}`,
+      );
+      if (
+        msg.includes("max_client_conn") ||
+        msg.includes("too many clients") ||
+        msg.includes("remaining connection slots")
+      ) {
+        console.error(
+          "[worker] connection pool saturated — waiting before retry (release stale clients)",
+        );
+        try {
+          await db.endPgPool();
+        } catch {
+          /* ignore */
+        }
+        await new Promise((r) => setTimeout(r, Math.min(5_000 * attempt, 20_000)));
+        continue;
+      }
+      // Lock held by another instance — exit so Railway does not thrash.
+      if (msg.includes("Worker lock not acquired")) {
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, Math.min(2_000 * attempt, 10_000)));
+    }
+  }
+  throw lastErr;
+}
+
+const result = await bootWithRetry();
 
 console.log(
   JSON.stringify({
@@ -58,35 +93,39 @@ console.log(
 
 process.on("uncaughtException", (err) => {
   console.error("[worker] uncaughtException:", err?.stack ?? err);
+  // Do not exit immediately — let Railway restart policy decide after SIGTERM
+  // from the platform; exiting here can race with in-flight pool clients.
 });
 process.on("unhandledRejection", (reason) => {
   console.error("[worker] unhandledRejection:", reason);
 });
 
-// Surface silent deaths — without these, an unhandled rejection after the
-// boot log can exit the process with no further Railway output.
-process.on("uncaughtException", (err) => {
-  console.error("[worker] uncaughtException:", err?.stack ?? err);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("[worker] unhandledRejection:", reason);
-});
-
-const shutdown = async () => {
+const shutdown = async (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[worker] ${signal} received — graceful shutdown`);
   try {
     await events.stopEventDrivenPipeline();
-  } catch {
-    /* best effort */
+  } catch (e) {
+    console.error("[worker] stopEventDrivenPipeline:", e?.message ?? e);
   }
   try {
     await liveBoot.stopLiveBoot();
-  } catch {
-    /* best effort */
+  } catch (e) {
+    console.error("[worker] stopLiveBoot:", e?.message ?? e);
+  }
+  try {
+    await db.endPgPool();
+    console.log("[worker] pg pool closed");
+  } catch (e) {
+    console.error("[worker] endPgPool:", e?.message ?? e);
   }
   process.exit(0);
 };
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 void pathToFileURL(import.meta.url);
-console.log("[worker] background prediction worker running (DATABASE_URL) — live pipeline booted");
+console.log(
+  "[worker] background prediction worker running (DATABASE_URL) — live pipeline booted",
+);

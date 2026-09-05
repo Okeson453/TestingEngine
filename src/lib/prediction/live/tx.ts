@@ -1,16 +1,7 @@
 /**
- * Transaction helper for the live prediction pipeline.
- *
- * Spec: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §5.2
- * Production hardening: pin a single connection on Neon so BEGIN/COMMIT
- * (and FOR UPDATE SKIP LOCKED) are actually atomic.
- *
- * On Neon (`pg.Pool`): acquire a dedicated client via pool.connect(), run
- * BEGIN → body → COMMIT/ROLLBACK on that client, then release.
- * On PGLite (tests/dev): fall back to sequential BEGIN/COMMIT via the
- * shared Sql surface (single underlying connection).
+ * Transaction helper — pins a single Neon pool client for BEGIN…COMMIT.
+ * Always releases the client in `finally` so pool slots cannot leak.
  */
-
 import type { Sql } from "@/lib/db";
 import { dbSource, getPgPool } from "@/lib/db";
 
@@ -18,7 +9,6 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
 
-/** Build a Sql-compatible tagged-template + .query surface over a runner. */
 function makeTxSql(
   queryFn: <T>(text: string, params?: unknown[]) => Promise<T[]>,
 ): Sql {
@@ -39,42 +29,38 @@ function makeTxSql(
   return txSql;
 }
 
-/**
- * Run the callback inside a real transaction.
- * On Neon the entire BEGIN…COMMIT runs on one pinned pool client.
- * The callback receives a Sql-compatible `tx` bound to that connection.
- */
 export async function runInTransaction<T>(
   sql: Sql,
   fn: (tx: Sql) => Promise<T>,
 ): Promise<T> {
-  // Prefer pinned pool client when available (Neon production path).
   const pool = getPgPool();
   if (pool && dbSource === "neon") {
-    const client = await pool.connect();
+    let client: import("pg").PoolClient | null = null;
     try {
+      client = await pool.connect();
       await client.query("BEGIN");
+      const held = client;
       const txSql = makeTxSql(async <U>(text: string, params: unknown[] = []) => {
-        const res = await client.query(text, params);
+        const res = await held.query(text, params);
         return res.rows as U[];
       });
       const result = await fn(txSql);
-      await client.query("COMMIT");
+      await held.query("COMMIT");
       return result;
     } catch (err) {
-      try {
-        await client.query("ROLLBACK");
-      } catch {
-        /* swallow — rollback after failed begin is harmless */
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          /* swallow */
+        }
       }
       throw err;
     } finally {
-      client.release();
+      client?.release();
     }
   }
 
-  // PGLite / fallback path: sequential BEGIN/COMMIT on the shared Sql.
-  // PGLite is single-connection so affinity is not an issue.
   let done = false;
   await sql.query("BEGIN");
   try {
@@ -97,7 +83,6 @@ export async function runInTransaction<T>(
   }
 }
 
-/** Escape hatch: detect if a query runner exposes a native transaction. */
 export function hasNativeTransaction(
   sql: Sql,
 ): sql is Sql & { transaction: <T>(fn: (tx: Sql) => Promise<T>) => Promise<T> } {
