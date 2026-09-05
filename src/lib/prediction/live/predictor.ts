@@ -886,6 +886,18 @@ export async function onGameEndPredict(
       return { predictionId: null, targetGameId, kind: "insufficient_history" };
     }
 
+    // Cold-start seed for advanced pipeline incremental state (once)
+    try {
+      const { globalIncrementalState } = await import(
+        "@/lib/prediction/state/incremental-state-engine"
+      );
+      if (globalIncrementalState.snapshot().count === 0 && rounds.length > 0) {
+        globalIncrementalState.seed(rounds.map((r) => r.crashPoint));
+      }
+    } catch {
+      /* soft */
+    }
+
     const tPredict0 = performance.now();
     // Hard timeout around sync model inference (P0 / 6.2)
     let signal: ReturnType<typeof defaultPredictFn>;

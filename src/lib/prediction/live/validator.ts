@@ -311,15 +311,69 @@ export async function onGameEnd(
     "round validated",
   );
 
-  // Learning feedback: pipeline + model performance tracker + ACIE observeRound
+  // Learning feedback — close the failure→learning loop (engine audit Fixes 1–4)
   try {
     const predicted = Number(state.pending.probability);
     const actual: 0 | 1 = result === "WIN" ? 1 : 0;
+
+    // CRITICAL: warm incremental state so advanced pipeline does not collapse to 0.65
+    try {
+      const { globalIncrementalState } = await import(
+        "@/lib/prediction/state/incremental-state-engine"
+      );
+      globalIncrementalState.update(evt.multiplier);
+    } catch {
+      /* soft */
+    }
+
+    // Baseline online learning
+    try {
+      const { globalBaselineModel } = await import(
+        "@/lib/prediction/models/baseline-model"
+      );
+      if (typeof globalBaselineModel.observeOutcome === "function") {
+        globalBaselineModel.observeOutcome(
+          predicted,
+          actual,
+          evt.multiplier,
+          Number(state.pending.target_multiplier) as 1.3,
+        );
+      }
+    } catch {
+      /* soft */
+    }
+
     if (Number.isFinite(predicted)) {
+      // Build metaFeatures so meta-logistic model can learn
       void import("@/lib/prediction/prediction-pipeline")
-        .then((mod) => {
+        .then(async (mod) => {
           try {
-            mod.feedbackPredictionPipeline(predicted, actual);
+            let metaFeatures: import("@/lib/prediction/models/meta-logistic-model").MetaFeatures | undefined;
+            try {
+              const { globalIncrementalState } = await import(
+                "@/lib/prediction/state/incremental-state-engine"
+              );
+              const { globalCalibrationState } = await import(
+                "@/lib/prediction/calibration/calibration-state"
+              );
+              const snap = globalIncrementalState.snapshot();
+              const calMetrics = globalCalibrationState.metrics();
+              metaFeatures = {
+                baseProbability: predicted,
+                disagreement: 0,
+                regimeConfidence: 0.5,
+                dataQuality: Math.min(1, snap.count / 100),
+                sampleCount: snap.count,
+                recentLogLoss: calMetrics.logLoss || 0.5,
+                recentBrier: calMetrics.brier || 0.25,
+                ece: calMetrics.ece,
+                shortHitRate: globalIncrementalState.shortHitRate13(),
+                markovP: globalIncrementalState.markovPNextAbove13(),
+              };
+            } catch {
+              metaFeatures = undefined;
+            }
+            mod.feedbackPredictionPipeline(predicted, actual, metaFeatures);
           } catch {
             /* soft */
           }

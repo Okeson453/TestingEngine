@@ -1,5 +1,5 @@
 import type { PredictiveModel } from './baseline-model.ts';
-import { BaselineStatisticalModel } from './baseline-model.ts';
+import { globalBaselineModel } from './baseline-model.ts';
 import type { ModelIdentity } from '../types.ts';
 import { getLogger } from '../../observability/logger.ts';
 
@@ -8,9 +8,9 @@ export class ModelRegistry {
   private readonly models = new Map<string, PredictiveModel>();
   private defaultKey: string;
   constructor() {
-    const baseline = new BaselineStatisticalModel();
-    this.register(baseline);
-    this.defaultKey = this.keyOf(baseline.identity);
+    // Use adaptive singleton so observeOutcome learning is shared
+    this.register(globalBaselineModel);
+    this.defaultKey = this.keyOf(globalBaselineModel.identity);
   }
   private keyOf(id: ModelIdentity): string { return `${id.name}@${id.version}`; }
   register(model: PredictiveModel): void {

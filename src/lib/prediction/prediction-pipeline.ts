@@ -143,10 +143,12 @@ export function runPredictionPipeline(input: PipelineInput): PipelineResult {
     (1 - metaWeight) * ensemble.probability + metaWeight * metaProbability;
 
   // Calibration
+  // Cold incremental state must preserve the blended signal, not collapse to 0.65.
+  // Pass `blended` as the shrinkage baseline so count=0 → returns blended.
   const calibratedProbability = globalCalibrationState.calibrateWithShrinkage(
     blended,
     learnedRegimeLabel,
-    snap.ewmaHit13,
+    blended,
     snap.count
   );
 
