@@ -2,6 +2,10 @@
  * Per-model online performance — EWMA log-loss / Brier for weighting.
  */
 
+import { getLogger } from "@/lib/observability/logger";
+
+const logger = getLogger("model-performance");
+
 export interface ModelPerf {
   ewmaLogLoss: number;
   ewmaBrier: number;
@@ -38,6 +42,21 @@ export class ModelPerformanceTracker {
       p.recentCorrect = Math.floor(p.recentCorrect * 0.9);
       p.recentTotal = Math.floor(p.recentTotal * 0.9);
     }
+
+    // P2.8: Add Metrics Emission for Model Performance
+    // Emit structured metrics after each update
+    const accuracy = p.count > 0 ? p.recentCorrect / Math.max(1, p.recentTotal) : 0;
+    const accuracyPct = (accuracy * 100).toFixed(2);
+    logger.info({
+      component: "model-performance",
+      modelName: name,
+      ewmaLogLoss: Number(p.ewmaLogLoss.toFixed(4)),
+      ewmaBrier: Number(p.ewmaBrier.toFixed(4)),
+      sampleCount: p.count,
+      recentAccuracy: accuracyPct,
+      recentCorrect: p.recentCorrect,
+      recentTotal: p.recentTotal,
+    }, "model performance updated");
   }
 
   get(name: string): ModelPerf | undefined {
