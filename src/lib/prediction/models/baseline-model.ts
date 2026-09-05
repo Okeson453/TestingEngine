@@ -145,7 +145,8 @@ export class BaselineStatisticalModel implements PredictiveModel {
     const longProb = v[`hit_${targetKey}_100`] ?? baseProb;
     baseProb = this.shortWeight * baseProb + this.longWeight * longProb;
 
-    // Volatility adjustment from roll_std_50 (audit: consume unused features)
+    // P1.6: Consume More Features in Baseline Model
+    // Volatility adjustment from roll_std_50
     const rollStd = v.roll_std_50 ?? 0;
     if (rollStd > 5) {
       baseProb *= 0.95; // high vol → slightly more conservative
@@ -160,6 +161,7 @@ export class BaselineStatisticalModel implements PredictiveModel {
       if (hour >= 0 && hour < 6) baseProb *= 0.97;
     }
 
+    // Pacing adjustment
     const since = v[`since_${targetKey}`] ?? 0;
     const expectedGap = 1 / Math.max(baseProb, 0.05);
     this.lastGapActive = since > expectedGap * 1.5;
@@ -174,7 +176,7 @@ export class BaselineStatisticalModel implements PredictiveModel {
       baseProb = Math.min(0.95, baseProb * this.streakMultiplier);
     }
 
-    // Regime dimensions (not only anomaly)
+    // P1.7: Use Regime Dimensions in Baseline Model
     const dims = regime?.dimensions as Record<string, unknown> | undefined;
     this.lastAnomalyActive = Boolean(dims?.anomalyState);
     if (this.lastAnomalyActive) {
@@ -187,6 +189,16 @@ export class BaselineStatisticalModel implements PredictiveModel {
     const vol = Number(dims?.volatility ?? dims?.vol ?? NaN);
     if (Number.isFinite(vol) && vol > 15) {
       baseProb *= 0.93;
+    }
+
+    // Additional regime dimension features
+    const streakState = dims?.streakState as string | undefined;
+    if (streakState === 'low') {
+      baseProb *= 1.1;
+    }
+    const thresholdFreq = dims?.thresholdFrequency as Record<string, number> | undefined;
+    if (thresholdFreq && thresholdFreq['1.30'] < 0.5) {
+      baseProb *= 0.9;
     }
 
     const probability = Math.max(0, Math.min(1, baseProb));
