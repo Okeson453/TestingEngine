@@ -27,19 +27,25 @@ const logger = getLogger("live-validator");
 /** Spec §2 / §3.2: always attempt N+1 prediction after Round N is known.
  *  Non-blocking; failures never affect validation. Enables cold-start first
  *  prediction when there was no prior pending row for N. */
-function triggerNextPrediction(
+/**
+ * Generate N+1 after learning for N has completed (audit §40).
+ * Still non-fatal: prediction failure does not roll back validation.
+ */
+async function triggerNextPrediction(
   gameId: string,
   endTime: string,
   multiplier: number,
   correlationId: string | null | undefined,
-): void {
+): Promise<void> {
   const corr = correlationId ?? randomUUID();
-  void onGameEndPredict(gameId, endTime, multiplier, corr).catch((e) => {
+  try {
+    await onGameEndPredict(gameId, endTime, multiplier, corr);
+  } catch (e) {
     logger.error(
       { gameId, error: String(e) },
       "Failed to generate N+1 prediction after ed processing",
     );
-  });
+  }
 }
 
 export interface GameEndEvent {
@@ -290,7 +296,18 @@ export async function onGameEnd(
     // and missed-bg recovery still produce the next prediction — unless
     // the caller (poll worker) explicitly suppressed cascade.
     if (!evt.skipPredict) {
-      triggerNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
+      // No pending row — still update incremental state for this crash, then predict
+      try {
+        const { globalIncrementalState } = await import(
+          "@/lib/prediction/state/incremental-state-engine"
+        );
+        globalIncrementalState.update(evt.multiplier);
+      } catch { /* soft */ }
+      try {
+        const eng = (globalThis as { __acieEngine__?: { observeRound: (r: { roundId: string; crashPoint: number }) => unknown } }).__acieEngine__;
+        eng?.observeRound({ roundId: evt.gameId, crashPoint: evt.multiplier });
+      } catch { /* soft */ }
+      await triggerNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
     }
     if (state.crashRow && state.crashRow.began_at == null) {
       return { kind: "orphaned", targetGameId: evt.gameId };
@@ -300,6 +317,7 @@ export async function onGameEnd(
 
   const target = Number(state.pending.target_multiplier);
   const result: "WIN" | "LOSS" = evt.multiplier >= target ? "WIN" : "LOSS";
+  const resolvedAt = new Date(now()).toISOString();
   logger.info(
     {
       component: "live-validator",
@@ -311,117 +329,37 @@ export async function onGameEnd(
     "round validated",
   );
 
-  // Learning feedback — close the failure→learning loop (engine audit Fixes 1–4)
+  // Authoritative closed-loop feedback BEFORE N+1 (audit §27 / §40)
   try {
-    const predicted = Number(state.pending.probability);
-    const actual: 0 | 1 = result === "WIN" ? 1 : 0;
-
-    // CRITICAL: warm incremental state so advanced pipeline does not collapse to 0.65
-    try {
-      const { globalIncrementalState } = await import(
-        "@/lib/prediction/state/incremental-state-engine"
-      );
-      globalIncrementalState.update(evt.multiplier);
-    } catch {
-      /* soft */
-    }
-
-    // Baseline online learning
-    try {
-      const { globalBaselineModel } = await import(
-        "@/lib/prediction/models/baseline-model"
-      );
-      if (typeof globalBaselineModel.observeOutcome === "function") {
-        globalBaselineModel.observeOutcome(
-          predicted,
-          actual,
-          evt.multiplier,
-          Number(state.pending.target_multiplier) as 1.3,
-        );
-      }
-    } catch {
-      /* soft */
-    }
-
-    if (Number.isFinite(predicted)) {
-      // Build metaFeatures so meta-logistic model can learn
-      void import("@/lib/prediction/prediction-pipeline")
-        .then(async (mod) => {
-          try {
-            let metaFeatures: import("@/lib/prediction/models/meta-logistic-model").MetaFeatures | undefined;
-            try {
-              const { globalIncrementalState } = await import(
-                "@/lib/prediction/state/incremental-state-engine"
-              );
-              const { globalCalibrationState } = await import(
-                "@/lib/prediction/calibration/calibration-state"
-              );
-              const snap = globalIncrementalState.snapshot();
-              const calMetrics = globalCalibrationState.metrics();
-              metaFeatures = {
-                baseProbability: predicted,
-                disagreement: 0,
-                regimeConfidence: 0.5,
-                dataQuality: Math.min(1, snap.count / 100),
-                sampleCount: snap.count,
-                recentLogLoss: calMetrics.logLoss || 0.5,
-                recentBrier: calMetrics.brier || 0.25,
-                ece: calMetrics.ece,
-                shortHitRate: globalIncrementalState.shortHitRate13(),
-                markovP: globalIncrementalState.markovPNextAbove13(),
-              };
-            } catch {
-              metaFeatures = undefined;
-            }
-            mod.feedbackPredictionPipeline(predicted, actual, metaFeatures);
-          } catch {
-            /* soft */
-          }
-        })
-        .catch(() => {
-          /* pipeline soft */
-        });
-
-      void import("@/lib/prediction/ensemble/model-performance")
-        .then((mod) => {
-          try {
-            const name = String(state.pending!.model_version ?? "baseline");
-            mod.globalModelPerformance.observe(name, predicted, actual);
-            mod.globalModelPerformance.observe("live", predicted, actual);
-          } catch {
-            /* soft */
-          }
-        })
-        .catch(() => {
-          /* soft */
-        });
-    }
-
-    // ACIE continuous learning on resolved crash
-    try {
-      const eng = (globalThis as { __acieEngine__?: {
-        observeRound: (r: { roundId: string; crashPoint: number }) => unknown;
-      } }).__acieEngine__;
-      if (eng) {
-        eng.observeRound({
-          roundId: evt.gameId,
-          crashPoint: evt.multiplier,
-        });
-      }
-    } catch {
-      /* soft */
-    }
+    const { processResolvedPredictionFeedback } = await import(
+      "@/lib/prediction/live/feedback"
+    );
+    await processResolvedPredictionFeedback({
+      predictionId: state.pending.prediction_id,
+      targetGameId: evt.gameId,
+      predictedProbability: Number(state.pending.probability),
+      predictedConfidence: state.pending.confidence != null
+        ? Number(state.pending.confidence)
+        : null,
+      targetMultiplier: Number(state.pending.target_multiplier),
+      actualMultiplier: evt.multiplier,
+      result,
+      regimeAtPrediction: state.pending.regime_name ?? null,
+      modelVersion: (state.pending as { model_version?: string | null }).model_version ?? null,
+      correlationId: state.pending.correlation_id ?? null,
+      resolvedAt,
+    });
   } catch (fbErr) {
-    logger.debug(
+    logger.warn(
       { component: "live-validator", error: String(fbErr) },
-      "learning feedback soft-failed",
+      "closed-loop feedback failed — continuing to N+1 with partial learning",
     );
   }
 
   // Spec §2/§3.2: trigger N+1 prediction after Round N is processed.
   // Poll recovery path sets skipPredict to prevent historical cascade.
   if (!evt.skipPredict) {
-    triggerNextPrediction(
+    await triggerNextPrediction(
       evt.gameId,
       evt.endTime,
       evt.multiplier,
