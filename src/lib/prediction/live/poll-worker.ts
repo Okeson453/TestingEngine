@@ -144,35 +144,34 @@ export class PollWorker {
 
         // Update live-round lifecycle from history (does NOT start predictions)
         // Parallelize upserts — independent per game_id.
-        await Promise.all(
-          ins.rounds.map(async (r) => {
-            try {
-              await upsertLiveRoundFromHistory(r, sql);
-              if (r.crashedAt) {
-                await markLiveRoundEnded(
-                  r.gameId,
-                  r.crashedAt instanceof Date
-                    ? r.crashedAt.toISOString()
-                    : String(r.crashedAt),
-                  Number(r.multiplier),
-                  sql,
-                );
-              }
-            } catch (le) {
-              logger.debug(
-                { component: "poll-worker", gameId: r.gameId, error: String(le) },
-                "live-round state update skipped",
+        // Sequential lifecycle updates — one connection at a time under tight pool limits
+        for (const r of ins.rounds) {
+          try {
+            await upsertLiveRoundFromHistory(r, sql);
+            if (r.crashedAt) {
+              await markLiveRoundEnded(
+                r.gameId,
+                r.crashedAt instanceof Date
+                  ? r.crashedAt.toISOString()
+                  : String(r.crashedAt),
+                Number(r.multiplier),
+                sql,
               );
             }
-          }),
-        );
+          } catch (le) {
+            logger.debug(
+              { component: "poll-worker", gameId: r.gameId, error: String(le) },
+              "live-round state update skipped",
+            );
+          }
+        }
 
         // Validation for newly inserted rounds (timing 7.10):
         // bounded parallelism instead of N sequential transactions.
         // skipPredict=true — N+1 prediction only via maybePredictNewest below.
         const VALIDATE_CONCURRENCY = Math.max(
           1,
-          Math.min(8, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 4) || 4),
+          Math.min(4, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 1) || 1),
         );
         {
           let cursor = 0;

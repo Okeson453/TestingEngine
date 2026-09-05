@@ -14,7 +14,7 @@
  * Socket.IO handlers must NOT call it to create predictions.
  */
 import { randomUUID } from "node:crypto";
-import { getSql, type Sql } from "@/lib/db";
+import { getSql, getPgPool, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
 import type { HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
@@ -642,31 +642,87 @@ export async function onGameEndPredict(
   try {
     let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
 
-    const [thrRows, residualRows, gapRows, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
-      await Promise.all([
-        sql<{ value: string }>`
-          SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
-        `.catch(() => [] as { value: string }[]),
-        sql<{ began_at: string | Date | null }>`
-          SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-        `.catch(() => [] as { began_at: string | Date | null }[]),
-        sql<{ value: string }>`
-          SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
-        `.catch(() => [] as { value: string }[]),
-        sql<{ value: string }>`
-          SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
-        `.catch(() => [] as { value: string }[]),
-        sql<{ prediction_id: string }>`
-          SELECT prediction_id FROM pending_predictions
-          WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
-        `.catch(() => [] as { prediction_id: string }[]),
-        sql<{ lifecycle: string | null; began_at: string | Date | null }>`
-          SELECT lifecycle, began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-        `.catch(() => [] as { lifecycle: string | null; began_at: string | Date | null }[]),
-        sql<{ game_id: string }>`
-          SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
-        `.catch(() => [] as { game_id: string }[]),
-      ]);
+    // Single pool client for all gate reads — avoids 7 concurrent connections
+    // which exhausted PgBouncer max_client_conn under POLL + heartbeat load.
+    type GateBag = {
+      thrRows: { value: string }[];
+      residualRows: { began_at: string | Date | null }[];
+      gapRows: { value: string }[];
+      skewRows: { value: string }[];
+      existingPending: { prediction_id: string }[];
+      liveLifecycle: { lifecycle: string | null; began_at: string | Date | null }[];
+      alreadyCrashedRows: { game_id: string }[];
+    };
+    let thrRows: GateBag["thrRows"] = [];
+    let residualRows: GateBag["residualRows"] = [];
+    let gapRows: GateBag["gapRows"] = [];
+    let skewRows: GateBag["skewRows"] = [];
+    let existingPending: GateBag["existingPending"] = [];
+    let liveLifecycle: GateBag["liveLifecycle"] = [];
+    let alreadyCrashedRows: GateBag["alreadyCrashedRows"] = [];
+
+    const pool = getPgPool();
+    if (pool) {
+      const client = await pool.connect();
+      try {
+        const q = async <T>(text: string, params: unknown[] = []): Promise<T[]> => {
+          const res = await client.query(text, params);
+          return res.rows as T[];
+        };
+        thrRows = await q<{ value: string }>(
+          `SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1`,
+        ).catch(() => []);
+        residualRows = await q<{ began_at: string | Date | null }>(
+          `SELECT began_at FROM live_round_state WHERE game_id = $1 LIMIT 1`,
+          [targetGameId],
+        ).catch(() => []);
+        gapRows = await q<{ value: string }>(
+          `SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1`,
+        ).catch(() => []);
+        skewRows = await q<{ value: string }>(
+          `SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1`,
+        ).catch(() => []);
+        existingPending = await q<{ prediction_id: string }>(
+          `SELECT prediction_id FROM pending_predictions
+           WHERE target_game_id = $1 AND status = 'PENDING' LIMIT 1`,
+          [targetGameId],
+        ).catch(() => []);
+        liveLifecycle = await q<{ lifecycle: string | null; began_at: string | Date | null }>(
+          `SELECT lifecycle, began_at FROM live_round_state WHERE game_id = $1 LIMIT 1`,
+          [targetGameId],
+        ).catch(() => []);
+        alreadyCrashedRows = await q<{ game_id: string }>(
+          `SELECT game_id FROM crash_rounds WHERE game_id = $1 LIMIT 1`,
+          [targetGameId],
+        ).catch(() => []);
+      } finally {
+        client.release();
+      }
+    } else {
+      // PGLite / tests — sequential via sql template
+      thrRows = await sql<{ value: string }>`
+        SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
+      `.catch(() => []);
+      residualRows = await sql<{ began_at: string | Date | null }>`
+        SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+      `.catch(() => []);
+      gapRows = await sql<{ value: string }>`
+        SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
+      `.catch(() => []);
+      skewRows = await sql<{ value: string }>`
+        SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
+      `.catch(() => []);
+      existingPending = await sql<{ prediction_id: string }>`
+        SELECT prediction_id FROM pending_predictions
+        WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
+      `.catch(() => []);
+      liveLifecycle = await sql<{ lifecycle: string | null; began_at: string | Date | null }>`
+        SELECT lifecycle, began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+      `.catch(() => []);
+      alreadyCrashedRows = await sql<{ game_id: string }>`
+        SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
+      `.catch(() => []);
+    }
 
     if (thrRows[0]?.value) {
       const t = Number(thrRows[0].value);
