@@ -31,6 +31,15 @@ const logger = getLogger("poll-worker");
 
 /** Emergency fallback interval — diagnosis recommends 3000 ms. */
 export const POLL_INTERVAL_MS = Number(process.env.POLL_WORKER_MS ?? 3_000);
+/** Degraded interval (Spec §6.7) — used when socket is unhealthy. */
+export const DEGRADED_POLL_INTERVAL_MS = Number(
+  process.env.POLL_DEGRADED_MS ?? 1_200,
+);
+/** Sustained-degraded detection threshold: after this many degraded
+ *  cycles, fire a WAF recovery probe + alert (Spec §6.7). */
+export const WAF_RECOVERY_PROBE_AFTER_CYCLES = Number(
+  process.env.WAF_RECOVERY_PROBE_AFTER_CYCLES ?? 5,
+);
 export const STALE_PREDICTED_MS = 15 * 60 * 1_000;
 
 export interface PollTickResult {
@@ -53,6 +62,8 @@ export class PollWorker {
   private pages = 2;
   /** When true, poll may call onGameEnd for the single newest eligible round. */
   private allowNewestPredict = true;
+  /** Spec §6.7 — count of consecutive degraded cycles; reset on healthy. */
+  private degradedCycles = 0;
 
   constructor(opts?: {
     getSqlFn?: () => Promise<Sql>;
@@ -244,7 +255,6 @@ export class PollWorker {
     // Stream health: if socket is healthy, prefer letting ED drive prediction
     // and only use poll when the stream appears degraded (optional soft gate)
     try {
-      const { bcGameSocket } = await import("@/lib/crash/socket-client");
       const st = bcGameSocket.getState();
       if (st.status === "connected" && st.lastEdAt) {
         const lag = Date.now() - new Date(st.lastEdAt).getTime();
@@ -311,14 +321,16 @@ export class PollWorker {
   /**
    * Adaptive poll interval: when Socket.IO is blocked/degraded (Cloudflare),
    * poll more aggressively so N+1 predictions stay ahead of the round.
-   * Cap at 2s minimum to avoid hammering BC.Game REST.
+   * Spec §6.7: degraded interval is `DEGRADED_POLL_INTERVAL_MS`
+   * (default 1200ms), not 2000ms. After sustained degradation a WAF
+   * recovery probe fires; the next interval remains degraded until the
+   * probe confirms recovery.
    */
   private nextIntervalMs(): number {
     const base = POLL_INTERVAL_MS;
+    let degraded = false;
     try {
       const st = bcGameSocket.getState().status;
-      // When live socket is unavailable (Cloudflare WAF common on Railway),
-      // poll at 2–3s so N+1 predictions stay ahead of the inter-round gap.
       if (
         st === "waf_blocked" ||
         st === "degraded" ||
@@ -326,11 +338,77 @@ export class PollWorker {
         st === "stopped" ||
         st === "connecting"
       ) {
-        return Math.max(2_000, Math.min(base, 3_000));
+        degraded = true;
       }
     } catch {
       /* socket optional in pure unit tests */
     }
+    if (degraded) {
+      this.degradedCycles += 1;
+      if (this.degradedCycles === WAF_RECOVERY_PROBE_AFTER_CYCLES) {
+        void this.fireWafRecoveryProbe().catch((e) => {
+          logger.warn(
+            { component: "poll-worker", error: String(e) },
+            "WAF recovery probe failed",
+          );
+        });
+      }
+      return DEGRADED_POLL_INTERVAL_MS;
+    }
+    this.degradedCycles = 0;
     return base;
+  }
+
+  /**
+   * Spec §6.7 — after sustained degraded polling, actively probe a
+   * BC.Game endpoint to determine whether the WAF block has lifted.
+   * Records the result in `worker_state` so the dashboard can surface
+   * it. A successful probe resets the degraded counter immediately.
+   */
+  private async fireWafRecoveryProbe(): Promise<void> {
+    const url = "https://bc.game/api/game/home/game-stat/";
+    let ok = false;
+    let status = 0;
+    try {
+      const fetchImpl =
+        typeof fetch !== "undefined" ? fetch : (await import("node:https")).request;
+      const res = await fetchImpl(url, { method: "GET" });
+      status = (res as { status?: number }).status ?? 0;
+      ok = status >= 200 && status < 400;
+    } catch (e) {
+      logger.warn(
+        { component: "poll-worker", error: String(e) },
+        "WAF recovery probe threw",
+      );
+    }
+    try {
+      const sql = await this.getSqlFn();
+      await sql`
+        insert into worker_state (key, value) values (
+          'waf_recovery_probe_at', ${new Date().toISOString()}
+        )
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value) values (
+          'waf_recovery_probe_ok', ${ok ? "1" : "0"}
+        )
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      if (ok) {
+        logger.info(
+          { component: "poll-worker", status },
+          "WAF recovery probe succeeded; socket is reachable",
+        );
+        this.degradedCycles = 0;
+      } else {
+        logger.warn(
+          { component: "poll-worker", status },
+          "WAF recovery probe failed; continuing degraded",
+        );
+      }
+    } catch {
+      /* non-fatal */
+    }
   }
 }

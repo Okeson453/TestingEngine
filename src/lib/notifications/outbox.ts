@@ -81,11 +81,11 @@ export async function createNotification(
   await sql`
     insert into notification_outbox (
       notification_id, type, content, metadata, status,
-      attempt_count, next_attempt_at, created_at, priority
+      attempt_count, next_attempt_at, created_at, priority, telegram_deadline_at
     ) values (
-      ${notificationId}, ${options.type}, ${options.content}, 
+      ${notificationId}, ${options.type}, ${options.content},
       ${JSON.stringify(options.metadata ?? {})}, 'pending',
-      0, ${nextAttemptAt}, ${now}, ${priority}
+      0, ${nextAttemptAt}, ${now}, ${priority}, NULL
     )
   `;
   

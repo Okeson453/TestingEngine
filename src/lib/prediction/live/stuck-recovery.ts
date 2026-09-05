@@ -15,6 +15,11 @@ import { getLogger } from "@/lib/observability/logger";
 const logger = getLogger("stuck-recovery");
 
 export const STALE_MS = 15 * 60 * 1_000;
+/** Spec §6.8 — tighter EXPIRED sweep. The default 15 min is too long
+ *  under sustained WAF or restart. Cap at 5 min so a stuck target that
+ *  started during the gap does not produce a late "predicts the past"
+ *  row. */
+export const STALE_MS_TIGHT = 5 * 60 * 1_000;
 
 export interface StuckRecoveryResult {
   inspected: number;

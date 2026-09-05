@@ -86,10 +86,17 @@ function createNeonSql(): Promise<Sql> {
       console.error("[db] Pool connection error (non-fatal):", err.message);
     });
 
-    return toSql(async <T>(text: string, params: unknown[]) => {
+    const sql = toSql(async <T>(text: string, params: unknown[]) => {
       const res = await pool.query(text, params);
       return res.rows as T[];
     });
+    // Production-path atomicity: pin a single pool client so the validator's
+    // BEGIN/SELECT/COMMIT/ROLLBACK share a connection. Without this hook
+    // every query can land on a different pool client and the transaction
+    // is not actually atomic on `pg.Pool`.
+    (sql as unknown as { getPinnedClient: () => Promise<unknown> }).getPinnedClient =
+      async () => pool.connect();
+    return sql;
   })().catch((err) => {
     globalRef.__pgSqlPromise__ = undefined;
     throw err;

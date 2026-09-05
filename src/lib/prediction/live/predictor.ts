@@ -35,6 +35,23 @@ export const SLA_LAG_MS = 2_000;
 /** DB-level CHECK constraint cap: a bg payload whose `beginTime` is in the
  *  future of the prediction row's `prediction_generated_at` is rejected. */
 export const TEMPORAL_TOLERANCE_MS = 100;
+/** Deadline-aware predict gate (Spec §6.1).
+ *  If the residual window before the target round's `began_at` is below
+ *  this threshold the predictor short-circuits with `skipped_late` and
+ *  writes nothing. ~800ms covers the 4 SELECTs + model + INSERT roundtrip
+ *  on Neon with comfortable headroom. */
+export const MIN_REQUIRED_WINDOW_MS = Number(
+  process.env.PREDICT_MIN_WINDOW_MS ?? 800,
+);
+/** Hard skip (Spec §6.11): if the target is already within this many ms
+ *  of `began_at`, return `skipped_late` immediately without any DB I/O. */
+export const SKIP_BELOW_MS = Number(
+  process.env.PREDICT_SKIP_BELOW_MS ?? 500,
+);
+/** Per-call timeout for `PredictionEngine.predict` (Spec §6.2). */
+export const PREDICT_TIMEOUT_MS = Number(
+  process.env.PREDICT_TIMEOUT_MS ?? 80,
+);
 
 export interface GameStartEvent {
   gameId: string;
@@ -93,6 +110,19 @@ interface PredictorDeps {
   slaLagMs?: number;
   /** Injected for tests. */
   temporalToleranceMs?: number;
+  /** Injected for tests. */
+  minRequiredWindowMs?: number;
+  /** Injected for tests. */
+  skipBelowMs?: number;
+  /** Injected for tests. */
+  predictTimeoutMs?: number;
+  /** Injected for tests; default uses real `live_event_log` writes. */
+  writeGateEvent?: (event: {
+    targetGameId: string;
+    decision: "predicted" | "skipped_late" | "timeout" | "no_history" | "duplicate" | "too_late";
+    remainingBeforeTargetMs: number | null;
+    slaViolated: boolean;
+  }) => Promise<void>;
 }
 
 interface PriorRow {
@@ -387,10 +417,19 @@ export async function onGameStart(
           `Prediction ID: ${predictionId}`,
           `Generated: ${predictionGeneratedAt}`,
         ].join("\n");
+        // telegram_deadline_at (Spec §6.12): refuse to deliver after the
+        // target round has begun. Bg event fill-in gives us beganAt; fall
+        // back to generatedAt + 5s as a safety net so an outbox row that
+        // never gets a beganAt still has a bounded delivery window.
+        const deadlineIso = (() => {
+          const base = new Date(evt.beginTime).getTime();
+          if (!Number.isFinite(base)) return null;
+          return new Date(base).toISOString();
+        })();
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at
+            attempt_count, next_attempt_at, telegram_deadline_at
           ) values (
             ${randomUUID()}::uuid, 'prediction',
             ${predictionContent},
@@ -407,7 +446,7 @@ export async function onGameStart(
               kind: "prediction",
             })},
             'pending', 2,
-            0, now()
+            0, now(), ${deadlineIso}::timestamptz
           )
         `;
         outboxEnqueued = 1;
@@ -504,7 +543,8 @@ export interface OnGameEndPredictResult {
     | "too_late"
     | "insufficient_history"
     | "error"
-    | "temporally_invalid";
+    | "temporally_invalid"
+    | "skipped_late";
   /** Proven only when targetStartedAt is known and remainingBeforeTargetMs > 0 */
   temporalValidity?: TemporalValidity;
   sourceGameId?: string;
@@ -514,6 +554,8 @@ export interface OnGameEndPredictResult {
   predictionLatencyMs?: number;
   availableWindowMs?: number | null;
   remainingBeforeTargetMs?: number | null;
+  /** Why the gate short-circuited, when it did. */
+  gateReason?: "below_skip_below" | "below_min_window" | "no_target_start" | "sheath_mode";
 }
 
 export async function onGameEndPredict(
@@ -528,6 +570,63 @@ export async function onGameEndPredict(
   const sql = await getSqlFn();
   const targetGameId = (BigInt(gameId) + 1n).toString();
   const generatedAt = new Date().toISOString();
+  const minRequiredWindowMs = deps.minRequiredWindowMs ?? MIN_REQUIRED_WINDOW_MS;
+  const skipBelowMs = deps.skipBelowMs ?? SKIP_BELOW_MS;
+  const predictTimeoutMs = deps.predictTimeoutMs ?? PREDICT_TIMEOUT_MS;
+  const nowFn = deps.now ?? (() => Date.now());
+
+  const defaultWriteGateEvent = async (event: {
+    targetGameId: string;
+    decision: "predicted" | "skipped_late" | "timeout" | "no_history" | "duplicate" | "too_late";
+    remainingBeforeTargetMs: number | null;
+    slaViolated: boolean;
+  }): Promise<void> => {
+    try {
+      await sql`
+        INSERT INTO live_event_log (
+          correlation_id, event_kind, game_id, payload, received_at, processed_at,
+          processor_latency_ms, sla_violated
+        ) VALUES (
+          ${correlationId}::text, 'PREDICT', ${event.targetGameId},
+          ${JSON.stringify({
+            kind: "gate",
+            decision: event.decision,
+            remainingBeforeTargetMs: event.remainingBeforeTargetMs,
+          })}::jsonb,
+          ${generatedAt}::timestamptz, now(), 0, ${event.slaViolated}
+        )
+        ON CONFLICT DO NOTHING
+      `;
+    } catch {
+      /* non-fatal */
+    }
+  };
+  const writeGateEvent = deps.writeGateEvent ?? defaultWriteGateEvent;
+
+  // Spec §6.10 — auto-sheath short-circuit. If the late-rate monitor
+  // has flipped `sheath_mode_active = 1`, skip the predict immediately
+  // without spending the residual window.
+  try {
+    const { isSheathed } = await import(
+      "@/lib/prediction/live/late-rate-monitor"
+    );
+    if (await isSheathed(sql)) {
+      await writeGateEvent({
+        targetGameId,
+        decision: "skipped_late",
+        remainingBeforeTargetMs: null,
+        slaViolated: false,
+      });
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "skipped_late",
+        gateReason: "sheath_mode",
+      };
+    }
+  } catch {
+    /* late-rate-monitor may not be initialized yet */
+  }
 
   try {
     const existing = await sql<{ prediction_id: string }>`
@@ -572,6 +671,76 @@ export async function onGameEndPredict(
       return { predictionId: null, targetGameId, kind: "too_late" };
     }
 
+    // Spec §6.1 / §6.11 — deadline-aware predict gate. Query the target's
+    // began_at from live_round_state and skip when the residual window is
+    // too small to safely finish model + INSERT + outbox enqueue.
+    let gateTargetBeganAt: string | null = null;
+    try {
+      const live = await sql<{ began_at: string | Date | null }>`
+        SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+      `.catch(() => [] as { began_at: string | Date | null }[]);
+      if (live[0]?.began_at) {
+        gateTargetBeganAt = new Date(live[0].began_at).toISOString();
+      }
+    } catch { /* ignore */ }
+
+    if (gateTargetBeganAt) {
+      const beganMs = new Date(gateTargetBeganAt).getTime();
+      const remainingMs = beganMs - nowFn();
+      if (remainingMs < skipBelowMs) {
+        const slaViolated = remainingMs < 0;
+        logger.warn(
+          {
+            targetGameId,
+            gateReason: "below_skip_below",
+            remainingMs,
+            skipBelowMs,
+          },
+          "deadline gate short-circuit: target too close; skipping prediction",
+        );
+        await writeGateEvent({
+          targetGameId,
+          decision: "skipped_late",
+          remainingBeforeTargetMs: remainingMs,
+          slaViolated,
+        });
+        return {
+          predictionId: null,
+          targetGameId,
+          kind: "skipped_late",
+          remainingBeforeTargetMs: remainingMs,
+          targetStartedAt: gateTargetBeganAt,
+          gateReason: "below_skip_below",
+        };
+      }
+      if (remainingMs < minRequiredWindowMs) {
+        const slaViolated = remainingMs < 0;
+        logger.warn(
+          {
+            targetGameId,
+            gateReason: "below_min_window",
+            remainingMs,
+            minRequiredWindowMs,
+          },
+          "deadline gate short-circuit: residual window too small; skipping prediction",
+        );
+        await writeGateEvent({
+          targetGameId,
+          decision: "skipped_late",
+          remainingBeforeTargetMs: remainingMs,
+          slaViolated,
+        });
+        return {
+          predictionId: null,
+          targetGameId,
+          kind: "skipped_late",
+          remainingBeforeTargetMs: remainingMs,
+          targetStartedAt: gateTargetBeganAt,
+          gateReason: "below_min_window",
+        };
+      }
+    }
+
     const rows = await sql<{
       game_id: string;
       multiplier: string | number;
@@ -595,8 +764,99 @@ export async function onGameEndPredict(
     }
 
     const tPredict0 = performance.now();
-    const signal = predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET);
+    type PredictSignal = {
+      predictionId: string;
+      probability: number;
+      confidence: number;
+      regimeId: string | null;
+      reasoning: string[];
+      featureSummary: Record<string, unknown>;
+      modelVersion: string;
+    };
+    let signal: PredictSignal;
+    let predictTimedOut = false;
+    try {
+      signal = await new Promise<PredictSignal>((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          predictTimedOut = true;
+          resolve({
+            predictionId: `timeout-${correlationId}`,
+            probability: 0,
+            confidence: 0,
+            regimeId: null,
+            reasoning: ["predict_timeout"],
+            featureSummary: { timeout: true },
+            modelVersion: "timeout-fallback",
+          });
+        }, predictTimeoutMs);
+        try {
+          const out = predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET);
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({
+            predictionId: out.predictionId,
+            probability: out.probability,
+            confidence: out.confidence,
+            regimeId: out.regimeId,
+            reasoning: [...out.reasoning],
+            featureSummary: { ...out.featureSummary },
+            modelVersion: out.modelVersion,
+          });
+        } catch (e) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
+    } catch (e) {
+      logger.error(
+        { targetGameId, error: String(e) },
+        "PredictionEngine.predict threw; recording as error",
+      );
+      await writeGateEvent({
+        targetGameId,
+        decision: "timeout",
+        remainingBeforeTargetMs: null,
+        slaViolated: false,
+      });
+      return { predictionId: null, targetGameId, kind: "error" };
+    }
     const generationLatencyMs = Math.round(performance.now() - tPredict0);
+    if (predictTimedOut) {
+      logger.warn(
+        {
+          targetGameId,
+          generationLatencyMs,
+          predictTimeoutMs,
+        },
+        "PredictionEngine.predict exceeded timeout; baseline fallback applied (no row written)",
+      );
+      await writeGateEvent({
+        targetGameId,
+        decision: "timeout",
+        remainingBeforeTargetMs:
+          gateTargetBeganAt != null
+            ? new Date(gateTargetBeganAt).getTime() - nowFn()
+            : null,
+        slaViolated: false,
+      });
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "skipped_late",
+        gateReason: "below_min_window",
+        targetStartedAt: gateTargetBeganAt,
+        remainingBeforeTargetMs:
+          gateTargetBeganAt != null
+            ? new Date(gateTargetBeganAt).getTime() - nowFn()
+            : null,
+      };
+    }
     try {
       const { predictionGenerationMs, edToPredictMs } = await import(
         "@/lib/observability/performance/latency"

@@ -28,7 +28,8 @@ Two deployments of the same repository, talking to the same PostgreSQL:
 The worker (`scripts/worker.mjs`) runs as a long-lived Node.js process on
 Railway (see `railway.toml` / `Procfile`):
 
-- Polls BC.Game history every `PREDICTION_POLL_MS` (default **10 s**)
+- Polls BC.Game history every `POLL_WORKER_MS` (default **3 s**; tighter
+  `POLL_DEGRADED_MS=1200` when the socket is blocked)
 - Detects new rounds by comparing `game_id` against the DB primary key
 - Generates predictions using the existing `PredictionEngine`
 - Validates WIN/LOSS outcomes, deterministically 1:1:1 with the round
@@ -163,9 +164,21 @@ predictionSetDailyTarget({ target: 50 })
 | Variable                   | Default  | Used by                    | Purpose                                       |
 |----------------------------|----------|----------------------------|-----------------------------------------------|
 | `DATABASE_URL`             | —        | Vercel **+** Railway       | Postgres connection string                    |
-| `PREDICTION_POLL_MS`       | `10000`  | Railway worker only        | BC.Game poll interval (ms)                    |
+| `POLL_WORKER_MS`           | `3000`   | Railway worker only        | BC.Game REST poll interval (ms); canonical.   |
+| `POLL_DEGRADED_MS`         | `1200`   | Railway worker only        | Poll interval when socket is degraded/WAF.   |
+| `RESEED_INTERVAL_MS`       | `600000` | Railway worker only        | Periodic re-seeder cadence (ms).             |
 | `PREDICTION_LOCK_TTL_SEC`  | `60`     | Railway worker only        | Distributed lock TTL (s)                      |
 | `PREDICTION_FETCH_PAGES`   | `2`      | Railway worker only        | Pages of BC.Game history per poll             |
+| `PREDICT_MIN_WINDOW_MS`    | `800`    | Railway worker only        | Deadline gate: skip predict below this.      |
+| `PREDICT_SKIP_BELOW_MS`    | `500`    | Railway worker only        | Hard short-circuit: refuse to attempt.       |
+| `PREDICT_TIMEOUT_MS`       | `80`     | Railway worker only        | Per-call timeout on `PredictionEngine.predict`|
+| `OUTBOX_BATCH_PARALLELISM` | `4`      | Railway worker only        | Parallel Telegram send per tick.             |
+| `OUTBOX_TICK_MS`           | `200`    | Railway worker only        | Outbox dispatcher tick cadence (ms).          |
+| `TELEGRAM_SEND_BUDGET_MS`  | `5000`   | Railway worker only        | Delivery latency p95 alarm threshold.        |
+| `CLOCK_SKEW_INTERVAL_MS`   | `300000` | Railway worker only        | Wallclock skew probe cadence.                |
+| `CLOCK_SKEW_ALERT_MS`      | `1000`   | Railway worker only        | |skew| above this logs an alarm.             |
+| `LATE_RATE_WARN`           | `0.05`   | Railway worker only        | Late-rate warn threshold (5%).               |
+| `LATE_RATE_SHEATH`         | `0.20`   | Railway worker only        | Late-rate auto-sheath threshold (20%).       |
 | `PG_DATA_PATH`             | `./data/crashwave` | Dev only         | PGLite on-disk dir (never set in production) |
 
 See `.env.example` for the full annotated list.

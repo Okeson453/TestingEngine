@@ -228,7 +228,7 @@ export async function onGameEnd(
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at
+            attempt_count, next_attempt_at, telegram_deadline_at
           ) values (
             ${randomUUID()}::uuid, 'validation',
             ${validationContent},
@@ -245,7 +245,7 @@ export async function onGameEnd(
               kind: "validation",
             })},
             'pending', 2,
-            0, now()
+            0, now(), now() + interval '30 seconds'
           )
         `;
       }

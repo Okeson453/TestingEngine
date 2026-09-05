@@ -24,6 +24,13 @@ import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
 
 const logger = getLogger("live-boot");
 
+/** Spec §6.8 — periodic re-seed cadence. If a restart happens mid-stream
+ *  the seeder only ran once on boot, so the first few rounds after
+ *  restart are late/missing. Re-run every RESEED_INTERVAL_MS to plug
+ *  the gap. */
+const RESEED_INTERVAL_MS = Number(process.env.RESEED_INTERVAL_MS ?? 10 * 60 * 1_000);
+const RESEED_MIN_HISTORY = Number(process.env.RESEED_MIN_HISTORY ?? 100);
+
 /** Spec §3.10 — startup schema validation. Verifies every required table
  *  exists before any worker role is started. A missing table is a hard
  *  failure: the worker would otherwise fail in an arbitrary place. */
@@ -72,6 +79,7 @@ class LiveBoot {
   private dispatcher: OutboxDispatcher | null = null;
   private pollWorker: PollWorker | null = null;
   private clockMonitor: ClockSkewMonitor | null = null;
+  private reseedTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
   private lastResult: BootResult | null = null;
 
@@ -202,13 +210,59 @@ class LiveBoot {
     await pollWorker.start();
     await clockMonitor.start();
 
+    // Spec §6.8 — periodic re-seeder. If we restarted mid-stream the
+    // boot-time seeder may not have caught up to live conditions; re-run
+    // every RESEED_INTERVAL_MS whenever history is short of
+    // RESEED_MIN_HISTORY rows. Failures are logged and do not crash.
+    this.scheduleReseed(RESEED_INTERVAL_MS, deps?.seeder);
+
     this.lastResult = { seed, bootStartedAt };
     return this.lastResult;
+  }
+
+  private scheduleReseed(
+    delayMs: number,
+    seeder: (() => Promise<SeedResult>) | undefined,
+  ): void {
+    if (!this.started) return;
+    this.reseedTimer = setTimeout(() => {
+      void this.runReseed(seeder);
+    }, delayMs);
+    this.reseedTimer.unref?.();
+  }
+
+  private async runReseed(
+    seeder: (() => Promise<SeedResult>) | undefined,
+  ): Promise<void> {
+    if (!this.started) return;
+    try {
+      const sql = await getSql();
+      const rows = await sql<{ c: number }>`select count(*)::int as c from crash_rounds`;
+      const count = rows[0]?.c ?? 0;
+      if (count < RESEED_MIN_HISTORY) {
+        const fn = seeder ?? (() => runColdStartSeeder());
+        const r = await fn();
+        logger.info(
+          { component: "live-boot", reseed: r, count },
+          "periodic re-seed completed (history was below threshold)",
+        );
+      }
+    } catch (e) {
+      logger.warn(
+        { component: "live-boot", error: String(e) },
+        "periodic re-seed failed; continuing",
+      );
+    }
+    this.scheduleReseed(RESEED_INTERVAL_MS, seeder);
   }
 
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
+    if (this.reseedTimer) {
+      clearTimeout(this.reseedTimer);
+      this.reseedTimer = null;
+    }
     if (this.dispatcher) await this.dispatcher.stop();
     if (this.pollWorker) await this.pollWorker.stop();
     if (this.clockMonitor) await this.clockMonitor.stop();
