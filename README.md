@@ -28,7 +28,7 @@ Two deployments of the same repository, talking to the same PostgreSQL:
 The worker (`scripts/worker.mjs`) runs as a long-lived Node.js process on
 Railway (see `railway.toml` / `Procfile`):
 
-- Polls BC.Game history every `PREDICTION_POLL_MS` (default **10 s**)
+- Polls BC.Game history every `POLL_WORKER_MS` (default **10 s**)
 - Detects new rounds by comparing `game_id` against the DB primary key
 - Generates predictions using the existing `PredictionEngine`
 - Validates WIN/LOSS outcomes, deterministically 1:1:1 with the round
@@ -163,7 +163,7 @@ predictionSetDailyTarget({ target: 50 })
 | Variable                   | Default  | Used by                    | Purpose                                       |
 |----------------------------|----------|----------------------------|-----------------------------------------------|
 | `DATABASE_URL`             | —        | Vercel **+** Railway       | Postgres connection string                    |
-| `PREDICTION_POLL_MS`       | `10000`  | Railway worker only        | BC.Game poll interval (ms)                    |
+| `POLL_WORKER_MS`       | `10000`  | Railway worker only        | BC.Game poll interval (ms)                    |
 | `PREDICTION_LOCK_TTL_SEC`  | `60`     | Railway worker only        | Distributed lock TTL (s)                      |
 | `PREDICTION_FETCH_PAGES`   | `2`      | Railway worker only        | Pages of BC.Game history per poll             |
 | `PG_DATA_PATH`             | `./data/crashwave` | Dev only         | PGLite on-disk dir (never set in production) |
@@ -177,7 +177,7 @@ See `.env.example` for the full annotated list.
 1. New Railway project from this repository.
 2. Add a PostgreSQL database (or use Neon / external Postgres — set
    `DATABASE_URL` in the Railway service's env vars).
-3. Set `DATABASE_URL`, `PREDICTION_POLL_MS=10000`,
+3. Set `DATABASE_URL`, `POLL_WORKER_MS=10000`,
    `PREDICTION_LOCK_TTL_SEC=60`, `PREDICTION_FETCH_PAGES=2`.
 4. `railway.toml` auto-detects the build (`npm install`) and start command
    (`npm run worker`).

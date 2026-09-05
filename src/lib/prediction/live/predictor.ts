@@ -32,6 +32,12 @@ const MAX_HISTORY = 100;
  *  outbox writes are skipped to avoid the "predicts the past" operator
  *  symptom. */
 export const SLA_LAG_MS = 2_000;
+/** Residual window below which we skip prediction entirely (no row written). */
+export const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 800);
+/** Stronger short-circuit: if residual is below this, skip even earlier. */
+export const SKIP_BELOW_MS = Number(process.env.SKIP_BELOW_MS ?? 500);
+/** Hard timeout for PredictionEngine.predict (ms). */
+export const PREDICT_TIMEOUT_MS = Number(process.env.PREDICT_TIMEOUT_MS ?? 80);
 /** DB-level CHECK constraint cap: a bg payload whose `beginTime` is in the
  *  future of the prediction row's `prediction_generated_at` is rejected. */
 export const TEMPORAL_TOLERANCE_MS = 100;
@@ -502,6 +508,7 @@ export interface OnGameEndPredictResult {
     | "predicted"
     | "duplicate"
     | "too_late"
+    | "skipped_late"
     | "insufficient_history"
     | "error"
     | "temporally_invalid";
@@ -528,6 +535,46 @@ export async function onGameEndPredict(
   const sql = await getSqlFn();
   const targetGameId = (BigInt(gameId) + 1n).toString();
   const generatedAt = new Date().toISOString();
+
+  // P0 deadline-aware gate (before any expensive work / SELECTs beyond residual check)
+  try {
+    const residualRows = await sql<{ began_at: string | Date | null }>`
+      SELECT began_at FROM live_round_state
+      WHERE game_id = ${targetGameId}
+      LIMIT 1
+    `;
+    if (residualRows.length > 0 && residualRows[0]!.began_at != null) {
+      const beganMs = new Date(residualRows[0]!.began_at).getTime();
+      const remainingMs = beganMs - Date.now();
+      if (Number.isFinite(remainingMs) && remainingMs < MIN_REQUIRED_WINDOW_MS) {
+        logger.warn(
+          { targetGameId, remainingMs, threshold: MIN_REQUIRED_WINDOW_MS },
+          "Skipping prediction: insufficient residual window",
+        );
+        try {
+          await sql`
+            INSERT INTO live_event_log (
+              correlation_id, event_kind, game_id, payload, received_at, processed_at,
+              processor_latency_ms, sla_violated
+            ) VALUES (
+              ${correlationId}::text, 'PREDICT', ${targetGameId},
+              ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: MIN_REQUIRED_WINDOW_MS })},
+              ${generatedAt}::timestamptz, now(), 0, true
+            )
+            ON CONFLICT DO NOTHING
+          `;
+        } catch { /* non-fatal */ }
+        return {
+          predictionId: null,
+          targetGameId,
+          kind: "skipped_late",
+          remainingBeforeTargetMs: remainingMs,
+        };
+      }
+    }
+  } catch {
+    /* live_round_state may be absent during migration window — proceed */
+  }
 
   try {
     const existing = await sql<{ prediction_id: string }>`
@@ -595,7 +642,41 @@ export async function onGameEndPredict(
     }
 
     const tPredict0 = performance.now();
-    const signal = predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET);
+    // Hard timeout around sync model inference (P0 / 6.2)
+    let signal: ReturnType<typeof defaultPredictFn>;
+    try {
+      signal = await Promise.race([
+        Promise.resolve().then(() =>
+          predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET),
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`predict_timeout_${PREDICT_TIMEOUT_MS}ms`)),
+            PREDICT_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+    } catch (timeoutErr) {
+      const generationLatencyMs = Math.round(performance.now() - tPredict0);
+      logger.warn(
+        { targetGameId, generationLatencyMs, error: String(timeoutErr) },
+        "PredictionEngine.predict timed out — skipping",
+      );
+      try {
+        await sql`
+          INSERT INTO live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) VALUES (
+            ${correlationId}::text, 'PREDICT', ${targetGameId},
+            ${JSON.stringify({ kind: "predict_timeout", generationLatencyMs })},
+            ${generatedAt}::timestamptz, now(), ${generationLatencyMs}, true
+          )
+          ON CONFLICT DO NOTHING
+        `;
+      } catch { /* non-fatal */ }
+      return { predictionId: null, targetGameId, kind: "error" };
+    }
     const generationLatencyMs = Math.round(performance.now() - tPredict0);
     try {
       const { predictionGenerationMs, edToPredictMs } = await import(
@@ -775,6 +856,45 @@ export async function onGameEndPredict(
         generatedAt,
         correlationId,
       });
+      // P0: attempt synchronous Telegram delivery (2s timeout). Outbox remains
+      // as durable retry fallback if this fails.
+      if (temporalValidity !== "TEMPORALLY_INVALID") {
+        try {
+          const { sendTelegramMessage, formatPredictionMessage } = await import(
+            "@/lib/notifications/telegram"
+          );
+          const content = formatPredictionMessage({
+            predictionId,
+            targetMultiplier: Number(DEFAULT_TARGET),
+            probability: signal.probability,
+            confidence: signal.confidence,
+            regimeName: signal.regimeId ?? null,
+            lastRoundMultiplier: rounds[rounds.length - 1]?.crashPoint ?? null,
+            generatedAt,
+          });
+          const results = await sendTelegramMessage(content, { timeout: 2000 });
+          const allOk = results.length > 0 && results.every((r) => r.ok);
+          if (allOk) {
+            await sql`
+              UPDATE notification_outbox
+              SET status = 'delivered', delivered_at = now(), last_error = null
+              WHERE metadata->>'predictionId' = ${predictionId}
+                AND status IN ('pending', 'inflight')
+            `;
+            logger.info({ predictionId }, "Sync Telegram delivery succeeded");
+          } else {
+            logger.warn(
+              { predictionId, results },
+              "Sync Telegram delivery partial/failed; outbox will retry",
+            );
+          }
+        } catch (syncErr) {
+          logger.warn(
+            { predictionId, error: String(syncErr) },
+            "Sync Telegram delivery threw; outbox will retry",
+          );
+        }
+      }
     } catch (notifErr) {
       logger.warn(
         { predictionId, error: String(notifErr) },

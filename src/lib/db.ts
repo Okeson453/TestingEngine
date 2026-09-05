@@ -29,6 +29,7 @@ export interface Sql {
 
 const globalRef = globalThis as typeof globalThis & {
   __pgSqlPromise__?: Promise<Sql>;
+  __pgPool__?: import("pg").Pool;
   __pgliteInstance__?: Promise<import("@electric-sql/pglite").PGlite>;
   __pgliteMigrateChain__?: Promise<void>;
 };
@@ -86,15 +87,30 @@ function createNeonSql(): Promise<Sql> {
       console.error("[db] Pool connection error (non-fatal):", err.message);
     });
 
+    // Expose the pool so runInTransaction can pin a single client for
+    // true atomic multi-statement transactions on Neon (pool.query alone
+    // does not guarantee connection affinity across BEGIN/COMMIT).
+    globalRef.__pgPool__ = pool;
+
     return toSql(async <T>(text: string, params: unknown[]) => {
       const res = await pool.query(text, params);
       return res.rows as T[];
     });
   })().catch((err) => {
     globalRef.__pgSqlPromise__ = undefined;
+    globalRef.__pgPool__ = undefined;
     throw err;
   });
   return globalRef.__pgSqlPromise__;
+}
+
+/**
+ * Return the underlying pg.Pool when running against Neon.
+ * Used by runInTransaction to pin a dedicated client for the full
+ * BEGIN…COMMIT lifecycle. Returns null on the PGLite path.
+ */
+export function getPgPool(): import("pg").Pool | null {
+  return globalRef.__pgPool__ ?? null;
 }
 
 async function createPgliteSql(): Promise<Sql> {

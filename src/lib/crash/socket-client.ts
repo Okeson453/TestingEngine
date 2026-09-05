@@ -96,6 +96,10 @@ export class BcGameSocketClient {
   /** Only true after intentional stop(); never set by reconnect cleanup. */
   private intentionalShutdown = false;
   private discoveredEvents: Set<string> = new Set();
+  /** Per-game last ED timestamp. Global lastEdAt is still updated for
+   *  backward compatibility, but poll-worker must use Crash-specific lag
+   *  to avoid false deferral when Dice/Limbo emit ed events. */
+  private lastEdAtByGame: Map<string, string> = new Map();
 
   constructor() {
     for (const event of ["bg", "pg", "ed"] as const) {
@@ -126,6 +130,12 @@ export class BcGameSocketClient {
     return () => {
       this.errorHandlers.delete(handler);
     };
+  }
+
+  /** Crash-specific last ED time (or null). Prefer this over getState().lastEdAt
+   *  when deciding whether the poll worker should defer. */
+  getLastEdAtForGame(gameKey: string = "crash"): string | null {
+    return this.lastEdAtByGame.get(gameKey) ?? null;
   }
 
   getState(): ConnectionState {
@@ -431,7 +441,24 @@ export class BcGameSocketClient {
       lastEventKind: event,
       eventLagMs: 0,
     };
-    if (event === "ed") updates.lastEdAt = now;
+    if (event === "ed") {
+      updates.lastEdAt = now;
+      // Record Crash-specific ED when payload identifies the crash game.
+      // normalizePayload runs after this; extract gameId opportunistically.
+      try {
+        const p = payload as Record<string, unknown> | null;
+        const gid =
+          (p && (p["gameId"] ?? p["game_id"] ?? p["id"])) != null
+            ? String(p["gameId"] ?? p["game_id"] ?? p["id"])
+            : "crash";
+        this.lastEdAtByGame.set(String(gid), now);
+        // Also always stamp the canonical "crash" key used by poll-worker
+        // when the event is on the crash socket namespace.
+        this.lastEdAtByGame.set("crash", now);
+      } catch {
+        this.lastEdAtByGame.set("crash", now);
+      }
+    }
     if (event === "bg") updates.lastBgAt = now;
     if (this.state.status === "degraded") updates.status = "connected";
     this.updateState(updates);

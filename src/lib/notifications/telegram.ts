@@ -155,10 +155,11 @@ async function sendToChat(
   token: string,
   chatId: string,
   text: string,
+  timeoutMs: number = SEND_TIMEOUT_MS,
 ): Promise<SendResult> {
   const url = `${TELEGRAM_API}/bot${token}/sendMessage`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
       method: "POST",
@@ -187,7 +188,7 @@ async function sendToChat(
   } catch (e: unknown) {
     const name = (e as { name?: string })?.name;
     if (name === "AbortError") {
-      return { ok: false, status: 0, error: `timeout_${SEND_TIMEOUT_MS}ms`, chatId };
+      return { ok: false, status: 0, error: `timeout_${timeoutMs}ms`, chatId };
     }
     return { ok: false, status: 0, error: (e as Error)?.message ?? "network_error", chatId };
   } finally {
@@ -204,13 +205,19 @@ async function sendToChat(
  * Never throws. Each destination is an independent `AbortController`-bound
  * fetch, so a slow or failing chat never delays or blocks another.
  */
-export async function sendTelegramMessage(text: string): Promise<SendResult[]> {
+export async function sendTelegramMessage(
+  text: string,
+  options?: { timeout?: number },
+): Promise<SendResult[]> {
   const token = readEnv("TELEGRAM_BOT_TOKEN");
   const chatIds = getConfiguredChatIds();
+  const timeoutMs = options?.timeout ?? SEND_TIMEOUT_MS;
   if (!token || chatIds.length === 0) {
     return [{ ok: false, status: 0, error: "not_configured", chatId: "" }];
   }
-  return Promise.all(chatIds.map((chatId) => sendToChat(token, chatId, text)));
+  return Promise.all(
+    chatIds.map((chatId) => sendToChat(token, chatId, text, timeoutMs)),
+  );
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

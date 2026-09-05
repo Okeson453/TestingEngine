@@ -28,6 +28,8 @@ export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 200);
 export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
+/** Max concurrent Telegram sends within a claimed batch (P0 / 6.5). */
+export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 4);
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -98,24 +100,21 @@ export class OutboxDispatcher {
     requeued: number;
   }> {
     this.stats.tickCount += 1;
-    const recovered = 0;
     let delivered = 0;
     let dead = 0;
     let requeued = 0;
 
     const sql = await this.getSqlFn();
 
-    // Stale-row recovery is performed by `recoverStale()` which is called
-    // by the runOneTick loop *before* tickOnce; tickOnce itself only
-    // claims + sends.
-
-    // Step 1: claim a batch. SELECT FOR UPDATE SKIP LOCKED → mark inflight → COMMIT.
+    // Claim batch: SELECT FOR UPDATE SKIP LOCKED → set status=inflight → COMMIT.
+    // Exclude rows past telegram_deadline_at so we never deliver "predicts the past".
     const claimed = await runInTransaction(sql, async (tx) => {
       const rows = await tx<OutboxRow>`
         select id, notification_id, type, content, metadata, status, attempt_count, next_attempt_at
         from notification_outbox
         where status = 'pending'::text
           and next_attempt_at <= now()
+          and (telegram_deadline_at is null or telegram_deadline_at > now())
         order by next_attempt_at asc, id asc
         limit ${BATCH_SIZE}
         for update skip locked
@@ -123,12 +122,9 @@ export class OutboxDispatcher {
       for (const r of rows) {
         await tx`
           update notification_outbox
-          set attempt_count = attempt_count + 1,
-              last_error = case
-                when last_error like '%recovered from inflight%' then ' [recovered from inflight]'
-                else last_error
-              end
-          where id = ${r.id}
+          set status = 'inflight',
+              attempt_count = attempt_count + 1
+          where id = ${r.id} and status = 'pending'
         `;
       }
       return rows;
@@ -138,62 +134,82 @@ export class OutboxDispatcher {
       this.stats.claimed += claimed.length;
     }
 
-    // Step 3: send each.
-    for (const row of claimed) {
-      try {
-        const results = await sendTelegramMessage(row.content);
-        const allOk = results.length > 0 && results.every((r) => r.ok);
-        if (allOk) {
-          await sql`
-            update notification_outbox
-            set status = 'delivered', delivered_at = now(), last_error = null
-            where id = ${row.id}
-          `;
-          delivered += 1;
-          this.stats.delivered += 1;
-        } else {
-          const updated = await this.handleFailure(sql, row, results);
-          if (updated === "dead") dead += 1;
-          else requeued += 1;
-        }
-      } catch (e) {
-        this.stats.lastError = String(e);
-        logger.warn(
-          { component: "outbox-dispatcher", notificationId: row.notification_id, error: String(e) },
-          "send threw; treating as retryable",
-        );
-        const updated = await this.handleFailure(sql, row, []);
-        if (updated === "dead") dead += 1;
+    // Parallel dispatch bounded by BATCH_PARALLELISM (P0 / 6.5)
+    const parallelism = Math.max(1, BATCH_PARALLELISM);
+    for (let i = 0; i < claimed.length; i += parallelism) {
+      const chunk = claimed.slice(i, i + parallelism);
+      const results = await Promise.all(
+        chunk.map(async (row) => {
+          try {
+            const sendResults = await sendTelegramMessage(row.content);
+            const allOk =
+              sendResults.length > 0 && sendResults.every((r) => r.ok);
+            if (allOk) {
+              await sql`
+                update notification_outbox
+                set status = 'delivered', delivered_at = now(), last_error = null
+                where id = ${row.id}
+              `;
+              this.stats.delivered += 1;
+              return "delivered" as const;
+            }
+            const updated = await this.handleFailure(sql, row, sendResults);
+            return updated;
+          } catch (e) {
+            this.stats.lastError = String(e);
+            logger.warn(
+              {
+                component: "outbox-dispatcher",
+                notificationId: row.notification_id,
+                error: String(e),
+              },
+              "send threw; treating as retryable",
+            );
+            const updated = await this.handleFailure(sql, row, []);
+            return updated;
+          }
+        }),
+      );
+      for (const r of results) {
+        if (r === "delivered") delivered += 1;
+        else if (r === "dead") dead += 1;
         else requeued += 1;
       }
     }
-    return { recovered, delivered, dead, requeued };
+    return { recovered: 0, delivered, dead, requeued };
   }
 
   /** Recover stale INFLIGHT (legacy status) or stuck pending rows. */
   async recoverStale(): Promise<number> {
     const sql = await this.getSqlFn();
-    // Pending rows whose `next_attempt_at` is more than STALE_INFLIGHT_MS
-    // in the past are stuck (the dispatcher crashed mid-send). Reset
-    // `attempt_count` so the row retries from a clean state. (Some
-    // older schema variants had a separate 'inflight' status — that path
-    // is preserved for safety.)
-    const res = await sql<{ count: number }>`
-      with x as (
-        update notification_outbox
-        set status = 'pending',
-            last_error = coalesce(last_error, '') || ' [recovered from inflight]'
-        where status in ('inflight', 'pending')
+    // Reset stuck inflight rows (crash mid-send) and very-old pending rows.
+    const result = await sql<{ id: number }>`
+      update notification_outbox
+      set status = 'pending',
+          last_error = coalesce(last_error, '') || ' [recovered from inflight]',
+          next_attempt_at = now()
+      where (
+          status = 'inflight'
+          and updated_at < now() - (${STALE_INFLIGHT_MS}::int * interval '1 millisecond')
+        )
+        or (
+          status = 'pending'
           and next_attempt_at < now() - (${STALE_INFLIGHT_MS}::int * interval '1 millisecond')
           and coalesce(last_error, '') not like '%recovered from inflight%'
-        returning 1
-      )
-      select count(*)::int as count from x
+        )
+      returning id
     `;
-    const count = res[0]?.count ?? 0;
-    this.stats.recoveredInflight += count;
-    return count;
+    const n = result.length;
+    if (n > 0) {
+      this.stats.recoveredInflight += n;
+      logger.info(
+        { component: "outbox-dispatcher", recovered: n },
+        "recovered stale inflight/pending outbox rows",
+      );
+    }
+    return n;
   }
+
 
   private async handleFailure(
     sql: Sql,

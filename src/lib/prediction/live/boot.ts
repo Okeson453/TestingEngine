@@ -24,6 +24,62 @@ import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
 
 const logger = getLogger("live-boot");
 
+/** Distributed single-writer lock (P0). Uses worker_locks table from 0006. */
+const WORKER_ID =
+  process.env.RAILWAY_REPLICA_ID ||
+  process.env.WORKER_ID ||
+  `worker-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+const LOCK_KEY = "prediction_worker";
+const LOCK_TTL_SECONDS = 30;
+let lockHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+async function acquireWorkerLock(sql: Sql): Promise<boolean> {
+  const rows = await sql<{ owner_id: string }>`
+    INSERT INTO worker_locks (lock_key, owner_id, acquired_at, expires_at, heartbeat_at)
+    VALUES (
+      ${LOCK_KEY},
+      ${WORKER_ID},
+      now(),
+      now() + (${LOCK_TTL_SECONDS}::int * interval '1 second'),
+      now()
+    )
+    ON CONFLICT (lock_key) DO UPDATE
+    SET owner_id = EXCLUDED.owner_id,
+        acquired_at = EXCLUDED.acquired_at,
+        expires_at = EXCLUDED.expires_at,
+        heartbeat_at = EXCLUDED.heartbeat_at
+    WHERE worker_locks.expires_at < now()
+       OR worker_locks.owner_id = ${WORKER_ID}
+    RETURNING owner_id
+  `;
+  return rows[0]?.owner_id === WORKER_ID;
+}
+
+async function heartbeatWorkerLock(sql: Sql): Promise<void> {
+  await sql`
+    UPDATE worker_locks
+    SET heartbeat_at = now(),
+        expires_at = now() + (${LOCK_TTL_SECONDS}::int * interval '1 second')
+    WHERE lock_key = ${LOCK_KEY} AND owner_id = ${WORKER_ID}
+  `;
+}
+
+function startLockHeartbeat(getSqlFn: () => Promise<Sql>): void {
+  if (lockHeartbeatTimer) return;
+  lockHeartbeatTimer = setInterval(() => {
+    void getSqlFn()
+      .then((sql) => heartbeatWorkerLock(sql))
+      .catch((e) => {
+        logger.warn(
+          { component: "live-boot", error: String(e) },
+          "worker lock heartbeat failed",
+        );
+      });
+  }, 10_000);
+  lockHeartbeatTimer.unref?.();
+}
+
+
 /** Spec §3.10 — startup schema validation. Verifies every required table
  *  exists before any worker role is started. A missing table is a hard
  *  failure: the worker would otherwise fail in an arbitrary place. */
@@ -187,6 +243,24 @@ class LiveBoot {
       );
       throw e;
     }
+
+    // P0: distributed single-writer lock
+    const hasLock = await acquireWorkerLock(sql);
+    if (!hasLock) {
+      logger.error(
+        { component: "live-boot", workerId: WORKER_ID },
+        "Another worker holds the distributed lock. Refusing to start mutation roles.",
+      );
+      // Still allow read-only / outbox recovery? Spec says shut down.
+      throw new Error(
+        `Worker lock not acquired (another instance holds '${LOCK_KEY}')`,
+      );
+    }
+    logger.info(
+      { component: "live-boot", workerId: WORKER_ID },
+      "distributed worker lock acquired",
+    );
+    startLockHeartbeat(getSql);
 
     await dispatcher.start();
     if (deps.startSubscriber) {

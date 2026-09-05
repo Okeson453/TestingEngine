@@ -77,15 +77,19 @@ export async function createNotification(
   // Calculate next attempt time based on priority
   const delayMs = options.delayMs ?? (priority >= HIGH_PRIORITY_THRESHOLD ? 0 : 0);
   const nextAttemptAt = delayMs > 0 ? new Date(Date.now() + delayMs).toISOString() : now;
+  // Per-row Telegram delivery deadline (P0 / 6.12). Default 5s from now;
+  // dispatcher will not claim rows past this timestamp.
+  const deadlineMs = Number(process.env.TELEGRAM_DEADLINE_MS ?? 5_000);
+  const telegramDeadlineAt = new Date(Date.now() + deadlineMs).toISOString();
   
   await sql`
     insert into notification_outbox (
       notification_id, type, content, metadata, status,
-      attempt_count, next_attempt_at, created_at, priority
+      attempt_count, next_attempt_at, created_at, priority, telegram_deadline_at
     ) values (
       ${notificationId}, ${options.type}, ${options.content}, 
       ${JSON.stringify(options.metadata ?? {})}, 'pending',
-      0, ${nextAttemptAt}, ${now}, ${priority}
+      0, ${nextAttemptAt}, ${now}, ${priority}, ${telegramDeadlineAt}::timestamptz
     )
   `;
   

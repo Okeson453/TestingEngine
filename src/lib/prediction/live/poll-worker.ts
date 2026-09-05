@@ -29,8 +29,11 @@ import { bcGameSocket } from "@/lib/crash/socket-client";
 
 const logger = getLogger("poll-worker");
 
-/** Emergency fallback interval — diagnosis recommends 3000 ms. */
-export const POLL_INTERVAL_MS = Number(process.env.POLL_WORKER_MS ?? 3_000);
+/** Emergency fallback interval. Canonical env: POLL_WORKER_MS (default 3000).
+ *  README previously documented PREDICTION_POLL_MS — that name is unused. */
+export const POLL_INTERVAL_MS = Number(
+  process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 3_000,
+);
 export const STALE_PREDICTED_MS = 15 * 60 * 1_000;
 
 export interface PollTickResult {
@@ -246,8 +249,14 @@ export class PollWorker {
     try {
       const { bcGameSocket } = await import("@/lib/crash/socket-client");
       const st = bcGameSocket.getState();
-      if (st.status === "connected" && st.lastEdAt) {
-        const lag = Date.now() - new Date(st.lastEdAt).getTime();
+      // Use Crash-specific last ED so Dice/Limbo activity cannot suppress
+      // the poll recovery path when the Crash socket is silent.
+      const lastCrashEd =
+        (typeof bcGameSocket.getLastEdAtForGame === "function"
+          ? bcGameSocket.getLastEdAtForGame("crash")
+          : null) || st.lastEdAt;
+      if (st.status === "connected" && lastCrashEd) {
+        const lag = Date.now() - new Date(lastCrashEd).getTime();
         if (lag < 30_000) {
           logger.debug(
             { component: "poll-worker", lagMs: lag },
@@ -326,7 +335,8 @@ export class PollWorker {
         st === "stopped" ||
         st === "connecting"
       ) {
-        return Math.max(2_000, Math.min(base, 3_000));
+        // P0: 1–1.5s when socket unhealthy (was 2–3s)
+        return Math.max(1_000, Math.min(base, 1_500));
       }
     } catch {
       /* socket optional in pure unit tests */
