@@ -43,6 +43,25 @@ function startEventLoopLagMonitor(): void {
   if (typeof eventLoopProbeTimer.unref === "function") eventLoopProbeTimer.unref();
 }
 
+/** Keep one connection warm so first critical-path query avoids cold connect. */
+let connectionWarmerTimer: ReturnType<typeof setInterval> | null = null;
+function startConnectionWarmer(getSqlFn: () => Promise<Sql>): void {
+  if (connectionWarmerTimer) return;
+  connectionWarmerTimer = setInterval(() => {
+    void getSqlFn()
+      .then((sql) => sql`SELECT 1`)
+      .catch(() => undefined);
+  }, 3_000);
+  if (typeof connectionWarmerTimer.unref === "function") connectionWarmerTimer.unref();
+}
+
+function stopConnectionWarmer(): void {
+  if (connectionWarmerTimer) {
+    clearInterval(connectionWarmerTimer);
+    connectionWarmerTimer = null;
+  }
+}
+
 
 /** Distributed single-writer lock (P0). Uses worker_locks table from 0006. */
 const WORKER_ID =
