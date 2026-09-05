@@ -48,6 +48,9 @@ export const PREDICT_TIMEOUT_MS = Number(process.env.PREDICT_TIMEOUT_MS ?? 80);
 /** Default 500ms (was 100) — P1 recommendation. */
 export const TEMPORAL_TOLERANCE_MS = Number(process.env.TEMPORAL_TOLERANCE_MS ?? 500);
 
+// P2.10: SLA Alert threshold for prediction timing
+export const PREDICTION_SLA_THRESHOLD_MS = Number(process.env.PREDICTION_SLA_THRESHOLD_MS ?? 2000);
+
 export interface GameStartEvent {
   gameId: string;
   beginTime: string;
@@ -531,12 +534,18 @@ export async function onGameStart(
       `;
     });
   } catch (e) {
+    // P2.15: Improve Error Logging in onGameStart
     logger.error(
       {
         component: "live-predictor",
         correlationId,
         targetGameId: evt.gameId,
         error: String(e),
+        errorStack: e instanceof Error ? e.stack : undefined,
+        beginTime: evt.beginTime,
+        receivedAt: evt.receivedAt,
+        slaLagMsActual,
+        slaViolated,
       },
       "predictor.onGameStart failed; logging and recording in worker_state",
     );
@@ -974,26 +983,47 @@ export async function onGameEndPredict(
         `;
       });
     } catch (persistErr) {
+      // P2.15: Improve Error Logging in onGameEndPredict
       logger.error(
-        { targetGameId, error: String(persistErr) },
-        "persist failed",
+        {
+          component: "live-predictor",
+          targetGameId,
+          sourceGameId: gameId,
+          error: String(persistErr),
+          errorStack: persistErr instanceof Error ? persistErr.stack : undefined,
+          correlationId,
+          signalProbability: signal?.probability,
+          signalConfidence: signal?.confidence,
+        },
+        "persist failed in onGameEndPredict",
       );
       return { predictionId: null, targetGameId, kind: "error" };
     }
     const persistMs = Math.round(performance.now() - tPersist0);
 
     // P1.8: Emit structured timing metrics
-    logger.info({
+    // P2.10: Add SLA Alert for Prediction Timing
+    const totalMs = Math.round(performance.now() - tGate0);
+    const timingLog = {
       component: "timing",
       path: "onGameEndPredict",
       gateMs,
       histMs,
       predictMs,
       persistMs,
-      totalMs: Math.round(performance.now() - tGate0),
+      totalMs,
       targetGameId,
       predictionId,
-    }, "prediction timing");
+    };
+    
+    if (totalMs > PREDICTION_SLA_THRESHOLD_MS) {
+      logger.error(
+        { ...timingLog, threshold: PREDICTION_SLA_THRESHOLD_MS },
+        "SLA violation: prediction too slow",
+      );
+    } else {
+      logger.info(timingLog, "prediction timing");
+    }
 
     if (!predictionId) {
       return { predictionId: null, targetGameId, kind: "error" };
@@ -1012,8 +1042,17 @@ export async function onGameEndPredict(
       remainingBeforeTargetMs: remainingMs,
     };
   } catch (e) {
+    // P2.15: Improve Error Logging
     logger.error(
-      { component: "live-predictor", targetGameId, error: String(e) },
+      {
+        component: "live-predictor",
+        targetGameId,
+        sourceGameId: gameId,
+        error: String(e),
+        errorStack: e instanceof Error ? e.stack : undefined,
+        correlationId,
+        crashedAt,
+      },
       "onGameEndPredict failed",
     );
     return { predictionId: null, targetGameId, kind: "error" };
