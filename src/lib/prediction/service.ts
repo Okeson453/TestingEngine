@@ -638,6 +638,134 @@ export async function getValidationHistory(
   return { records, total, page, pageSize };
 }
 
+/** Max rows for a single export download (safety cap). */
+export const HISTORY_EXPORT_MAX = 50_000;
+
+/**
+ * Fetch the full validation history (all pages) for CSV/JSON download.
+ * Honours the same filters as getValidationHistory. Capped at HISTORY_EXPORT_MAX.
+ */
+export async function getAllValidationHistory(
+  opts: Omit<ValidationHistoryOpts, "page" | "pageSize"> = {},
+): Promise<{ records: ValidationRecord[]; total: number; truncated: boolean }> {
+  const sql = await getSql();
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  let paramIdx = 1;
+
+  if (opts.result) {
+    conditions.push(`result = $${paramIdx++}`);
+    params.push(opts.result);
+  }
+  if (opts.fromDate) {
+    conditions.push(`resolved_at::date >= $${paramIdx++}`);
+    params.push(opts.fromDate);
+  }
+  if (opts.toDate) {
+    conditions.push(`resolved_at::date <= $${paramIdx++}`);
+    params.push(opts.toDate);
+  }
+
+  const where =
+    conditions.length > 0 ? `where ${conditions.join(" and ")}` : "";
+  const countQuery = `select count(*)::int as total from prediction_validations ${where}`;
+  const dataQuery = `
+    select prediction_id, game_id, target_multiplier, predicted_probability,
+           predicted_confidence, actual_multiplier, result, model_version,
+           regime_name, requested_at, resolved_at
+    from prediction_validations ${where}
+    order by resolved_at desc, id desc
+    limit $${paramIdx++}
+  `;
+  params.push(HISTORY_EXPORT_MAX);
+
+  const [countRows, dataRows] = await Promise.all([
+    sql.query<{ total: number }>(countQuery, params.slice(0, paramIdx - 2)),
+    sql.query<{
+      prediction_id: string;
+      game_id: string;
+      target_multiplier: number;
+      predicted_probability: number;
+      predicted_confidence: number;
+      actual_multiplier: number;
+      result: string;
+      model_version: string;
+      regime_name: string | null;
+      requested_at: string;
+      resolved_at: string;
+    }>(dataQuery, params),
+  ]);
+
+  const total = countRows[0]?.total ?? 0;
+  const records = dataRows.map((r) => ({
+    predictionId: r.prediction_id,
+    gameId: r.game_id,
+    targetMultiplier: Number(r.target_multiplier),
+    predictedProbability: Number(r.predicted_probability),
+    predictedConfidence: Number(r.predicted_confidence),
+    actualMultiplier: Number(r.actual_multiplier),
+    result: r.result as "WIN" | "LOSS",
+    modelVersion: r.model_version,
+    regimeName: r.regime_name,
+    requestedAt:
+      r.requested_at instanceof Date
+        ? r.requested_at.toISOString()
+        : String(r.requested_at),
+    resolvedAt:
+      r.resolved_at instanceof Date
+        ? r.resolved_at.toISOString()
+        : String(r.resolved_at),
+  }));
+
+  return {
+    records,
+    total,
+    truncated: total > records.length,
+  };
+}
+
+/** Serialize validation records to CSV (UTF-8 with header). */
+export function validationRecordsToCsv(records: ValidationRecord[]): string {
+  const header = [
+    "prediction_id",
+    "game_id",
+    "result",
+    "target_multiplier",
+    "actual_multiplier",
+    "predicted_probability",
+    "predicted_confidence",
+    "model_version",
+    "regime_name",
+    "requested_at",
+    "resolved_at",
+  ];
+  const escape = (v: string | number | null | undefined): string => {
+    if (v == null) return "";
+    const s = String(v);
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const lines = [header.join(",")];
+  for (const r of records) {
+    lines.push(
+      [
+        escape(r.predictionId),
+        escape(r.gameId),
+        escape(r.result),
+        escape(r.targetMultiplier),
+        escape(r.actualMultiplier),
+        escape(r.predictedProbability),
+        escape(r.predictedConfidence),
+        escape(r.modelVersion),
+        escape(r.regimeName),
+        escape(r.requestedAt),
+        escape(r.resolvedAt),
+      ].join(","),
+    );
+  }
+  return lines.join("\n");
+}
+
 export interface PendingStatus {
   hasPending: boolean;
   pendingCount: number;

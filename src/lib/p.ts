@@ -7,6 +7,8 @@ import {
   getStreaks,
   getRecentValidations,
   getValidationHistory,
+  getAllValidationHistory,
+  validationRecordsToCsv,
   getPendingStatus,
   type ValidationHistoryOpts,
 } from "./prediction/service.ts";
@@ -155,6 +157,54 @@ export const predictionGetHistory = createServerFn({ method: "POST" })
       toDate: data.toDate ?? undefined,
     }),
   );
+
+/**
+ * Full history export (all pages) for dashboard download.
+ * Returns CSV text plus metadata. Caps at HISTORY_EXPORT_MAX rows.
+ */
+export const predictionExportHistory = createServerFn({ method: "POST" })
+  .validator((data: unknown) => {
+    const d = data as {
+      result?: "WIN" | "LOSS" | null;
+      fromDate?: string | null;
+      toDate?: string | null;
+      format?: "csv" | "json";
+    } | undefined;
+    const result =
+      d?.result === "WIN" || d?.result === "LOSS" ? d.result : null;
+    return {
+      result,
+      fromDate: typeof d?.fromDate === "string" ? d.fromDate : null,
+      toDate: typeof d?.toDate === "string" ? d.toDate : null,
+      format: d?.format === "json" ? ("json" as const) : ("csv" as const),
+    };
+  })
+  .handler(async ({ data }) => {
+    const { records, total, truncated } = await getAllValidationHistory({
+      result: data.result,
+      fromDate: data.fromDate ?? undefined,
+      toDate: data.toDate ?? undefined,
+    });
+    if (data.format === "json") {
+      return {
+        format: "json" as const,
+        total,
+        truncated,
+        count: records.length,
+        records,
+        body: JSON.stringify(records, null, 2),
+      };
+    }
+    const body = validationRecordsToCsv(records);
+    return {
+      format: "csv" as const,
+      total,
+      truncated,
+      count: records.length,
+      records: null,
+      body,
+    };
+  });
 
 export const predictionGetPending = createServerFn({ method: "GET" }).handler(getPendingStatus);
 

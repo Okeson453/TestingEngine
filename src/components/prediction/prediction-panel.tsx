@@ -17,6 +17,8 @@ import {
   Cpu,
   History,
   ArrowLeft,
+  Download,
+  Loader2,
 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import {
@@ -27,6 +29,7 @@ import {
   predictionGetStreaks,
   predictionGetRecent,
   predictionGetHistory,
+  predictionExportHistory,
   predictionGetPending,
   predictionGetWorkerStatus,
 } from "@/lib/p";
@@ -94,10 +97,25 @@ interface PredictionPanelProps {
   };
 }
 
+function triggerBrowserDownload(filename: string, content: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 export function PredictionPanel({ initial }: PredictionPanelProps) {
   const queryClient = useQueryClient();
   const [targetInput, setTargetInput] = useState(String(initial.dailyTarget.dailyTarget));
   const [historyPage, setHistoryPage] = useState(1);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const [historyFilter, setHistoryFilter] = useState<"WIN" | "LOSS" | "all">("all");
   const [searchId, setSearchId] = useState("");
 
@@ -153,6 +171,39 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
         },
       }),
   });
+
+  async function downloadFullHistory(format: "csv" | "json" = "csv") {
+    if (exporting) return;
+    setExporting(true);
+    setExportError(null);
+    try {
+      const res = await predictionExportHistory({
+        data: {
+          result: historyFilter === "all" ? null : historyFilter,
+          format,
+        },
+      });
+      if (!res?.body) {
+        setExportError("Export returned no data");
+        return;
+      }
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const filterTag = historyFilter === "all" ? "all" : historyFilter.toLowerCase();
+      const filename = `prediction-history-${filterTag}-${stamp}.${format}`;
+      const mime =
+        format === "json" ? "application/json;charset=utf-8" : "text/csv;charset=utf-8";
+      triggerBrowserDownload(filename, res.body, mime);
+      if (res.truncated) {
+        setExportError(
+          `Downloaded ${res.count} of ${res.total} rows (export cap reached).`,
+        );
+      }
+    } catch (e) {
+      setExportError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setExporting(false);
+    }
+  }
 
   const setTargetMut = useMutation({
     mutationFn: (target: number) => predictionSetDailyTarget({ data: { target } }),
@@ -453,7 +504,7 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
                   </CardDescription>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <select
                   value={historyFilter}
                   onChange={(e) => {
@@ -466,8 +517,39 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
                   <option value="WIN">WIN only</option>
                   <option value="LOSS">LOSS only</option>
                 </select>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={exporting || (history?.total ?? 0) === 0}
+                  onClick={() => void downloadFullHistory("csv")}
+                  title="Download all pages matching the current filter as CSV"
+                >
+                  {exporting ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Download className="size-4" />
+                  )}
+                  <span className="ml-1.5">CSV</span>
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={exporting || (history?.total ?? 0) === 0}
+                  onClick={() => void downloadFullHistory("json")}
+                  title="Download all pages matching the current filter as JSON"
+                >
+                  {exporting ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Download className="size-4" />
+                  )}
+                  <span className="ml-1.5">JSON</span>
+                </Button>
               </div>
             </div>
+            {exportError ? (
+              <p className="mt-2 text-xs text-muted">{exportError}</p>
+            ) : null}
           </CardHeader>
           <div className="flex flex-col gap-3">
             {historyQ.isPending && !history ? (
