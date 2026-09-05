@@ -47,39 +47,40 @@ export async function insertNewRounds(
 ): Promise<{ inserted: number; rounds: CrashRound[] }> {
   if (rounds.length === 0) return { inserted: 0, rounds: [] };
   const sql = await getSql();
-  let inserted = 0;
   const affectedDates = new Set<string>();
   const insertedRounds: CrashRound[] = [];
 
-  for (const round of rounds) {
-    const rows = await sql<{ game_id: string }>`
+  // P2.5: Batch INSERT in insertNewRounds
+  // Use single transaction with multi-row INSERT for efficiency
+  if (rounds.length > 0) {
+    const result = await sql<{ game_id: string }>`
       insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
-      values (
-        ${round.gameId},
-        ${round.multiplier},
-        ${round.hash},
-        ${round.salt},
-        ${round.beganAt ? round.beganAt.toISOString() : null},
-        ${round.crashedAt.toISOString()}
-      )
+      select * from unnest(
+        ${rounds.map(r => `('${r.gameId}', ${r.multiplier}, ${r.hash}, ${r.salt}, ${r.beganAt ? `'${r.beganAt.toISOString()}'` : null}, '${r.crashedAt.toISOString()}')`)}::text[],
+        ${rounds.map(r => r.multiplier)}::numeric[],
+        ${rounds.map(r => r.hash)}::text[],
+        ${rounds.map(r => r.salt)}::text[],
+        ${rounds.map(r => r.beganAt ? `'${r.beganAt.toISOString()}'` : null)}::text[],
+        ${rounds.map(r => `'${r.crashedAt.toISOString()}'`)}::text[]
+      ) as t(game_id, multiplier, hash, salt, began_at, crashed_at)
       on conflict (game_id) do nothing
       returning game_id
     `;
-    if (rows.length > 0) {
-      inserted += 1;
-      affectedDates.add(round.crashedAt.toISOString().slice(0, 10));
-      // FIX: beganAt is the round's start time, NOT the crash time. Previously
-      // this used crashedAt as beganAt, which leaked the round's outcome into
-      // history rows and made temporal-integrity checks meaningless.
-      const beganIso = round.beganAt ? round.beganAt.toISOString() : null;
-      insertedRounds.push({
-        gameId: round.gameId,
-        multiplier: round.multiplier,
-        hash: round.hash,
-        salt: round.salt,
-        beganAt: beganIso,
-        crashedAt: round.crashedAt.toISOString(),
-      });
+    
+    const insertedIds = new Set(result.map(r => r.game_id));
+    
+    for (const round of rounds) {
+      if (insertedIds.has(round.gameId)) {
+        affectedDates.add(round.crashedAt.toISOString().slice(0, 10));
+        insertedRounds.push({
+          gameId: round.gameId,
+          multiplier: round.multiplier,
+          hash: round.hash,
+          salt: round.salt,
+          beganAt: round.beganAt ? round.beganAt.toISOString() : null,
+          crashedAt: round.crashedAt.toISOString(),
+        });
+      }
     }
   }
 
@@ -87,7 +88,7 @@ export async function insertNewRounds(
     await recomputeDaily(Array.from(affectedDates));
   }
 
-  return { inserted, rounds: insertedRounds };
+  return { inserted: insertedRounds.length, rounds: insertedRounds };
 }
 
 export function dateRangeUtc(dateStr: string): { start: string; end: string } {
