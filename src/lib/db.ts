@@ -81,11 +81,12 @@ function createNeonSql(): Promise<Sql> {
     types.setTypeParser(OID_INTERVAL, identity);
 
     const poolMax = readPoolMax();
+    // P1.2: Warm DB Connections - set min to 1, idle timeout to 30s
     const poolMin = Math.min(
       poolMax,
-      Math.max(0, Number(process.env.PG_POOL_MIN ?? 1) || 0),
+      Math.max(0, Number(process.env.PG_POOL_MIN ?? 1) || 1), // Default 1 (was 0)
     );
-    const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 5_000) || 5_000;
+    const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 30_000) || 30_000; // Default 30s (was 5s)
     // Fail fast on exhaustion instead of hanging the worker loop for 30s.
     const connectionTimeoutMillis =
       Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 8_000) || 8_000;
@@ -317,6 +318,33 @@ export function ensureDbReady(): Promise<void> {
 const globalBoot = globalThis as typeof globalThis & {
   __pgBootstrapPromise__?: Promise<void>;
 };
+
+// P1.3: Add Event-Loop Lag Monitor
+if (typeof window === "undefined") {
+  setInterval(() => {
+    const start = process.hrtime.bigint();
+    setImmediate(() => {
+      const lagMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+      if (lagMs > 50) {
+        console.warn(`[event-loop] lag detected: ${lagMs.toFixed(2)}ms`);
+      }
+    });
+  }, 2000);
+
+  // P1.12: Add Connection Keepalive (already present via keepAlive: true)
+  // Additional proactive warming for PGLite
+  if (dbSource === "pglite") {
+    setInterval(async () => {
+      try {
+        const sql = await getSql();
+        await sql`SELECT 1`;
+      } catch {
+        /* ignore */
+      }
+    }, 30_000);
+  }
+}
+
 if (typeof window === "undefined" && dbSource === "pglite") {
   globalBoot.__pgBootstrapPromise__ ??= ensureDbReady().catch((err) => {
     globalBoot.__pgBootstrapPromise__ = undefined;
