@@ -145,7 +145,7 @@ function getSharedPredictionEngine(): PredictionEngine {
 }
 
 const USE_ADVANCED_PIPELINE =
-  (process.env.USE_ADVANCED_PIPELINE ?? "1") !== "0";
+  (process.env.USE_ADVANCED_PIPELINE ?? "0") !== "0";
 
 type PipelineFn = (input: {
   baseProbability: number;

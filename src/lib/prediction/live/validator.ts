@@ -21,7 +21,6 @@ import { runInTransaction } from "@/lib/prediction/live/tx";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEndPredict } from "@/lib/prediction/live/predictor";
-import { feedbackPredictionPipeline } from "@/lib/prediction/prediction-pipeline";
 
 const logger = getLogger("live-validator");
 
@@ -312,13 +311,24 @@ export async function onGameEnd(
     "round validated",
   );
 
-  // Learning feedback loop (was dead code §10.2): update calibration, meta-model,
-  // concept drift, production controller from resolved WIN/LOSS.
+  // Learning feedback loop (soft): dynamic import so worker boot is not blocked
+  // by advanced pipeline modules that use TS parameter properties incompatible
+  // with node --experimental-strip-types.
   try {
     const predicted = Number(state.pending.probability);
     const actual: 0 | 1 = result === "WIN" ? 1 : 0;
     if (Number.isFinite(predicted)) {
-      feedbackPredictionPipeline(predicted, actual);
+      void import("@/lib/prediction/prediction-pipeline")
+        .then((mod) => {
+          try {
+            mod.feedbackPredictionPipeline(predicted, actual);
+          } catch {
+            /* soft */
+          }
+        })
+        .catch(() => {
+          /* pipeline unavailable under strip-types — baseline still works */
+        });
     }
   } catch (fbErr) {
     logger.debug(
