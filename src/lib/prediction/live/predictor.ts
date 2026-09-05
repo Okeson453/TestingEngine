@@ -767,26 +767,19 @@ export async function onGameEndPredict(
     if (residualRows.length > 0 && residualRows[0]!.began_at != null) {
       // Authoritative: target N+1 already has began_at
       remainingMs = new Date(residualRows[0]!.began_at).getTime() - Date.now();
-    } else if (recoveryMode) {
-      // Poll recovery: crashedAt may be many seconds old. Elapsed-based residual
-      // would always be negative and block all predictions while WAF is up.
-      // Hard checks above already rejected started/crashed targets — allow.
-      remainingMs = null;
+    } else if (recoveryMode || (Number.isFinite(elapsedSinceEd) && elapsedSinceEd > medianGapMs * 1.5)) {
+      // Recovery/stale: use conservative residual = medianGap/2 from *now*
+      // (not from crash time). Hard checks still reject started/crashed targets.
+      remainingMs = Math.floor(medianGapMs / 2);
       logger.info(
         {
           targetGameId,
           elapsedSinceEd,
           medianGapMs,
-          recoveryMode: true,
+          remainingMs,
+          recoveryMode,
         },
-        "recoveryMode: residual estimate skipped; hard checks passed",
-      );
-    } else if (Number.isFinite(elapsedSinceEd) && elapsedSinceEd > medianGapMs * 1.5) {
-      // Stale ED path (delayed socket): same as recovery — rely on hard checks
-      remainingMs = null;
-      logger.info(
-        { targetGameId, elapsedSinceEd, medianGapMs },
-        "stale ED: residual estimate skipped; hard checks passed",
+        "recovery/stale: conservative residual estimate (medianGap/2)",
       );
     } else {
       // Hot ED path: estimate time left until typical N+1 start
@@ -1158,6 +1151,12 @@ export async function onGameEndPredict(
     }
 
     // Structured timing metrics (finding 3.9 / rec 7.9)
+    const timingClass =
+      temporalValidity === "TEMPORALLY_INVALID"
+        ? "GENERATED_LATE"
+        : temporalValidity === "TEMPORALLY_VALID"
+          ? "GENERATED_AHEAD"
+          : "GENERATED_UNVERIFIED";
     logger.info(
       {
         component: "timing",
@@ -1166,6 +1165,7 @@ export async function onGameEndPredict(
         dbGateMs: gateMs,
         modelInferenceMs: generationLatencyMs,
         temporalValidity,
+        timingClassification: timingClass,
         targetGameId,
         predictionId,
         residualPolicy: "predictive_median_gap",

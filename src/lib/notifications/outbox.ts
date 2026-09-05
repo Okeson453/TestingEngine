@@ -378,7 +378,7 @@ export async function createPredictionNotification(
       correlationId: options.correlationId ?? null,
       generatedAt: options.generatedAt,
     },
-    priority: HIGH_PRIORITY_THRESHOLD, // Predictions are high priority
+    priority: HIGH_PRIORITY_THRESHOLD + 1, // Predictions preempt validations (rec 5.6)
   });
 }
 
@@ -410,7 +410,7 @@ export async function createValidationNotification(
       probability: options.probability,
       result: options.result,
     },
-    priority: HIGH_PRIORITY_THRESHOLD, // Validations are high priority
+    priority: HIGH_PRIORITY_THRESHOLD, // Validations below predictions
   });
 }
 

@@ -171,7 +171,7 @@ export class PollWorker {
         // skipPredict=true — N+1 prediction only via maybePredictNewest below.
         const VALIDATE_CONCURRENCY = Math.max(
           1,
-          Math.min(4, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 1) || 1),
+          Math.min(4, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 2) || 2),
         );
         {
           let cursor = 0;

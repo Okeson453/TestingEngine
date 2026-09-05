@@ -171,16 +171,37 @@ function onPgEvent(payload: unknown): void {
   logger.debug({ event: "pg", gameId, multiplier }, "pg received");
 }
 
+const bgHandler = async (payload: unknown): Promise<void> => {
+  await onBgEvent(payload);
+};
+const edHandler = async (payload: unknown): Promise<void> => {
+  await onEdEvent(payload);
+};
+const pgHandler = (payload: unknown): void => {
+  onPgEvent(payload);
+};
+
+let handlersWired = false;
+
 export function initializeEventHandlers(): void {
-  bcGameSocket.on("bg", async (payload) => {
-    await onBgEvent(payload);
-  });
-  bcGameSocket.on("ed", async (payload) => {
-    await onEdEvent(payload);
-  });
-  bcGameSocket.on("pg", async (payload) => {
-    onPgEvent(payload);
-  });
+  // Idempotent: remove prior listeners before attaching (P0 restart-safe)
+  try {
+    const sock = bcGameSocket as unknown as {
+      off?: (ev: string, fn: (...args: unknown[]) => void) => void;
+      removeListener?: (ev: string, fn: (...args: unknown[]) => void) => void;
+    };
+    const rem = sock.off ?? sock.removeListener;
+    if (typeof rem === "function") {
+      rem.call(bcGameSocket, "bg", bgHandler as (...args: unknown[]) => void);
+      rem.call(bcGameSocket, "ed", edHandler as (...args: unknown[]) => void);
+      rem.call(bcGameSocket, "pg", pgHandler as (...args: unknown[]) => void);
+    }
+  } catch { /* soft */ }
+
+  bcGameSocket.on("bg", bgHandler);
+  bcGameSocket.on("ed", edHandler);
+  bcGameSocket.on("pg", pgHandler);
+  handlersWired = true;
   logger.info(
     { component: "game-event-handlers" },
     "event handlers wired: bg=observability, ed=validate+predict-N+1",
@@ -200,6 +221,19 @@ export async function startEventDrivenPipeline(): Promise<void> {
 }
 
 export async function stopEventDrivenPipeline(): Promise<void> {
+  try {
+    const sock = bcGameSocket as unknown as {
+      off?: (ev: string, fn: (...args: unknown[]) => void) => void;
+      removeListener?: (ev: string, fn: (...args: unknown[]) => void) => void;
+    };
+    const rem = sock.off ?? sock.removeListener;
+    if (typeof rem === "function") {
+      rem.call(bcGameSocket, "bg", bgHandler as (...args: unknown[]) => void);
+      rem.call(bcGameSocket, "ed", edHandler as (...args: unknown[]) => void);
+      rem.call(bcGameSocket, "pg", pgHandler as (...args: unknown[]) => void);
+    }
+  } catch { /* soft */ }
+  handlersWired = false;
   bcGameSocket.disconnect();
   logger.info({ component: "game-event-handlers" }, "event-driven pipeline stopped");
 }

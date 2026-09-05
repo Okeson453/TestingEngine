@@ -65,7 +65,7 @@ function toSql(run: Run): Sql {
  * Keep the worker pool small; prefer queueing over opening new clients.
  */
 function readPoolMax(): number {
-  const raw = Number(process.env.PG_POOL_MAX ?? 2);
+  const raw = Number(process.env.PG_POOL_MAX ?? 3);
   return Math.max(1, Math.min(Number.isFinite(raw) ? raw : 3, 10));
 }
 
@@ -83,7 +83,7 @@ function createNeonSql(): Promise<Sql> {
     const poolMax = readPoolMax();
     const poolMin = Math.min(
       poolMax,
-      Math.max(0, Number(process.env.PG_POOL_MIN ?? 0) || 0),
+      Math.max(0, Number(process.env.PG_POOL_MIN ?? 1) || 0),
     );
     const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 5_000) || 5_000;
     // Fail fast on exhaustion instead of hanging the worker loop for 30s.

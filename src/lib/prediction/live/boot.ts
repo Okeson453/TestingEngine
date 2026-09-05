@@ -32,14 +32,14 @@ function startEventLoopLagMonitor(): void {
     const start = process.hrtime.bigint();
     setImmediate(() => {
       const lagMs = Number(process.hrtime.bigint() - start) / 1_000_000;
-      if (lagMs > 100) {
+      if (lagMs > 50) {
         logger.warn({ eventLoopLagMs: Math.round(lagMs) }, "Event loop lag detected");
       }
       try {
         (globalThis as { __eventLoopLagMs__?: number }).__eventLoopLagMs__ = lagMs;
       } catch { /* ignore */ }
     });
-  }, 5_000);
+  }, 2_000);
   if (typeof eventLoopProbeTimer.unref === "function") eventLoopProbeTimer.unref();
 }
 
@@ -212,9 +212,10 @@ class LiveBoot {
     if (this.started) {
       return this.lastResult!;
     }
-    this.started = true;
+    // Do NOT set started=true until all components initialize (P0 startup state machine)
     const bootStartedAt = new Date().toISOString();
 
+    try {
     const seeder = deps.seeder ?? (() => runColdStartSeeder());
     const dispatcher = deps.dispatcher ?? new OutboxDispatcher();
     const pollWorker = deps.pollWorker ?? new PollWorker();
@@ -364,11 +365,28 @@ class LiveBoot {
       }
     }
     startEventLoopLagMonitor();
+    startConnectionWarmer(getSql);
     await pollWorker.start();
     await clockMonitor.start();
 
+    this.started = true;
     this.lastResult = { seed, bootStartedAt };
     return this.lastResult;
+    } catch (err) {
+      // Cleanup partial init so retry can rebuild cleanly
+      this.started = false;
+      try { await this.dispatcher?.stop(); } catch { /* */ }
+      try { await this.pollWorker?.stop(); } catch { /* */ }
+      try { await this.clockMonitor?.stop(); } catch { /* */ }
+      try {
+        const s = await getSql();
+        await releaseWorkerLock(s);
+      } catch { /* */ }
+      this.dispatcher = null;
+      this.pollWorker = null;
+      this.clockMonitor = null;
+      throw err;
+    }
   }
 
   async stop(): Promise<void> {

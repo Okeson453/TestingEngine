@@ -22,10 +22,10 @@ if (!process.env.DATABASE_URL) {
 
 // Prefer a small pool on the worker process unless operator overrides.
 if (!process.env.PG_POOL_MAX) {
-  process.env.PG_POOL_MAX = "2";
+  process.env.PG_POOL_MAX = "3";
 }
 if (!process.env.PG_POOL_MIN) {
-  process.env.PG_POOL_MIN = "0";
+  process.env.PG_POOL_MIN = "1";
 }
 if (!process.env.PG_APP_NAME) {
   process.env.PG_APP_NAME = "testingengine-worker";

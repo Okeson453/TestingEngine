@@ -29,7 +29,7 @@ export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
 /** Max concurrent Telegram sends within a claimed batch (P0 / 6.5). */
-export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 1);
+export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 2);
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -38,10 +38,12 @@ interface OutboxRow {
   notification_id: string;
   type: string;
   content: string;
-  metadata: Record<string, unknown>;
+  metadata: Record<string, unknown> | null;
   status: string;
   attempt_count: number;
   next_attempt_at: string;
+  telegram_deadline_at?: string | Date | null;
+  priority?: number;
 }
 
 export interface DispatcherStats {
@@ -110,7 +112,8 @@ export class OutboxDispatcher {
     // Exclude rows past telegram_deadline_at so we never deliver "predicts the past".
     const claimed = await runInTransaction(sql, async (tx) => {
       const rows = await tx<OutboxRow>`
-        select id, notification_id, type, content, metadata, status, attempt_count, next_attempt_at
+        select id, notification_id, type, content, metadata, status, attempt_count,
+               next_attempt_at, telegram_deadline_at, priority
         from notification_outbox
         where status = 'pending'::text
           and next_attempt_at <= now()
@@ -144,22 +147,109 @@ export class OutboxDispatcher {
       const results = await Promise.all(
         chunk.map(async (row) => {
           try {
-            const sendResults = await sendTelegramMessage(row.content);
+            // Deadline-aware pre-send check (P0): stop if past telegram_deadline_at
+            const deadlineRaw = row.telegram_deadline_at;
+            const deadlineMs = deadlineRaw
+              ? new Date(deadlineRaw as string | Date).getTime()
+              : NaN;
+            const remainingMs = Number.isFinite(deadlineMs)
+              ? deadlineMs - this.now()
+              : Number.POSITIVE_INFINITY;
+            if (remainingMs < 50) {
+              await sql`
+                update notification_outbox
+                set status = 'dead_letter',
+                    last_error = 'expired_before_send: telegram_deadline_at passed'
+                where id = ${row.id}
+              `;
+              this.stats.dead += 1;
+              logger.warn(
+                {
+                  component: "outbox-dispatcher",
+                  notificationId: row.notification_id,
+                  remainingMs,
+                },
+                "expired before send — not delivering late signal",
+              );
+              return "dead" as const;
+            }
+
+            // For predictions: if target already started, expire rather than late-send
+            if (row.type === "prediction") {
+              try {
+                const meta = (row.metadata ?? {}) as Record<string, unknown>;
+                const targetGameId =
+                  (meta.targetGameId as string) ||
+                  (meta.target_game_id as string) ||
+                  null;
+                if (targetGameId) {
+                  const live = await sql<{ began_at: string | Date | null }>`
+                    SELECT began_at FROM live_round_state
+                    WHERE game_id = ${targetGameId} LIMIT 1
+                  `.catch(() => [] as { began_at: string | Date | null }[]);
+                  if (live[0]?.began_at) {
+                    const began = new Date(live[0].began_at).getTime();
+                    if (Number.isFinite(began) && began <= this.now()) {
+                      await sql`
+                        update notification_outbox
+                        set status = 'dead_letter',
+                            last_error = 'target_already_started_before_delivery'
+                        where id = ${row.id}
+                      `;
+                      this.stats.dead += 1;
+                      logger.warn(
+                        {
+                          component: "outbox-dispatcher",
+                          notificationId: row.notification_id,
+                          targetGameId,
+                        },
+                        "target started before delivery — expiring signal",
+                      );
+                      return "dead" as const;
+                    }
+                  }
+                }
+              } catch { /* soft */ }
+            }
+
+            // Cap Telegram timeout by remaining deadline (rec 93)
+            const sendTimeout = Math.max(
+              200,
+              Math.min(5_000, Number.isFinite(remainingMs) ? remainingMs - 50 : 5_000),
+            );
+            const sendResults = await sendTelegramMessage(row.content, {
+              timeout: sendTimeout,
+            });
             const allOk =
               sendResults.length > 0 && sendResults.every((r) => r.ok);
             if (allOk) {
               const t0 = this.now();
+              const acceptedAt = new Date(t0).toISOString();
               await sql`
                 update notification_outbox
-                set status = 'delivered', delivered_at = now(), last_error = null
+                set status = 'delivered',
+                    delivered_at = ${acceptedAt}::timestamptz,
+                    last_error = null
                 where id = ${row.id}
               `;
               this.stats.delivered += 1;
+              logger.info(
+                {
+                  component: "timing",
+                  path: "outbox_delivery",
+                  notificationId: row.notification_id,
+                  type: row.type,
+                  deliveryAcceptedAt: acceptedAt,
+                  remainingBudgetMs: Number.isFinite(remainingMs)
+                    ? Math.round(remainingMs)
+                    : null,
+                },
+                "delivery accepted",
+              );
               try {
                 const { outboxDeliveryMs } = await import(
                   "@/lib/observability/performance/latency"
                 );
-                // Approximate claim→deliver latency using next_attempt_at age when present
                 const claimedAt = row.next_attempt_at
                   ? new Date(row.next_attempt_at).getTime()
                   : NaN;
@@ -168,6 +258,17 @@ export class OutboxDispatcher {
                 }
               } catch { /* metrics optional */ }
               return "delivered" as const;
+            }
+            // Deadline-aware retry: if remaining budget too small for another attempt, dead-letter
+            if (Number.isFinite(remainingMs) && remainingMs < 300) {
+              await sql`
+                update notification_outbox
+                set status = 'dead_letter',
+                    last_error = ${'expired_after_failed_send: ' + (sendResults.find((r) => !r.ok)?.error ?? 'send_failed')}
+                where id = ${row.id}
+              `;
+              this.stats.dead += 1;
+              return "dead" as const;
             }
             const updated = await this.handleFailure(sql, row, sendResults);
             return updated;
