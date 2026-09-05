@@ -115,7 +115,7 @@ export class OutboxDispatcher {
         where status = 'pending'::text
           and next_attempt_at <= now()
           and (telegram_deadline_at is null or telegram_deadline_at > now())
-        order by next_attempt_at asc, id asc
+        order by priority desc, next_attempt_at asc, id asc
         limit ${BATCH_SIZE}
         for update skip locked
       `;
@@ -126,6 +126,9 @@ export class OutboxDispatcher {
               attempt_count = attempt_count + 1
           where id = ${r.id} and status = 'pending'
         `;
+        // Keep in-memory attempt_count in sync with the DB increment so
+        // handleFailure does not double-count.
+        r.attempt_count = (r.attempt_count ?? 0) + 1;
       }
       return rows;
     });
@@ -145,12 +148,25 @@ export class OutboxDispatcher {
             const allOk =
               sendResults.length > 0 && sendResults.every((r) => r.ok);
             if (allOk) {
+              const t0 = this.now();
               await sql`
                 update notification_outbox
                 set status = 'delivered', delivered_at = now(), last_error = null
                 where id = ${row.id}
               `;
               this.stats.delivered += 1;
+              try {
+                const { outboxDeliveryMs } = await import(
+                  "@/lib/observability/performance/latency"
+                );
+                // Approximate claim→deliver latency using next_attempt_at age when present
+                const claimedAt = row.next_attempt_at
+                  ? new Date(row.next_attempt_at).getTime()
+                  : NaN;
+                if (Number.isFinite(claimedAt)) {
+                  outboxDeliveryMs.observe(Math.max(0, t0 - claimedAt));
+                }
+              } catch { /* metrics optional */ }
               return "delivered" as const;
             }
             const updated = await this.handleFailure(sql, row, sendResults);
@@ -216,7 +232,8 @@ export class OutboxDispatcher {
     row: OutboxRow,
     results: SendResult[],
   ): Promise<"dead" | "requeued"> {
-    const attempts = row.attempt_count + 1;
+    // attempt_count was already incremented at claim time
+    const attempts = row.attempt_count;
     const firstFailure = results.find((r) => !r.ok);
     const isPermanent =
       firstFailure != null &&

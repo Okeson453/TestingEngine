@@ -494,3 +494,66 @@ export async function getSocketDiagnostics() {
   const { runSocketDiagnostics } = await import("@/lib/crash/socket-diagnostics");
   return runSocketDiagnostics();
 }
+
+/** Ahead-of-time rate for dashboard widget (6.15). */
+export async function getAheadOfTimeStats(hours = 24): Promise<{
+  total: number;
+  measurable: number;
+  valid: number;
+  late: number;
+  rate: number;
+  windowMsP50: number | null;
+  windowMsP95: number | null;
+  measuredAt: string;
+}> {
+  const sql = await getSql();
+  const rows = await sql<{
+    total: number;
+    measurable: number;
+    valid: number;
+    late: number;
+    p50: number | null;
+    p95: number | null;
+  }>`
+    SELECT
+      count(*)::int AS total,
+      count(*) FILTER (
+        WHERE generated_at IS NOT NULL AND target_round_started_at IS NOT NULL
+      )::int AS measurable,
+      count(*) FILTER (
+        WHERE generated_at IS NOT NULL
+          AND target_round_started_at IS NOT NULL
+          AND generated_at < target_round_started_at
+      )::int AS valid,
+      count(*) FILTER (
+        WHERE generated_at IS NOT NULL
+          AND target_round_started_at IS NOT NULL
+          AND generated_at >= target_round_started_at
+      )::int AS late,
+      percentile_cont(0.5) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (target_round_started_at - generated_at)) * 1000
+      ) FILTER (
+        WHERE generated_at IS NOT NULL AND target_round_started_at IS NOT NULL
+      ) AS p50,
+      percentile_cont(0.95) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (target_round_started_at - generated_at)) * 1000
+      ) FILTER (
+        WHERE generated_at IS NOT NULL AND target_round_started_at IS NOT NULL
+      ) AS p95
+    FROM pending_predictions
+    WHERE requested_at > now() - (${hours}::int * interval '1 hour')
+  `;
+  const r = rows[0];
+  const measurable = r?.measurable ?? 0;
+  const valid = r?.valid ?? 0;
+  return {
+    total: r?.total ?? 0,
+    measurable,
+    valid,
+    late: r?.late ?? 0,
+    rate: measurable === 0 ? 1 : valid / measurable,
+    windowMsP50: r?.p50 != null ? Math.round(Number(r.p50)) : null,
+    windowMsP95: r?.p95 != null ? Math.round(Number(r.p95)) : null,
+    measuredAt: new Date().toISOString(),
+  };
+}

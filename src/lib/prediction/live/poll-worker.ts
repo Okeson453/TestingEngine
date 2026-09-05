@@ -17,6 +17,7 @@ import { fetchCrashHistory, type FetchedRound } from "@/lib/crash/fetch-bc";
 import { insertNewRounds } from "@/lib/crash/ingest";
 import { onGameEnd } from "@/lib/prediction/live/validator";
 import { getLogger } from "@/lib/observability/logger";
+import { runColdStartSeeder } from "@/lib/prediction/live/cold-start-seeder";
 import {
   reconcileStuckPredictions,
   type StuckRecoveryResult,
@@ -34,7 +35,7 @@ const logger = getLogger("poll-worker");
 export const POLL_INTERVAL_MS = Number(
   process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 3_000,
 );
-export const STALE_PREDICTED_MS = 15 * 60 * 1_000;
+export const STALE_PREDICTED_MS = Number(process.env.STUCK_STALE_MS ?? 5 * 60 * 1_000);
 
 export interface PollTickResult {
   fetched: number;
@@ -56,6 +57,7 @@ export class PollWorker {
   private pages = 2;
   /** When true, poll may call onGameEnd for the single newest eligible round. */
   private allowNewestPredict = true;
+  private tickCount = 0;
 
   constructor(opts?: {
     getSqlFn?: () => Promise<Sql>;
@@ -175,6 +177,25 @@ export class PollWorker {
       try {
         const recovery: StuckRecoveryResult = await reconcileStuckPredictions(sql);
         result.stuckRecovered = recovery.reconciled + recovery.cancelled;
+
+        // Periodic thin-history reseed (D10 / 6.8): every 20 ticks if history < 100
+        this.tickCount += 1;
+        if (this.tickCount % 20 === 0) {
+          try {
+            const seed = await runColdStartSeeder({ maxPages: 2, timeoutMs: 8_000 });
+            if (!seed.alreadySeeded && seed.insertedTotal > 0) {
+              logger.info(
+                { component: "poll-worker", inserted: seed.insertedTotal, finalCount: seed.finalCount },
+                "thin-history reseed inserted rounds",
+              );
+            }
+          } catch (seedErr) {
+            logger.debug(
+              { component: "poll-worker", error: String(seedErr) },
+              "thin-history reseed soft-failed",
+            );
+          }
+        }
         result.stuckPredicted = recovery.stillLive;
       } catch (re) {
         logger.warn(

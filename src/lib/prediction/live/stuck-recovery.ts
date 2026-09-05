@@ -14,7 +14,8 @@ import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("stuck-recovery");
 
-export const STALE_MS = 15 * 60 * 1_000;
+/** Default 5 minutes (was 15). Env: STUCK_STALE_MS. */
+export const STALE_MS = Number(process.env.STUCK_STALE_MS ?? 5 * 60 * 1_000);
 
 export interface StuckRecoveryResult {
   inspected: number;

@@ -21,6 +21,11 @@ import type { HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 
+import {
+  evaluateSheath,
+  recordPredictionOutcome,
+} from "@/lib/core/sheath-mode";
+
 const logger = getLogger("live-predictor");
 
 /** Prediction-related constants. */
@@ -546,9 +551,10 @@ export async function onGameEndPredict(
     if (residualRows.length > 0 && residualRows[0]!.began_at != null) {
       const beganMs = new Date(residualRows[0]!.began_at).getTime();
       const remainingMs = beganMs - Date.now();
-      if (Number.isFinite(remainingMs) && remainingMs < MIN_REQUIRED_WINDOW_MS) {
+      const skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
+      if (Number.isFinite(remainingMs) && remainingMs < skipThreshold) {
         logger.warn(
-          { targetGameId, remainingMs, threshold: MIN_REQUIRED_WINDOW_MS },
+          { targetGameId, remainingMs, threshold: skipThreshold },
           "Skipping prediction: insufficient residual window",
         );
         try {
@@ -558,7 +564,7 @@ export async function onGameEndPredict(
               processor_latency_ms, sla_violated
             ) VALUES (
               ${correlationId}::text, 'PREDICT', ${targetGameId},
-              ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: MIN_REQUIRED_WINDOW_MS })},
+              ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: skipThreshold })},
               ${generatedAt}::timestamptz, now(), 0, true
             )
             ON CONFLICT DO NOTHING
@@ -575,6 +581,30 @@ export async function onGameEndPredict(
   } catch {
     /* live_round_state may be absent during migration window — proceed */
   }
+
+  // Ahead-of-time rate sheath (6.10): halt generation if rolling late rate is high
+  try {
+    const sheath = evaluateSheath();
+    if (sheath.decision === "halt") {
+      logger.warn(
+        { targetGameId, lateRate: sheath.rate, total: sheath.total },
+        "Sheath mode HALT — skipping prediction due to elevated late rate",
+      );
+      recordPredictionOutcome(true);
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "skipped_late",
+        remainingBeforeTargetMs: null,
+      };
+    }
+    if (sheath.decision === "warn") {
+      logger.warn(
+        { targetGameId, lateRate: sheath.rate, total: sheath.total },
+        "Sheath mode WARN — late rate elevated",
+      );
+    }
+  } catch { /* sheath optional */ }
 
   try {
     const existing = await sql<{ prediction_id: string }>`
@@ -926,6 +956,10 @@ export async function onGameEndPredict(
     } catch {
       /* ignore */
     }
+
+    try {
+      recordPredictionOutcome(temporalValidity === "TEMPORALLY_INVALID");
+    } catch { /* ignore */ }
 
     return {
       predictionId,

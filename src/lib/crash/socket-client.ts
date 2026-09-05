@@ -345,20 +345,34 @@ export class BcGameSocketClient {
     }
   }
 
+  private wafBlockCount = 0;
+
   private handleWafBlock(): void {
+    this.wafBlockCount += 1;
     this.updateState({
       status: "waf_blocked",
       lastError: "WAF blocked connection",
       lastDisconnectedAt: new Date().toISOString(),
     });
     logger.error(
-      { component: "BcGameSocketClient" },
-      "WAF blocked connection — backing off 5 minutes",
+      {
+        component: "BcGameSocketClient",
+        wafBlockCount: this.wafBlockCount,
+        backoffMs: WAF_BACKOFF_MS,
+      },
+      "WAF blocked connection — backing off then probing recovery",
     );
     this.clearTimers();
     this.wafBackoffTimer = setTimeout(() => {
       this.wafBackoffTimer = null;
       if (!this.intentionalShutdown) {
+        logger.info(
+          {
+            component: "BcGameSocketClient",
+            wafBlockCount: this.wafBlockCount,
+          },
+          "WAF backoff elapsed — active recovery probe (reconnect)",
+        );
         this.updateState({ status: "stopped", lastError: null });
         void this.connect();
       }

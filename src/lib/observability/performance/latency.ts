@@ -32,6 +32,7 @@ export const featureLatencyMs = makeRecorder("feature");
 export const predictionGenerationMs = makeRecorder("predictionGeneration");
 export const predictionPersistMs = makeRecorder("predictionPersist");
 export const edToPredictMs = makeRecorder("edToPredict");
+export const outboxDeliveryMs = makeRecorder("outboxDelivery");
 
 /** Alias for ACIE heavy path — real histogram may live in metrics-acie if prom is wired */
 export const acieHeavyEvidenceLatencyMs = makeRecorder("acieHeavyEvidence");
