@@ -6,6 +6,38 @@ import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("model-performance");
 
+// P3.7: Add Alert for Constant Predictions
+// Track recent predictions to detect constant output
+let recentPredictions: number[] = [];
+const MAX_RECENT_PREDICTIONS = 100;
+const CONSTANT_THRESHOLD = 0.01; // If all predictions within 1% range
+
+function checkForConstantPredictions(prediction: number): void {
+  recentPredictions.push(prediction);
+  if (recentPredictions.length > MAX_RECENT_PREDICTIONS) {
+    recentPredictions.shift();
+  }
+  
+  if (recentPredictions.length >= 20) {
+    const min = Math.min(...recentPredictions);
+    const max = Math.max(...recentPredictions);
+    const range = max - min;
+    
+    if (range < CONSTANT_THRESHOLD) {
+      logger.error(
+        {
+          component: "model-performance",
+          recentPredictionsCount: recentPredictions.length,
+          minPrediction: min,
+          maxPrediction: max,
+          range: range,
+        },
+        "ALERT: Constant predictions detected — model may be stuck",
+      );
+    }
+  }
+}
+
 export interface ModelPerf {
   ewmaLogLoss: number;
   ewmaBrier: number;
@@ -57,6 +89,9 @@ export class ModelPerformanceTracker {
       recentCorrect: p.recentCorrect,
       recentTotal: p.recentTotal,
     }, "model performance updated");
+
+    // P3.7: Check for constant predictions
+    checkForConstantPredictions(probability);
   }
 
   get(name: string): ModelPerf | undefined {
