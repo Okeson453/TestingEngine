@@ -24,7 +24,7 @@ import { getLogger } from "@/lib/observability/logger";
 const logger = getLogger("outbox-dispatcher");
 
 /** Tunables (env-overridable for tests). */
-export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 200);
+export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 50);
 export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);

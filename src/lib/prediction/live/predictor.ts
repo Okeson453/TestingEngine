@@ -628,63 +628,103 @@ export async function onGameEndPredict(
   const targetGameId = (BigInt(gameId) + 1n).toString();
   const generatedAt = new Date().toISOString();
 
-  // P0 deadline-aware gate — residual window for target N+1
-  // When BG(N+1) has not arrived, began_at is null; estimate residual from
-  // typical inter-round gap (worker_state / default 4s) so late cascade is caught.
+  // === Timing-critical gate (findings 3.1, 3.2, 3.6) ===
+  // Parallelize independent SELECTs; predictive residual when began_at is null.
+  const tGate0 = performance.now();
+  const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 500);
+  const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 200);
   try {
     let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
-    try {
-      const thr = await sql<{ value: string }>`
-        SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
-      `;
-      if (thr[0]?.value) {
-        const t = Number(thr[0].value);
-        if (Number.isFinite(t) && t >= 300 && t <= 5_000) {
-          skipThreshold = Math.max(skipThreshold, t);
-        }
-      }
-    } catch { /* optional */ }
-    let remainingMs: number | null = null;
 
-    const residualRows = await sql<{ began_at: string | Date | null }>`
-      SELECT began_at FROM live_round_state
-      WHERE game_id = ${targetGameId}
-      LIMIT 1
-    `;
+    const [thrRows, residualRows, gapRows, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
+      await Promise.all([
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
+        `.catch(() => [] as { value: string }[]),
+        sql<{ began_at: string | Date | null }>`
+          SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => [] as { began_at: string | Date | null }[]),
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
+        `.catch(() => [] as { value: string }[]),
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
+        `.catch(() => [] as { value: string }[]),
+        sql<{ prediction_id: string }>`
+          SELECT prediction_id FROM pending_predictions
+          WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
+        `.catch(() => [] as { prediction_id: string }[]),
+        sql<{ lifecycle: string | null; began_at: string | Date | null }>`
+          SELECT lifecycle, began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => [] as { lifecycle: string | null; began_at: string | Date | null }[]),
+        sql<{ game_id: string }>`
+          SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => [] as { game_id: string }[]),
+      ]);
+
+    if (thrRows[0]?.value) {
+      const t = Number(thrRows[0].value);
+      if (Number.isFinite(t) && t >= 300 && t <= 5_000) {
+        skipThreshold = Math.max(skipThreshold, t);
+      }
+    }
+
+    // Fast reject: already have pending / already crashed / target started
+    if (existingPending.length > 0) {
+      return {
+        predictionId: existingPending[0]!.prediction_id,
+        targetGameId,
+        kind: "duplicate",
+      };
+    }
+    if (alreadyCrashedRows.length > 0) {
+      logger.warn({ targetGameId }, "Target round N+1 already crashed — too late");
+      recordPredictionOutcome(true);
+      return { predictionId: null, targetGameId, kind: "too_late" };
+    }
+    const life = liveLifecycle[0];
+    if (life?.began_at != null) {
+      const beganMs = new Date(life.began_at).getTime();
+      if (Number.isFinite(beganMs) && beganMs <= Date.now()) {
+        logger.warn({ targetGameId }, "Target round N+1 already started — too late");
+        recordPredictionOutcome(true);
+        return { predictionId: null, targetGameId, kind: "too_late" };
+      }
+    }
+
+    // Predictive residual window
+    let remainingMs: number | null = null;
     if (residualRows.length > 0 && residualRows[0]!.began_at != null) {
       remainingMs = new Date(residualRows[0]!.began_at).getTime() - Date.now();
     } else {
-      // Fallback estimate: gap - elapsed since ED(N)
       let medianGapMs = 4_000;
-      try {
-        const gapRow = await sql<{ value: string }>`
-          SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
-        `;
-        if (gapRow[0]?.value) {
-          const g = Number(gapRow[0].value);
-          if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;
-        }
-      } catch { /* optional */ }
-      const elapsedSinceEd = Date.now() - new Date(endTime).getTime();
+      if (gapRows[0]?.value) {
+        const g = Number(gapRows[0].value);
+        if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;
+      }
+      // CRITICAL: use crashedAt (param), not endTime (was undefined → gate bypassed)
+      const elapsedSinceEd = Date.now() - new Date(crashedAt).getTime();
       remainingMs = medianGapMs - Math.max(0, elapsedSinceEd);
     }
 
-    // Apply clock-skew correction: if worker clock is ahead of BC.Game, residual is overstated
-    try {
-      const skewRow = await sql<{ value: string }>`
-        SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
-      `;
-      const skew = skewRow[0]?.value != null ? Number(skewRow[0].value) : 0;
-      if (Number.isFinite(skew) && remainingMs != null) {
-        // worker ahead of server → subtract skew from remaining
-        remainingMs = remainingMs - skew;
-      }
-    } catch { /* optional */ }
+    const skew = skewRows[0]?.value != null ? Number(skewRows[0].value) : 0;
+    if (Number.isFinite(skew) && remainingMs != null) {
+      remainingMs = remainingMs - skew;
+    }
 
-    if (remainingMs != null && Number.isFinite(remainingMs) && remainingMs < skipThreshold) {
+    // Predictive deadline: need generation + delivery budget inside residual
+    const deadlineBudget = GENERATION_BUDGET_MS + DELIVERY_BUDGET_MS;
+    const effectiveFloor = Math.max(skipThreshold, deadlineBudget);
+    if (remainingMs != null && Number.isFinite(remainingMs) && remainingMs < effectiveFloor) {
       logger.warn(
-        { targetGameId, remainingMs, threshold: skipThreshold },
-        "Skipping prediction: insufficient residual window",
+        {
+          targetGameId,
+          remainingMs,
+          threshold: effectiveFloor,
+          generationBudgetMs: GENERATION_BUDGET_MS,
+          deliveryBudgetMs: DELIVERY_BUDGET_MS,
+        },
+        "Skipping prediction: predictive deadline gate",
       );
       try {
         await sql`
@@ -693,8 +733,8 @@ export async function onGameEndPredict(
             processor_latency_ms, sla_violated
           ) VALUES (
             ${correlationId}::text, 'PREDICT', ${targetGameId},
-            ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: skipThreshold })},
-            ${generatedAt}::timestamptz, now(), 0, true
+            ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: effectiveFloor })},
+            ${generatedAt}::timestamptz, now(), ${Math.round(performance.now() - tGate0)}, true
           )
           ON CONFLICT DO NOTHING
         `;
@@ -707,11 +747,14 @@ export async function onGameEndPredict(
         remainingBeforeTargetMs: remainingMs,
       };
     }
-  } catch {
-    /* live_round_state may be absent during migration window — proceed */
+  } catch (gateErr) {
+    logger.warn(
+      { targetGameId, error: String(gateErr) },
+      "deadline gate soft-failed — proceeding with caution",
+    );
   }
 
-  // Ahead-of-time rate sheath (6.10): halt generation if rolling late rate is high
+  // Sheath mode (3.2 / 3.10) — file exists at src/lib/core/sheath-mode.ts
   try {
     const sheath = evaluateSheath();
     if (sheath.decision === "halt") {
@@ -733,51 +776,12 @@ export async function onGameEndPredict(
         "Sheath mode WARN — late rate elevated",
       );
     }
-  } catch { /* sheath optional */ }
+  } catch (sheathErr) {
+    logger.debug({ error: String(sheathErr) }, "sheath optional");
+  }
 
   try {
-    const existing = await sql<{ prediction_id: string }>`
-      SELECT prediction_id FROM pending_predictions
-      WHERE target_game_id = ${targetGameId} AND status = 'PENDING'
-      LIMIT 1
-    `;
-    if (existing.length > 0) {
-      logger.info(
-        { targetGameId, existingPredictionId: existing[0]!.prediction_id },
-        "Prediction for N+1 already exists",
-      );
-      return {
-        predictionId: existing[0]!.prediction_id,
-        targetGameId,
-        kind: "duplicate",
-      };
-    }
-
-    // Diagnosis §6: prefer live_round_state over crash_rounds existence.
-    // REST backfill must not be mistaken for "target already started".
-    try {
-      const { hasTargetStarted } = await import(
-        "@/lib/prediction/live/live-round-state"
-      );
-      if (await hasTargetStarted(targetGameId, sql)) {
-        logger.warn(
-          { targetGameId },
-          "Target round N+1 already started (live state) — too late to predict",
-        );
-        return { predictionId: null, targetGameId, kind: "too_late" };
-      }
-    } catch {
-      /* live_round_state table may not exist yet during migration window */
-    }
-
-    const alreadyCrashed = await sql<{ game_id: string }>`
-      SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
-    `;
-    if (alreadyCrashed.length > 0) {
-      logger.warn({ targetGameId }, "Target round N+1 already crashed — too late to predict");
-      return { predictionId: null, targetGameId, kind: "too_late" };
-    }
-
+    // Duplicate / too_late checks already done in parallel gate above.
     const rows = await sql<{
       game_id: string;
       multiplier: string | number;
@@ -1028,75 +1032,55 @@ export async function onGameEndPredict(
     );
 
     if (temporalValidity === "TEMPORALLY_INVALID") {
-      // Mark reasoning so operators can filter; keep row for audit but do not
-      // pretend it was ahead-of-time. Downstream may still resolve on crash.
+      // Finding 3.3: prevent late predictions from entering the active pipeline.
+      // Void PENDING status so they are not validated as live signals; keep row for audit.
       try {
         await sql`
           UPDATE pending_predictions
-          SET reasoning = COALESCE(reasoning, ARRAY[]::text[]) ||
-            ARRAY['TEMPORALLY_INVALID: generated_at >= target_started_at']::text[]
+          SET status = 'EXPIRED',
+              matched = false,
+              reasoning = COALESCE(reasoning, ARRAY[]::text[]) ||
+                ARRAY['TEMPORALLY_INVALID: generated_at >= target_started_at']::text[]
           WHERE prediction_id = ${predictionId}
         `;
       } catch { /* non-critical */ }
+      recordPredictionOutcome(true);
+      // Do NOT enqueue Telegram for temporally invalid predictions
+    } else {
+      // Finding 3.4: outbox-only delivery (no blocking sync Telegram on hot path)
+      try {
+        const { createPredictionNotification } = await import("@/lib/notifications/outbox");
+        await createPredictionNotification(sql, {
+          predictionId,
+          targetMultiplier: Number(DEFAULT_TARGET),
+          probability: signal.probability,
+          confidence: signal.confidence,
+          regimeName: signal.regimeId ?? null,
+          lastRoundMultiplier: rounds[rounds.length - 1]?.crashPoint ?? null,
+          generatedAt,
+          correlationId,
+        });
+      } catch (notifErr) {
+        logger.warn(
+          { predictionId, error: String(notifErr) },
+          "Failed to enqueue prediction notification; prediction still persisted",
+        );
+      }
     }
 
-    try {
-      const { createPredictionNotification } = await import("@/lib/notifications/outbox");
-      await createPredictionNotification(sql, {
+    // Structured timing metrics (finding 3.9 / rec 7.9)
+    logger.info(
+      {
+        component: "timing",
+        path: "onGameEndPredict",
+        detectionToPredictMs: predictionLatencyMs,
+        modelInferenceMs: generationLatencyMs,
+        temporalValidity,
+        targetGameId,
         predictionId,
-        targetMultiplier: Number(DEFAULT_TARGET),
-        probability: signal.probability,
-        confidence: signal.confidence,
-        regimeName: signal.regimeId ?? null,
-        lastRoundMultiplier: rounds[rounds.length - 1]?.crashPoint ?? null,
-        generatedAt,
-        correlationId,
-      });
-      // P0: attempt synchronous Telegram delivery (2s timeout). Outbox remains
-      // as durable retry fallback if this fails.
-      if (temporalValidity !== "TEMPORALLY_INVALID") {
-        try {
-          const { sendTelegramMessage, formatPredictionMessage } = await import(
-            "@/lib/notifications/telegram"
-          );
-          const content = formatPredictionMessage({
-            predictionId,
-            targetMultiplier: Number(DEFAULT_TARGET),
-            probability: signal.probability,
-            confidence: signal.confidence,
-            regimeName: signal.regimeId ?? null,
-            lastRoundMultiplier: rounds[rounds.length - 1]?.crashPoint ?? null,
-            generatedAt,
-          });
-          const results = await sendTelegramMessage(content, { timeout: 2000 });
-          const allOk = results.length > 0 && results.every((r) => r.ok);
-          if (allOk) {
-            await sql`
-              UPDATE notification_outbox
-              SET status = 'delivered', delivered_at = now(), last_error = null
-              WHERE metadata->>'predictionId' = ${predictionId}
-                AND status IN ('pending', 'inflight')
-            `;
-            logger.info({ predictionId }, "Sync Telegram delivery succeeded");
-          } else {
-            logger.warn(
-              { predictionId, results },
-              "Sync Telegram delivery partial/failed; outbox will retry",
-            );
-          }
-        } catch (syncErr) {
-          logger.warn(
-            { predictionId, error: String(syncErr) },
-            "Sync Telegram delivery threw; outbox will retry",
-          );
-        }
-      }
-    } catch (notifErr) {
-      logger.warn(
-        { predictionId, error: String(notifErr) },
-        "Failed to enqueue prediction notification; prediction still persisted",
-      );
-    }
+      },
+      "prediction timing",
+    )
 
     try {
       await sql`

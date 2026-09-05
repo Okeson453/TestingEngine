@@ -24,6 +24,26 @@ import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
 
 const logger = getLogger("live-boot");
 
+/** Event-loop lag probe (timing diagnosis 3.8 / 7.6). */
+let eventLoopProbeTimer: ReturnType<typeof setInterval> | null = null;
+function startEventLoopLagMonitor(): void {
+  if (eventLoopProbeTimer) return;
+  eventLoopProbeTimer = setInterval(() => {
+    const start = process.hrtime.bigint();
+    setImmediate(() => {
+      const lagMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+      if (lagMs > 100) {
+        logger.warn({ eventLoopLagMs: Math.round(lagMs) }, "Event loop lag detected");
+      }
+      try {
+        (globalThis as { __eventLoopLagMs__?: number }).__eventLoopLagMs__ = lagMs;
+      } catch { /* ignore */ }
+    });
+  }, 5_000);
+  if (typeof eventLoopProbeTimer.unref === "function") eventLoopProbeTimer.unref();
+}
+
+
 /** Distributed single-writer lock (P0). Uses worker_locks table from 0006. */
 const WORKER_ID =
   process.env.RAILWAY_REPLICA_ID ||
@@ -330,6 +350,7 @@ class LiveBoot {
         );
       }
     }
+    startEventLoopLagMonitor();
     await pollWorker.start();
     await clockMonitor.start();
 

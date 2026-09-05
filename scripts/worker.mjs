@@ -25,7 +25,7 @@ if (!process.env.PG_POOL_MAX) {
   process.env.PG_POOL_MAX = "3";
 }
 if (!process.env.PG_POOL_MIN) {
-  process.env.PG_POOL_MIN = "0";
+  process.env.PG_POOL_MIN = "1";
 }
 if (!process.env.PG_APP_NAME) {
   process.env.PG_APP_NAME = "testingengine-worker";
