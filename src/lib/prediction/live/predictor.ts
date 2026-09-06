@@ -96,8 +96,7 @@ export type OnGameStartResult =
 interface PredictorDeps {
   getSqlFn?: () => Promise<Sql>;
   /** Injected for tests; default uses the real `PredictionEngine`. */
-  predictF
-n?: (
+  predictFn?: (
     priorRounds: HistoricalRound[],
     targetRoundId: string,
     timestamp: string,
@@ -298,8 +297,7 @@ async function loadPriorRoundsStrict(
  *     `game_id`; if found, return `{ kind: 'duplicate' }` (idempotency).
  *  3. tx1 — atomic: anchor `crash_rounds` row, INSERT prediction,
  *     INSERT outbox rows, INSERT `live_event_log` row. The strict temporal
- *     invariant `prediction_genera
-ted_at < target_round_began_at` holds at
+ *     invariant `prediction_generated_at < target_round_began_at` holds at
  *     the COMMIT of this transaction.
  *  4. If `target_round_began_at > now + TEMPORAL_TOLERANCE_MS` (future-dated
  *     payload, clock skew or replay attack), return `{ kind:
@@ -371,8 +369,7 @@ export async function onGameStart(
 
   const sql = await getSqlFn();
 
-  // Refine the temporal check using th
-e DB clock when available —
+  // Refine the temporal check using the DB clock when available —
   // PGLite/Neon, containerized runners, and CI can have drifted clocks
   // relative to the host, and the DB clock is the canonical
   // `requested_at` source.
@@ -433,8 +430,7 @@ e DB clock when available —
 
   // Step 3: strict causal window — only rounds whose outcome is fully
   // known BEFORE the target began are valid model input.
-  const priorRounds = awai
-t loadPriorRoundsStrict(sql, evt.beginTime, MAX_HISTORY);
+  const priorRounds = await loadPriorRoundsStrict(sql, evt.beginTime, MAX_HISTORY);
   if (priorRounds.length < minHistory) {
     logger.warn(
       {
@@ -584,8 +580,7 @@ D: ${predictionId}`,
       },
       "predictor.onGameStart failed; logging and recording in worker_state",
     );
-    // Best-effort: write last_error to 
-worker_state.
+    // Best-effort: write last_error to worker_state.
     try {
       await sql`
         insert into worker_state (key, value)
