@@ -1,9 +1,1140 @@
-{
-  "path": "/home/user/temp/predictor_1abc_1e.ts",
-  "content": "/**\n * Synchronous-on-event predictor.\n *\n * Spec: TestingEngine_Comprehensive_Diagnosis_and_Solution.md §5–§7\n *\n * PRIMARY production path (ahead-of-time N+1):\n *   ED(N) → onGameEndPredict → persist pending for N+1 with generated_at\n *   BG(N+1) → backfill target_round_started_at only (never creates prediction)\n *\n * Hard temporal invariant:\n *   prediction_generated_at < target_round_started_at < target_round_crashed_at\n *\n * `onGameStart` is retained only for tests / emergency recovery. Production\n * Socket.IO handlers must NOT call it to create predictions.\n */\nimport { randomUUID } from \"node:crypto\";\nimport { getSql, getPgPool, type Sql } from \"@/lib/db\";\nimport { runInTransaction } from \"@/lib/prediction/live/tx\";\nimport { PredictionEngine } from \"@/lib/prediction/prediction-engine\";\nimport type { HistoricalRound, ThresholdTarget } from \"@/lib/prediction/types\";\nimport { getConfiguredChatIds } from \"@/lib/notifications/telegram\";\nimport { getLogger } from \"@/lib/observability/logger\";\n\nimport {\n  evaluateSheath,\n  recordPredictionOutcome,\n} from \"@/lib/core/sheath-mode\";\n\nconst logger = getLogger(\"live-predictor\");\n\n/** Prediction-related constants. */\nconst DEFAULT_TARGET: ThresholdTarget = 1.3;\nconst MIN_HISTORY = 20;\n/** Reduced 100→50: halves history query cost on the hot ED path while\n *  remaining well above MIN_HISTORY for model stability. */\nconst MAX_HISTORY = 50;\n/** SLA gate: if the bg payload's `beginTime` is older than this, the\n *  prediction is still persisted (correctness preserved) but the Telegram\n *  outbox writes are skipped to avoid the \"predicts the past\" operator\n *  symptom. */\nexport const SLA_LAG_MS = Number(process.env.SLA_LAG_MS ?? 2_000);\n/** Residual window below which we skip prediction entirely (no row written).\n *  Lowered 800→250: prior floor systematically skipped hot-ED predictions when\n *  elapsedSinceEd + gate latency consumed a normal 3–5s inter-round gap,\n *  forcing poll recovery 1–3 rounds later (the observed signal\n lag). */\nexport const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 250);\n/** Stronger short-circuit: only abandon when the window is truly gone. */\nexport const SKIP_BELOW_MS = Number(process.env.SKIP_BELOW_MS ?? 150);\n/** Hard timeout for PredictionEngine.predict (ms). */\nexport const PREDICT_TIMEOUT_MS = Number(process.env.PREDICT_TIMEOUT_MS ?? 80);\n/** Source-event staleness ceiling. If the crash event we're reacting to is\n *  older than this, the live round has almost certainly advanced past the\n *  target. Set to 15s to avoid interfering with normal delayed events (6-10s)\n *  while catching truly stale reconnect bursts (15s+). */\nexport const MAX_SOURCE_ROUND_AGE_MS = Number(process.env.MAX_SOURCE_ROUND_AGE_MS ?? 15_000);\n\n/** DB-level CHECK constraint cap: a bg payload whose `beginTime` is in the\n *  future of the prediction row's `prediction_generated_at` is rejected. */\n/** Default 500ms (was 100) — P1 recommendation. */\nexport const TEMPORAL_TOLERANCE_MS = Number(process.env.TEMPORAL_TOLERANCE_MS ?? 500);\n\n// P2.10: SLA Alert threshold for prediction timing\nexport const PREDICTION_SLA_THRESHOLD_MS = Number(process.env.PREDICTION_SLA_THRESHOLD_MS ?? 2000);\n\nexport interface GameStartEvent {\n  gameId: string;\n  beginTime: string;\n  hash: string | null;\n  salt: string | null;\n  /** The most recently settled round (BC.Game `gameId`); used for the\n   *  `source_round_game_id` column. May be null on the first bg after\n   *  boot, in which case the cold-start seeder must have already populated\n   *  history. */\n  sourceRoundGameId: string | null;\n  receivedAt: string;\n}\n\nexport type OnGameStartResult =\n  | {\n      kind: \"predicted\";\n      predictionId: string;\n      targetGameId: string;\n      targetBeganAt: string;\n      predictionGeneratedAt: string;\n      latencyMs: number;\n      slaViolated: boolean;\n      correlationId: string;\n      outboxEnqueued: number;\n    }\n  | { kind: \"duplicate\"; predictionId: string; targetGameId: string }\n  | { kind: \"no_history\"; available: number; targetGameId: string }\n  | { kind: \"temporal_violation\"; targetGameId: string; beginTime: string; reason: string }\n  | { kind: \"sla_violated_no_outbox\"; predictionId: string; targetGameId: string };\n\ninterface PredictorDeps {\n  getSqlFn?: () => Promise<Sql>;\n  /** Injected for tests; default uses the real `PredictionEngine`. */\n  predictF\nn?: (\n    priorRounds: HistoricalRound[],\n    targetRoundId: string,\n    timestamp: string,\n    target: ThresholdTarget,\n  ) => {\n    predictionId: string;\n    probability: number;\n    confidence: number;\n    regimeId: string | null;\n    reasoning: string[];\n    featureSummary: Record<string, unknown>;\n    modelVersion: string;\n  };\n  /** Injected for tests; default reads env. */\n  getChatIds?: () => string[];\n  /** Injected for tests; default uses `Date.now`. */\n  now?: () => number;\n  /** Injected for tests. */\n  minHistory?: number;\n  /** Injected for tests. */\n  slaLagMs?: number;\n  /** Injected for tests. */\n  temporalToleranceMs?: number;\n  /**\n   * Poll/recovery path: newest crash may be seconds old. Do not apply the\n   * elapsed-since-ED residual estimate (it always looks \"too late\"). Hard\n   * checks (target started/crashed/duplicate) still apply.\n   */\n  recoveryMode?: boolean;\n}\n\ninterface PriorRow {\n  game_id: string;\n  multiplier: string | number;\n  began_at: string | Date | null;\n  crashed_at: string | Date;\n}\n\nfunction mapRowToHistorical(r: PriorRow): HistoricalRound {\n  const crashedAt =\n    r.crashed_at instanceof Date ? r.crashed_at.toISOString() : String(r.crashed_at);\n  const beganAt =\n    r.began_at instanceof Date\n      ? r.began_at.toISOString()\n      : r.began_at\n        ? String(r.began_at)\n        : null;\n  return {\n    id: r.game_id,\n    externalRoundId: r.game_id,\n    sessionId: null,\n    startedAt: beganAt,\n    crashedAt,\n    crashPoint: Number(r.multiplier),\n    observationSource: \"bc-game-socket\",\n    dataQuality: \"high\",\n    createdAt: crashedAt,\n    sequenceIndex: undefined,\n  };\n}\n\n/** Singleton PredictionEngine — avoid re-allocating FeatureEngine/RegimeDetector/Registry per call (P1 #5). */\nlet cachedEngine: PredictionEngine | null = null;\nfunction getSharedPredictionEngine(): PredictionEngine {\n  cachedEngine ??= new PredictionEngine();\n  return cachedEngine;\n}\n\nconst USE_ADVANCED_PIPELINE =\n  (process.env.USE_ADVANCED_PIPELINE ??\n \"1\") !== \"0\";\n\ntype PipelineFn = (input: {\n  baseProbability: number;\n  regime: string;\n  regimeConfidence?: number;\n  predictionId?: string;\n  modelVersion?: string;\n  baseThreshold?: number;\n}) => {\n  calibratedProbability: number;\n  metaProbability: number;\n  action: string;\n  reason: string;\n  threshold: number;\n};\n\nlet cachedPipelineFn: PipelineFn | null | undefined;\nfunction getPipelineFn(): PipelineFn | null {\n  if (cachedPipelineFn !== undefined) return cachedPipelineFn;\n  try {\n    // Dynamic path so a broken advanced-pipeline dependency cannot take down the live worker.\n    // eslint-disable-next-line @typescript-eslint/no-require-imports\n    const mod = require(\"../../prediction/prediction-pipeline.ts\") as {\n      runPredictionPipeline: PipelineFn;\n    };\n    cachedPipelineFn = mod.runPredictionPipeline;\n  } catch {\n    try {\n      // eslint-disable-next-line @typescript-eslint/no-require-imports\n      const mod = require(\"@/lib/prediction/prediction-pipeline\") as {\n        runPredictionPipeline: PipelineFn;\n      };\n      cachedPipelineFn = mod.runPredictionPipeline;\n    } catch {\n      cachedPipelineFn = null;\n    }\n  }\n  return cachedPipelineFn;\n}\n\nconst defaultPredictFn = (\n  priorRounds: HistoricalRound[],\n  targetRoundId: string,\n  timestamp: string,\n  target: ThresholdTarget,\n) => {\n  const engine = getSharedPredictionEngine();\n  const signal = engine.predict({\n    priorRounds,\n    targetRoundId,\n    timestamp,\n    target,\n  });\n\n  let probability = signal.probability;\n  let confidence = signal.confidence;\n  let modelVersion = signal.modelVersion ?? \"live-v2\";\n  let reasoning: string[] = Array.isArray(signal.reasoning)\n    ? [...signal.reasoning]\n    : signal.reasoning\n      ? [String(signal.reasoning)]\n      : [];\n\n  // Optional Phases 4–8 (was dead code). Soft-fail keeps baseline signal.\n  if (USE_ADVANCED_PIPELINE) {\n    try {\n      const runPipeline = getPipelineFn();\n      if (!runPipeline) throw new Error(\"pipeline_unavailable\");\n      const\n pipe = runPipeline({\n        baseProbability: signal.probability,\n        regime: signal.regimeId ?? \"unknown\",\n        regimeConfidence: 0.6,\n        predictionId: signal.predictionId,\n        modelVersion: signal.modelVersion,\n        baseThreshold: Number(target),\n      });\n      probability =\n        pipe.calibratedProbability ?? pipe.metaProbability ?? probability;\n      confidence = Math.min(1, Math.max(confidence, probability));\n      modelVersion = `${modelVersion}+pipeline`;\n      reasoning.push(\n        `pipeline_action=${pipe.action}`,\n        `pipeline_reason=${pipe.reason}`,\n        `threshold=${pipe.threshold}`,\n      );\n    } catch {\n      /* keep baseline — pipeline may be unavailable in pure unit tests */\n    }\n  }\n\n  return {\n    predictionId: signal.predictionId,\n    probability,\n    confidence,\n    regimeId: signal.regimeId,\n    reasoning,\n    featureSummary: signal.featureSummary,\n    modelVersion,\n  };\n};\n\nasync function loadPriorRoundsStrict(\n  sql: Sql,\n  beganAt: string,\n  limit: number,\n): Promise<HistoricalRound[]> {\n  const rows = await sql<PriorRow>`\n    select game_id, multiplier, began_at, crashed_at\n    from crash_rounds\n    where crashed_at < ${beganAt}::timestamptz\n      and crashed_at is not null\n    order by crashed_at desc, game_id desc\n    limit ${limit}\n  `;\n  return rows.reverse().map(mapRowToHistorical);\n}\n\n/**\n * Handle a BC.Game `bg` (begin) event.\n *\n * The function is synchronous from the caller's perspective (it awaits the\n * single transaction) and is responsible for:\n *  1. SLA-gate: if `now - beginTime > SLA_LAG_MS`, set `slaViolated = true`\n *     and skip outbox writes (prediction still persists).\n *  2. Duplicate check: SELECT pending_predictions for the same target\n *     `game_id`; if found, return `{ kind: 'duplicate' }` (idempotency).\n *  3. tx1 — atomic: anchor `crash_rounds` row, INSERT prediction,\n *     INSERT outbox rows, INSERT `live_event_log` row. The strict temporal\n *     invariant `prediction_genera\nted_at < target_round_began_at` holds at\n *     the COMMIT of this transaction.\n *  4. If `target_round_began_at > now + TEMPORAL_TOLERANCE_MS` (future-dated\n *     payload, clock skew or replay attack), return `{ kind:\n *     'temporal_violation' }` and DO NOT insert.\n */\nexport async function onGameStart(\n  evt: GameStartEvent,\n  deps: PredictorDeps = {},\n): Promise<OnGameStartResult> {\n  const getSqlFn = deps.getSqlFn ?? getSql;\n  const predictFn = deps.predictFn ?? defaultPredictFn;\n  const getChatIds = deps.getChatIds ?? getConfiguredChatIds;\n  const now = deps.now ?? Date.now;\n  const minHistory = deps.minHistory ?? MIN_HISTORY;\n  const slaLagMs = deps.slaLagMs ?? SLA_LAG_MS;\n  const temporalToleranceMs = deps.temporalToleranceMs ?? TEMPORAL_TOLERANCE_MS;\n\n  const correlationId = randomUUID();\n  const beginMs = new Date(evt.beginTime).getTime();\n  const receivedMs = new Date(evt.receivedAt).getTime();\n  const slaLagMsActual = receivedMs - beginMs;\n  const slaViolated = slaLagMsActual > slaLagMs;\n\n  // Step 1: temporal violation — bg payload claims a future beginTime.\n  // Defends against clock skew / replay attack / future-dated payload.\n  if (beginMs > now() + temporalToleranceMs) {\n    logger.error(\n      {\n        component: \"live-predictor\",\n        correlationId,\n        targetGameId: evt.gameId,\n        beginTime: evt.beginTime,\n        now: new Date(now()).toISOString(),\n      },\n      \"temporal violation: beginTime is in the future; skipping prediction\",\n    );\n    return {\n      kind: \"temporal_violation\",\n      targetGameId: evt.gameId,\n      beginTime: evt.beginTime,\n      reason: \"beginTime in the future\",\n    };\n  }\n\n  // Defensive: if beginTime is invalid, treat as a parse failure.\n  if (!Number.isFinite(beginMs)) {\n    return {\n      kind: \"temporal_violation\",\n      targetGameId: evt.gameId,\n      beginTime: evt.beginTime,\n      reason: \"beginTime unparseable\",\n    };\n  }\n\n  const sql = await getSqlFn();\n\n  // Refine the temporal check using th\ne DB clock when available —\n  // PGLite/Neon, containerized runners, and CI can have drifted clocks\n  // relative to the host, and the DB clock is the canonical\n  // `requested_at` source.\n  let refNow = now();\n  try {\n    const dbNow = await sql<{ now: string | Date }>`select now() as now`;\n    if (dbNow[0]?.now) {\n      const v = dbNow[0].now;\n      const dbMs = v instanceof Date ? v.getTime() : new Date(v).getTime();\n      if (Number.isFinite(dbMs)) refNow = dbMs;\n    }\n  } catch {\n    /* fall back to local clock */\n  }\n  if (beginMs > refNow + temporalToleranceMs) {\n    logger.error(\n      {\n        component: \"live-predictor\",\n        correlationId,\n        targetGameId: evt.gameId,\n        beginTime: evt.beginTime,\n        refNowIso: new Date(refNow).toISOString(),\n      },\n      \"temporal violation (db-clock): beginTime is in the future; skipping prediction\",\n    );\n    return {\n      kind: \"temporal_violation\",\n      targetGameId: evt.gameId,\n      beginTime: evt.beginTime,\n      reason: \"beginTime in the future (db clock)\",\n    };\n  }\n\n  // Step 2: duplicate check. Partial unique index on target_game_id in 0008\n  // makes the second INSERT a no-op too, so the belt is the SELECT and the\n  // suspenders are the index.\n  const existing = await sql<{ prediction_id: string }>`\n    select prediction_id from pending_predictions\n    where target_game_id = ${evt.gameId} and matched = false\n    limit 1\n  `;\n  if (existing.length > 0) {\n    logger.info(\n      {\n        component: \"live-predictor\",\n        correlationId,\n        targetGameId: evt.gameId,\n        predictionId: existing[0]!.prediction_id,\n      },\n      \"duplicate bg event; prediction already exists for this target\",\n    );\n    return {\n      kind: \"duplicate\",\n      predictionId: existing[0]!.prediction_id,\n      targetGameId: evt.gameId,\n    };\n  }\n\n  // Step 3: strict causal window — only rounds whose outcome is fully\n  // known BEFORE the target began are valid model input.\n  const priorRounds = awai\nt loadPriorRoundsStrict(sql, evt.beginTime, MAX_HISTORY);\n  if (priorRounds.length < minHistory) {\n    logger.warn(\n      {\n        component: \"live-predictor\",\n        correlationId,\n        targetGameId: evt.gameId,\n        available: priorRounds.length,\n        minHistory,\n      },\n      \"insufficient history; skipping prediction (cold-start seeder should run first)\",\n    );\n    return { kind: \"no_history\", available: priorRounds.length, targetGameId: evt.gameId };\n  }\n\n  // Step 4: model inference. Pure CPU. The engine must NEVER see rows\n  // whose `crashed_at` is the target round's own (the strict window\n  // guarantees that).\n  const timestamp = new Date(now()).toISOString();\n  const signal = predictFn(priorRounds, evt.gameId, timestamp, DEFAULT_TARGET);\n\n  // Step 5: atomic transaction. The crash_rounds row is anchored first so\n  // any consumer querying `WHERE game_id = $G` finds a row even before\n  // the prediction is committed. The pending_predictions INSERT is\n  // gated by the partial unique index — re-runs of the same bg are\n  // no-ops. The outbox rows are written in the same transaction as\n  // the prediction so the strict invariant is durable.\n  let predictionId: string = signal.predictionId;\n  let predictionGeneratedAt = timestamp;\n  let outboxEnqueued = 0;\n\n  // chat fan-out is handled by sendTelegramMessage, not per-row inserts\n  void getChatIds;\n\n  try {\n    await runInTransaction(sql, async (tx) => {\n      // Note: we do NOT pre-insert the crash_rounds row here. The schema\n      // requires `multiplier` and `crashed_at` to be NOT NULL; both will\n      // arrive on the `ed` event. The validator's UPDATE will create the\n      // row via `insertNewRounds` (REST backfill) or via the ed handler's\n      // own INSERT path on first arrival. Skipping here keeps the\n      // transaction idempotent and removes the schema mismatch.\n\n      const ins = await tx<{ prediction_id: string; requested_at: string }>`\n        insert into pending_predictions (\n    \n      prediction_id, target_multiplier, probability, confidence,\n          regime_name, regime_confidence, reasoning, feature_summary,\n          model_version, requested_at,\n          target_game_id, target_round_started_at, source_round_id,\n          correlation_id\n        ) values (\n          ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},\n          ${signal.confidence}, ${signal.regimeId},\n          ${signal.regimeId ? 0.5 : null},\n          ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},\n          ${signal.modelVersion}, ${timestamp},\n          ${evt.gameId}, ${evt.beginTime}, ${evt.sourceRoundGameId},\n          ${correlationId}\n        )\n        on conflict (prediction_id) do nothing\n        returning prediction_id, requested_at\n      `;\n      if (ins.length === 0) {\n        // Lost the race; the unique index caught a duplicate.\n        const dup = await tx<{ prediction_id: string }>`\n          select prediction_id from pending_predictions\n          where target_game_id = ${evt.gameId} and matched = false\n          limit 1\n        `;\n        if (dup.length === 0) {\n          throw new Error(\"PREDICTION_DUPLICATE_BUT_UNREADABLE\");\n        }\n        predictionId = dup[0]!.prediction_id;\n        return;\n      }\n      predictionId = ins[0]!.prediction_id;\n      predictionGeneratedAt = String(ins[0]!.requested_at);\n\n      // ONE outbox row per prediction. sendTelegramMessage fans out to all\n      // chats — per-chat rows caused duplicate deliveries.\n      // SKIP when slaViolated so operators do not see \"predicts the past\".\n      if (!slaViolated) {\n        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : \"\";\n        const predictionContent = [\n          `🎯 NEW PREDICTION${regimeText}`,\n          ``,\n          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,\n          `Probability: ${(signal.probability * 100).toFixed(1)}%`,\n          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,\n          ``,\n          `Prediction I\nD: ${predictionId}`,\n          `Generated: ${predictionGeneratedAt}`,\n        ].join(\"\\n\");\n        await tx`\n          insert into notification_outbox (\n            notification_id, type, content, metadata, status, priority,\n            attempt_count, next_attempt_at\n          ) values (\n            ${randomUUID()}::uuid, 'prediction',\n            ${predictionContent},\n            ${JSON.stringify({\n              predictionId,\n              correlationId,\n              targetGameId: evt.gameId,\n              targetBeganAt: evt.beginTime,\n              targetMultiplier: Number(DEFAULT_TARGET),\n              probability: signal.probability,\n              confidence: signal.confidence,\n              regimeName: signal.regimeId,\n              slaViolated: false,\n              kind: \"prediction\",\n            })},\n            'pending', 2,\n            0, now()\n          )\n        `;\n        outboxEnqueued = 1;\n      }\n\n      // live_event_log row: append-only observability.\n      await tx`\n        insert into live_event_log (\n          correlation_id, event_kind, game_id, payload, received_at, processed_at,\n          processor_latency_ms, sla_violated\n        ) values (\n          ${correlationId}::text, 'BG', ${evt.gameId},\n          ${JSON.stringify({ beginTime: evt.beginTime, sourceRoundGameId: evt.sourceRoundGameId })},\n          ${evt.receivedAt}::timestamptz, now(),\n          ${Math.max(0, now() - receivedMs)}, ${slaViolated}\n        )\n      `;\n    });\n  } catch (e) {\n    // P2.15: Improve Error Logging in onGameStart\n    logger.error(\n      {\n        component: \"live-predictor\",\n        correlationId,\n        targetGameId: evt.gameId,\n        error: String(e),\n        errorStack: e instanceof Error ? e.stack : undefined,\n        beginTime: evt.beginTime,\n        receivedAt: evt.receivedAt,\n        slaLagMsActual,\n        slaViolated,\n      },\n      \"predictor.onGameStart failed; logging and recording in worker_state\",\n    );\n    // Best-effort: write last_error to \nworker_state.\n    try {\n      await sql`\n        insert into worker_state (key, value)\n        values ('last_error', ${String(e)})\n        on conflict (key) do update set value = excluded.value, updated_at = now()\n      `;\n    } catch {\n      /* ignore */\n    }\n    return { kind: \"temporal_violation\", targetGameId: evt.gameId, beginTime: evt.beginTime, reason: String(e) };\n  }\n\n  logger.info(\n    {\n      component: \"live-predictor\",\n      correlationId,\n      predictionId,\n      targetGameId: evt.gameId,\n      targetBeganAt: evt.beginTime,\n      latencyMs: now() - receivedMs,\n      slaViolated,\n      outboxEnqueued,\n    },\n    slaViolated\n      ? \"prediction persisted; SLA-gate suppressed outbox writes\"\n      : \"prediction generated and persisted for next round\",\n  );\n\n  if (slaViolated) {\n    return {\n      kind: \"sla_violated_no_outbox\",\n      predictionId,\n      targetGameId: evt.gameId,\n    };\n  }\n  return {\n    kind: \"predicted\",\n    predictionId,\n    targetGameId: evt.gameId,\n    targetBeganAt: evt.beginTime,\n    predictionGeneratedAt,\n    latencyMs: now() - receivedMs,\n    slaViolated: false,\n    correlationId,\n    outboxEnqueued,\n  };\n}\n\n\n/**\n * CRITICAL (TestingEngine_Deep_Diagnosis.md §3.2): Generate prediction for\n * Round N+1 immediately after Round N ends. This is the ONLY correct trigger\n * point for ahead-of-time prediction so that\n *   prediction_generated_at < target_round_started_at\n * always holds (target_round_started_at is backfilled later on the bg event).\n */\nexport type TemporalValidity = \"TEMPORALLY_VALID\" | \"TEMPORALLY_UNVERIFIED\" | \"TEMPORALLY_INVALID\";\n\nexport interface OnGameEndPredictResult {\n  predictionId: string | null;\n  targetGameId: string;\n  kind:\n    | \"predicted\"\n    | \"duplicate\"\n    | \"too_late\"\n    | \"skipped_late\"\n    | \"insufficient_history\"\n    | \"error\"\n        | \"skipped_stale_source\";\n| \"temporally_invalid\";\n  /** Proven only when targetStartedAt is known and remainingBeforeTargetMs > 0 */\n  temporalValidity?: TemporalValidity;\n  sourceGameId?: str\ning;\n  sourceCrashAt?: string;\n  targetStartedAt?: string | null;\n  predictionGeneratedAt?: string;\n  predictionLatencyMs?: number;\n  availableWindowMs?: number | null;\n  remainingBeforeTargetMs?: number | null;\n}\n\nexport async function onGameEndPredict(\n  gameId: string,\n  crashedAt: string,\n  multiplier: number,\n  correlationId: string,\n  deps: PredictorDeps = {},\n): Promise<OnGameEndPredictResult> {\n  const getSqlFn = deps.getSqlFn ?? getSql;\n  const predictFn = deps.predictFn ?? defaultPredictFn;\n  const sql = await getSqlFn();\n  const targetGameId = (BigInt(gameId) + 1n).toString();\n  const generatedAt = new Date().toISOString();\n  // === Source-staleness gate ===\n  // Reject before any DB work if the crash event is itself already old.\n  // This catches the \"socket says connected but crash ED events silently\n  // stopped\" failure mode where buffered events arrive 10-60s late.\n  {\n    const sourceAgeMs = Date.now() - new Date(crashedAt).getTime();\n    if (Number.isFinite(sourceAgeMs) && sourceAgeMs > MAX_SOURCE_ROUND_AGE_MS) {\n      logger.warn(\n        { targetGameId, sourceGameId: gameId, sourceAgeMs, crashedAt },\n        \"Skipping prediction: source round crash event is stale — live round has likely advanced past this target\",\n      );\n      try {\n        await sql`\n          INSERT INTO live_event_log (\n            correlation_id, event_kind, game_id, payload, received_at, processed_at,\n            processor_latency_ms, sla_violated\n          ) VALUES (\n            ${correlationId}::text, 'PREDICT', ${targetGameId},\n            ${JSON.stringify({ kind: \"skipped_stale_source\", sourceGameId: gameId, sourceAgeMs, crashedAt })},\n            ${generatedAt}::timestamptz, now(), 0, true\n          )\n          ON CONFLICT DO NOTHING\n        `;\n      } catch { /* non-fatal */ }\n      recordPredictionOutcome(true);\n      return {\n        predictionId: null,\n        targetGameId,\n        kind: \"skipped_stale_source\" as const,\n        sourceGameId: gameId,\n        sourceCrashAt: crashedAt,\n      };\n    }\n  }\n\n\n\n  // === Timing-critical gate (findings 3.1, 3.2, 3.6) ===\n  // P1.1: Parallelize independent SELECTs using Promise.all\n  const tGate0 = performance.now();\n  // Measured hot-path costs: predict ~20–80ms, persist ~30–80ms, outbox tick 50ms.\n  // Prior 500+200 budgets made effectiveFloor ≥700ms and caused mass skipped_late.\n  const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 150);\n  const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 100);\n  try {\n    let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);\n\n    // P1.1: Use Promise.all for parallel DB queries\n    const [thrRows, residualRows, gapRows, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =\n      await Promise.all([\n        sql<{ value: string }>`\n          SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1\n        `.catch(() => []),\n        sql<{ began_at: string | Date | null }>`\n          SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1\n        `.catch(() => []),\n        sql<{ value: string }>`\n          SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1\n        `.catch(() => []),\n        sql<{ value: string }>`\n          SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1\n        `.catch(() => []),\n        s\nql<{ prediction_id: string }>`\n          SELECT prediction_id FROM pending_predictions\n          WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1\n        `.catch(() => []),\n        sql<{ lifecycle: string | null; began_at: string | Date | null }>`\n          SELECT lifecycle, began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1\n        `.catch(() => []),\n        sql<{ game_id: string }>`\n          SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1\n        `.catch(() => []),\n      ]);\n\n    if (thrRows[0]?.value) {\n      const t = Number(thrRows[0].value);\n      if (Number.isFinite(t) && t >= 300 && t <= 5_000) {\n        skipThreshold = Math.max(skipThreshold, t);\n      }\n    }\n\n    // Fast reject: already have pending / already crashed / target started\n    if (existingPending.length > 0) {\n      return {\n        predictionId: existingPending[0]!.prediction_id,\n        targetGameId,\n        kind: \"duplicate\",\n      };\n    }\n    if (alreadyCrashedRows.length > 0) {\n      logger.warn({ targetGameId }, \"Target round N+1 already crashed — too late\");\n      recordPredictionOutcome(true);\n      return { predictionId: null, targetGameId, kind: \"too_late\" };\n    }\n    const life = liveLifecycle[0];\n    if (life?.began_at != null) {\n      const beganMs = new Date(life.began_at).getTime();\n      if (Number.isFinite(beganMs) && beganMs <= Date.now()) {\n        logger.warn({ targetGameId }, \"Target round N+1 already started — too late\");\n        recordPredictionOutcome(true);\n        return { predictionId: null, targetGameId, kind: \"too_late\" };\n      }\n    }\n\n    // Predictive residual window\n    let remainingMs: number | null = null;\n    let medianGapMs = 4_000;\n    if (gapRows[0]?.value) {\n      const g = Number(gapRows[0].value);\n      if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;\n    }\n    const elapsedSinceEd = Date.now() - new Date(crashedAt).getTime();\n    const recoveryMode = deps.recoveryMod\ne === true;\n\n    if (residualRows.length > 0 && residualRows[0]!.began_at != null) {\n      // Authoritative: target N+1 already has began_at\n      remainingMs = new Date(residualRows[0]!.began_at).getTime() - Date.now();\n    } else if (recoveryMode || (Number.isFinite(elapsedSinceEd) && elapsedSinceEd > medianGapMs * 1.5)) {\n      // Recovery/stale: use conservative residual = medianGap/2 from *now*\n      // (not from crash time). Hard checks still reject started/crashed targets.\n      remainingMs = Math.floor(medianGapMs / 2);\n      logger.info(\n        {\n          targetGameId,\n          elapsedSinceEd,\n          medianGapMs,\n          remainingMs,\n          recoveryMode,\n        },\n        \"recovery/stale: conservative residual estimate (medianGap/2)\",\n      );\n    } else {\n      // Hot ED path: estimate time left until typical N+1 start\n      remainingMs = medianGapMs - Math.max(0, elapsedSinceEd);\n    }\n\n    const skew = skewRows[0]?.value != null ? Number(skewRows[0].value) : 0;\n    if (Number.isFinite(skew) && remainingMs != null) {\n      remainingMs = remainingMs - skew;\n    }\n\n    // Predictive deadline gate — only hard-skip when residual is gone or\n    // extremely tight. Prefer generating + letting outbox deadline expire\n    // a late signal over skipping generation (which forced multi-round lag\n    // via the poll recovery path).\n    const deadlineBudget = GENERATION_BUDGET_MS + DELIVERY_BUDGET_MS;\n    // Hard floor is the tighter of SKIP_BELOW / MIN_REQUIRED only.\n    // deadlineBudget is advisory: log but still generate when residual is\n    // between skipThreshold and deadlineBudget so the signal can still land\n    // inside the betting window for many rounds.\n    const effectiveFloor = skipThreshold;\n    if (remainingMs != null && Number.isFinite(remainingMs) && remainingMs < effectiveFloor) {\n      logger.warn(\n        {\n          targetGameId,\n          remainingMs,\n          threshold: effectiveFloor,\n          generationBudgetMs: GENERATION_BUDGE\nT_MS,\n          deliveryBudgetMs: DELIVERY_BUDGET_MS,\n          elapsedSinceEd,\n          recoveryMode,\n        },\n        \"Skipping prediction: residual window exhausted\",\n      );\n      try {\n        await sql`\n          INSERT INTO live_event_log (\n            correlation_id, event_kind, game_id, payload, received_at, processed_at,\n            processor_latency_ms, sla_violated\n          ) VALUES (\n            ${correlationId}::text, 'PREDICT', ${targetGameId},\n            ${JSON.stringify({ kind: \"skipped_late\", remainingMs, threshold: effectiveFloor, recoveryMode })},\n            ${generatedAt}::timestamptz, now(), ${Math.round(performance.now() - tGate0)}, true\n          )\n          ON CONFLICT DO NOTHING\n        `;\n      logger.warn(\n        { targetGameId, remainingMs, threshold: effectiveFloor, generationBudgetMs: GENERATION_BUDGET_MS, deliveryBudgetMs: DELIVERY_BUDGET_MS, elapsedSinceEd, recoveryMode },\n        \"tight residual window — generating anyway; outbox will expire if too late\",\n      );\n    }\n    if (\n      remainingMs != null &&\n      Number.isFinite(remainingMs) &&\n      remainingMs < deadlineBudget\n    ) {\n      logger.info(\n        {\n          targetGameId,\n          remainingMs,\n          deadlineBudget,\n          elapsedSinceEd,\n        },\n        \"tight residual — generating anyway; outbox may expire if target starts first\",\n      );\n    }\n  } catch (gateErr) {\n    logger.warn(\n      { targetGameId, error: String(gateErr) },\n      \"deadline gate soft-failed — proceeding with caution\",\n    );\n  }\n\n  // Sheath mode (3.2 / 3.10)\n  try {\n    const sheath = evaluateSheath();\n    if (sheath.decision === \"halt\") {\n      logger.warn(\n        { targetGameId, lateRate: sheath.rate, total: sheath.total },\n        \"Sheath mode HALT — skipping prediction due to elevated late rate\",\n      );\n      recordPredictionOutcome(true);\n      return {\n        predictionId: null,\n        targetGameId,\n        kind: \"skipped_late\",\n        remainingBeforeTargetMs: null,\n      };\n    }\n    if (sheath.decision === \"warn\") {\n      log\nger.warn(\n        { targetGameId, lateRate: sheath.rate, total: sheath.total },\n        \"Sheath mode WARN — late rate elevated\",\n      );\n    }\n  } catch (sheathErr) {\n    logger.debug({ error: String(sheathErr) }, \"sheath optional\");\n  }\n  const gateMs = Math.round(performance.now() - tGate0);\n\n  // P1.8: Add Per-Path Timing Metrics\n  const tHist0 = performance.now();\n  try {\n    // Duplicate / too_late checks already done in parallel gate above.\n    const rows = await sql<{\n      game_id: string;\n      multiplier: string | number;\n      began_at: string | Date | null;\n      crashed_at: string | Date;\n    }>`\n      SELECT game_id, multiplier, began_at, crashed_at\n      FROM crash_rounds\n      WHERE crashed_at <= ${crashedAt}::timestamptz\n        AND crashed_at IS NOT NULL\n      ORDER BY crashed_at DESC, game_id DESC\n      LIMIT ${MAX_HISTORY}\n    `;\n    const histMs = Math.round(performance.now() - tHist0);\n\n    const rounds = rows.reverse().map(mapRowToHistorical);\n    if (rounds.length < MIN_HISTORY) {\n      logger.info(\n        { targetGameId, availableHistory: rounds.length },\n        \"Insufficient history for N+1 prediction\",\n      );\n      return { predictionId: null, targetGameId, kind: \"insufficient_history\" };\n    }\n\n    // Cold-start seed for advanced pipeline incremental state (once)\n    try {\n      const { globalIncrementalState } = await import(\n        \"@/lib/prediction/state/incremental-state-engine\"\n      );\n      if (globalIncrementalState.snapshot().count === 0 && rounds.length > 0) {\n        globalIncrementalState.seed(rounds.map((r) => r.crashPoint));\n      }\n    } catch {\n      /* soft */\n    }\n\n    const tPredict0 = performance.now();\n    // Hard timeout around sync model inference\n    let signal: ReturnType<typeof defaultPredictFn>;\n    try {\n      signal = await Promise.race([\n        Promise.resolve().then(() =>\n          predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET),\n        ),\n        new Promise<never>((_, reject) =>\n     \n     setTimeout(() => reject(new Error(\"PREDICT_TIMEOUT\")), PREDICT_TIMEOUT_MS),\n        ),\n      ]);\n    } catch (predictErr) {\n      logger.error(\n        { targetGameId, error: String(predictErr), predictTimeoutMs: PREDICT_TIMEOUT_MS },\n        \"model inference timed out or failed\",\n      );\n      return { predictionId: null, targetGameId, kind: \"error\" };\n    }\n    const predictMs = Math.round(performance.now() - tPredict0);\n\n    const tPersist0 = performance.now();\n    let predictionId: string | null = null;\n    let predictionGeneratedAt: string | null = null;\n\n    try {\n      await runInTransaction(sql, async (tx) => {\n        // Do NOT pre-insert crash_rounds for N+1: multiplier + crashed_at are\n        // NOT NULL and only arrive on t\n\n... [Content truncated]        // NOT NULL and only arrive on the `ed` event. The validator's UPDATE will create the\n        // row via `insertNewRounds` (REST backfill) or via the ed handler's\n        // own INSERT path on first arrival. Skipping here keeps the\n        // transaction idempotent and removes the schema mismatch.\n\n        const ins = await tx<{ prediction_id: string; requested_at: string }>`\n          insert into pending_predictions (\n            prediction_id, target_multiplier, probability, confidence,\n            regime_name, regime_confidence, reasoning, feature_summary,\n            model_version, requested_at,\n            target_game_id, source_round_id,\n            correlation_id\n          ) values (\n            ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},\n            ${signal.confidence}, ${signal.regimeId},\n            ${signal.regimeId ? 0.5 : null},\n            ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},\n            ${signal.modelVersion}, ${generatedAt},\n            ${targetGameId}, ${gameId},\n            ${correlationId}\n          )\n          on conflict (prediction_id) do nothing\n          returning prediction_id, requested_at\n        `;\n        if (ins.length === 0) {\n          // Lost the race; the unique index caught a duplicate.\n          const dup = await tx<{ prediction_id: string }>`\n            select prediction_id from pending_predictions\n            where target_game_id = ${targetGameId} and matched = false\n            limit 1\n          `;\n          if (dup.length === 0) {\n            throw new Error(\"PREDICTION_DUPLICATE_BUT_UNREADABLE\");\n          }\n          predictionId = dup[0]!.prediction_id;\n          return;\n        }\n        predictionId = ins[0]!.prediction_id;\n        predictionGeneratedAt = String(ins[0]!.requested_at);\n\n        // ONE outbox row per prediction.\n        // Compute deadline: estimated target start + 500ms buffer\n        const medianGapMs = (() => {\n          try {\n            const g = gapRows[0]?.value != null ? Number(gapRows[0].value) : 4_000;\n            return Number.isFinite(g) && g > 500 && g < 30_000 ? g : 4_000;\n          } catch { return 4_000; }\n        })();\n        const estimatedTargetStartMs = new Date(crashedAt).getTime() + medianGapMs;\n        const telegramDeadlineAt = new Date(estimatedTargetStartMs + 500).toISOString();\n\n        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : \"\";\n        const predictionContent = [\n          `🎯 NEW PREDICTION${regimeText}`,\n          ``,\n          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,\n          `Probability: ${(signal.probability * 100).toFixed(1)}%`,\n          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,\n          ``,\n          `Prediction ID: ${predictionId}`,\n          `Generated: ${predictionGeneratedAt}`,\n        ].join(\"\\n\");\n        await tx`\n          insert into notification_outbox (\n            notification_id, type, content, metadata, status, priority,\n            attempt_count, next_attempt_at, telegram_deadline_at\n          ) values (\n            ${randomUUID()}::uuid, 'prediction',\n            ${predictionContent},\n            ${JSON.stringify({\n              predictionId,\n              correlationId,\n              targetGameId,\n              targetBeganAt: null,\n              targetMultiplier: Number(DEFAULT_TARGET),\n              probability: signal.probability,\n              confidence: signal.confidence,\n              regimeName: signal.regimeId,\n              slaViolated: false,\n              kind: \"prediction\",\n              sourceRoundId: gameId,\n              sourceCrashAt: crashedAt,\n              estimatedTargetStartAt: new Date(estimatedTargetStartMs).toISOString(),\n            })},\n            'pending', 3,\n            0, now(),\n            ${telegramDeadlineAt}::timestamptz\n          )\n        `;\n\n        // live_event_log row: append-only observability.\n        await tx`\n          insert into live_event_log (\n            correlation_id, event_kind, game_id, payload, received_at, processed_at,\n            processor_latency_ms, sla_violated\n          ) values (\n            ${correlationId}::text, 'PREDICT', ${targetGameId},\n            ${JSON.stringify({ sourceRoundGameId: gameId, crashedAt })},\n            ${generatedAt}::timestamptz, now(),\n            ${Math.round(performance.now() - tPersist0)}, false\n          )\n        `;\n      });\n    } catch (e) {\n      logger.error(\n        { targetGameId, error: String(e) },\n        \"onGameEndPredict persistence failed\",\n      );\n      return { predictionId: null, targetGameId, kind: \"error\" };\n    }\n\n    logger.info(\n      {\n        component: \"live-predictor\",\n        correlationId,\n        predictionId,\n        targetGameId,\n        latencyMs: Math.round(performance.now() - tPredict0),\n      },\n      \"prediction generated and persisted for next round\",\n    );\n\n    return {\n      predictionId,\n      targetGameId,\n      kind: \"predicted\",\n      predictionGeneratedAt,\n      temporalValidity: \"TEMPORALLY_UNVERIFIED\",\n    };\n  }\n",
-  "file_size_bytes": 39796,
-  "returned_bytes": 39796,
-  "offset": 0,
-  "lines_read": 1102,
-  "was_truncated": false
+/**
+ * Synchronous-on-event predictor.
+ *
+ * Spec: TestingEngine_Comprehensive_Diagnosis_and_Solution.md §5–§7
+ *
+ * PRIMARY production path (ahead-of-time N+1):
+ *   ED(N) → onGameEndPredict → persist pending for N+1 with generated_at
+ *   BG(N+1) → backfill target_round_started_at only (never creates prediction)
+ *
+ * Hard temporal invariant:
+ *   prediction_generated_at < target_round_started_at < target_round_crashed_at
+ *
+ * `onGameStart` is retained only for tests / emergency recovery. Production
+ * Socket.IO handlers must NOT call it to create predictions.
+ */
+import { randomUUID } from "node:crypto";
+import { getSql, getPgPool, type Sql } from "@/lib/db";
+import { runInTransaction } from "@/lib/prediction/live/tx";
+import { PredictionEngine } from "@/lib/prediction/prediction-engine";
+import type { HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
+import { getConfiguredChatIds } from "@/lib/notifications/telegram";
+import { getLogger } from "@/lib/observability/logger";
+
+import {
+  evaluateSheath,
+  recordPredictionOutcome,
+} from "@/lib/core/sheath-mode";
+
+const logger = getLogger("live-predictor");
+
+/** Prediction-related constants. */
+const DEFAULT_TARGET: ThresholdTarget = 1.3;
+const MIN_HISTORY = 20;
+/** Reduced 100→50: halves history query cost on the hot ED path while
+ *  remaining well above MIN_HISTORY for model stability. */
+const MAX_HISTORY = 50;
+/** SLA gate: if the bg payload's `beginTime` is older than this, the
+ *  prediction is still persisted (correctness preserved) but the Telegram
+ *  outbox writes are skipped to avoid the "predicts the past" operator
+ *  symptom. */
+export const SLA_LAG_MS = Number(process.env.SLA_LAG_MS ?? 2_000);
+/** Residual window below which we skip prediction entirely (no row written).
+ *  Lowered 800→250: prior floor systematically skipped hot-ED predictions when
+ *  elapsedSinceEd + gate latency consumed a normal 3–5s inter-round gap,
+ *  forcing poll recovery 1–3 rounds later (the observed signal
+ lag). */
+export const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 250);
+/** Stronger short-circuit: only abandon when the window is truly gone. */
+export const SKIP_BELOW_MS = Number(process.env.SKIP_BELOW_MS ?? 150);
+/** Hard timeout for PredictionEngine.predict (ms). */
+export const PREDICT_TIMEOUT_MS = Number(process.env.PREDICT_TIMEOUT_MS ?? 80);
+/** Source-event staleness ceiling. If the crash event we're reacting to is
+ *  older than this, the live round has almost certainly advanced past the
+ *  target. Set to 15s to avoid interfering with normal delayed events (6-10s)
+ *  while catching truly stale reconnect bursts (15s+). */
+export const MAX_SOURCE_ROUND_AGE_MS = Number(process.env.MAX_SOURCE_ROUND_AGE_MS ?? 15_000);
+
+/** DB-level CHECK constraint cap: a bg payload whose `beginTime` is in the
+ *  future of the prediction row's `prediction_generated_at` is rejected. */
+/** Default 500ms (was 100) — P1 recommendation. */
+export const TEMPORAL_TOLERANCE_MS = Number(process.env.TEMPORAL_TOLERANCE_MS ?? 500);
+
+// P2.10: SLA Alert threshold for prediction timing
+export const PREDICTION_SLA_THRESHOLD_MS = Number(process.env.PREDICTION_SLA_THRESHOLD_MS ?? 2000);
+
+export interface GameStartEvent {
+  gameId: string;
+  beginTime: string;
+  hash: string | null;
+  salt: string | null;
+  /** The most recently settled round (BC.Game `gameId`); used for the
+   *  `source_round_game_id` column. May be null on the first bg after
+   *  boot, in which case the cold-start seeder must have already populated
+   *  history. */
+  sourceRoundGameId: string | null;
+  receivedAt: string;
 }
+
+export type OnGameStartResult =
+  | {
+      kind: "predicted";
+      predictionId: string;
+      targetGameId: string;
+      targetBeganAt: string;
+      predictionGeneratedAt: string;
+      latencyMs: number;
+      slaViolated: boolean;
+      correlationId: string;
+      outboxEnqueued: number;
+    }
+  | { kind: "duplicate"; predictionId: string; targetGameId: string }
+  | { kind: "no_history"; available: number; targetGameId: string }
+  | { kind: "temporal_violation"; targetGameId: string; beginTime: string; reason: string }
+  | { kind: "sla_violated_no_outbox"; predictionId: string; targetGameId: string };
+
+interface PredictorDeps {
+  getSqlFn?: () => Promise<Sql>;
+  /** Injected for tests; default uses the real `PredictionEngine`. */
+  predictF
+n?: (
+    priorRounds: HistoricalRound[],
+    targetRoundId: string,
+    timestamp: string,
+    target: ThresholdTarget,
+  ) => {
+    predictionId: string;
+    probability: number;
+    confidence: number;
+    regimeId: string | null;
+    reasoning: string[];
+    featureSummary: Record<string, unknown>;
+    modelVersion: string;
+  };
+  /** Injected for tests; default reads env. */
+  getChatIds?: () => string[];
+  /** Injected for tests; default uses `Date.now`. */
+  now?: () => number;
+  /** Injected for tests. */
+  minHistory?: number;
+  /** Injected for tests. */
+  slaLagMs?: number;
+  /** Injected for tests. */
+  temporalToleranceMs?: number;
+  /**
+   * Poll/recovery path: newest crash may be seconds old. Do not apply the
+   * elapsed-since-ED residual estimate (it always looks "too late"). Hard
+   * checks (target started/crashed/duplicate) still apply.
+   */
+  recoveryMode?: boolean;
+}
+
+interface PriorRow {
+  game_id: string;
+  multiplier: string | number;
+  began_at: string | Date | null;
+  crashed_at: string | Date;
+}
+
+function mapRowToHistorical(r: PriorRow): HistoricalRound {
+  const crashedAt =
+    r.crashed_at instanceof Date ? r.crashed_at.toISOString() : String(r.crashed_at);
+  const beganAt =
+    r.began_at instanceof Date
+      ? r.began_at.toISOString()
+      : r.began_at
+        ? String(r.began_at)
+        : null;
+  return {
+    id: r.game_id,
+    externalRoundId: r.game_id,
+    sessionId: null,
+    startedAt: beganAt,
+    crashedAt,
+    crashPoint: Number(r.multiplier),
+    observationSource: "bc-game-socket",
+    dataQuality: "high",
+    createdAt: crashedAt,
+    sequenceIndex: undefined,
+  };
+}
+
+/** Singleton PredictionEngine — avoid re-allocating FeatureEngine/RegimeDetector/Registry per call (P1 #5). */
+let cachedEngine: PredictionEngine | null = null;
+function getSharedPredictionEngine(): PredictionEngine {
+  cachedEngine ??= new PredictionEngine();
+  return cachedEngine;
+}
+
+const USE_ADVANCED_PIPELINE =
+  (process.env.USE_ADVANCED_PIPELINE ??
+ "1") !== "0";
+
+type PipelineFn = (input: {
+  baseProbability: number;
+  regime: string;
+  regimeConfidence?: number;
+  predictionId?: string;
+  modelVersion?: string;
+  baseThreshold?: number;
+}) => {
+  calibratedProbability: number;
+  metaProbability: number;
+  action: string;
+  reason: string;
+  threshold: number;
+};
+
+let cachedPipelineFn: PipelineFn | null | undefined;
+function getPipelineFn(): PipelineFn | null {
+  if (cachedPipelineFn !== undefined) return cachedPipelineFn;
+  try {
+    // Dynamic path so a broken advanced-pipeline dependency cannot take down the live worker.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require("../../prediction/prediction-pipeline.ts") as {
+      runPredictionPipeline: PipelineFn;
+    };
+    cachedPipelineFn = mod.runPredictionPipeline;
+  } catch {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mod = require("@/lib/prediction/prediction-pipeline") as {
+        runPredictionPipeline: PipelineFn;
+      };
+      cachedPipelineFn = mod.runPredictionPipeline;
+    } catch {
+      cachedPipelineFn = null;
+    }
+  }
+  return cachedPipelineFn;
+}
+
+const defaultPredictFn = (
+  priorRounds: HistoricalRound[],
+  targetRoundId: string,
+  timestamp: string,
+  target: ThresholdTarget,
+) => {
+  const engine = getSharedPredictionEngine();
+  const signal = engine.predict({
+    priorRounds,
+    targetRoundId,
+    timestamp,
+    target,
+  });
+
+  let probability = signal.probability;
+  let confidence = signal.confidence;
+  let modelVersion = signal.modelVersion ?? "live-v2";
+  let reasoning: string[] = Array.isArray(signal.reasoning)
+    ? [...signal.reasoning]
+    : signal.reasoning
+      ? [String(signal.reasoning)]
+      : [];
+
+  // Optional Phases 4–8 (was dead code). Soft-fail keeps baseline signal.
+  if (USE_ADVANCED_PIPELINE) {
+    try {
+      const runPipeline = getPipelineFn();
+      if (!runPipeline) throw new Error("pipeline_unavailable");
+      const
+ pipe = runPipeline({
+        baseProbability: signal.probability,
+        regime: signal.regimeId ?? "unknown",
+        regimeConfidence: 0.6,
+        predictionId: signal.predictionId,
+        modelVersion: signal.modelVersion,
+        baseThreshold: Number(target),
+      });
+      probability =
+        pipe.calibratedProbability ?? pipe.metaProbability ?? probability;
+      confidence = Math.min(1, Math.max(confidence, probability));
+      modelVersion = `${modelVersion}+pipeline`;
+      reasoning.push(
+        `pipeline_action=${pipe.action}`,
+        `pipeline_reason=${pipe.reason}`,
+        `threshold=${pipe.threshold}`,
+      );
+    } catch {
+      /* keep baseline — pipeline may be unavailable in pure unit tests */
+    }
+  }
+
+  return {
+    predictionId: signal.predictionId,
+    probability,
+    confidence,
+    regimeId: signal.regimeId,
+    reasoning,
+    featureSummary: signal.featureSummary,
+    modelVersion,
+  };
+};
+
+async function loadPriorRoundsStrict(
+  sql: Sql,
+  beganAt: string,
+  limit: number,
+): Promise<HistoricalRound[]> {
+  const rows = await sql<PriorRow>`
+    select game_id, multiplier, began_at, crashed_at
+    from crash_rounds
+    where crashed_at < ${beganAt}::timestamptz
+      and crashed_at is not null
+    order by crashed_at desc, game_id desc
+    limit ${limit}
+  `;
+  return rows.reverse().map(mapRowToHistorical);
+}
+
+/**
+ * Handle a BC.Game `bg` (begin) event.
+ *
+ * The function is synchronous from the caller's perspective (it awaits the
+ * single transaction) and is responsible for:
+ *  1. SLA-gate: if `now - beginTime > SLA_LAG_MS`, set `slaViolated = true`
+ *     and skip outbox writes (prediction still persists).
+ *  2. Duplicate check: SELECT pending_predictions for the same target
+ *     `game_id`; if found, return `{ kind: 'duplicate' }` (idempotency).
+ *  3. tx1 — atomic: anchor `crash_rounds` row, INSERT prediction,
+ *     INSERT outbox rows, INSERT `live_event_log` row. The strict temporal
+ *     invariant `prediction_genera
+ted_at < target_round_began_at` holds at
+ *     the COMMIT of this transaction.
+ *  4. If `target_round_began_at > now + TEMPORAL_TOLERANCE_MS` (future-dated
+ *     payload, clock skew or replay attack), return `{ kind:
+ *     'temporal_violation' }` and DO NOT insert.
+ */
+export async function onGameStart(
+  evt: GameStartEvent,
+  deps: PredictorDeps = {},
+): Promise<OnGameStartResult> {
+  const getSqlFn = deps.getSqlFn ?? getSql;
+  const predictFn = deps.predictFn ?? defaultPredictFn;
+  const getChatIds = deps.getChatIds ?? getConfiguredChatIds;
+  const now = deps.now ?? Date.now;
+  const minHistory = deps.minHistory ?? MIN_HISTORY;
+  const slaLagMs = deps.slaLagMs ?? SLA_LAG_MS;
+  const temporalToleranceMs = deps.temporalToleranceMs ?? TEMPORAL_TOLERANCE_MS;
+
+  const correlationId = randomUUID();
+  const beginMs = new Date(evt.beginTime).getTime();
+  const receivedMs = new Date(evt.receivedAt).getTime();
+  const slaLagMsActual = receivedMs - beginMs;
+  const slaViolated = slaLagMsActual > slaLagMs;
+
+  // Step 1: temporal violation — bg payload claims a future beginTime.
+  // Defends against clock skew / replay attack / future-dated payload.
+  if (beginMs > now() + temporalToleranceMs) {
+    logger.error(
+      {
+        component: "live-predictor",
+        correlationId,
+        targetGameId: evt.gameId,
+        beginTime: evt.beginTime,
+        now: new Date(now()).toISOString(),
+      },
+      "temporal violation: beginTime is in the future; skipping prediction",
+    );
+    return {
+      kind: "temporal_violation",
+      targetGameId: evt.gameId,
+      beginTime: evt.beginTime,
+      reason: "beginTime in the future",
+    };
+  }
+
+  // Defensive: if beginTime is invalid, treat as a parse failure.
+  if (!Number.isFinite(beginMs)) {
+    return {
+      kind: "temporal_violation",
+      targetGameId: evt.gameId,
+      beginTime: evt.beginTime,
+      reason: "beginTime unparseable",
+    };
+  }
+
+  const sql = await getSqlFn();
+
+  // Refine the temporal check using th
+e DB clock when available —
+  // PGLite/Neon, containerized runners, and CI can have drifted clocks
+  // relative to the host, and the DB clock is the canonical
+  // `requested_at` source.
+  let refNow = now();
+  try {
+    const dbNow = await sql<{ now: string | Date }>`select now() as now`;
+    if (dbNow[0]?.now) {
+      const v = dbNow[0].now;
+      const dbMs = v instanceof Date ? v.getTime() : new Date(v).getTime();
+      if (Number.isFinite(dbMs)) refNow = dbMs;
+    }
+  } catch {
+    /* fall back to local clock */
+  }
+  if (beginMs > refNow + temporalToleranceMs) {
+    logger.error(
+      {
+        component: "live-predictor",
+        correlationId,
+        targetGameId: evt.gameId,
+        beginTime: evt.beginTime,
+        refNowIso: new Date(refNow).toISOString(),
+      },
+      "temporal violation (db-clock): beginTime is in the future; skipping prediction",
+    );
+    return {
+      kind: "temporal_violation",
+      targetGameId: evt.gameId,
+      beginTime: evt.beginTime,
+      reason: "beginTime in the future (db clock)",
+    };
+  }
+
+  // Step 2: duplicate check. Partial unique index on target_game_id in 0008
+  // makes the second INSERT a no-op too, so the belt is the SELECT and the
+  // suspenders are the index.
+  const existing = await sql<{ prediction_id: string }>`
+    select prediction_id from pending_predictions
+    where target_game_id = ${evt.gameId} and matched = false
+    limit 1
+  `;
+  if (existing.length > 0) {
+    logger.info(
+      {
+        component: "live-predictor",
+        correlationId,
+        targetGameId: evt.gameId,
+        predictionId: existing[0]!.prediction_id,
+      },
+      "duplicate bg event; prediction already exists for this target",
+    );
+    return {
+      kind: "duplicate",
+      predictionId: existing[0]!.prediction_id,
+      targetGameId: evt.gameId,
+    };
+  }
+
+  // Step 3: strict causal window — only rounds whose outcome is fully
+  // known BEFORE the target began are valid model input.
+  const priorRounds = awai
+t loadPriorRoundsStrict(sql, evt.beginTime, MAX_HISTORY);
+  if (priorRounds.length < minHistory) {
+    logger.warn(
+      {
+        component: "live-predictor",
+        correlationId,
+        targetGameId: evt.gameId,
+        available: priorRounds.length,
+        minHistory,
+      },
+      "insufficient history; skipping prediction (cold-start seeder should run first)",
+    );
+    return { kind: "no_history", available: priorRounds.length, targetGameId: evt.gameId };
+  }
+
+  // Step 4: model inference. Pure CPU. The engine must NEVER see rows
+  // whose `crashed_at` is the target round's own (the strict window
+  // guarantees that).
+  const timestamp = new Date(now()).toISOString();
+  const signal = predictFn(priorRounds, evt.gameId, timestamp, DEFAULT_TARGET);
+
+  // Step 5: atomic transaction. The crash_rounds row is anchored first so
+  // any consumer querying `WHERE game_id = $G` finds a row even before
+  // the prediction is committed. The pending_predictions INSERT is
+  // gated by the partial unique index — re-runs of the same bg are
+  // no-ops. The outbox rows are written in the same transaction as
+  // the prediction so the strict invariant is durable.
+  let predictionId: string = signal.predictionId;
+  let predictionGeneratedAt = timestamp;
+  let outboxEnqueued = 0;
+
+  // chat fan-out is handled by sendTelegramMessage, not per-row inserts
+  void getChatIds;
+
+  try {
+    await runInTransaction(sql, async (tx) => {
+      // Note: we do NOT pre-insert the crash_rounds row here. The schema
+      // requires `multiplier` and `crashed_at` to be NOT NULL; both will
+      // arrive on the `ed` event. The validator's UPDATE will create the
+      // row via `insertNewRounds` (REST backfill) or via the ed handler's
+      // own INSERT path on first arrival. Skipping here keeps the
+      // transaction idempotent and removes the schema mismatch.
+
+      const ins = await tx<{ prediction_id: string; requested_at: string }>`
+        insert into pending_predictions (
+    
+      prediction_id, target_multiplier, probability, confidence,
+          regime_name, regime_confidence, reasoning, feature_summary,
+          model_version, requested_at,
+          target_game_id, target_round_started_at, source_round_id,
+          correlation_id
+        ) values (
+          ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
+          ${signal.confidence}, ${signal.regimeId},
+          ${signal.regimeId ? 0.5 : null},
+          ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
+          ${signal.modelVersion}, ${timestamp},
+          ${evt.gameId}, ${evt.beginTime}, ${evt.sourceRoundGameId},
+          ${correlationId}
+        )
+        on conflict (prediction_id) do nothing
+        returning prediction_id, requested_at
+      `;
+      if (ins.length === 0) {
+        // Lost the race; the unique index caught a duplicate.
+        const dup = await tx<{ prediction_id: string }>`
+          select prediction_id from pending_predictions
+          where target_game_id = ${evt.gameId} and matched = false
+          limit 1
+        `;
+        if (dup.length === 0) {
+          throw new Error("PREDICTION_DUPLICATE_BUT_UNREADABLE");
+        }
+        predictionId = dup[0]!.prediction_id;
+        return;
+      }
+      predictionId = ins[0]!.prediction_id;
+      predictionGeneratedAt = String(ins[0]!.requested_at);
+
+      // ONE outbox row per prediction. sendTelegramMessage fans out to all
+      // chats — per-chat rows caused duplicate deliveries.
+      // SKIP when slaViolated so operators do not see "predicts the past".
+      if (!slaViolated) {
+        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
+        const predictionContent = [
+          `🎯 NEW PREDICTION${regimeText}`,
+          ``,
+          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
+          `Probability: ${(signal.probability * 100).toFixed(1)}%`,
+          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
+          ``,
+          `Prediction I
+D: ${predictionId}`,
+          `Generated: ${predictionGeneratedAt}`,
+        ].join("\n");
+        await tx`
+          insert into notification_outbox (
+            notification_id, type, content, metadata, status, priority,
+            attempt_count, next_attempt_at
+          ) values (
+            ${randomUUID()}::uuid, 'prediction',
+            ${predictionContent},
+            ${JSON.stringify({
+              predictionId,
+              correlationId,
+              targetGameId: evt.gameId,
+              targetBeganAt: evt.beginTime,
+              targetMultiplier: Number(DEFAULT_TARGET),
+              probability: signal.probability,
+              confidence: signal.confidence,
+              regimeName: signal.regimeId,
+              slaViolated: false,
+              kind: "prediction",
+            })},
+            'pending', 2,
+            0, now()
+          )
+        `;
+        outboxEnqueued = 1;
+      }
+
+      // live_event_log row: append-only observability.
+      await tx`
+        insert into live_event_log (
+          correlation_id, event_kind, game_id, payload, received_at, processed_at,
+          processor_latency_ms, sla_violated
+        ) values (
+          ${correlationId}::text, 'BG', ${evt.gameId},
+          ${JSON.stringify({ beginTime: evt.beginTime, sourceRoundGameId: evt.sourceRoundGameId })},
+          ${evt.receivedAt}::timestamptz, now(),
+          ${Math.max(0, now() - receivedMs)}, ${slaViolated}
+        )
+      `;
+    });
+  } catch (e) {
+    // P2.15: Improve Error Logging in onGameStart
+    logger.error(
+      {
+        component: "live-predictor",
+        correlationId,
+        targetGameId: evt.gameId,
+        error: String(e),
+        errorStack: e instanceof Error ? e.stack : undefined,
+        beginTime: evt.beginTime,
+        receivedAt: evt.receivedAt,
+        slaLagMsActual,
+        slaViolated,
+      },
+      "predictor.onGameStart failed; logging and recording in worker_state",
+    );
+    // Best-effort: write last_error to 
+worker_state.
+    try {
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error', ${String(e)})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+    } catch {
+      /* ignore */
+    }
+    return { kind: "temporal_violation", targetGameId: evt.gameId, beginTime: evt.beginTime, reason: String(e) };
+  }
+
+  logger.info(
+    {
+      component: "live-predictor",
+      correlationId,
+      predictionId,
+      targetGameId: evt.gameId,
+      targetBeganAt: evt.beginTime,
+      latencyMs: now() - receivedMs,
+      slaViolated,
+      outboxEnqueued,
+    },
+    slaViolated
+      ? "prediction persisted; SLA-gate suppressed outbox writes"
+      : "prediction generated and persisted for next round",
+  );
+
+  if (slaViolated) {
+    return {
+      kind: "sla_violated_no_outbox",
+      predictionId,
+      targetGameId: evt.gameId,
+    };
+  }
+  return {
+    kind: "predicted",
+    predictionId,
+    targetGameId: evt.gameId,
+    targetBeganAt: evt.beginTime,
+    predictionGeneratedAt,
+    latencyMs: now() - receivedMs,
+    slaViolated: false,
+    correlationId,
+    outboxEnqueued,
+  };
+}
+
+
+/**
+ * CRITICAL (TestingEngine_Deep_Diagnosis.md §3.2): Generate prediction for
+ * Round N+1 immediately after Round N ends. This is the ONLY correct trigger
+ * point for ahead-of-time prediction so that
+ *   prediction_generated_at < target_round_started_at
+ * always holds (target_round_started_at is backfilled later on the bg event).
+ */
+export type TemporalValidity = "TEMPORALLY_VALID" | "TEMPORALLY_UNVERIFIED" | "TEMPORALLY_INVALID";
+
+export interface OnGameEndPredictResult {
+  predictionId: string | null;
+  targetGameId: string;
+  kind:
+    | "predicted"
+    | "duplicate"
+    | "too_late"
+    | "skipped_late"
+    | "insufficient_history"
+    | "error"
+    | "skipped_stale_source"
+    | "skipped_invalid_target"
+    | "temporally_invalid";
+  /** Proven only when targetStartedAt is known and remainingBeforeTargetMs > 0 */
+  temporalValidity?: TemporalValidity;
+  sourceGameId?: string;
+  sourceCrashAt?: string;
+  targetStartedAt?: string | null;
+  predictionGeneratedAt?: string;
+  predictionLatencyMs?: number;
+  availableWindowMs?: number | null;
+  remainingBeforeTargetMs?: number | null;
+}
+
+export async function onGameEndPredict(
+  gameId: string,
+  crashedAt: string,
+  multiplier: number,
+  correlationId: string,
+  deps: PredictorDeps = {},
+): Promise<OnGameEndPredictResult> {
+  const getSqlFn = deps.getSqlFn ?? getSql;
+  const predictFn = deps.predictFn ?? defaultPredictFn;
+  const sql = await getSqlFn();
+
+  // Phase 8 — Harden N+1 targeting: never silently convert non-numeric IDs.
+  // Prefer authoritative numeric sequence when safe; otherwise reject with an
+  // explicit skip reason and enough metadata to reconstruct why the target
+  // was selected or rejected.
+  let targetGameId: string;
+  try {
+    if (typeof gameId !== "string" || !/^\d+$/.test(gameId)) {
+      logger.warn(
+        { sourceGameId: gameId },
+        "Skipping prediction: source gameId is not a safe numeric sequence",
+      );
+      return {
+        predictionId: null,
+        targetGameId: String(gameId ?? "unknown"),
+        kind: "skipped_invalid_target",
+        sourceGameId: String(gameId ?? ""),
+        sourceCrashAt: crashedAt,
+      };
+    }
+    const next = BigInt(gameId) + 1n;
+    if (next <= 0n) {
+      throw new Error("non-positive next id");
+    }
+    targetGameId = next.toString();
+  } catch (e) {
+    logger.warn(
+      { sourceGameId: gameId, error: String(e) },
+      "Skipping prediction: cannot derive safe N+1 target from source gameId",
+    );
+    return {
+      predictionId: null,
+      targetGameId: String(gameId ?? "unknown"),
+      kind: "skipped_invalid_target",
+      sourceGameId: String(gameId ?? ""),
+      sourceCrashAt: crashedAt,
+    };
+  }
+
+  const generatedAt = new Date().toISOString();
+  // === Source-staleness gate ===
+  // Reject before any DB work if the crash event is itself already old.
+  // This catches the "socket says connected but crash ED events silently
+  // stopped" failure mode where buffered events arrive 10-60s late.
+  {
+    const sourceAgeMs = Date.now() - new Date(crashedAt).getTime();
+    if (Number.isFinite(sourceAgeMs) && sourceAgeMs > MAX_SOURCE_ROUND_AGE_MS) {
+      logger.warn(
+        { targetGameId, sourceGameId: gameId, sourceAgeMs, crashedAt },
+        "Skipping prediction: source round crash event is stale — live round has likely advanced past this target",
+      );
+      try {
+        await sql`
+          INSERT INTO live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) VALUES (
+            ${correlationId}::text, 'PREDICT', ${targetGameId},
+            ${JSON.stringify({ kind: "skipped_stale_source", sourceGameId: gameId, sourceAgeMs, crashedAt })},
+            ${generatedAt}::timestamptz, now(), 0, true
+          )
+          ON CONFLICT DO NOTHING
+        `;
+      } catch { /* non-fatal */ }
+      recordPredictionOutcome(true);
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "skipped_stale_source" as const,
+        sourceGameId: gameId,
+        sourceCrashAt: crashedAt,
+      };
+    }
+  }
+
+
+
+  // === Timing-critical gate (findings 3.1, 3.2, 3.6) ===
+  // P1.1: Parallelize independent SELECTs using Promise.all
+  const tGate0 = performance.now();
+  // Measured hot-path costs: predict ~20–80ms, persist ~30–80ms, outbox tick 50ms.
+  // Prior 500+200 budgets made effectiveFloor ≥700ms and caused mass skipped_late.
+  const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 150);
+  const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 100);
+  try {
+    let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
+
+    // P1.1: Use Promise.all for parallel DB queries
+    const [thrRows, residualRows, gapRows, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
+      await Promise.all([
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
+        `.catch(() => []),
+        sql<{ began_at: string | Date | null }>`
+          SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => []),
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
+        `.catch(() => []),
+        sql<{ value: string }>`
+          SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
+        `.catch(() => []),
+        s
+ql<{ prediction_id: string }>`
+          SELECT prediction_id FROM pending_predictions
+          WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
+        `.catch(() => []),
+        sql<{ lifecycle: string | null; began_at: string | Date | null }>`
+          SELECT lifecycle, began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => []),
+        sql<{ game_id: string }>`
+          SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
+        `.catch(() => []),
+      ]);
+
+    if (thrRows[0]?.value) {
+      const t = Number(thrRows[0].value);
+      if (Number.isFinite(t) && t >= 300 && t <= 5_000) {
+        skipThreshold = Math.max(skipThreshold, t);
+      }
+    }
+
+    // Fast reject: already have pending / already crashed / target started
+    if (existingPending.length > 0) {
+      return {
+        predictionId: existingPending[0]!.prediction_id,
+        targetGameId,
+        kind: "duplicate",
+      };
+    }
+    if (alreadyCrashedRows.length > 0) {
+      logger.warn({ targetGameId }, "Target round N+1 already crashed — too late");
+      recordPredictionOutcome(true);
+      return { predictionId: null, targetGameId, kind: "too_late" };
+    }
+    const life = liveLifecycle[0];
+    if (life?.began_at != null) {
+      const beganMs = new Date(life.began_at).getTime();
+      if (Number.isFinite(beganMs) && beganMs <= Date.now()) {
+        logger.warn({ targetGameId }, "Target round N+1 already started — too late");
+        recordPredictionOutcome(true);
+        return { predictionId: null, targetGameId, kind: "too_late" };
+      }
+    }
+
+    // Predictive residual window
+    let remainingMs: number | null = null;
+    let medianGapMs = 4_000;
+    if (gapRows[0]?.value) {
+      const g = Number(gapRows[0].value);
+      if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;
+    }
+    const elapsedSinceEd = Date.now() - new Date(crashedAt).getTime();
+    const recoveryMode = deps.recoveryMod
+e === true;
+
+    if (residualRows.length > 0 && residualRows[0]!.began_at != null) {
+      // Authoritative: target N+1 already has began_at
+      remainingMs = new Date(residualRows[0]!.began_at).getTime() - Date.now();
+    } else if (recoveryMode || (Number.isFinite(elapsedSinceEd) && elapsedSinceEd > medianGapMs * 1.5)) {
+      // Recovery/stale: use conservative residual = medianGap/2 from *now*
+      // (not from crash time). Hard checks still reject started/crashed targets.
+      remainingMs = Math.floor(medianGapMs / 2);
+      logger.info(
+        {
+          targetGameId,
+          elapsedSinceEd,
+          medianGapMs,
+          remainingMs,
+          recoveryMode,
+        },
+        "recovery/stale: conservative residual estimate (medianGap/2)",
+      );
+    } else {
+      // Hot ED path: estimate time left until typical N+1 start
+      remainingMs = medianGapMs - Math.max(0, elapsedSinceEd);
+    }
+
+    const skew = skewRows[0]?.value != null ? Number(skewRows[0].value) : 0;
+    if (Number.isFinite(skew) && remainingMs != null) {
+      remainingMs = remainingMs - skew;
+    }
+
+    // Predictive deadline gate — only hard-skip when residual is gone or
+    // extremely tight. Prefer generating + letting outbox deadline expire
+    // a late signal over skipping generation (which forced multi-round lag
+    // via the poll recovery path).
+    const deadlineBudget = GENERATION_BUDGET_MS + DELIVERY_BUDGET_MS;
+    // Hard floor is the tighter of SKIP_BELOW / MIN_REQUIRED only.
+    // deadlineBudget is advisory: log but still generate when residual is
+    // between skipThreshold and deadlineBudget so the signal can still land
+    // inside the betting window for many rounds.
+    const effectiveFloor = skipThreshold;
+    if (remainingMs != null && Number.isFinite(remainingMs) && remainingMs < effectiveFloor) {
+      logger.warn(
+        {
+          targetGameId,
+          remainingMs,
+          threshold: effectiveFloor,
+          generationBudgetMs: GENERATION_BUDGE
+T_MS,
+          deliveryBudgetMs: DELIVERY_BUDGET_MS,
+          elapsedSinceEd,
+          recoveryMode,
+        },
+        "Skipping prediction: residual window exhausted",
+      );
+      try {
+        await sql`
+          INSERT INTO live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) VALUES (
+            ${correlationId}::text, 'PREDICT', ${targetGameId},
+            ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: effectiveFloor, recoveryMode })},
+            ${generatedAt}::timestamptz, now(), ${Math.round(performance.now() - tGate0)}, true
+          )
+          ON CONFLICT DO NOTHING
+        `;
+      logger.warn(
+        { targetGameId, remainingMs, threshold: effectiveFloor, generationBudgetMs: GENERATION_BUDGET_MS, deliveryBudgetMs: DELIVERY_BUDGET_MS, elapsedSinceEd, recoveryMode },
+        "tight residual window — generating anyway; outbox will expire if too late",
+      );
+    }
+    if (
+      remainingMs != null &&
+      Number.isFinite(remainingMs) &&
+      remainingMs < deadlineBudget
+    ) {
+      logger.info(
+        {
+          targetGameId,
+          remainingMs,
+          deadlineBudget,
+          elapsedSinceEd,
+        },
+        "tight residual — generating anyway; outbox may expire if target starts first",
+      );
+    }
+  } catch (gateErr) {
+    logger.warn(
+      { targetGameId, error: String(gateErr) },
+      "deadline gate soft-failed — proceeding with caution",
+    );
+  }
+
+  // Sheath mode (3.2 / 3.10)
+  try {
+    const sheath = evaluateSheath();
+    if (sheath.decision === "halt") {
+      logger.warn(
+        { targetGameId, lateRate: sheath.rate, total: sheath.total },
+        "Sheath mode HALT — skipping prediction due to elevated late rate",
+      );
+      recordPredictionOutcome(true);
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "skipped_late",
+        remainingBeforeTargetMs: null,
+      };
+    }
+    if (sheath.decision === "warn") {
+      log
+ger.warn(
+        { targetGameId, lateRate: sheath.rate, total: sheath.total },
+        "Sheath mode WARN — late rate elevated",
+      );
+    }
+  } catch (sheathErr) {
+    logger.debug({ error: String(sheathErr) }, "sheath optional");
+  }
+  const gateMs = Math.round(performance.now() - tGate0);
+
+  // P1.8: Add Per-Path Timing Metrics
+  const tHist0 = performance.now();
+  try {
+    // Duplicate / too_late checks already done in parallel gate above.
+    const rows = await sql<{
+      game_id: string;
+      multiplier: string | number;
+      began_at: string | Date | null;
+      crashed_at: string | Date;
+    }>`
+      SELECT game_id, multiplier, began_at, crashed_at
+      FROM crash_rounds
+      WHERE crashed_at <= ${crashedAt}::timestamptz
+        AND crashed_at IS NOT NULL
+      ORDER BY crashed_at DESC, game_id DESC
+      LIMIT ${MAX_HISTORY}
+    `;
+    const histMs = Math.round(performance.now() - tHist0);
+
+    const rounds = rows.reverse().map(mapRowToHistorical);
+    if (rounds.length < MIN_HISTORY) {
+      logger.info(
+        { targetGameId, availableHistory: rounds.length },
+        "Insufficient history for N+1 prediction",
+      );
+      return { predictionId: null, targetGameId, kind: "insufficient_history" };
+    }
+
+    // Cold-start seed for advanced pipeline incremental state (once)
+    try {
+      const { globalIncrementalState } = await import(
+        "@/lib/prediction/state/incremental-state-engine"
+      );
+      if (globalIncrementalState.snapshot().count === 0 && rounds.length > 0) {
+        globalIncrementalState.seed(rounds.map((r) => r.crashPoint));
+      }
+    } catch {
+      /* soft */
+    }
+
+    const tPredict0 = performance.now();
+    // Hard timeout around sync model inference
+    let signal: ReturnType<typeof defaultPredictFn>;
+    try {
+      signal = await Promise.race([
+        Promise.resolve().then(() =>
+          predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET),
+        ),
+        new Promise<never>((_, reject) =>
+     
+     setTimeout(() => reject(new Error("PREDICT_TIMEOUT")), PREDICT_TIMEOUT_MS),
+        ),
+      ]);
+    } catch (predictErr) {
+      logger.error(
+        { targetGameId, error: String(predictErr), predictTimeoutMs: PREDICT_TIMEOUT_MS },
+        "model inference timed out or failed",
+      );
+      return { predictionId: null, targetGameId, kind: "error" };
+    }
+    const predictMs = Math.round(performance.now() - tPredict0);
+
+    const tPersist0 = performance.now();
+    let predictionId: string | null = null;
+    let predictionGeneratedAt: string | null = null;
+
+    try {
+      await runInTransaction(sql, async (tx) => {
+        // Do NOT pre-insert crash_rounds for N+1: multiplier + crashed_at are
+        // NOT NULL and only arrive on t
+
+... [Content truncated]        // NOT NULL and only arrive on the `ed` event. The validator's UPDATE will create the
+        // row via `insertNewRounds` (REST backfill) or via the ed handler's
+        // own INSERT path on first arrival. Skipping here keeps the
+        // transaction idempotent and removes the schema mismatch.
+
+        const ins = await tx<{ prediction_id: string; requested_at: string }>`
+          insert into pending_predictions (
+            prediction_id, target_multiplier, probability, confidence,
+            regime_name, regime_confidence, reasoning, feature_summary,
+            model_version, requested_at,
+            target_game_id, source_round_id,
+            correlation_id
+          ) values (
+            ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
+            ${signal.confidence}, ${signal.regimeId},
+            ${signal.regimeId ? 0.5 : null},
+            ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
+            ${signal.modelVersion}, ${generatedAt},
+            ${targetGameId}, ${gameId},
+            ${correlationId}
+          )
+          on conflict (prediction_id) do nothing
+          returning prediction_id, requested_at
+        `;
+        if (ins.length === 0) {
+          // Lost the race; the unique index caught a duplicate.
+          const dup = await tx<{ prediction_id: string }>`
+            select prediction_id from pending_predictions
+            where target_game_id = ${targetGameId} and matched = false
+            limit 1
+          `;
+          if (dup.length === 0) {
+            throw new Error("PREDICTION_DUPLICATE_BUT_UNREADABLE");
+          }
+          predictionId = dup[0]!.prediction_id;
+          return;
+        }
+        predictionId = ins[0]!.prediction_id;
+        predictionGeneratedAt = String(ins[0]!.requested_at);
+
+        // ONE outbox row per prediction.
+        // Compute deadline: estimated target start + 500ms buffer
+        const medianGapMs = (() => {
+          try {
+            const g = gapRows[0]?.value != null ? Number(gapRows[0].value) : 4_000;
+            return Number.isFinite(g) && g > 500 && g < 30_000 ? g : 4_000;
+          } catch { return 4_000; }
+        })();
+        const estimatedTargetStartMs = new Date(crashedAt).getTime() + medianGapMs;
+        const telegramDeadlineAt = new Date(estimatedTargetStartMs + 500).toISOString();
+
+        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
+        const predictionContent = [
+          `🎯 NEW PREDICTION${regimeText}`,
+          ``,
+          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
+          `Probability: ${(signal.probability * 100).toFixed(1)}%`,
+          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
+          ``,
+          `Prediction ID: ${predictionId}`,
+          `Generated: ${predictionGeneratedAt}`,
+        ].join("\n");
+        await tx`
+          insert into notification_outbox (
+            notification_id, type, content, metadata, status, priority,
+            attempt_count, next_attempt_at, telegram_deadline_at
+          ) values (
+            ${randomUUID()}::uuid, 'prediction',
+            ${predictionContent},
+            ${JSON.stringify({
+              predictionId,
+              correlationId,
+              targetGameId,
+              targetBeganAt: null,
+              targetMultiplier: Number(DEFAULT_TARGET),
+              probability: signal.probability,
+              confidence: signal.confidence,
+              regimeName: signal.regimeId,
+              slaViolated: false,
+              kind: "prediction",
+              sourceRoundId: gameId,
+              sourceCrashAt: crashedAt,
+              estimatedTargetStartAt: new Date(estimatedTargetStartMs).toISOString(),
+            })},
+            'pending', 3,
+            0, now(),
+            ${telegramDeadlineAt}::timestamptz
+          )
+        `;
+
+        // live_event_log row: append-only observability.
+        await tx`
+          insert into live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) values (
+            ${correlationId}::text, 'PREDICT', ${targetGameId},
+            ${JSON.stringify({ sourceRoundGameId: gameId, crashedAt })},
+            ${generatedAt}::timestamptz, now(),
+            ${Math.round(performance.now() - tPersist0)}, false
+          )
+        `;
+      });
+    } catch (e) {
+      logger.error(
+        { targetGameId, error: String(e) },
+        "onGameEndPredict persistence failed",
+      );
+      return { predictionId: null, targetGameId, kind: "error" };
+    }
+
+    logger.info(
+      {
+        component: "live-predictor",
+        correlationId,
+        predictionId,
+        targetGameId,
+        latencyMs: Math.round(performance.now() - tPredict0),
+      },
+      "prediction generated and persisted for next round",
+    );
+
+    return {
+      predictionId,
+      targetGameId,
+      kind: "predicted",
+      predictionGeneratedAt,
+      temporalValidity: "TEMPORALLY_UNVERIFIED",
+    };
+  }
