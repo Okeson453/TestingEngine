@@ -243,6 +243,27 @@ export class EntryDecisionService {
       },
       'ACIE onCrash learning tick'
     );
+
+    // Consecutive Loss Streak Sheath Trigger
+    try {
+      const cl = this.acie.getConsecutiveLosses?.() ?? 0;
+      if (cl >= 4) {
+        this.logger.warn(
+          { component: 'EntryDecisionService', streak: cl },
+          'Consecutive loss streak sheath — forcing conservative mode'
+        );
+        this.sheathMode?.reportTriggers([
+          {
+            id: 'consecutive_loss_streak',
+            severity: 'high',
+            message: `${cl} consecutive losses — conservative lock`,
+            detectedAt: new Date().toISOString(),
+            metadata: { streak: cl },
+          },
+        ]);
+      }
+    } catch { /* non-critical */ }
+
     return result;
   }
 
@@ -289,7 +310,10 @@ export class EntryDecisionService {
 
     const riskPartial: Partial<StrategyRiskState> = {
       balance: ctx.riskInput.currentBalance ?? 0,
-      consecutiveLosses: ctx.riskInput.consecutiveErrors ?? 0,
+      consecutiveLosses:
+        ctx.riskInput.consecutiveErrors ??
+        this.acie.getConsecutiveLosses?.() ??
+        0,
       dailyEntriesUsed: ctx.riskInput.dailyEntriesConfirmed,
       dailyEntriesLimit: ctx.riskInput.maxDailyEntries,
     };
