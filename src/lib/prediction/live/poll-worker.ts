@@ -10,12 +10,16 @@
  *     already started/crashed as a live target.
  *   - Primary work: insert missed crash_rounds, validate outcomes,
  *     recover stuck PENDING predictions, detect stream health.
- *   - 1-1.5s interval is the optimized target, with adaptive fallback logic.
+ *   - Adaptive interval; schedule-after-completion (no overlapping requests).
+ *
+ * Phase 3: prediction/latency deps loaded at module init, not per tick.
  */
+import { randomUUID } from "node:crypto";
 import { getSql, type Sql } from "@/lib/db";
 import { fetchCrashHistory, type FetchedRound } from "@/lib/crash/fetch-bc";
 import { insertNewRounds } from "@/lib/crash/ingest";
 import { onGameEnd } from "@/lib/prediction/live/validator";
+import { onGameEndPredict } from "@/lib/prediction/live/predictor";
 import { getLogger } from "@/lib/observability/logger";
 import { runColdStartSeeder } from "@/lib/prediction/live/cold-start-seeder";
 import {
@@ -27,6 +31,13 @@ import {
   markLiveRoundEnded,
 } from "@/lib/prediction/live/live-round-state";
 import { bcGameSocket } from "@/lib/crash/socket-client";
+import {
+  interRoundGapMs,
+  httpFetchMs,
+  pollTickMs,
+  validateBatchMs,
+  predictionHandoffMs,
+} from "@/lib/observability/performance/latency";
 
 const logger = getLogger("poll-worker");
 
@@ -66,6 +77,8 @@ export class PollWorker {
   /** Consecutive failed ticks — drives exponential backoff to avoid pool thrash. */
   private consecutiveFailures = 0;
   private lastError: string | null = null;
+  /** Guard: at most one BC.Game request in flight. */
+  private fetchInFlight = false;
 
   constructor(opts?: {
     getSqlFn?: () => Promise<Sql>;
@@ -94,6 +107,7 @@ export class PollWorker {
   }
 
   async tickOnce(): Promise<PollTickResult> {
+    const tickT0 = performance.now();
     const sql = await this.getSqlFn();
     const result: PollTickResult = {
       fetched: 0,
@@ -107,7 +121,20 @@ export class PollWorker {
     };
 
     try {
-      const rounds = await this.fetchImpl(this.pages);
+      // Enforce single active BC.Game request
+      if (this.fetchInFlight) {
+        logger.warn({ component: "poll-worker" }, "skip tick — fetch already in flight");
+        return result;
+      }
+      this.fetchInFlight = true;
+      const fetchT0 = performance.now();
+      let rounds: FetchedRound[];
+      try {
+        rounds = await this.fetchImpl(this.pages);
+      } finally {
+        this.fetchInFlight = false;
+        httpFetchMs.observe(performance.now() - fetchT0);
+      }
       result.fetched = rounds.length;
 
       if (rounds.length > 0) {
@@ -131,12 +158,7 @@ export class PollWorker {
             const b = new Date(withCrash[i]!.crashedAt as string | Date).getTime();
             const gap = Math.abs(b - a);
             this.recordInterRoundGap(gap);
-            try {
-              const { interRoundGapMs } = await import(
-                "@/lib/observability/performance/latency"
-              );
-              interRoundGapMs.observe(gap);
-            } catch { /* optional */ }
+            interRoundGapMs.observe(gap);
           }
           const med = this.medianGapMs();
           if (med != null) {
@@ -151,8 +173,6 @@ export class PollWorker {
         } catch { /* ignore */ }
 
         // Update live-round lifecycle from history (does NOT start predictions)
-        // Parallelize upserts — independent per game_id.
-        // Sequential lifecycle updates — one connection at a time under tight pool limits
         for (const r of ins.rounds) {
           try {
             await upsertLiveRoundFromHistory(r, sql);
@@ -174,14 +194,13 @@ export class PollWorker {
           }
         }
 
-        // Validation for newly inserted rounds (timing 7.10):
-        // bounded parallelism instead of N sequential transactions.
-        // skipPredict=true — N+1 prediction only via maybePredictNewest below.
+        // Validation for newly inserted rounds — bounded parallelism
         const VALIDATE_CONCURRENCY = Math.max(
           1,
           Math.min(4, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 2) || 2),
         );
         {
+          const valT0 = performance.now();
           let cursor = 0;
           const workers = Array.from(
             { length: Math.min(VALIDATE_CONCURRENCY, ins.rounds.length) },
@@ -217,12 +236,15 @@ export class PollWorker {
             },
           );
           await Promise.all(workers);
+          validateBatchMs.observe(performance.now() - valT0);
         }
 
         // At most one prediction attempt: newest round only, if still eligible
         if (this.allowNewestPredict && sorted.length > 0) {
           const newest = sorted[sorted.length - 1]!;
+          const handoffT0 = performance.now();
           const attempted = await this.maybePredictNewest(newest, sql);
+          predictionHandoffMs.observe(performance.now() - handoffT0);
           if (attempted) result.predictionAttempts = 1;
         }
       }
@@ -261,7 +283,6 @@ export class PollWorker {
       result.error = String(e);
       this.consecutiveFailures += 1;
       this.lastError = String(e);
-      // Put error in the message so Railway/structured sinks that drop fields still show it.
       logger.error(
         {
           component: "poll-worker",
@@ -276,6 +297,7 @@ export class PollWorker {
       this.consecutiveFailures = 0;
       this.lastError = null;
     }
+    pollTickMs.observe(performance.now() - tickT0);
     return result;
   }
 
@@ -292,7 +314,6 @@ export class PollWorker {
   ): Promise<boolean> {
     if (!newest.crashedAt) return false;
 
-    // Phase 8 — same safe N+1 targeting as onGameEndPredict
     let targetGameId: string;
     try {
       if (typeof newest.gameId !== "string" || !/^\d+$/.test(newest.gameId)) {
@@ -315,7 +336,6 @@ export class PollWorker {
     `;
     if ((existing[0]?.c ?? 0) > 0) return false;
 
-    // Prefer live state; fall back to crash_rounds existence
     const live = await sql<{ lifecycle: string }>`
       SELECT lifecycle FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
     `.catch(() => [] as { lifecycle: string }[]);
@@ -341,14 +361,8 @@ export class PollWorker {
       return false;
     }
 
-    // Stream health: if socket is healthy, prefer letting ED drive prediction
-    // and only use poll when the stream appears degraded (optional soft gate)
-    // Stream health: only defer if the ED path is actually generating
-    // current predictions. Stale ed bursts (reconnect) refresh lastCrashEd
-    // to "now", fooling the old lag-based check into deferring to a broken
-    // ED path. We now verify prediction freshness directly.
+    // Stream health: only defer if ED path is generating current predictions
     try {
-      const { bcGameSocket } = await import("@/lib/crash/socket-client");
       const st = bcGameSocket.getState();
       const lastCrashEd =
         (typeof bcGameSocket.getLastEdAtForGame === "function"
@@ -358,7 +372,6 @@ export class PollWorker {
       if (st.status === "connected" && lastCrashEd) {
         const lag = Date.now() - new Date(lastCrashEd).getTime();
         if (lag < 10_000) {
-          // NEW: Check if recent predictions actually exist and are current
           const recentPending = await sql<{ target_game_id: string }>`
             SELECT target_game_id FROM pending_predictions
             WHERE status = 'PENDING'
@@ -371,16 +384,13 @@ export class PollWorker {
             try {
               const pendingId = BigInt(recentPending[0]!.target_game_id);
               const newestId = BigInt(newest.gameId);
-              // Defer only if predictions are within 2 rounds of newest
               if (pendingId >= newestId || newestId - pendingId <= 2n) {
                 shouldDefer = true;
               }
             } catch {
-              shouldDefer = true; // Non-numeric IDs: fall back to deferring
+              shouldDefer = true;
             }
           } else {
-            // No pending predictions at all — ED path is completely cold.
-            // Do NOT defer; generate immediately.
             shouldDefer = false;
           }
 
@@ -404,7 +414,7 @@ export class PollWorker {
         }
       }
     } catch {
-      /* socket module optional in pure unit tests */
+      /* socket optional in pure unit tests */
     }
 
     const crashedAt =
@@ -422,9 +432,6 @@ export class PollWorker {
     );
 
     try {
-      // Import lazily to avoid circular deps in tests
-      const { onGameEndPredict } = await import("@/lib/prediction/live/predictor");
-      const { randomUUID } = await import("node:crypto");
       await onGameEndPredict(
         newest.gameId,
         crashedAt,
@@ -464,14 +471,8 @@ export class PollWorker {
     this.scheduleNext(this.nextIntervalMs());
   }
 
-  /**
-   * Adaptive poll interval: when Socket.IO is blocked/degraded (Cloudflare),
-   * poll more aggressively so N+1 predictions stay ahead of the round.
-   * Target band: 200–1000 ms (was 1–1.5 s).
-   */
   private recentGapMs: number[] = [];
 
-  /** Record an observed inter-round gap for adaptive polling (P3 #12). */
   recordInterRoundGap(gapMs: number): void {
     if (!Number.isFinite(gapMs) || gapMs <= 0 || gapMs > 120_000) return;
     this.recentGapMs.push(gapMs);
@@ -486,9 +487,6 @@ export class PollWorker {
 
   private nextIntervalMs(): number {
     const base = POLL_INTERVAL_MS;
-    // Exponential backoff on consecutive fetch/DB failures so we do not
-    // thrash the 3-client pool or hammer a WAF-blocked BC.Game API.
-    // Caps at 30s. Success path resets consecutiveFailures to 0.
     if (this.consecutiveFailures > 0) {
       const backoff = Math.min(
         30_000,
@@ -507,12 +505,9 @@ export class PollWorker {
     }
     try {
       const st = bcGameSocket.getState().status;
-      // Adaptive: 25% of median inter-round gap, clamped to 200–1000 ms.
       const med = this.medianGapMs();
       if (med != null) {
         const adaptive = Math.round(med * 0.25);
-        // When socket is WAF-blocked, poll is the only path — stay in the
-        // fast band but never below 400ms to leave headroom for the pool.
         const minMs =
           st === "waf_blocked" || st === "degraded" ? 400 : 200;
         return Math.max(minMs, Math.min(1_000, adaptive));
