@@ -233,7 +233,7 @@ test("sendTelegramMessage: captures Telegram description per chat on 4xx", async
   );
 });
 
-test("sendTelegramMessage: per-chat timeout produces timeout_5000ms", async () => {
+test("sendTelegramMessage: per-chat timeout produces timeout_2000ms", async () => {
   await withEnv(
     { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
@@ -250,7 +250,7 @@ test("sendTelegramMessage: per-chat timeout produces timeout_5000ms", async () =
         const results = await sendTelegramMessage("hello");
         assert.equal(results.length, 1);
         assert.equal(results[0]!.ok, false);
-        assert.equal(results[0]!.error, "timeout_5000ms");
+        assert.equal(results[0]!.error, "timeout_2000ms");
         assert.equal(results[0]!.chatId, "-100123");
       } finally {
         globalThis.fetch = realFetch;

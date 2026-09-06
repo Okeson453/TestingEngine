@@ -447,10 +447,12 @@ export async function onGameStart(
           `Prediction ID: ${predictionId}`,
           `Generated: ${predictionGeneratedAt}`,
         ].join("\n");
+        // P1.6: Populate telegram_deadline_at for onGameStart path too.
+        const deadlineAt = new Date(Date.now() + 2_000).toISOString();
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at
+            attempt_count, next_attempt_at, telegram_deadline_at
           ) values (
             ${randomUUID()}::uuid, 'prediction',
             ${predictionContent},
@@ -467,7 +469,7 @@ export async function onGameStart(
               kind: "prediction",
             })},
             'pending', 2,
-            0, now()
+            0, now(), ${deadlineAt}::timestamptz
           )
         `;
         outboxEnqueued = 1;
@@ -618,69 +620,48 @@ export async function onGameEndPredict(
 
   const generatedAt = new Date().toISOString();
   const recoveryMode = deps.recoveryMode === true;
-  
-  // FIX 1: Source-staleness gate now respects recoveryMode
-  // In recovery mode (poll worker), skip the staleness check since poll worker
-  // intentionally processes slightly delayed rounds. Hard checks (target started/crashed/duplicate) still apply.
+
+  // P0.1: Stale source gate removed for Socket.IO path.
+  // BC.Game retransmits ed events on reconnect; Crash rounds last 3-5s,
+  // so a 30s gate was absurdly conservative and caused 6-12s signal lag.
+  // For poll recovery, use a 10s ceiling (still generous for 3-5s rounds).
+  // Hard checks (target already started/crashed/duplicate) still apply below.
   {
     const sourceAgeMs = Date.now() - new Date(crashedAt).getTime();
-    
-    // Only enforce staleness check in non-recovery mode
-    if (!recoveryMode && Number.isFinite(sourceAgeMs) && sourceAgeMs > MAX_SOURCE_ROUND_AGE_MS) {
-      logger.warn(
-        { targetGameId, sourceGameId: gameId, sourceAgeMs, crashedAt },
-        "Skipping prediction: source round crash event is stale - live round has likely advanced past this target",
-      );
-      try {
-        await sql`
-          INSERT INTO live_event_log (
-            correlation_id, event_kind, game_id, payload, received_at, processed_at,
-            processor_latency_ms, sla_violated
-          ) VALUES (
-            ${correlationId}::text, 'PREDICT', ${targetGameId},
-            ${JSON.stringify({ kind: "skipped_stale_source", sourceGameId: gameId, sourceAgeMs, crashedAt })},
-            ${generatedAt}::timestamptz, now(), 0, true
-          )
-          ON CONFLICT DO NOTHING
-        `;
-      } catch {}
-      recordPredictionOutcome(true);
-      return {
-        predictionId: null,
-        targetGameId,
-        kind: "skipped_stale_source" as const,
-        sourceGameId: gameId,
-        sourceCrashAt: crashedAt,
-      };
-    }
-    
-    if (recoveryMode && sourceAgeMs > 10_000) {
+
+    if (recoveryMode && Number.isFinite(sourceAgeMs) && sourceAgeMs > 10_000) {
       logger.info(
         { targetGameId, sourceGameId: gameId, sourceAgeMs, crashedAt },
-        "Recovery mode: source round age elevated but acceptable for poll path"
+        "Recovery mode: source round age elevated but acceptable for poll path",
+      );
+    } else if (!recoveryMode && Number.isFinite(sourceAgeMs) && sourceAgeMs > MAX_SOURCE_ROUND_AGE_MS) {
+      // Log only — do NOT skip. The prediction still has value; the temporal
+      // invariant check inside the transaction is the real correctness gate.
+      logger.warn(
+        { targetGameId, sourceGameId: gameId, sourceAgeMs, crashedAt },
+        "Stale source in Socket.IO path — proceeding anyway (BC.Game retransmits)",
       );
     }
   }
 
   const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 150);
   const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 100);
+  // P1.3: Hoist liveLifecycle outside the try block so the transaction
+  // section below can reuse it without re-querying live_round_state.
+  let liveLifecycle: Array<{ lifecycle: string | null; began_at: string | Date | null }> = [];
   try {
     let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
 
-    const [thrRows, residualRows, gapRows, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
+    // P1.1: Consolidated gate queries — 4 queries instead of 7.
+    // - 3 worker_state lookups merged into 1 query
+    // - redundant live_round_state SELECT (residualRows) removed;
+    //   liveLifecycle already fetches began_at
+    const [workerStateRows, existingPending, _liveLifecycle, alreadyCrashedRows] =
       await Promise.all([
-        sql<{ value: string }>`
-          SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
-        `.catch(() => []),
-        sql<{ began_at: string | Date | null }>`
-          SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-        `.catch(() => []),
-        sql<{ value: string }>`
-          SELECT value FROM worker_state WHERE key = 'median_inter_round_gap_ms' LIMIT 1
-        `.catch(() => []),
-        sql<{ value: string }>`
-          SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
-        `.catch(() => []),
+        sql<{ key: string; value: string }>`
+          SELECT key, value FROM worker_state
+          WHERE key IN ('effective_skip_below_ms', 'median_inter_round_gap_ms', 'wall_clock_skew_ms')
+        `.catch(() => [] as { key: string; value: string }[]),
         sql<{ prediction_id: string }>`
           SELECT prediction_id FROM pending_predictions
           WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
@@ -693,8 +674,15 @@ export async function onGameEndPredict(
         `.catch(() => []),
       ]);
 
-    if (thrRows[0]?.value) {
-      const t = Number(thrRows[0].value);
+    // P1.3: Assign to hoisted variable for use outside the try block
+    liveLifecycle = _liveLifecycle;
+
+    // Extract worker_state values from consolidated query
+    const getWorkerValue = (key: string): string | undefined =>
+      workerStateRows.find((r) => r.key === key)?.value;
+
+    if (getWorkerValue('effective_skip_below_ms')) {
+      const t = Number(getWorkerValue('effective_skip_below_ms'));
       if (Number.isFinite(t) && t >= 300 && t <= 5_000) {
         skipThreshold = Math.max(skipThreshold, t);
       }
@@ -724,14 +712,17 @@ export async function onGameEndPredict(
 
     let remainingMs: number | null = null;
     let medianGapMs = 4_000;
-    if (gapRows[0]?.value) {
-      const g = Number(gapRows[0].value);
+    const gapVal = getWorkerValue('median_inter_round_gap_ms');
+    if (gapVal) {
+      const g = Number(gapVal);
       if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;
     }
     const elapsedSinceEd = Date.now() - new Date(crashedAt).getTime();
 
-    if (residualRows.length > 0 && residualRows[0]!.began_at != null) {
-      remainingMs = new Date(residualRows[0]!.began_at).getTime() - Date.now();
+    // P1.3: Reuse liveLifecycle[0]?.began_at instead of re-querying residualRows
+    const liveBeganAt = liveLifecycle[0]?.began_at;
+    if (liveBeganAt != null) {
+      remainingMs = new Date(liveBeganAt).getTime() - Date.now();
     } else if (recoveryMode || (Number.isFinite(elapsedSinceEd) && elapsedSinceEd > medianGapMs * 1.5)) {
       remainingMs = Math.floor(medianGapMs / 2);
       logger.info(
@@ -748,7 +739,8 @@ export async function onGameEndPredict(
       remainingMs = medianGapMs - Math.max(0, elapsedSinceEd);
     }
 
-    const skew = skewRows[0]?.value != null ? Number(skewRows[0].value) : 0;
+    const skewVal = getWorkerValue('wall_clock_skew_ms');
+    const skew = skewVal != null ? Number(skewVal) : 0;
     if (Number.isFinite(skew) && remainingMs != null) {
       remainingMs = remainingMs - skew;
     }
@@ -808,7 +800,7 @@ export async function onGameEndPredict(
     }
   } catch {}
 
-  const sql2 = await getSqlFn();
+  const sql2 = sql; // P1.2: reuse existing connection — no second getSqlFn() call
   const priorRounds = await loadPriorRoundsStrict(
     sql2,
     crashedAt,
@@ -836,16 +828,30 @@ export async function onGameEndPredict(
   }
 
   const timestamp = generatedAt;
+  // P0.4 + P3.1: Measure prediction generation time and wire latency metric
+  const predictT0 = Date.now();
   const signal = predictFn(priorRounds, targetGameId, timestamp, DEFAULT_TARGET);
+  const predictElapsed = Date.now() - predictT0;
+  if (predictElapsed > PREDICT_TIMEOUT_MS) {
+    logger.warn(
+      { targetGameId, predictElapsedMs: predictElapsed, budgetMs: PREDICT_TIMEOUT_MS },
+      "prediction exceeded PREDICT_TIMEOUT_MS budget — consider offloading to worker thread",
+    );
+  }
+  try {
+    const { predictionGenerationMs } = await import(
+      "@/lib/observability/performance/latency"
+    );
+    predictionGenerationMs.observe(predictElapsed);
+  } catch { /* metrics optional */ }
   const predictionId = signal.predictionId;
 
   try {
     await runInTransaction(sql, async (tx) => {
-      const targetStarted = await tx<{ began_at: string | Date | null }>`
-        SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-      `;
-      
-      const targetBeganAt = targetStarted[0]?.began_at;
+      // P1.3: Reuse liveLifecycle data from gate query instead of re-querying.
+      // liveLifecycle was fetched outside the transaction; the temporal invariant
+      // check only needs to know if the target round already started.
+      const targetBeganAt = liveLifecycle[0]?.began_at ?? null;
       if (targetBeganAt != null) {
         const beganMs = new Date(targetBeganAt).getTime();
         const genMs = new Date(timestamp).getTime();
@@ -915,10 +921,13 @@ export async function onGameEndPredict(
           recoveryMode ? "Source: poll recovery" : "Source: live ED",
         ].join("\n");
         // Priority 2 = high; next_attempt_at must be timestamptz (use now()), not Date.now() number
+        // P1.6: Populate telegram_deadline_at so the outbox dispatcher can expire
+        // stale signals before wasting a Telegram API round-trip.
+        const deadlineAt = new Date(Date.now() + 2_000).toISOString();
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at
+            attempt_count, next_attempt_at, telegram_deadline_at
           ) values (
             ${randomUUID()}::uuid, 'prediction',
             ${predictionContent},
@@ -937,7 +946,7 @@ export async function onGameEndPredict(
               recoveryMode,
             })},
             'pending', 2,
-            0, now()
+            0, now(), ${deadlineAt}::timestamptz
           )
         `;
       }

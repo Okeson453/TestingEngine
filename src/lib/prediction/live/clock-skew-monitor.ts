@@ -135,9 +135,13 @@ export class ClockSkewMonitor {
           "Wall clock skew exceeds threshold — temporal invariant at risk",
         );
         // Corrective action: raise residual skip threshold and surface operator flag
+        // P2.7: Cap at 1000ms (was 3000ms). A 3000ms skip threshold re-introduces
+        // the original skip-gate problem: with 3-5s inter-round gaps, predictions
+        // skip when >1-2s has elapsed since the ED event, which is most of the time.
+        // 1000ms is still safe for 3-5s rounds while preventing excessive skipping.
         const adjusted = Math.min(
-          3_000,
-          Math.max(800, Math.abs(wallClockSkewMs) + 500),
+          1_000,
+          Math.max(250, Math.abs(wallClockSkewMs) + 200),
         );
         await sql`
           insert into worker_state (key, value) values

@@ -27,7 +27,10 @@
  */
 
 const TELEGRAM_API = "https://api.telegram.org";
-const SEND_TIMEOUT_MS = 5_000;
+// P1.5: Reduced from 5s to 2s. Crash rounds last 3-5s; a 5s timeout
+// can block the entire outbox for a full round window. 2s is still
+// generous for Telegram API (typical RTT: 100-500ms).
+const SEND_TIMEOUT_MS = 2_000;
 
 export type SendResult = {
   ok: boolean;

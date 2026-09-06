@@ -114,12 +114,13 @@ export async function onGameEnd(
       // First, anchor the round's crash outcome. The row may not exist
       // yet (the predictor doesn't pre-insert crash_rounds because the
       // schema requires multiplier+crashed_at to be NOT NULL — both
-      // arrive on this ed event). Use UPSERT for idempotency.
+      // arrive on this ed event). Use UPSERT with RETURNING for idempotency
+      // and to avoid a separate SELECT (P2.2: RETURNING clause).
       {
         const endDate = new Date(evt.endTime);
         const crashedParam = Number.isNaN(endDate.getTime()) ? new Date() : endDate;
         const beganParam = new Date(crashedParam.getTime() - 3_000);
-        await tx`
+        const upserted = await tx<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
           insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
           values (
             ${evt.gameId}, ${evt.multiplier}, null, null,
@@ -130,15 +131,21 @@ export async function onGameEnd(
             set crashed_at = excluded.crashed_at,
                 multiplier = excluded.multiplier
             where crash_rounds.crashed_at is null
+          returning began_at, crashed_at
         `;
+        state.crashRow = upserted[0] ?? null;
+        // If conflict (row existed with crashed_at already set), RETURNING is empty.
+        // Fall back to a single SELECT only in that case.
+        if (upserted.length === 0) {
+          const fetched = await tx<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
+            select began_at, crashed_at
+            from crash_rounds
+            where game_id = ${evt.gameId}
+            limit 1
+          `;
+          state.crashRow = fetched[0] ?? null;
+        }
       }
-      const fetched = await tx<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
-        select began_at, crashed_at
-        from crash_rounds
-        where game_id = ${evt.gameId}
-        limit 1
-      `;
-      state.crashRow = fetched[0] ?? null;
 
       const lockedRows = await tx<PendingRow>`
         select prediction_id, target_multiplier, probability, confidence,
@@ -238,10 +245,14 @@ export async function onGameEnd(
           `Resolved: ${resolvedAt}`,
         ].join("\n");
 
+        // P1.6: Populate telegram_deadline_at for validation messages too.
+        // Validation messages have a longer deadline (5 min) since they're
+        // for completed rounds and are never stale in the prediction sense.
+        const valDeadlineAt = new Date(Date.now() + 300_000).toISOString();
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at
+            attempt_count, next_attempt_at, telegram_deadline_at
           ) values (
             ${randomUUID()}::uuid, 'validation',
             ${validationContent},
@@ -258,7 +269,7 @@ export async function onGameEnd(
               kind: "validation",
             })},
             'pending', 2,
-            0, now()
+            0, now(), ${valDeadlineAt}::timestamptz
           )
         `;
       }
@@ -368,31 +379,39 @@ export async function onGameEnd(
     /* soft */
   }
 
-  // Authoritative closed-loop feedback BEFORE N+1 (audit §27 / §40)
+  // P0.3: Make feedback processing non-blocking via setImmediate.
+  // Feedback is for learning (incremental state, calibration, model performance),
+  // not correctness. The N+1 prediction can proceed without waiting for it.
+  const pendingSnapshot = state.pending; // capture for async closure
   try {
     const { processResolvedPredictionFeedback } = await import(
       "@/lib/prediction/live/feedback"
     );
-    await processResolvedPredictionFeedback({
-      predictionId: state.pending.prediction_id,
-      targetGameId: evt.gameId,
-      predictedProbability: Number(state.pending.probability),
-      predictedConfidence: state.pending.confidence != null
-        ? Number(state.pending.confidence)
-        : null,
-      targetMultiplier: Number(state.pending.target_multiplier),
-      actualMultiplier: evt.multiplier,
-      result,
-      regimeAtPrediction: state.pending.regime_name ?? null,
-      modelVersion: (state.pending as { model_version?: string | null }).model_version ?? null,
-      correlationId: state.pending.correlation_id ?? null,
-      resolvedAt,
+    setImmediate(() => {
+      if (!pendingSnapshot) return;
+      void processResolvedPredictionFeedback({
+        predictionId: pendingSnapshot.prediction_id,
+        targetGameId: evt.gameId,
+        predictedProbability: Number(pendingSnapshot.probability),
+        predictedConfidence: pendingSnapshot.confidence != null
+          ? Number(pendingSnapshot.confidence)
+          : null,
+        targetMultiplier: Number(pendingSnapshot.target_multiplier),
+        actualMultiplier: evt.multiplier,
+        result,
+        regimeAtPrediction: pendingSnapshot.regime_name ?? null,
+        modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
+        correlationId: pendingSnapshot.correlation_id ?? null,
+        resolvedAt,
+      }).catch((fbErr) => {
+        logger.warn(
+          { component: "live-validator", error: String(fbErr) },
+          "async closed-loop feedback failed",
+        );
+      });
     });
-  } catch (fbErr) {
-    logger.warn(
-      { component: "live-validator", error: String(fbErr) },
-      "closed-loop feedback failed — continuing to N+1 with partial learning",
-    );
+  } catch {
+    /* import failed — feedback is best-effort */
   }
 
   // Spec §2/§3.2: trigger N+1 prediction after Round N is processed.
