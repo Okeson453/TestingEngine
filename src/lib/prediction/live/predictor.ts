@@ -890,15 +890,21 @@ export async function onGameEndPredict(
         return;
       }
 
+      // Always enqueue prediction Telegram signal.
+      // Prior gate used (now - crashedAt) > SLA_LAG_MS (~2s) which is almost
+      // always true on poll recovery and often true on slightly delayed ED,
+      // so predictions were persisted (WIN/LOSS still fire) but signal messages
+      // never entered the outbox.
       const effectiveSlaLagMs = recoveryMode ? SLA_LAG_MS * 2 : SLA_LAG_MS;
       const receivedMs = new Date(crashedAt).getTime();
       const slaLagMsActual = Date.now() - receivedMs;
-      const slaViolated = slaLagMsActual > effectiveSlaLagMs;
+      const slaViolated = Number.isFinite(slaLagMsActual) && slaLagMsActual > effectiveSlaLagMs;
 
-      if (!slaViolated) {
+      {
         const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
+        const lateTag = slaViolated ? " (delayed)" : "";
         const predictionContent = [
-          `NEW PREDICTION${regimeText}`,
+          `NEW PREDICTION${regimeText}${lateTag}`,
           "",
           `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
           `Probability: ${(signal.probability * 100).toFixed(1)}%`,
@@ -906,7 +912,9 @@ export async function onGameEndPredict(
           "",
           `Prediction ID: ${predictionId}`,
           `Generated: ${timestamp}`,
+          recoveryMode ? "Source: poll recovery" : "Source: live ED",
         ].join("\n");
+        // Priority 2 = high; next_attempt_at must be timestamptz (use now()), not Date.now() number
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
@@ -923,12 +931,13 @@ export async function onGameEndPredict(
               probability: signal.probability,
               confidence: signal.confidence,
               regimeName: signal.regimeId,
-              slaViolated: false,
+              slaViolated,
+              slaLagMsActual,
               kind: "prediction",
               recoveryMode,
             })},
             'pending', 2,
-            0, Date.now()
+            0, now()
           )
         `;
       }
