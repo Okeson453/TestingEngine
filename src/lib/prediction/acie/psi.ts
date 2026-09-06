@@ -205,13 +205,14 @@ export class PredictiveSequenceIntelligence {
 
     // NEW: Penalize probability after consecutive losses (mean-reversion skepticism)
     // Previous gambler's-fallacy bump removed.
+    // Mild anti-momentum only (hard skip gate removed from strategy).
+    // Keep small penalties so long low streaks don't inflate P.
     let momentum = baseline;
-    if (streakBelow >= 2) {
-      const penalty = Math.min(0.12, (streakBelow - 1) * 0.04);
+    if (streakBelow >= 3) {
+      const penalty = Math.min(0.06, (streakBelow - 2) * 0.02);
       momentum = clamp01(baseline - penalty);
-    } else if (streakAbove >= 4) {
-      // Slight penalty after 4+ wins (don't get greedy)
-      momentum = clamp01(baseline - 0.02);
+    } else if (streakAbove >= 5) {
+      momentum = clamp01(baseline - 0.015);
     }
 
     // Single-pass last SHORT_WINDOW for Bayesian + volatility
@@ -301,8 +302,8 @@ export class PredictiveSequenceIntelligence {
     if (matchCount < STREAK_MIN_MATCHES) return baseline;
 
     const nextRoundHitRate = nextRoundHits / matchCount;
-    // Apply additional penalty if currently in a loss streak
-    const streakPenalty = streak >= 2 ? 0.05 : 0;
+    // Mild extra penalty only on longer streaks
+    const streakPenalty = streak >= 4 ? 0.03 : 0;
     return clamp01(nextRoundHitRate - streakPenalty);
   }
 
