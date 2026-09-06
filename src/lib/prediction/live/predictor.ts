@@ -775,8 +775,7 @@ export async function onGameEndPredict(
         sql<{ value: string }>`
           SELECT value FROM worker_state WHERE key = 'wall_clock_skew_ms' LIMIT 1
         `.catch(() => []),
-        s
-ql<{ prediction_id: string }>`
+        sql<{ prediction_id: string }>`
           SELECT prediction_id FROM pending_predictions
           WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
         `.catch(() => []),
@@ -867,33 +866,17 @@ e === true;
     // inside the betting window for many rounds.
     const effectiveFloor = skipThreshold;
     if (remainingMs != null && Number.isFinite(remainingMs) && remainingMs < effectiveFloor) {
+      // Finding 1: residual window is advisory only — generate; outbox deadline expires stale rows
       logger.warn(
         {
           targetGameId,
           remainingMs,
           threshold: effectiveFloor,
-          generationBudgetMs: GENERATION_BUDGE
-T_MS,
+          generationBudgetMs: GENERATION_BUDGET_MS,
           deliveryBudgetMs: DELIVERY_BUDGET_MS,
           elapsedSinceEd,
           recoveryMode,
         },
-        "Skipping prediction: residual window exhausted",
-      );
-      try {
-        await sql`
-          INSERT INTO live_event_log (
-            correlation_id, event_kind, game_id, payload, received_at, processed_at,
-            processor_latency_ms, sla_violated
-          ) VALUES (
-            ${correlationId}::text, 'PREDICT', ${targetGameId},
-            ${JSON.stringify({ kind: "skipped_late", remainingMs, threshold: effectiveFloor, recoveryMode })},
-            ${generatedAt}::timestamptz, now(), ${Math.round(performance.now() - tGate0)}, true
-          )
-          ON CONFLICT DO NOTHING
-        `;
-      logger.warn(
-        { targetGameId, remainingMs, threshold: effectiveFloor, generationBudgetMs: GENERATION_BUDGET_MS, deliveryBudgetMs: DELIVERY_BUDGET_MS, elapsedSinceEd, recoveryMode },
         "tight residual window — generating anyway; outbox will expire if too late",
       );
     }
@@ -936,8 +919,7 @@ T_MS,
       };
     }
     if (sheath.decision === "warn") {
-      log
-ger.warn(
+      logger.warn(
         { targetGameId, lateRate: sheath.rate, total: sheath.total },
         "Sheath mode WARN — late rate elevated",
       );
