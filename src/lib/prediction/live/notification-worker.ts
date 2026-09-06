@@ -174,7 +174,7 @@ export class OutboxDispatcher {
               return "dead" as const;
             }
 
-            // For predictions: if target already started, expire rather than late-send
+            // For predictions: if target already started or crashed, expire rather than late-send
             if (row.type === "prediction") {
               try {
                 const meta = (row.metadata ?? {}) as Record<string, unknown>;
@@ -183,10 +183,12 @@ export class OutboxDispatcher {
                   (meta.target_game_id as string) ||
                   null;
                 if (targetGameId) {
-                  const live = await sql<{ began_at: string | Date | null }>`
-                    SELECT began_at FROM live_round_state
+                  // Check live_round_state for began_at AND crashed_at
+                  const live = await sql<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
+                    SELECT began_at, crashed_at FROM live_round_state
                     WHERE game_id = ${targetGameId} LIMIT 1
-                  `.catch(() => [] as { began_at: string | Date | null }[]);
+                  `.catch(() => [] as { began_at: string | Date | null; crashed_at: string | Date | null }[]);
+
                   if (live[0]?.began_at) {
                     const began = new Date(live[0].began_at).getTime();
                     if (Number.isFinite(began) && began <= this.now()) {
@@ -198,12 +200,50 @@ export class OutboxDispatcher {
                       `;
                       this.stats.dead += 1;
                       logger.warn(
-                        {
-                          component: "outbox-dispatcher",
-                          notificationId: row.notification_id,
-                          targetGameId,
-                        },
+                        { component: "outbox-dispatcher", notificationId: row.notification_id, targetGameId },
                         "target started before delivery — expiring signal",
+                      );
+                      return "dead" as const;
+                    }
+                  }
+
+                  if (live[0]?.crashed_at) {
+                    const crashed = new Date(live[0].crashed_at).getTime();
+                    if (Number.isFinite(crashed) && crashed <= this.now()) {
+                      await sql`
+                        update notification_outbox
+                        set status = 'dead_letter',
+                            last_error = 'target_already_crashed_before_delivery'
+                        where id = ${row.id}
+                      `;
+                      this.stats.dead += 1;
+                      logger.warn(
+                        { component: "outbox-dispatcher", notificationId: row.notification_id, targetGameId },
+                        "target already crashed before delivery — expiring signal",
+                      );
+                      return "dead" as const;
+                    }
+                  }
+
+                  // Fallback: check crash_rounds directly if live state is missing
+                  const crashedInHistory = await sql<{ crashed_at: string | Date | null }>`
+                    SELECT crashed_at FROM crash_rounds
+                    WHERE game_id = ${targetGameId} LIMIT 1
+                  `.catch(() => [] as { crashed_at: string | Date | null }[]);
+
+                  if (crashedInHistory[0]?.crashed_at) {
+                    const crashed = new Date(crashedInHistory[0].crashed_at).getTime();
+                    if (Number.isFinite(crashed) && crashed <= this.now()) {
+                      await sql`
+                        update notification_outbox
+                        set status = 'dead_letter',
+                            last_error = 'target_already_crashed_before_delivery (crash_rounds)'
+                        where id = ${row.id}
+                      `;
+                      this.stats.dead += 1;
+                      logger.warn(
+                        { component: "outbox-dispatcher", notificationId: row.notification_id, targetGameId },
+                        "target already crashed before delivery (crash_rounds) — expiring signal",
                       );
                       return "dead" as const;
                     }
