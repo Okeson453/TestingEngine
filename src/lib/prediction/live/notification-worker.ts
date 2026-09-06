@@ -394,21 +394,31 @@ export class OutboxDispatcher {
   /** Recover stale INFLIGHT (legacy status) or stuck pending rows. */
   async recoverStale(): Promise<number> {
     const sql = await this.getSqlFn();
+
+    // Dead-letter overdue prediction rows past telegram deadline (or very old).
+    // Re-queueing them only produces permanent failure / noise and never helps.
+    try {
+      await sql`
+        update notification_outbox
+        set status = 'dead_letter',
+            last_error = coalesce(last_error, '') || ' [expired on recover: past deadline or stale]'
+        where type = 'prediction'
+          and status in ('pending', 'inflight')
+          and (
+            (telegram_deadline_at is not null and telegram_deadline_at < now())
+            or created_at < now() - interval '2 minutes'
+          )
+      `;
+    } catch { /* soft */ }
+
     // Reset stuck inflight rows (crash mid-send) and very-old pending rows.
     const result = await sql<{ id: number }>`
       update notification_outbox
       set status = 'pending',
           last_error = coalesce(last_error, '') || ' [recovered from inflight]',
           next_attempt_at = now()
-      where (
-          status = 'inflight'
-          and updated_at < now() - (${STALE_INFLIGHT_MS}::int * interval '1 millisecond')
-        )
-        or (
-          status = 'pending'
-          and next_attempt_at < now() - (${STALE_INFLIGHT_MS}::int * interval '1 millisecond')
-          and coalesce(last_error, '') not like '%recovered from inflight%'
-        )
+      where status = 'inflight'
+        and updated_at < now() - (${STALE_INFLIGHT_MS}::int * interval '1 millisecond')
       returning id
     `;
     const n = result.length;
