@@ -3,9 +3,18 @@
  *
  * Every resolved prediction MUST flow through processResolvedPredictionFeedback
  * before N+1 is generated. Updates are idempotent by prediction_id.
+ *
+ * Durability (Phase 2):
+ * - In-memory Set is a fast path for the current process lifetime.
+ * - PostgreSQL `prediction_validations.feedback_applied_at` is the recovery
+ *   source of truth. A row is claimed with
+ *   UPDATE ... SET feedback_applied_at = now() WHERE prediction_id = $1
+ *   AND feedback_applied_at IS NULL RETURNING prediction_id.
+ * - Second calls (restart, duplicate ed, poll recovery) see no claim and no-op.
  */
 
 import { getLogger } from "@/lib/observability/logger";
+import { getSql } from "@/lib/db";
 
 const logger = getLogger("prediction-feedback");
 
@@ -67,7 +76,7 @@ export interface FeedbackResult {
   incrementalCount: number | null;
 }
 
-/** Idempotency set for process lifetime (DB uniqueness is primary). */
+/** Idempotency set for process lifetime (DB claim is primary). */
 const processedIds = new Set<string>();
 const MAX_PROCESSED = 5_000;
 
@@ -126,6 +135,32 @@ export function analyzeFailure(
 }
 
 /**
+ * Claim durable ownership of feedback for this prediction_id.
+ * Returns true if this process/call owns the claim (first successful claim).
+ * Returns false if already claimed or no validation row exists.
+ */
+async function claimFeedbackDurable(predictionId: string): Promise<boolean> {
+  try {
+    const sql = await getSql();
+    const claimed = await sql<{ prediction_id: string }>`
+      UPDATE prediction_validations
+      SET feedback_applied_at = now()
+      WHERE prediction_id = ${predictionId}
+        AND feedback_applied_at IS NULL
+      RETURNING prediction_id
+    `;
+    return claimed.length > 0;
+  } catch (e) {
+    // Column may not exist yet (pre-migration). Fall back to in-memory only.
+    logger.warn(
+      { predictionId, error: String(e) },
+      "durable feedback claim failed — falling back to in-memory idempotency",
+    );
+    return !processedIds.has(predictionId);
+  }
+}
+
+/**
  * Canonical feedback pipeline. Safe to call multiple times for same predictionId
  * (second call is a no-op). Always await before generating N+1.
  */
@@ -148,10 +183,29 @@ export async function processResolvedPredictionFeedback(
     : 0.5;
   const analysis = analyzeFailure(predicted, actual, input.result);
 
+  // Fast path: process memory
   if (processedIds.has(input.predictionId)) {
     logger.debug(
       { predictionId: input.predictionId },
-      "feedback already processed — idempotent skip",
+      "feedback already processed — idempotent skip (memory)",
+    );
+    return {
+      predictionId: input.predictionId,
+      targetGameId: input.targetGameId,
+      learningStatus: "COMPLETE",
+      learningComponents: components,
+      analysis,
+      incrementalCount: null,
+    };
+  }
+
+  // Durable claim (survives restart / duplicate ed / poll recovery)
+  const owned = await claimFeedbackDurable(input.predictionId);
+  if (!owned) {
+    processedIds.add(input.predictionId);
+    logger.debug(
+      { predictionId: input.predictionId },
+      "feedback already processed — idempotent skip (durable)",
     );
     return {
       predictionId: input.predictionId,
