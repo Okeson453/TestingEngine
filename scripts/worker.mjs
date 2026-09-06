@@ -24,7 +24,7 @@ if (!process.env.DATABASE_URL) {
 
 // Prefer a small pool on the worker process unless operator overrides.
 if (!process.env.PG_POOL_MAX) {
-  process.env.PG_POOL_MAX = "3";
+  process.env.PG_POOL_MAX = "6";
 }
 if (!process.env.PG_POOL_MIN) {
   process.env.PG_POOL_MIN = "1";
@@ -36,6 +36,7 @@ if (!process.env.PG_APP_NAME) {
 const liveBoot = await import("@/lib/prediction/live/boot");
 const events = await import("@/lib/prediction/events/game-event-handlers");
 const db = await import("@/lib/db");
+const edgeHttp = await import("@/lib/prediction/live/edge-http");
 
 let shuttingDown = false;
 
@@ -87,6 +88,12 @@ async function bootWithRetry(maxAttempts = 8) {
 }
 
 const result = await bootWithRetry();
+
+try {
+  await edgeHttp.startEdgeHttpServer();
+} catch (e) {
+  console.error("[worker] edge HTTP server failed to start:", e?.message ?? e);
+}
 
 console.log(
   JSON.stringify({
@@ -146,6 +153,11 @@ const shutdown = async (signal) => {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[worker] ${signal} received — graceful shutdown`);
+  try {
+    await edgeHttp.stopEdgeHttpServer();
+  } catch (e) {
+    console.error("[worker] stopEdgeHttpServer:", e?.message ?? e);
+  }
   try {
     await events.stopEventDrivenPipeline();
   } catch (e) {
