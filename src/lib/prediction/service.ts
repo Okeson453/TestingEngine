@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getSql } from "@/lib/db";
+import { getLogger } from "@/lib/observability/logger";
 import { PredictionEngine } from "./prediction-engine.ts";
 import type {
   PredictionSignal,
@@ -12,6 +13,7 @@ import type { Sql } from "@/lib/db";
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
 const MIN_HISTORY = 20;
 const MAX_HISTORY = 100;
+const serviceLogger = getLogger("prediction-service");
 
 function mapCrashRoundToHistorical(r: CrashRound): HistoricalRound {
   return {
@@ -85,6 +87,15 @@ export interface QueuedPrediction {
 export async function generateAndQueuePrediction(
   sql: Sql,
 ): Promise<QueuedPrediction | null> {
+  // Fix 6: REST path is recovery/backtest only — not the live primary path
+  if (process.env.NODE_ENV === "production" && process.env.ALLOW_REST_PREDICTION !== "1") {
+    serviceLogger.warn(
+      { component: "prediction-service" },
+      "REST polling prediction path disabled in production — use Socket.IO / poll recovery only",
+    );
+    return null;
+  }
+
   // 1. Determine the next round id: MAX(game_id) + 1.
   const maxRows = await sql<{ max_id: string | null }>`
     SELECT MAX(game_id) as max_id FROM crash_rounds
