@@ -4,6 +4,7 @@ import type { FetchedRound } from "./fetch-bc";
 import type { CrashRound } from "./types";
 import { globalRecentRoundCache } from "@/lib/observability/performance/hot-cache";
 import { ingestMs } from "@/lib/observability/performance/latency";
+import { runInTransaction } from "@/lib/prediction/live/tx";
 
 export type RoundRow = {
   game_id: string;
@@ -120,7 +121,7 @@ export async function insertNewRounds(
       // fall back to a transactional per-row path when the batch path is awkward.
       // For small N (typical poll page = ≤50) a single transaction of inserts
       // is still a large win vs N separate autocommit round-trips.
-      await sql.begin(async (tx) => {
+      await runInTransaction(sql, async (tx) => {
         for (const p of prepared) {
           const result = await tx<{ game_id: string }>`
             insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
