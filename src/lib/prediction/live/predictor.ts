@@ -27,6 +27,7 @@ import {
 } from "@/lib/core/sheath-mode";
 
 const logger = getLogger("live-predictor");
+// SYNTAX_GUARD_20260906: file must parse under node --experimental-strip-types
 
 /** Prediction-related constants. */
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
