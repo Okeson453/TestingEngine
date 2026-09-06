@@ -220,6 +220,31 @@ async function writeWorkerHealth(sql: Sql, cycle: number): Promise<void> {
 
   // P2.11: Persist incremental state on each heartbeat
   await persistIncrementalState(sql);
+
+  // Phase 17 — sample production invariants on heartbeat (non-blocking soft)
+  try {
+    const { sampleProductionInvariants } = await import(
+      "@/lib/prediction/live/invariants"
+    );
+    await sampleProductionInvariants(sql);
+  } catch {
+    /* soft */
+  }
+
+  // Phase 18 — log lifecycle metrics snapshot periodically
+  if (cycle % 6 === 0) {
+    try {
+      const { getLifecycleMetricsSnapshot } = await import(
+        "@/lib/observability/metrics/lifecycle-metrics"
+      );
+      logger.info(
+        { component: "live-boot", metrics: getLifecycleMetricsSnapshot() },
+        "lifecycle metrics snapshot",
+      );
+    } catch {
+      /* soft */
+    }
+  }
 }
 
 async function releaseWorkerLock(sql: Sql): Promise<void> {

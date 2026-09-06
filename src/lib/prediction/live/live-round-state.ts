@@ -14,12 +14,21 @@ import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("live-round-state");
 
+/** Phase 11 — explicit round state machine stages + recovery. */
 export type LiveLifecycle =
   | "DISCOVERED"
   | "STARTED"
   | "RUNNING"
   | "ENDED"
-  | "RECONCILED";
+  | "PREDICTION_RESOLVED"
+  | "FEEDBACK_APPLIED"
+  | "NEXT_PREDICTION_GENERATED"
+  | "RECONCILED"
+  | "MISSING_END"
+  | "LATE_END"
+  | "ORPHANED"
+  | "RECONCILING"
+  | "FAILED";
 
 export type LiveSource = "socket" | "poll" | "history" | "unknown";
 
@@ -38,7 +47,16 @@ const ORDER: Record<LiveLifecycle, number> = {
   STARTED: 1,
   RUNNING: 2,
   ENDED: 3,
-  RECONCILED: 4,
+  PREDICTION_RESOLVED: 4,
+  FEEDBACK_APPLIED: 5,
+  NEXT_PREDICTION_GENERATED: 6,
+  RECONCILED: 7,
+  // Recovery states sit beside the happy path (not strictly after RECONCILED)
+  MISSING_END: 2,
+  LATE_END: 3,
+  ORPHANED: 3,
+  RECONCILING: 4,
+  FAILED: 7,
 };
 
 function canAdvance(from: LiveLifecycle, to: LiveLifecycle): boolean {
@@ -216,4 +234,61 @@ export async function markReconciled(gameId: string, sql?: Sql): Promise<void> {
     SET lifecycle = 'RECONCILED', updated_at = now()
     WHERE game_id = ${gameId}
   `;
+}
+
+
+/** Phase 11 — advance lifecycle idempotently (never regresses on happy path). */
+export async function advanceLiveRoundLifecycle(
+  gameId: string,
+  to: LiveLifecycle,
+  sql?: Sql,
+  meta?: { source?: LiveSource; correlationId?: string },
+): Promise<void> {
+  const db = sql ?? (await getSql());
+  await db`
+    INSERT INTO live_round_state (
+      game_id, lifecycle, source, correlation_id, updated_at
+    ) VALUES (
+      ${gameId}, ${to}, ${meta?.source ?? "unknown"},
+      ${meta?.correlationId ?? null}, now()
+    )
+    ON CONFLICT (game_id) DO UPDATE SET
+      lifecycle = CASE
+        WHEN live_round_state.lifecycle = 'FAILED' THEN 'FAILED'
+        WHEN live_round_state.lifecycle = 'RECONCILED'
+          AND ${to} NOT IN ('FAILED') THEN 'RECONCILED'
+        ELSE ${to}
+      END,
+      correlation_id = COALESCE(live_round_state.correlation_id, EXCLUDED.correlation_id),
+      updated_at = now()
+  `;
+}
+
+export async function markPredictionResolved(
+  gameId: string,
+  sql?: Sql,
+): Promise<void> {
+  await advanceLiveRoundLifecycle(gameId, "PREDICTION_RESOLVED", sql);
+}
+
+export async function markFeedbackApplied(
+  gameId: string,
+  sql?: Sql,
+): Promise<void> {
+  await advanceLiveRoundLifecycle(gameId, "FEEDBACK_APPLIED", sql);
+}
+
+export async function markNextPredictionGenerated(
+  gameId: string,
+  sql?: Sql,
+): Promise<void> {
+  await advanceLiveRoundLifecycle(gameId, "NEXT_PREDICTION_GENERATED", sql);
+}
+
+export async function markOrphaned(gameId: string, sql?: Sql): Promise<void> {
+  await advanceLiveRoundLifecycle(gameId, "ORPHANED", sql);
+}
+
+export async function markLateEnd(gameId: string, sql?: Sql): Promise<void> {
+  await advanceLiveRoundLifecycle(gameId, "LATE_END", sql);
 }

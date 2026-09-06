@@ -347,6 +347,27 @@ export async function onGameEnd(
     "round validated",
   );
 
+  // Phase 11 — prediction resolved for this round
+  try {
+    const { markPredictionResolved } = await import(
+      "@/lib/prediction/live/live-round-state"
+    );
+    await markPredictionResolved(evt.gameId);
+  } catch {
+    /* soft */
+  }
+
+  // Phase 18 — ed processing latency
+  try {
+    const { edProcessingLatencyMs } = await import(
+      "@/lib/observability/metrics/lifecycle-metrics"
+    );
+    const lat = Math.max(0, now() - new Date(evt.receivedAt).getTime());
+    edProcessingLatencyMs.observe(lat);
+  } catch {
+    /* soft */
+  }
+
   // Authoritative closed-loop feedback BEFORE N+1 (audit §27 / §40)
   try {
     const { processResolvedPredictionFeedback } = await import(

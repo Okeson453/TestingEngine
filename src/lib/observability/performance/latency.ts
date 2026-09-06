@@ -39,3 +39,21 @@ export const deliveryMissCount = makeRecorder("deliveryMiss");
 
 /** Alias for ACIE heavy path — real histogram may live in metrics-acie if prom is wired */
 export const acieHeavyEvidenceLatencyMs = makeRecorder("acieHeavyEvidence");
+
+/** Phase 18/19 — re-export lifecycle + lead-time metrics */
+export {
+  socketEventLatencyMs,
+  bgToEdDurationMs,
+  edProcessingLatencyMs,
+  predictionGenerationLatencyMs,
+  feedbackLatencyMs,
+  endToEndPredictionLatencyMs,
+  predictionSkipCount,
+  duplicateEventCount,
+  pollRecoveryCount,
+  missedEventCount,
+  predictionLeadTimeMs,
+  notificationLeadTimeMs,
+  recordLeadTimes,
+  getLifecycleMetricsSnapshot,
+} from "@/lib/observability/metrics/lifecycle-metrics";

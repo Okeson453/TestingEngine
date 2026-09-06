@@ -340,6 +340,27 @@ export async function processResolvedPredictionFeedback(
     if (first) processedIds.delete(first);
   }
 
+  // Phase 11 — advance round state machine
+  try {
+    const { markFeedbackApplied } = await import(
+      "@/lib/prediction/live/live-round-state"
+    );
+    await markFeedbackApplied(input.targetGameId);
+  } catch {
+    /* soft */
+  }
+
+  // Phase 18 — feedback latency observed by caller; count complete here
+  try {
+    const { feedbackLatencyMs } = await import(
+      "@/lib/observability/metrics/lifecycle-metrics"
+    );
+    // residual timing not known here; observe 0 as completion marker
+    feedbackLatencyMs.observe(0);
+  } catch {
+    /* soft */
+  }
+
   logger.info(
     {
       component: "prediction-feedback",
