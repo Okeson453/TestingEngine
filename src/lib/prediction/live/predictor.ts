@@ -979,8 +979,7 @@ e === true;
           predictFn(rounds, targetGameId, generatedAt, DEFAULT_TARGET),
         ),
         new Promise<never>((_, reject) =>
-     
-     setTimeout(() => reject(new Error("PREDICT_TIMEOUT")), PREDICT_TIMEOUT_MS),
+          setTimeout(() => reject(new Error("PREDICT_TIMEOUT")), PREDICT_TIMEOUT_MS),
         ),
       ]);
     } catch (predictErr) {
@@ -999,12 +998,9 @@ e === true;
     try {
       await runInTransaction(sql, async (tx) => {
         // Do NOT pre-insert crash_rounds for N+1: multiplier + crashed_at are
-        // NOT NULL and only arrive on t
-
-... [Content truncated]        // NOT NULL and only arrive on the `ed` event. The validator's UPDATE will create the
-        // row via `insertNewRounds` (REST backfill) or via the ed handler's
-        // own INSERT path on first arrival. Skipping here keeps the
-        // transaction idempotent and removes the schema mismatch.
+        // NOT NULL and only arrive on the ed event. The validator UPDATE or
+        // insertNewRounds / ed handler INSERT creates the row on first arrival.
+        // Skipping here keeps the transaction idempotent.
 
         const ins = await tx<{ prediction_id: string; requested_at: string }>`
           insert into pending_predictions (
