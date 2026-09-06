@@ -43,6 +43,7 @@ export const SLA_LAG_MS = Number(process.env.SLA_LAG_MS ?? 2_000);
 /** Residual window below which we skip prediction entirely (no row written).
  *  Lowered 800->250: prior floor systematically skipped hot-ED predictions when
  *  elapsedSinceEd + gate latency consumed a normal 
+
 3-5s inter-round gap,
  *  forcing poll recovery 1-3 rounds later (the observed signal lag). */
 export const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 250);
@@ -87,7 +88,8 @@ export type OnGameStartResult =
       latencyMs: number;
       slaViolated: boolean;
       correlationId: string;
-      outboxEnqueued: 
+      outboxEnqueued:
+ 
 number;
     }
   | { kind: "duplicate"; predictionId: string; targetGameId: string }
@@ -162,7 +164,8 @@ type PipelineFn = (input: {
   regime: string;
   regimeConfidence?: number;
   predict
-ionId?: string;
+ionId?
+: string;
   modelVersion?: string;
   baseThreshold?: number;
 }) => {
@@ -232,7 +235,8 @@ const defaultPredictFn = (
       probability = pipe.calibratedProbability ?? pipe.metaProbability ?? probability;
       confidence = Math.min(1, Math.max(confidence, probability));
       
-modelVersion = `${modelVersion}+pipeline`;
+model
+Version = `${modelVersion}+pipeline`;
       reasoning.push(
         `pipeline_action=${pipe.action}`,
         `pipeline_reason=${pipe.reason}`,
@@ -297,7 +301,8 @@ export async function onGameStart(
   const correlationId = randomUUID();
   const beginMs = new Date(evt.beginTime).getTime();
   const receivedMs = new Date(evt.receive
-dAt).getTime();
+dAt)
+.getTime();
   const slaLagMsActual = receivedMs - beginMs;
   const slaViolated = slaLagMsActual > slaLagMs;
 
@@ -371,7 +376,8 @@ dAt).getTime();
         component: "live-predictor",
         correlationId,
         targetGameId:
- evt.gameId,
+ ev
+t.gameId,
         predictionId: existing[0]!.prediction_id,
       },
       "duplicate bg event; prediction already exists for this target",
@@ -427,7 +433,8 @@ dAt).getTime();
         returning prediction_id, requested_at
       `;
       if
- (ins.length === 0) {
+ (
+ins.length === 0) {
         const dup = await tx<{ prediction_id: string }>`
           select prediction_id from pending_predictions
           where target_game_id = ${evt.gameId} and matched = false
@@ -484,7 +491,8 @@ dAt).getTime();
         insert into live_event_log (
           correlation_id, event_kind, game_id, payload, received_at, processed_at,
 
-          processor_latency_ms, sla_violated
+ 
+         processor_latency_ms, sla_violated
         ) values (
           ${correlationId}::text, 'BG', ${evt.gameId},
           ${JSON.stringify({ beginTime: evt.beginTime, sourceRoundGameId: evt.sourceRoundGameId })},
@@ -555,6 +563,7 @@ dAt).getTime();
 }
 
 export type TemporalValidity = "TEMPORALLY_VALID" | "TEMPORALLY_UNVERIFIED" | "TEMPOR
+
 ALLY_INVALID";
 
 export interface OnGameEndPredictResult {
@@ -627,6 +636,7 @@ export async function onGameEndPredict(
 
   const generatedAt = new Date().toISOString();
   const recoveryMode = deps.recov
+
 eryMode === true;
   
   // FIX 1: Source-staleness gate now respects recoveryMode
@@ -677,7 +687,8 @@ eryMode === true;
   try {
     let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
 
-    const [thrRows, residualRows, gapRows, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
+    const [thrRows, residualRows, gapRo
+ws, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
       await Promise.all([
         sql<{ value: string }>`
           SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
@@ -725,7 +736,8 @@ eryMode === true;
     const life = liveLifecycle[0];
     if (life?.began_at != null) {
       const beganMs = new Date(life.began_at).getTime();
-      if (Number
+      if (Numbe
+r
 .isFinite(beganMs) && beganMs <= Date.now()) {
         logger.warn({ targetGameId }, "Target round N+1 already started - too late");
         recordPredictionOutcome(true);
@@ -782,7 +794,8 @@ eryMode === true;
     }
     if (
       remainingMs != null &&
-      Number.isFini
+      Number.isFi
+ni
 te(remainingMs) &&
       remainingMs < deadlineBudget
     ) {
@@ -857,7 +870,8 @@ te(remainingMs) &&
         SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
       `;
       
-      const
+      co
+nst
  targetBeganAt = targetStarted[0]?.began_at;
       if (targetBeganAt != null) {
         const beganMs = new Date(targetBeganAt).getTime();
@@ -905,7 +919,8 @@ te(remainingMs) &&
 
       // Always enqueue prediction Telegram signal.
       // Prior gate used (now - crashedAt) > SLA_LAG_MS (~2s) which is almost
-      // always true on p
+      // always true 
+on p
 oll recovery and often true on slightly delayed ED,
       // so predictions were persisted (WIN/LOSS still fire) but signal messages
       // never entered the outbox.
@@ -953,7 +968,8 @@ oll recovery and often true on slightly delayed ED,
             'pending', 2,
             0, now()
           )
-       
+  
+     
  `;
       }
 
@@ -978,6 +994,6 @@ oll recovery and often true on slightly delayed ED,
         sourceGameId: gameId,
         correlationId,
         recoveryMode,
-        latencyMs: Date.now() - new Date(crashedAt).getT
+        latencyMs: Date.now() - new Date(crashedAt
 
 ... [Content truncated]
