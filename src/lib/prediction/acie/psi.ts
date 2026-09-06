@@ -6,6 +6,10 @@
  * - No full-history O(n) scans; capped reverse windows
  * - Single-pass short-window stats
  * - estimate() runs models once (estimateModels shares the same path)
+ *
+ * Anti-momentum: after consecutive losses the momentum model *penalizes*
+ * probability (mean-reversion skepticism) instead of the previous gambler's
+ * fallacy bump.
  */
 
 import {
@@ -195,14 +199,19 @@ export class PredictiveSequenceIntelligence {
 
     const streakAware = this.fastStreakAware(baseline, sequenceState, history);
 
+    // ── Momentum / streak model (ANTI-MOMENTUM) ────────────────────
     const streakBelow = sequenceState.currentStreakBelow130 | 0;
     const streakAbove = sequenceState.currentStreakAbove130 | 0;
+
+    // NEW: Penalize probability after consecutive losses (mean-reversion skepticism)
+    // Previous gambler's-fallacy bump removed.
     let momentum = baseline;
-    if (streakBelow >= 1) {
-      const bump = streakBelow * 0.015;
-      momentum = clamp01(baseline + (bump > 0.12 ? 0.12 : bump));
+    if (streakBelow >= 2) {
+      const penalty = Math.min(0.12, (streakBelow - 1) * 0.04);
+      momentum = clamp01(baseline - penalty);
     } else if (streakAbove >= 4) {
-      momentum = clamp01(baseline - 0.03);
+      // Slight penalty after 4+ wins (don't get greedy)
+      momentum = clamp01(baseline - 0.02);
     }
 
     // Single-pass last SHORT_WINDOW for Bayesian + volatility
@@ -262,8 +271,8 @@ export class PredictiveSequenceIntelligence {
   }
 
   /**
-   * Streak-aware: scan at most MATCH_SCAN_LIMIT recent SOL records (from the end).
-   * Avoids O(full history) filter + second pass.
+   * Looks at what happened in the round AFTER similar streaks.
+   * If the next round was usually a loss, returns a LOWER probability.
    */
   private fastStreakAware(
     baseline: number,
@@ -276,19 +285,25 @@ export class PredictiveSequenceIntelligence {
     const streak = sequenceState.currentStreakBelow130;
     const start = len > MATCH_SCAN_LIMIT ? len - MATCH_SCAN_LIMIT : 0;
     let matchCount = 0;
-    let matchHits = 0;
+    let nextRoundHits = 0;
 
-    for (let i = start; i < len; i++) {
+    // Look at rounds where a similar streak existed, then check the NEXT round
+    for (let i = start; i < len - 1; i++) {
       const s = history[i].sequenceState.currentStreakBelow130;
       const d = s - streak;
       if (d <= 1 && d >= -1) {
         matchCount++;
-        if (history[i].reached130) matchHits++;
+        // Check the NEXT round after this similar streak
+        if (history[i + 1].reached130) nextRoundHits++;
       }
     }
 
     if (matchCount < STREAK_MIN_MATCHES) return baseline;
-    return matchHits / matchCount;
+
+    const nextRoundHitRate = nextRoundHits / matchCount;
+    // Apply additional penalty if currently in a loss streak
+    const streakPenalty = streak >= 2 ? 0.05 : 0;
+    return clamp01(nextRoundHitRate - streakPenalty);
   }
 
   private resolveWeightsInto(

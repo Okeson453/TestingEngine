@@ -3,6 +3,11 @@
  *
  * High-frequency (HF) adaptive mode targets up to ~500 quality entries/day
  * without hard-blocking on mild evidence degradation.
+ *
+ * Consecutive-loss protection:
+ * - After consecutiveLossSkipAt losses → SKIP for up to consecutiveLossMaxSkip rounds
+ * - After max skip exhausted → only emergency high-probability entries
+ * - Threshold escalates with loss streak (lossStreakThresholdEscalation)
  */
 
 import { fractionalKellyStake } from '../stake/kelly-sizer.ts';
@@ -24,12 +29,15 @@ export const DEFAULT_STRATEGY_POLICY: StrategyPolicy = {
   consecutiveLossReduceAt: 4,
   reducedStakeFactor: 0.5,
   defaultStake: 700,
+  consecutiveLossSkipAt: 2,
+  consecutiveLossMaxSkip: 2,
+  lossStreakThresholdEscalation: 0.025,
 };
 
 /**
  * Tuned for ≥500 selective entries/day at 1.30× cash-out.
  * Slightly lower bars, stronger mean-reversion bias after low streaks,
- * softer consecutive-loss handling so the engine keeps evaluating.
+ * consecutive-loss skip after 2 losses (max 3 skip rounds).
  */
 export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
   mode: 'adaptive',
@@ -41,6 +49,9 @@ export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
   consecutiveLossReduceAt: 5,
   reducedStakeFactor: 0.6,
   defaultStake: 700,
+  consecutiveLossSkipAt: 2,
+  consecutiveLossMaxSkip: 3,
+  lossStreakThresholdEscalation: 0.03,
 };
 
 export class StrategyLayer {
@@ -53,6 +64,24 @@ export class StrategyLayer {
   evaluate(ctx: StrategyDecisionContext): StrategyDecision {
     const { probability, evidence, calibrationError, uncertainty, riskState, regime } = ctx;
     const p = this.policy;
+    const cl = riskState?.consecutiveLosses ?? 0;
+
+    // ── 0. Consecutive Loss Skip Gate ────────────────────────────────
+    if (cl >= p.consecutiveLossSkipAt) {
+      const skipRounds = cl - p.consecutiveLossSkipAt + 1;
+      if (skipRounds <= p.consecutiveLossMaxSkip) {
+        return this.skip(
+          `${cl} consecutive losses — cooling off (skip ${skipRounds}/${p.consecutiveLossMaxSkip}).`
+        );
+      }
+      // Max skip exhausted: only enter if probability is VERY strong
+      const emergencyThreshold = p.supportedThreshold + 0.12;
+      if (probability < emergencyThreshold) {
+        return this.skip(
+          `${cl} consecutive losses — max skip exhausted, prob ${(probability * 100).toFixed(1)}% too weak.`
+        );
+      }
+    }
 
     // Extreme calibration failure — skip only in strict mode
     if (calibrationError > p.maxCalibrationError && evidence === 'DEGRADED') {
@@ -88,7 +117,7 @@ export class StrategyLayer {
       return this.skip(`Evidence ${evidence} under strict/unsupported policy.`);
     }
 
-    // Regime-adaptive threshold adjustments (boost entry rate after low streaks)
+    // Regime-adaptive + loss-streak threshold escalation
     threshold = this.regimeAdjustedThreshold(threshold, regime, ctx);
 
     // Soft daily pacing: when approaching limit, raise bar slightly to keep best entries
@@ -120,11 +149,12 @@ export class StrategyLayer {
       );
     }
 
-    if (riskState.consecutiveLosses >= p.consecutiveLossReduceAt) {
+    // Stake reduction still applies when past reduceAt (and past the skip window)
+    if (cl >= p.consecutiveLossReduceAt) {
       return {
         action: 'REDUCED_ENTRY',
         stake: this.reducedStake(riskState),
-        reason: `${riskState.consecutiveLosses} consecutive losses — reduced stake.`,
+        reason: `${cl} consecutive losses — reduced stake.`,
         confidence: effectiveProb,
         isOpportunity: true,
       };
@@ -213,7 +243,17 @@ export class StrategyLayer {
     if (typeof lo === 'number' && lo >= 0.55) {
       t -= 0.01;
     }
-    return Math.max(0.52, Math.min(0.75, t));
+
+    // Loss-streak threshold escalation — demand stronger signals after losses
+    const cl = ctx.riskState?.consecutiveLosses ?? 0;
+    if (cl >= this.policy.consecutiveLossSkipAt) {
+      const extra =
+        (cl - this.policy.consecutiveLossSkipAt + 1) *
+        this.policy.lossStreakThresholdEscalation;
+      t += Math.min(extra, 0.1); // cap at +10pp
+    }
+
+    return Math.max(0.52, Math.min(0.82, t));
   }
 
   private reducedStake(_risk: StrategyDecisionContext['riskState']): number {

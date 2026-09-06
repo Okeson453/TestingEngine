@@ -178,6 +178,12 @@ export interface StrategyPolicy {
   consecutiveLossReduceAt: number;
   reducedStakeFactor: number;
   defaultStake: number;
+  /** Skip entries after N consecutive losses (cooldown). */
+  consecutiveLossSkipAt: number;
+  /** Max consecutive skip rounds after skipAt before emergency-only entry. */
+  consecutiveLossMaxSkip: number;
+  /** Extra threshold added per loss above skipAt (capped). */
+  lossStreakThresholdEscalation: number;
 }
 
 export interface StrategyDecision {
