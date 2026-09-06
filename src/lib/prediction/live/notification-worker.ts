@@ -174,7 +174,9 @@ export class OutboxDispatcher {
               return "dead" as const;
             }
 
-            // For predictions: if target already started or crashed, expire rather than late-send
+            // For predictions: only expire if target already CRASHED (past is fully over).
+            // Do NOT drop on "started" — poll recovery often delivers after N+1 has begun;
+            // operators still need the signal, and WIN/LOSS otherwise arrives with no prior alert.
             if (row.type === "prediction") {
               try {
                 const meta = (row.metadata ?? {}) as Record<string, unknown>;
@@ -183,27 +185,22 @@ export class OutboxDispatcher {
                   (meta.target_game_id as string) ||
                   null;
                 if (targetGameId) {
-                  // Check live_round_state for began_at AND crashed_at
                   const live = await sql<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
                     SELECT began_at, crashed_at FROM live_round_state
                     WHERE game_id = ${targetGameId} LIMIT 1
                   `.catch(() => [] as { began_at: string | Date | null; crashed_at: string | Date | null }[]);
 
+                  // Soft note only if already started (still deliver)
                   if (live[0]?.began_at) {
                     const began = new Date(live[0].began_at).getTime();
                     if (Number.isFinite(began) && began <= this.now()) {
-                      await sql`
-                        update notification_outbox
-                        set status = 'dead_letter',
-                            last_error = 'target_already_started_before_delivery'
-                        where id = ${row.id}
-                      `;
-                      this.stats.dead += 1;
-                      logger.warn(
+                      logger.info(
                         { component: "outbox-dispatcher", notificationId: row.notification_id, targetGameId },
-                        "target started before delivery — expiring signal",
+                        "target already started — delivering late signal anyway",
                       );
-                      return "dead" as const;
+                      if (!String(row.content).includes("(late)")) {
+                        row.content = `${row.content}\n\n(late: target already started)`;
+                      }
                     }
                   }
 
