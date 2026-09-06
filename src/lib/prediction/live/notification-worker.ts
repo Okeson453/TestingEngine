@@ -297,6 +297,64 @@ export class OutboxDispatcher {
                   outboxDeliveryMs.observe(Math.max(0, t0 - claimedAt));
                 }
               } catch { /* metrics optional */ }
+
+              // Phase 19 — record lead times when target_round_started_at is known
+              try {
+                const meta = (row.metadata ?? {}) as Record<string, unknown>;
+                const targetGameId =
+                  (meta.targetGameId as string) ||
+                  (meta.target_game_id as string) ||
+                  null;
+                if (targetGameId) {
+                  const predRows = await sql<{
+                    requested_at: string | Date | null;
+                    target_round_started_at: string | Date | null;
+                  }>`
+                    SELECT requested_at, target_round_started_at
+                    FROM pending_predictions
+                    WHERE target_game_id = ${targetGameId}
+                    ORDER BY requested_at DESC
+                    LIMIT 1
+                  `.catch(() => [] as { requested_at: string | Date | null; target_round_started_at: string | Date | null }[]);
+                  let startedAt: string | Date | null =
+                    predRows[0]?.target_round_started_at ?? null;
+                  const generatedAt: string | Date | null =
+                    predRows[0]?.requested_at ?? null;
+                  if (!startedAt) {
+                    const live = await sql<{ began_at: string | Date | null }>`
+                      SELECT began_at FROM live_round_state
+                      WHERE game_id = ${targetGameId} LIMIT 1
+                    `.catch(() => [] as { began_at: string | Date | null }[]);
+                    startedAt = live[0]?.began_at ?? null;
+                  }
+                  if (startedAt && generatedAt) {
+                    const { recordLeadTimes } = await import(
+                      "@/lib/observability/metrics/lifecycle-metrics"
+                    );
+                    const lt = recordLeadTimes({
+                      predictionGeneratedAt: generatedAt,
+                      notificationSentAt: acceptedAt,
+                      nextRoundStartAt: startedAt,
+                    });
+                    logger.info(
+                      {
+                        component: "timing",
+                        path: "lead_time",
+                        targetGameId,
+                        predictionLeadMs: lt.predictionLeadMs,
+                        notificationLeadMs: lt.notificationLeadMs,
+                        stale: lt.stale,
+                      },
+                      lt.stale
+                        ? "stale signal: notification after target start"
+                        : "lead times recorded",
+                    );
+                  }
+                }
+              } catch {
+                /* soft — lead time must never break delivery */
+              }
+
               return "delivered" as const;
             }
             // Deadline-aware retry: if remaining budget too small for another attempt, dead-letter
