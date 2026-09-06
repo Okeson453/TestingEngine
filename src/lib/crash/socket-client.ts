@@ -354,11 +354,16 @@ export class BcGameSocketClient {
       lastError: "WAF blocked connection",
       lastDisconnectedAt: new Date().toISOString(),
     });
+    // Exponential backoff for repeated WAF blocks (cap 5 minutes)
+    const backoffMs = Math.min(
+      WAF_BACKOFF_MS * Math.pow(2, Math.min(this.wafBlockCount - 1, 4)),
+      5 * 60 * 1000,
+    );
     logger.error(
       {
         component: "BcGameSocketClient",
         wafBlockCount: this.wafBlockCount,
-        backoffMs: WAF_BACKOFF_MS,
+        backoffMs,
       },
       "WAF blocked connection — backing off then probing recovery",
     );
@@ -376,7 +381,7 @@ export class BcGameSocketClient {
         this.updateState({ status: "stopped", lastError: null });
         void this.connect();
       }
-    }, WAF_BACKOFF_MS);
+    }, backoffMs);
   }
 
   private scheduleReconnect(): void {
