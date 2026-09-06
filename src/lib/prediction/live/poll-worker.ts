@@ -38,6 +38,7 @@ import {
   validateBatchMs,
   predictionHandoffMs,
 } from "@/lib/observability/performance/latency";
+import { isEdgeFresh } from "@/lib/prediction/live/edge-ingest";
 
 const logger = getLogger("poll-worker");
 
@@ -331,6 +332,22 @@ export class PollWorker {
       );
       return false;
     }
+
+    // Browser-edge is fresher than poll — defer N+1 to avoid duplicate/cascade
+    try {
+      const edge = await isEdgeFresh(sql);
+      if (edge.fresh) {
+        logger.debug(
+          {
+            component: "poll-worker",
+            edgeAgeMs: edge.ageMs,
+            lastEdgeGameId: edge.lastGameId,
+          },
+          "edge feed fresh — defer poll prediction",
+        );
+        return false;
+      }
+    } catch { /* soft */ }
 
     let targetGameId: string;
     try {
