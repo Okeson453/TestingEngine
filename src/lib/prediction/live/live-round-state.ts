@@ -30,7 +30,7 @@ export type LiveLifecycle =
   | "RECONCILING"
   | "FAILED";
 
-export type LiveSource = "socket" | "poll" | "history" | "unknown";
+export type LiveSource = "socket" | "poll" | "history" | "browser-edge" | "unknown";
 
 export interface LiveRoundRow {
   gameId: string;
