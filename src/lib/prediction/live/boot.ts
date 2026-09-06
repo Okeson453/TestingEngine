@@ -231,6 +231,14 @@ async function writeWorkerHealth(sql: Sql, cycle: number): Promise<void> {
     /* soft */
   }
 
+  // Phase 14 — sample pool pressure; log if PG_POOL_MAX should rise
+  try {
+    const { logPoolSizingAdvice } = await import("@/lib/db/pool-sizing");
+    logPoolSizingAdvice();
+  } catch {
+    /* soft */
+  }
+
   // Phase 18 — log lifecycle metrics snapshot periodically
   if (cycle % 6 === 0) {
     try {
