@@ -309,6 +309,21 @@ export async function onGameStart(
   evt: GameStartEvent,
   deps: PredictorDeps = {},
 ): Promise<OnGameStartResult> {
+  // Phase 15 — production Socket.IO path must NOT call onGameStart for predictions.
+  // Canonical path is ED → onGameEnd → onGameEndPredict. Retained for tests / recovery.
+  if (process.env.NODE_ENV === "production" && process.env.ALLOW_LEGACY_ON_GAME_START !== "1") {
+    const isTest = process.env.VITEST || process.env.NODE_TEST_CONTEXT || process.env.ALLOW_LEGACY_ON_GAME_START;
+    if (!isTest) {
+      logger.warn(
+        {
+          component: "live-predictor",
+          targetGameId: evt.gameId,
+          deprecation: "onGameStart",
+        },
+        "onGameStart called in production without ALLOW_LEGACY_ON_GAME_START — prefer onGameEndPredict",
+      );
+    }
+  }
   const getSqlFn = deps.getSqlFn ?? getSql;
   const predictFn = deps.predictFn ?? defaultPredictFn;
   const getChatIds = deps.getChatIds ?? getConfiguredChatIds;
