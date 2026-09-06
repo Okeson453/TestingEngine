@@ -1126,4 +1126,11 @@ e === true;
       predictionGeneratedAt,
       temporalValidity: "TEMPORALLY_UNVERIFIED",
     };
+  } catch (histErr) {
+    logger.error(
+      { targetGameId, error: String(histErr) },
+      "onGameEndPredict history/predict path failed",
+    );
+    return { predictionId: null, targetGameId, kind: "error" };
   }
+}
