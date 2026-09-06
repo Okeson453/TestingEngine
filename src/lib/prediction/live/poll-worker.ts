@@ -333,26 +333,64 @@ export class PollWorker {
 
     // Stream health: if socket is healthy, prefer letting ED drive prediction
     // and only use poll when the stream appears degraded (optional soft gate)
+    // Stream health: only defer if the ED path is actually generating
+    // current predictions. Stale ed bursts (reconnect) refresh lastCrashEd
+    // to "now", fooling the old lag-based check into deferring to a broken
+    // ED path. We now verify prediction freshness directly.
     try {
       const { bcGameSocket } = await import("@/lib/crash/socket-client");
       const st = bcGameSocket.getState();
-      // Use Crash-specific last ED so Dice/Limbo activity cannot suppress
-      // the poll recovery path when the Crash socket is silent.
       const lastCrashEd =
         (typeof bcGameSocket.getLastEdAtForGame === "function"
           ? bcGameSocket.getLastEdAtForGame("crash")
           : null) || st.lastEdAt;
+
       if (st.status === "connected" && lastCrashEd) {
         const lag = Date.now() - new Date(lastCrashEd).getTime();
-        // Was 30s — allowed 2–3 full rounds of missed ED predictions before
-        // recovery. 10s is enough to prefer socket while still recovering
-        // within ~1–2 inter-round gaps when residual skips occur.
         if (lag < 10_000) {
-          logger.debug(
-            { component: "poll-worker", lagMs: lag },
-            "socket healthy — defer prediction to ED path",
+          // NEW: Check if recent predictions actually exist and are current
+          const recentPending = await sql<{ target_game_id: string }>`
+            SELECT target_game_id FROM pending_predictions
+            WHERE status = 'PENDING'
+            ORDER BY requested_at DESC
+            LIMIT 1
+          `.catch(() => [] as { target_game_id: string }[]);
+
+          let shouldDefer = false;
+          if (recentPending.length > 0) {
+            try {
+              const pendingId = BigInt(recentPending[0]!.target_game_id);
+              const newestId = BigInt(newest.gameId);
+              // Defer only if predictions are within 2 rounds of newest
+              if (pendingId >= newestId || newestId - pendingId <= 2n) {
+                shouldDefer = true;
+              }
+            } catch {
+              shouldDefer = true; // Non-numeric IDs: fall back to deferring
+            }
+          } else {
+            // No pending predictions at all — ED path is completely cold.
+            // Do NOT defer; generate immediately.
+            shouldDefer = false;
+          }
+
+          if (shouldDefer) {
+            logger.debug(
+              { component: "poll-worker", lagMs: lag },
+              "socket healthy and predictions current — defer prediction to ED path",
+            );
+            return false;
+          }
+
+          logger.info(
+            {
+              component: "poll-worker",
+              lagMs: lag,
+              newestGameId: newest.gameId,
+              recentPendingId: recentPending[0]?.target_game_id ?? null,
+            },
+            "socket appears healthy but predictions are stale — forcing poll recovery",
           );
-          return false;
         }
       }
     } catch {
