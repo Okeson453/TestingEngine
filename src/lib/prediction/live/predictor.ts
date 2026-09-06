@@ -53,7 +53,7 @@ export const PREDICT_TIMEOUT_MS = Number(process.env.PREDICT_TIMEOUT_MS ?? 80);
  *  older than this, the live round has almost certainly advanced past the
  *  target. Set to 15s to avoid interfering with normal delayed events (6-10s)
  *  while catching truly stale reconnect bursts (15s+). */
-export const MAX_SOURCE_ROUND_AGE_MS = Number(process.env.MAX_SOURCE_ROUND_AGE_MS ?? 15_000);
+export const MAX_SOURCE_ROUND_AGE_MS = Number(process.env.MAX_SOURCE_ROUND_AGE_MS ?? 30_000);
 
 /** DB-level CHECK constraint cap: a bg payload whose `beginTime` is in the
  *  future of the prediction row's `prediction_generated_at` is rejected. */
