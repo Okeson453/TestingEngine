@@ -314,6 +314,24 @@ export class PollWorker {
   ): Promise<boolean> {
     if (!newest.crashedAt) return false;
 
+    // Fix 2: source must be recent enough for a reliable N+1 (poll lag ceiling)
+    const crashedAtDate =
+      newest.crashedAt instanceof Date
+        ? newest.crashedAt
+        : new Date(newest.crashedAt as string);
+    const sourceAgeMs = Date.now() - crashedAtDate.getTime();
+    if (Number.isFinite(sourceAgeMs) && sourceAgeMs > 30_000) {
+      logger.info(
+        {
+          component: "poll-worker",
+          sourceGameId: newest.gameId,
+          sourceAgeMs,
+        },
+        "skip poll prediction: source round too old for reliable N+1",
+      );
+      return false;
+    }
+
     let targetGameId: string;
     try {
       if (typeof newest.gameId !== "string" || !/^\d+$/.test(newest.gameId)) {
