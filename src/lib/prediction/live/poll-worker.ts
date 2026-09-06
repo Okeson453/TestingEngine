@@ -292,9 +292,19 @@ export class PollWorker {
   ): Promise<boolean> {
     if (!newest.crashedAt) return false;
 
+    // Phase 8 — same safe N+1 targeting as onGameEndPredict
     let targetGameId: string;
     try {
-      targetGameId = (BigInt(newest.gameId) + 1n).toString();
+      if (typeof newest.gameId !== "string" || !/^\d+$/.test(newest.gameId)) {
+        logger.warn(
+          { component: "poll-worker", sourceGameId: newest.gameId },
+          "skip poll prediction: source gameId not safe numeric sequence",
+        );
+        return false;
+      }
+      const next = BigInt(newest.gameId) + 1n;
+      if (next <= 0n) return false;
+      targetGameId = next.toString();
     } catch {
       return false;
     }
