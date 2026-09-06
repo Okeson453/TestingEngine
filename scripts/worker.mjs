@@ -6,7 +6,9 @@
  * Ensures:
  *   - Single live boot
  *   - Graceful SIGTERM/SIGINT with pool.end() so PgBouncer slots free
- *   - Uncaught errors are logged but do not leave abandoned DB clients
+ *   - Unrecoverable process-level exceptions terminate the worker (Phase 13)
+ *     so the runtime restarts a clean process rather than leaving a
+ *     potentially corrupted worker alive.
  */
 import { pathToFileURL } from "node:url";
 
@@ -96,13 +98,48 @@ console.log(
   }),
 );
 
+/**
+ * Phase 13 — Correct worker failure handling.
+ * Unrecoverable process-level exceptions must terminate the worker so the
+ * runtime (Railway / container) restarts a clean process. Leaving a
+ * potentially corrupted process alive is worse than a short outage.
+ */
 process.on("uncaughtException", (err) => {
-  console.error("[worker] uncaughtException:", err?.stack ?? err);
-  // Do not exit immediately — let Railway restart policy decide after SIGTERM
-  // from the platform; exiting here can race with in-flight pool clients.
+  console.error(
+    JSON.stringify({
+      level: "error",
+      time: new Date().toISOString(),
+      component: "worker-entry",
+      msg: "uncaughtException — terminating worker",
+      error: String(err?.stack ?? err),
+    }),
+  );
+  // Best-effort resource cleanup; do not await indefinitely.
+  try {
+    void db.endPgPool?.();
+  } catch {
+    /* ignore */
+  }
+  // Non-zero exit so the platform restarts the process.
+  process.exit(1);
 });
+
 process.on("unhandledRejection", (reason) => {
-  console.error("[worker] unhandledRejection:", reason);
+  console.error(
+    JSON.stringify({
+      level: "error",
+      time: new Date().toISOString(),
+      component: "worker-entry",
+      msg: "unhandledRejection — terminating worker",
+      error: String(reason?.stack ?? reason),
+    }),
+  );
+  try {
+    void db.endPgPool?.();
+  } catch {
+    /* ignore */
+  }
+  process.exit(1);
 });
 
 const shutdown = async (signal) => {
