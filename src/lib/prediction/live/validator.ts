@@ -120,7 +120,10 @@ export async function onGameEnd(
         const endDate = new Date(evt.endTime);
         const crashedParam = Number.isNaN(endDate.getTime()) ? new Date() : endDate;
         const beganParam = new Date(crashedParam.getTime() - 3_000);
-        const upserted = await tx<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
+        const upserted = await tx<{
+          began_at: string | Date | null;
+          crashed_at: string | Date | null;
+        }>`
           insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
           values (
             ${evt.gameId}, ${evt.multiplier}, null, null,
@@ -137,7 +140,10 @@ export async function onGameEnd(
         // If conflict (row existed with crashed_at already set), RETURNING is empty.
         // Fall back to a single SELECT only in that case.
         if (upserted.length === 0) {
-          const fetched = await tx<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
+          const fetched = await tx<{
+            began_at: string | Date | null;
+            crashed_at: string | Date | null;
+          }>`
             select began_at, crashed_at
             from crash_rounds
             where game_id = ${evt.gameId}
@@ -205,9 +211,11 @@ export async function onGameEnd(
           ${Number(state.pending!.probability)}, ${Number(state.pending!.confidence)},
           ${evt.multiplier}, ${result}, 'v1',
           ${state.pending!.regime_name},
-          ${state.pending!.requested_at instanceof Date
-            ? state.pending!.requested_at.toISOString()
-            : String(state.pending!.requested_at)},
+          ${
+            state.pending!.requested_at instanceof Date
+              ? state.pending!.requested_at.toISOString()
+              : String(state.pending!.requested_at)
+          },
           ${resolvedAt}
         )
         on conflict on constraint prediction_validations_prediction_id_key do nothing
@@ -279,7 +287,7 @@ export async function onGameEnd(
           correlation_id, event_kind, game_id, payload, received_at, processed_at,
           processor_latency_ms, sla_violated
         ) values (
-          ${(state.pending!.correlation_id ?? randomUUID())}::text, 'ED', ${evt.gameId},
+          ${state.pending!.correlation_id ?? randomUUID()}::text, 'ED', ${evt.gameId},
           ${JSON.stringify({ endTime: evt.endTime, multiplier: evt.multiplier, result })},
           ${evt.receivedAt}::timestamptz, now(),
           ${Math.max(0, now() - new Date(evt.receivedAt).getTime())},
@@ -313,11 +321,12 @@ export async function onGameEnd(
   // Update incremental state for EVERY crash, not just when pending==null
   if (state.pending != null) {
     try {
-      const { globalIncrementalState } = await import(
-        "@/lib/prediction/state/incremental-state-engine"
-      );
+      const { globalIncrementalState } =
+        await import("@/lib/prediction/state/incremental-state-engine");
       globalIncrementalState.update(evt.multiplier);
-    } catch { /* soft */ }
+    } catch {
+      /* soft */
+    }
   }
 
   if (state.pending == null) {
@@ -327,15 +336,24 @@ export async function onGameEnd(
     if (!evt.skipPredict) {
       // No pending row — still update incremental state for this crash, then predict
       try {
-        const { globalIncrementalState } = await import(
-          "@/lib/prediction/state/incremental-state-engine"
-        );
+        const { globalIncrementalState } =
+          await import("@/lib/prediction/state/incremental-state-engine");
         globalIncrementalState.update(evt.multiplier);
-      } catch { /* soft */ }
+      } catch {
+        /* soft */
+      }
       try {
-        const eng = (globalThis as { __acieEngine__?: { observeRound: (r: { roundId: string; crashPoint: number }) => unknown } }).__acieEngine__;
+        const eng = (
+          globalThis as {
+            __acieEngine__?: {
+              observeRound: (r: { roundId: string; crashPoint: number }) => unknown;
+            };
+          }
+        ).__acieEngine__;
         eng?.observeRound({ roundId: evt.gameId, crashPoint: evt.multiplier });
-      } catch { /* soft */ }
+      } catch {
+        /* soft */
+      }
       await triggerNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
     }
     if (state.crashRow && state.crashRow.began_at == null) {
@@ -360,9 +378,7 @@ export async function onGameEnd(
 
   // Phase 11 — prediction resolved for this round
   try {
-    const { markPredictionResolved } = await import(
-      "@/lib/prediction/live/live-round-state"
-    );
+    const { markPredictionResolved } = await import("@/lib/prediction/live/live-round-state");
     await markPredictionResolved(evt.gameId);
   } catch {
     /* soft */
@@ -370,9 +386,7 @@ export async function onGameEnd(
 
   // Phase 18 — ed processing latency
   try {
-    const { edProcessingLatencyMs } = await import(
-      "@/lib/observability/metrics/lifecycle-metrics"
-    );
+    const { edProcessingLatencyMs } = await import("@/lib/observability/metrics/lifecycle-metrics");
     const lat = Math.max(0, now() - new Date(evt.receivedAt).getTime());
     edProcessingLatencyMs.observe(lat);
   } catch {
@@ -384,18 +398,15 @@ export async function onGameEnd(
   // not correctness. The N+1 prediction can proceed without waiting for it.
   const pendingSnapshot = state.pending; // capture for async closure
   try {
-    const { processResolvedPredictionFeedback } = await import(
-      "@/lib/prediction/live/feedback"
-    );
+    const { processResolvedPredictionFeedback } = await import("@/lib/prediction/live/feedback");
     setImmediate(() => {
       if (!pendingSnapshot) return;
       void processResolvedPredictionFeedback({
         predictionId: pendingSnapshot.prediction_id,
         targetGameId: evt.gameId,
         predictedProbability: Number(pendingSnapshot.probability),
-        predictedConfidence: pendingSnapshot.confidence != null
-          ? Number(pendingSnapshot.confidence)
-          : null,
+        predictedConfidence:
+          pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
         targetMultiplier: Number(pendingSnapshot.target_multiplier),
         actualMultiplier: evt.multiplier,
         result,

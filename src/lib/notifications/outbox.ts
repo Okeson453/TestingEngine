@@ -1,13 +1,13 @@
 /**
  * Notification Outbox Pattern Implementation
- * 
+ *
  * Provides durable, asynchronous Telegram notification delivery with:
  * - Idempotency (no duplicate notifications)
  * - Retry with exponential backoff
  * - Dead-letter handling
  * - Delivery latency tracking
  * - Transactional atomicity with prediction persistence
- * 
+ *
  * Specification: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §10
  */
 
@@ -20,17 +20,9 @@ import { randomUUID } from "node:crypto";
 const logger = getLogger("notification-outbox");
 
 // Notification state types
-export type NotificationStatus = 
-  | "pending"
-  | "delivered"
-  | "failed"
-  | "dead_letter";
+export type NotificationStatus = "pending" | "delivered" | "failed" | "dead_letter";
 
-export type NotificationType = 
-  | "prediction"
-  | "validation"
-  | "alert"
-  | "summary";
+export type NotificationType = "prediction" | "validation" | "alert" | "summary";
 
 export interface OutboxNotification {
   id: string;
@@ -73,7 +65,7 @@ export async function createNotification(
   const notificationId = randomUUID();
   const priority = options.priority ?? 0;
   const now = new Date().toISOString();
-  
+
   // Calculate next attempt time based on priority
   const delayMs = options.delayMs ?? (priority >= HIGH_PRIORITY_THRESHOLD ? 0 : 0);
   const nextAttemptAt = delayMs > 0 ? new Date(Date.now() + delayMs).toISOString() : now;
@@ -81,7 +73,7 @@ export async function createNotification(
   // dispatcher will not claim rows past this timestamp.
   const deadlineMs = Number(process.env.TELEGRAM_DEADLINE_MS ?? 5_000);
   const telegramDeadlineAt = new Date(Date.now() + deadlineMs).toISOString();
-  
+
   await sql`
     insert into notification_outbox (
       notification_id, type, content, metadata, status,
@@ -92,12 +84,12 @@ export async function createNotification(
       0, ${nextAttemptAt}, ${now}, ${priority}, ${telegramDeadlineAt}::timestamptz
     )
   `;
-  
+
   logger.debug(
     { component: "NotificationOutbox", notificationId, type: options.type, priority },
-    "Created notification in outbox"
+    "Created notification in outbox",
   );
-  
+
   return notificationId;
 }
 
@@ -108,8 +100,8 @@ export async function createNotification(
 export async function createNotificationWithPrediction(
   sql: Sql,
   predictionId: string,
-  options: Omit<CreateNotificationOptions, 'metadata'> & { 
-    metadata?: Record<string, unknown> & { predictionId?: string }
+  options: Omit<CreateNotificationOptions, "metadata"> & {
+    metadata?: Record<string, unknown> & { predictionId?: string };
   },
 ): Promise<string> {
   // Ensure metadata includes predictionId for correlation
@@ -117,7 +109,7 @@ export async function createNotificationWithPrediction(
     predictionId,
     ...options.metadata,
   };
-  
+
   return createNotification(sql, {
     ...options,
     metadata,
@@ -127,12 +119,9 @@ export async function createNotificationWithPrediction(
 /**
  * Get next batch of notifications to deliver
  */
-export async function getPendingNotifications(
-  sql: Sql,
-  limit = 10,
-): Promise<OutboxNotification[]> {
+export async function getPendingNotifications(sql: Sql, limit = 10): Promise<OutboxNotification[]> {
   const now = new Date().toISOString();
-  
+
   const rows = await sql<OutboxNotification>`
     select id, notification_id, type, content, metadata, status,
            attempt_count, next_attempt_at, last_error, created_at,
@@ -146,8 +135,8 @@ export async function getPendingNotifications(
     limit ${limit}
     for update skip locked
   `;
-  
-  return rows.map(row => ({
+
+  return rows.map((row) => ({
     ...row,
     metadata: row.metadata as Record<string, unknown>,
   }));
@@ -170,10 +159,10 @@ export async function markDelivered(
         next_attempt_at = null
     where notification_id = ${notificationId} and status = 'pending'
   `;
-  
+
   logger.debug(
     { component: "NotificationOutbox", notificationId },
-    "Marked notification as delivered"
+    "Marked notification as delivered",
   );
 }
 
@@ -194,11 +183,11 @@ export async function updateAttempt(
         updated_at = now()
     where notification_id = ${notificationId} and status = 'pending'
   `;
-  
+
   if (error) {
     logger.warn(
       { component: "NotificationOutbox", notificationId, error },
-      "Notification delivery attempt failed"
+      "Notification delivery attempt failed",
     );
   }
 }
@@ -219,10 +208,10 @@ export async function moveToDeadLetter(
         updated_at = now()
     where notification_id = ${notificationId} and status = 'pending'
   `;
-  
+
   logger.error(
     { component: "NotificationOutbox", notificationId, error },
-    "Notification moved to dead letter queue"
+    "Notification moved to dead letter queue",
   );
 }
 
@@ -230,10 +219,9 @@ export async function moveToDeadLetter(
  * Calculate next backoff delay
  */
 function calculateBackoff(attemptCount: number, priority: number): number {
-  const baseBackoff = priority >= HIGH_PRIORITY_THRESHOLD 
-    ? HIGH_PRIORITY_BACKOFF_MS 
-    : BASE_BACKOFF_MS;
-  
+  const baseBackoff =
+    priority >= HIGH_PRIORITY_THRESHOLD ? HIGH_PRIORITY_BACKOFF_MS : BASE_BACKOFF_MS;
+
   const exponentialBackoff = baseBackoff * Math.pow(2, attemptCount - 1);
   return Math.min(exponentialBackoff, MAX_BACKOFF_MS);
 }
@@ -241,65 +229,59 @@ function calculateBackoff(attemptCount: number, priority: number): number {
 /**
  * Deliver a single notification
  */
-async function deliverNotification(
-  sql: Sql,
-  notification: OutboxNotification,
-): Promise<boolean> {
+async function deliverNotification(sql: Sql, notification: OutboxNotification): Promise<boolean> {
   if (!telegramConfigured()) {
     logger.debug(
       { component: "NotificationOutbox", notificationId: notification.notification_id },
-      "Telegram not configured, skipping delivery"
+      "Telegram not configured, skipping delivery",
     );
     await markDelivered(sql, notification.notification_id);
     return true;
   }
-  
+
   try {
     const results = await sendTelegramMessage(notification.content);
-    const allSuccessful = results.every(r => r.ok);
-    
+    const allSuccessful = results.every((r) => r.ok);
+
     if (allSuccessful) {
       await markDelivered(sql, notification.notification_id);
       logger.info(
-        { 
-          component: "NotificationOutbox", 
+        {
+          component: "NotificationOutbox",
           notificationId: notification.notification_id,
-          type: notification.type 
+          type: notification.type,
         },
-        "Notification delivered successfully"
+        "Notification delivered successfully",
       );
       return true;
     } else {
       // Partial failure - consider as failed for retry
       const errorSummary = results
-        .filter(r => !r.ok)
-        .map(r => `${r.chatId || "unknown"}:${r.error || "unknown_error"}`)
+        .filter((r) => !r.ok)
+        .map((r) => `${r.chatId || "unknown"}:${r.error || "unknown_error"}`)
         .join("; ");
-      
+
       throw new Error(`Partial delivery failure: ${errorSummary}`);
     }
   } catch (error) {
     const errorMessage = (error as Error).message;
-    const nextBackoffMs = calculateBackoff(
-      notification.attempt_count + 1,
-      notification.priority
-    );
+    const nextBackoffMs = calculateBackoff(notification.attempt_count + 1, notification.priority);
     const nextAttemptAt = new Date(Date.now() + nextBackoffMs).toISOString();
-    
+
     if (notification.attempt_count + 1 >= MAX_ATTEMPTS) {
       await moveToDeadLetter(sql, notification.notification_id, errorMessage);
       return false;
     } else {
       await updateAttempt(sql, notification.notification_id, errorMessage, nextAttemptAt);
       logger.info(
-        { 
-          component: "NotificationOutbox", 
+        {
+          component: "NotificationOutbox",
           notificationId: notification.notification_id,
           attempt: notification.attempt_count + 1,
           nextAttemptAt,
-          backoffMs: nextBackoffMs 
+          backoffMs: nextBackoffMs,
         },
-        "Scheduled notification retry"
+        "Scheduled notification retry",
       );
       return false;
     }
@@ -310,19 +292,22 @@ async function deliverNotification(
  * Process pending notifications in the outbox
  * This is called periodically to deliver notifications
  */
-export async function processOutbox(sql: Sql, batchSize = 10): Promise<{
+export async function processOutbox(
+  sql: Sql,
+  batchSize = 10,
+): Promise<{
   processed: number;
   delivered: number;
   failed: number;
   deadLetter: number;
 }> {
   const result = { processed: 0, delivered: 0, failed: 0, deadLetter: 0 };
-  
+
   const pending = await getPendingNotifications(sql, batchSize);
-  
+
   for (const notification of pending) {
     result.processed++;
-    
+
     try {
       const success = await deliverNotification(sql, notification);
       if (success) {
@@ -333,16 +318,16 @@ export async function processOutbox(sql: Sql, batchSize = 10): Promise<{
     } catch (error) {
       result.failed++;
       logger.error(
-        { 
-          component: "NotificationOutbox", 
+        {
+          component: "NotificationOutbox",
           notificationId: notification.notification_id,
-          error: error as Error 
+          error: error as Error,
         },
-        "Failed to process notification"
+        "Failed to process notification",
       );
     }
   }
-  
+
   return result;
 }
 
@@ -364,7 +349,7 @@ export async function createPredictionNotification(
   },
 ): Promise<string> {
   const content = formatPredictionMessageForOutbox(options);
-  
+
   return createNotificationWithPrediction(sql, options.predictionId, {
     type: "prediction",
     content,
@@ -398,7 +383,7 @@ export async function createValidationNotification(
   },
 ): Promise<string> {
   const content = formatValidationMessageForOutbox(options);
-  
+
   return createNotificationWithPrediction(sql, options.predictionId, {
     type: "validation",
     content,
@@ -427,10 +412,10 @@ function formatPredictionMessageForOutbox(options: {
   generatedAt: string;
 }): string {
   const regimeText = options.regimeName ? ` (${options.regimeName})` : "";
-  const lastRoundText = options.lastRoundMultiplier 
+  const lastRoundText = options.lastRoundMultiplier
     ? `Last round: ${options.lastRoundMultiplier.toFixed(2)}x`
     : "";
-  
+
   return [
     `🎯 NEW PREDICTION${regimeText}`,
     ``,
@@ -442,7 +427,9 @@ function formatPredictionMessageForOutbox(options: {
     ``,
     `Prediction ID: ${options.predictionId}`,
     `Generated: ${options.generatedAt}`,
-  ].filter(Boolean).join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 /**
@@ -459,10 +446,11 @@ function formatValidationMessageForOutbox(options: {
 }): string {
   const resultEmoji = options.result === "WIN" ? "🎉" : "💥";
   const resultText = options.result === "WIN" ? "WIN" : "LOSS";
-  const multiplierText = options.actualMultiplier >= options.targetMultiplier 
-    ? `Actual: ${options.actualMultiplier.toFixed(2)}x`
-    : `Crashed: ${options.actualMultiplier.toFixed(2)}x`;
-  
+  const multiplierText =
+    options.actualMultiplier >= options.targetMultiplier
+      ? `Actual: ${options.actualMultiplier.toFixed(2)}x`
+      : `Crashed: ${options.actualMultiplier.toFixed(2)}x`;
+
   return [
     `${resultEmoji} PREDICTION ${resultText}`,
     ``,
@@ -502,11 +490,11 @@ export async function getOutboxStats(sql: Sql): Promise<{
     from notification_outbox
     group by status
   `;
-  
+
   const stats: Record<string, number> = {};
   let oldestPendingAt: string | null = null;
   let avgDeliveryLatencyMs: number | null = null;
-  
+
   for (const row of rows) {
     stats[row.status] = row.count;
     if (row.status === "pending" && row.oldest_pending) {
@@ -516,7 +504,7 @@ export async function getOutboxStats(sql: Sql): Promise<{
       avgDeliveryLatencyMs = Math.round(row.avg_latency);
     }
   }
-  
+
   return {
     pending: stats.pending ?? 0,
     delivered: stats.delivered ?? 0,
@@ -543,16 +531,11 @@ export async function getDeadLetterNotifications(
     order by created_at desc
     limit ${limit}
   `;
-  
-  return rows.map(row => ({
+
+  return rows.map((row) => ({
     ...row,
     metadata: row.metadata as Record<string, unknown>,
   }));
 }
 
-export {
-  MAX_ATTEMPTS,
-  BASE_BACKOFF_MS,
-  MAX_BACKOFF_MS,
-  HIGH_PRIORITY_THRESHOLD,
-};
+export { MAX_ATTEMPTS, BASE_BACKOFF_MS, MAX_BACKOFF_MS, HIGH_PRIORITY_THRESHOLD };
