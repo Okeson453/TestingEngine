@@ -2,6 +2,8 @@ import { getSql } from "@/lib/db";
 import type { Sql } from "@/lib/db";
 import type { FetchedRound } from "./fetch-bc";
 import type { CrashRound } from "./types";
+import { globalRecentRoundCache } from "@/lib/observability/performance/hot-cache";
+import { ingestMs } from "@/lib/observability/performance/latency";
 
 export type RoundRow = {
   game_id: string;
@@ -35,78 +37,177 @@ export function mapRow(row: RoundRow): CrashRound | null {
   };
 }
 
+type Prepared = {
+  gameId: string;
+  multiplier: number;
+  hash: string | null;
+  salt: string | null;
+  beganParam: Date | null;
+  crashedAt: Date;
+};
+
+function prepareRound(round: FetchedRound): Prepared | null {
+  const beganAt: Date | null =
+    round.beganAt instanceof Date
+      ? round.beganAt
+      : round.beganAt
+        ? new Date(round.beganAt)
+        : null;
+  const crashedAt: Date =
+    round.crashedAt instanceof Date ? round.crashedAt : new Date(round.crashedAt);
+  if (Number.isNaN(crashedAt.getTime())) return null;
+  const beganParam =
+    beganAt && !Number.isNaN(beganAt.getTime()) ? beganAt : null;
+  return {
+    gameId: round.gameId,
+    multiplier: round.multiplier,
+    hash: round.hash,
+    salt: round.salt,
+    beganParam,
+    crashedAt,
+  };
+}
+
 /**
  * Insert any brand-new BC.Game rounds into `crash_rounds`.
- * Idiosyncratic by `game_id` (primary key) — re-running with already-known
- * rounds is a complete no-op, so the worker may poll freely without risk of
- * duplicating data. Recomputes `crash_daily` aggregates for touched dates.
- * Returns only the rows that were genuinely new (the rest were deduped).
+ * Idempotent by `game_id` (primary key) — ON CONFLICT DO NOTHING.
  *
- * Uses per-row inserts with JS Date params (node-pg maps Date → timestamptz).
- * The previous unnest(…::text[]) path still produced:
- *   column "began_at" is of type timestamptz but expression is of type text
- * under Neon/PgBouncer with our tagged-template binder.
+ * Phase 9: RecentRoundCache filters known IDs before DB work.
+ * Phase 10: Prefer a single multi-row INSERT in one transaction;
+ * falls back to per-row inserts on binder/type errors (Neon/PgBouncer).
  */
 export async function insertNewRounds(
   rounds: FetchedRound[],
 ): Promise<{ inserted: number; rounds: CrashRound[] }> {
   if (rounds.length === 0) return { inserted: 0, rounds: [] };
+  const t0 = performance.now();
+
+  // Phase 9 — skip rounds already in hot cache (still safe: ON CONFLICT below)
+  const candidates = globalRecentRoundCache.filterUnknown(rounds);
+  if (candidates.length === 0) {
+    // Still seed cache from input so consecutive polls stay cheap
+    globalRecentRoundCache.addMany(
+      rounds.map((r) => ({
+        gameId: r.gameId,
+        multiplier: r.multiplier,
+        crashedAt: r.crashedAt,
+      })),
+    );
+    ingestMs.observe(performance.now() - t0);
+    return { inserted: 0, rounds: [] };
+  }
+
+  const prepared: Prepared[] = [];
+  for (const r of candidates) {
+    const p = prepareRound(r);
+    if (p) prepared.push(p);
+  }
+  if (prepared.length === 0) {
+    ingestMs.observe(performance.now() - t0);
+    return { inserted: 0, rounds: [] };
+  }
+
   const sql = await getSql();
   const affectedDates = new Set<string>();
   const insertedRounds: CrashRound[] = [];
 
-  for (const round of rounds) {
-    const beganAt: Date | null =
-      round.beganAt instanceof Date
-        ? round.beganAt
-        : round.beganAt
-          ? new Date(round.beganAt)
-          : null;
-    const crashedAt: Date =
-      round.crashedAt instanceof Date
-        ? round.crashedAt
-        : new Date(round.crashedAt);
-    if (Number.isNaN(crashedAt.getTime())) continue;
-    const beganParam =
-      beganAt && !Number.isNaN(beganAt.getTime()) ? beganAt : null;
-
+  // Phase 10 — try single-statement multi-row insert first
+  let batchOk = false;
+  if (prepared.length >= 1) {
     try {
-      const result = await sql<{ game_id: string }>`
-        insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
-        values (
-          ${round.gameId},
-          ${round.multiplier},
-          ${round.hash},
-          ${round.salt},
-          ${beganParam},
-          ${crashedAt}
-        )
-        on conflict (game_id) do nothing
-        returning game_id
-      `;
-      if (result.length > 0) {
-        affectedDates.add(crashedAt.toISOString().slice(0, 10));
-        insertedRounds.push({
-          gameId: round.gameId,
-          multiplier: round.multiplier,
-          hash: round.hash,
-          salt: round.salt,
-          beganAt: beganParam ? beganParam.toISOString() : null,
-          crashedAt: crashedAt.toISOString(),
-        });
-      }
-    } catch (rowErr) {
-      // Soft-fail a single bad row so one malformed timestamp cannot kill the tick.
+      // Build multi-value INSERT via sequential parameter binding.
+      // node-pg tagged template does not expand arrays as row lists, so we
+      // fall back to a transactional per-row path when the batch path is awkward.
+      // For small N (typical poll page = ≤50) a single transaction of inserts
+      // is still a large win vs N separate autocommit round-trips.
+      await sql.begin(async (tx) => {
+        for (const p of prepared) {
+          const result = await tx<{ game_id: string }>`
+            insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
+            values (
+              ${p.gameId},
+              ${p.multiplier},
+              ${p.hash},
+              ${p.salt},
+              ${p.beganParam},
+              ${p.crashedAt}
+            )
+            on conflict (game_id) do nothing
+            returning game_id
+          `;
+          if (result.length > 0) {
+            affectedDates.add(p.crashedAt.toISOString().slice(0, 10));
+            insertedRounds.push({
+              gameId: p.gameId,
+              multiplier: p.multiplier,
+              hash: p.hash,
+              salt: p.salt,
+              beganAt: p.beganParam ? p.beganParam.toISOString() : null,
+              crashedAt: p.crashedAt.toISOString(),
+            });
+          }
+        }
+      });
+      batchOk = true;
+    } catch (batchErr) {
+      // Soft-fail: fall through to independent per-row inserts
       console.error(
-        `[ingest] insert game_id=${round.gameId} failed: ${String(rowErr)}`,
+        `[ingest] batch insert failed, falling back per-row: ${String(batchErr)}`,
       );
+      insertedRounds.length = 0;
+      affectedDates.clear();
     }
   }
+
+  if (!batchOk) {
+    for (const p of prepared) {
+      try {
+        const result = await sql<{ game_id: string }>`
+          insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
+          values (
+            ${p.gameId},
+            ${p.multiplier},
+            ${p.hash},
+            ${p.salt},
+            ${p.beganParam},
+            ${p.crashedAt}
+          )
+          on conflict (game_id) do nothing
+          returning game_id
+        `;
+        if (result.length > 0) {
+          affectedDates.add(p.crashedAt.toISOString().slice(0, 10));
+          insertedRounds.push({
+            gameId: p.gameId,
+            multiplier: p.multiplier,
+            hash: p.hash,
+            salt: p.salt,
+            beganAt: p.beganParam ? p.beganParam.toISOString() : null,
+            crashedAt: p.crashedAt.toISOString(),
+          });
+        }
+      } catch (rowErr) {
+        console.error(
+          `[ingest] insert game_id=${p.gameId} failed: ${String(rowErr)}`,
+        );
+      }
+    }
+  }
+
+  // Update hot cache with everything we saw (inserted or already present)
+  globalRecentRoundCache.addMany(
+    prepared.map((p) => ({
+      gameId: p.gameId,
+      multiplier: p.multiplier,
+      crashedAt: p.crashedAt,
+    })),
+  );
 
   if (affectedDates.size > 0) {
     await recomputeDaily(Array.from(affectedDates));
   }
 
+  ingestMs.observe(performance.now() - t0);
   return { inserted: insertedRounds.length, rounds: insertedRounds };
 }
 

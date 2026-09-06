@@ -1,6 +1,7 @@
 /**
  * Hot-path latency recorders.
  * Spec: TestingEngine_Comprehensive_Diagnosis §13 / latency budget.
+ * Phase 1 expansion — structured measurements for the full poll → signal path.
  *
  * Lightweight — no prom-client dependency on the prediction path.
  * Values are kept in a ring buffer for operator sampling via getRecentSamples().
@@ -22,8 +23,14 @@ function makeRecorder(name: string, maxSamples = 200) {
     percentile(p: number): number | null {
       if (samples.length === 0) return null;
       const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
-      const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+      const idx = Math.min(
+        sorted.length - 1,
+        Math.max(0, Math.ceil((p / 100) * sorted.length) - 1),
+      );
       return sorted[idx]!;
+    },
+    count(): number {
+      return samples.length;
     },
   };
 }
@@ -36,6 +43,14 @@ export const outboxDeliveryMs = makeRecorder("outboxDelivery");
 export const poolWaitMs = makeRecorder("poolWait");
 export const interRoundGapMs = makeRecorder("interRoundGap");
 export const deliveryMissCount = makeRecorder("deliveryMiss");
+
+/** Phase 1 — baseline expansion */
+export const httpFetchMs = makeRecorder("httpFetch");
+export const ingestMs = makeRecorder("ingest");
+export const validateBatchMs = makeRecorder("validateBatch");
+export const pollTickMs = makeRecorder("pollTick");
+export const roundDetectMs = makeRecorder("roundDetect");
+export const predictionHandoffMs = makeRecorder("predictionHandoff");
 
 /** Alias for ACIE heavy path — real histogram may live in metrics-acie if prom is wired */
 export const acieHeavyEvidenceLatencyMs = makeRecorder("acieHeavyEvidence");
