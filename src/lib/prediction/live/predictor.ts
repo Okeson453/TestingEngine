@@ -687,8 +687,7 @@ eryMode === true;
   try {
     let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
 
-    const [thrRows, residualRows, gapRo
-ws, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
+    const [thrRows, residualRows, gapRows, skewRows, existingPending, liveLifecycle, alreadyCrashedRows] =
       await Promise.all([
         sql<{ value: string }>`
           SELECT value FROM worker_state WHERE key = 'effective_skip_below_ms' LIMIT 1
