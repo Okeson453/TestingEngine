@@ -124,15 +124,63 @@ async function onEdEvent(payload: unknown): Promise<void> {
     return;
   }
   const receivedAt = new Date().toISOString();
+  const corr = randomUUID();
   try {
-    // Explicit live lifecycle end (Diagnosis §6) — keep synchronous/fast
+    // Phase 10 — Durable handoff BEFORE considering the event accepted.
+    // Persist outcome + idempotency marker so a process crash after Socket.IO
+    // receipt cannot permanently erase the ed event from the system.
+    const sql = await getSql();
+    const endIso = endTime ?? receivedAt;
+
+    // 1. Durable crash outcome (idempotent UPSERT)
+    try {
+      const endDate = new Date(endIso);
+      const crashedParam = Number.isNaN(endDate.getTime()) ? new Date() : endDate;
+      const beganParam = new Date(crashedParam.getTime() - 3_000);
+      await sql`
+        INSERT INTO crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
+        VALUES (
+          ${gameId}, ${multiplier}, null, null,
+          ${beganParam},
+          ${crashedParam}
+        )
+        ON CONFLICT (game_id) DO UPDATE
+          SET crashed_at = COALESCE(crash_rounds.crashed_at, excluded.crashed_at),
+              multiplier = COALESCE(crash_rounds.multiplier, excluded.multiplier)
+      `;
+    } catch (persistErr) {
+      logger.error(
+        { event: "ed", gameId, error: String(persistErr) },
+        "durable ed crash_rounds handoff failed",
+      );
+      // Still attempt lifecycle + processing; poll worker is the safety net
+    }
+
+    // 2. Durable receipt marker in live_event_log (idempotent)
+    try {
+      await sql`
+        INSERT INTO live_event_log (
+          correlation_id, event_kind, game_id, payload, received_at, processed_at,
+          processor_latency_ms, sla_violated
+        ) VALUES (
+          ${corr}::text, 'ED_RECEIVED', ${gameId},
+          ${JSON.stringify({ endTime: endIso, multiplier, source: "socket" })},
+          ${receivedAt}::timestamptz, now(), 0, false
+        )
+        ON CONFLICT DO NOTHING
+      `;
+    } catch {
+      /* soft — table may lack unique constraint on ED_RECEIVED */
+    }
+
+    // 3. Explicit live lifecycle end (Diagnosis §6)
     try {
       const { markLiveRoundEnded } = await import(
         "@/lib/prediction/live/live-round-state"
       );
       await markLiveRoundEnded(
         gameId,
-        endTime ?? receivedAt,
+        endIso,
         multiplier,
         undefined,
         "socket",
@@ -144,26 +192,24 @@ async function onEdEvent(payload: unknown): Promise<void> {
       );
     }
 
-    // Offload validate+predict to the next microtask so the Socket.IO
-    // event loop is not blocked by DB transactions / model inference.
-    // Errors are still captured; ordering vs subsequent events is preserved
-    // by the sequential nature of the Node event loop.
+    // 4. Async validate+predict — durable state already written above.
+    // Ordering vs subsequent events preserved by Node event loop.
     setImmediate(() => {
       void (async () => {
         try {
           const result = await onGameEnd({
             gameId,
-            endTime: endTime ?? receivedAt,
+            endTime: endIso,
             multiplier,
             receivedAt,
           });
           logger.info(
-            { event: "ed", gameId, kind: result.kind },
+            { event: "ed", gameId, kind: result.kind, correlationId: corr },
             `ed processed (${result.kind})`,
           );
         } catch (e) {
           logger.error(
-            { event: "ed", gameId, error: String(e) },
+            { event: "ed", gameId, error: String(e), correlationId: corr },
             "ed handler threw (async)",
           );
         }

@@ -133,33 +133,56 @@ async function persistIncrementalState(sql: Sql): Promise<void> {
   }
 }
 
+/**
+ * Phase 4 / 12 — Restore adaptive incremental state from real Crash observations.
+ * Never fabricate crash points (no Array(n).fill(1.5)).
+ * Prefer recent multipliers from crash_rounds; fall back to cold-start if insufficient.
+ */
 async function restoreIncrementalState(sql: Sql): Promise<void> {
   try {
     const { globalIncrementalState } = await import(
       "@/lib/prediction/state/incremental-state-engine"
     );
-    const rows = await sql<{ value: string }>`
-      SELECT value FROM worker_state WHERE key = 'incremental_state' LIMIT 1
+    // Authoritative history: last N real crash multipliers (chronological)
+    const history = await sql<{ multiplier: string | number }>`
+      SELECT multiplier
+      FROM crash_rounds
+      WHERE crashed_at IS NOT NULL
+        AND multiplier IS NOT NULL
+      ORDER BY crashed_at DESC, game_id DESC
+      LIMIT 500
     `;
-    if (rows[0]?.value) {
-      const state = JSON.parse(rows[0].value) as Record<string, unknown>;
-      // Only restore if count > 0 and state looks valid
-      if (state && typeof state.count === "number" && state.count > 0) {
-        globalIncrementalState.seed(
-          // This is a partial restore; full history is in crash_rounds
-          // We just need to warm the running state
-          Array(state.count).fill(1.5) // Placeholder - real seed would be better
-        );
-        logger.info(
-          { component: "live-boot", count: state.count },
-          "Incremental state restored from DB",
-        );
-      }
+    const points = history
+      .map((r) => Number(r.multiplier))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .reverse();
+
+    if (points.length >= 5) {
+      globalIncrementalState.seed(points);
+      logger.info(
+        {
+          component: "live-boot",
+          count: points.length,
+          source: "crash_rounds",
+        },
+        "Incremental state restored from real crash_rounds history",
+      );
+      return;
     }
+
+    // Insufficient history — controlled cold start (do not fabricate values)
+    logger.warn(
+      {
+        component: "live-boot",
+        available: points.length,
+        reason: "insufficient_history",
+      },
+      "Incremental state cold-start: insufficient crash_rounds history (no fabricated points)",
+    );
   } catch (e) {
     logger.debug(
       { component: "live-boot", error: String(e) },
-      "incremental state restore failed (soft)",
+      "incremental state restore failed (soft) — continuing cold",
     );
   }
 }
