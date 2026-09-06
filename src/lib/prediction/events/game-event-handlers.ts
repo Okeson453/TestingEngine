@@ -202,6 +202,7 @@ async function onEdEvent(payload: unknown): Promise<void> {
             endTime: endIso,
             multiplier,
             receivedAt,
+            skipPredict: false, // Explicit: always trigger N+1 after ED validation
           });
           logger.info(
             { event: "ed", gameId, kind: result.kind, correlationId: corr },
