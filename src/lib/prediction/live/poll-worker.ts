@@ -295,6 +295,8 @@ export class PollWorker {
       }
     } catch (e) {
       result.error = String(e);
+      const msg = String(e).toLowerCase();
+      // Timeouts / 403s are often transient; still count but don't explode.
       this.consecutiveFailures += 1;
       this.lastError = String(e);
       logger.error(
@@ -303,11 +305,13 @@ export class PollWorker {
           error: String(e),
           consecutiveFailures: this.consecutiveFailures,
           pages: this.pages,
+          transient: msg.includes("timeout") || msg.includes("403") || msg.includes("abort"),
         },
         `poll tick failed: ${String(e)} (failures=${this.consecutiveFailures})`,
       );
     }
     if (result.error == null) {
+      // Decay quickly on success so one good tick clears multi-failure backoff.
       this.consecutiveFailures = 0;
       this.lastError = null;
     }
@@ -560,11 +564,13 @@ export class PollWorker {
 
   private nextIntervalMs(): number {
     const base = POLL_INTERVAL_MS;
+    // Failure backoff: LINEAR + hard cap. Exponential (base*2^n) produced
+    // 2.4–4.8s stalls after 3–4 transient BC.Game timeouts — the operator
+    // "3–4 second pulling" symptom. Cap at 2s so recovery stays inside one
+    // Crash inter-round gap (~3–5s).
     if (this.consecutiveFailures > 0) {
-      const backoff = Math.min(
-        30_000,
-        Math.round(base * Math.pow(2, Math.min(this.consecutiveFailures, 6))),
-      );
+      const n = Math.min(this.consecutiveFailures, 8);
+      const backoff = Math.min(2_000, Math.round(base + n * 250));
       logger.warn(
         {
           component: "poll-worker",
