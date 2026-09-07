@@ -295,18 +295,16 @@ export class BcGameSocketClient {
 
   private subscribeToCrashEvents(): void {
     if (!this.socket) return;
-    // On namespace /g/cm the server expects a bare join (RE report §5/§11).
-    // Keep legacy "crash" room emit only when using root namespace.
+    // Always request Crash room; also emit bare join for /g/cm servers.
     const nsp = process.env.BCGAME_SOCKET_NAMESPACE?.trim() || "/g/cm";
-    if (nsp === "/" || nsp === "") {
-      this.socket.emit("join", "crash");
-    } else {
-      try {
+    try {
+      if (nsp !== "/" && nsp !== "") {
         this.socket.emit("join");
-      } catch {
-        this.socket.emit("join", "crash");
       }
-    }
+    } catch { /* soft */ }
+    try {
+      this.socket.emit("join", "crash");
+    } catch { /* soft */ }
     logger.info(
       { component: "BcGameSocketClient", namespace: nsp },
       "Subscribed to crash game events",
@@ -508,21 +506,9 @@ export class BcGameSocketClient {
     };
     if (event === "ed") {
       updates.lastEdAt = now;
-      // Record Crash-specific ED when payload identifies the crash game.
-      // normalizePayload runs after this; extract gameId opportunistically.
-      try {
-        const p = payload as Record<string, unknown> | null;
-        const gid =
-          (p && (p["gameId"] ?? p["game_id"] ?? p["id"])) != null
-            ? String(p["gameId"] ?? p["game_id"] ?? p["id"])
-            : "crash";
-        this.lastEdAtByGame.set(String(gid), now);
-        // Also always stamp the canonical "crash" key used by poll-worker
-        // when the event is on the crash socket namespace.
-        this.lastEdAtByGame.set("crash", now);
-      } catch {
-        this.lastEdAtByGame.set("crash", now);
-      }
+      // Do NOT stamp lastEdAtByGame("crash") here — non-Crash ed (or empty
+      // payloads) used to refresh the crash key and made poll-worker DEFER
+      // forever while Crash never arrived. Stamp only after normalize below.
     }
     if (event === "bg") updates.lastBgAt = now;
     if (this.state.status === "degraded") updates.status = "connected";
@@ -532,6 +518,12 @@ export class BcGameSocketClient {
       const handlers = this.eventHandlers.get(event as BcGameEvent)!;
       const eventPayload = this.normalizePayload(event, payload);
       if (eventPayload) {
+        // Crash-specific ED health for poll defer (only normalized crash rounds).
+        if (event === "ed" && "gameId" in eventPayload && eventPayload.gameId) {
+          const ts = new Date().toISOString();
+          this.lastEdAtByGame.set(String(eventPayload.gameId), ts);
+          this.lastEdAtByGame.set("crash", ts);
+        }
         for (const handler of handlers) {
           void handler(eventPayload, event as BcGameEvent).catch((error) => {
             this.handleError(error as Error, `handler_${event}`);

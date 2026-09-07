@@ -103,7 +103,7 @@ const WORKER_ID =
   process.env.WORKER_ID ||
   `worker-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
 const LOCK_KEY = "prediction_worker";
-const LOCK_TTL_SECONDS = 30;
+const LOCK_TTL_SECONDS = 10;
 let lockHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 async function acquireWorkerLock(sql: Sql): Promise<boolean> {
@@ -346,18 +346,19 @@ const REQUIRED_TABLES = [
 ] as const;
 
 export async function validateSchema(sql: Sql): Promise<void> {
-  for (const table of REQUIRED_TABLES) {
-    const rows = await sql<{ exists: boolean }>`
-      select exists (
-        select 1 from information_schema.tables
-        where table_schema = 'public' and table_name = ${table}
-      ) as exists
-    `;
-    if (!rows[0]?.exists) {
-      throw new Error(
-        `Required table missing: ${table}. Run migrations before starting the worker.`,
-      );
-    }
+  // Single round-trip instead of 9× sequential information_schema checks.
+  const rows = await sql<{ table_name: string }>`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_name IN ('crash_rounds', 'pending_predictions', 'prediction_validations', 'notification_outbox', 'live_event_log', 'worker_locks', 'worker_state', 'acie_online_state', 'live_round_state')
+  `;
+  const found = new Set(rows.map((r) => r.table_name));
+  const missing = (REQUIRED_TABLES as unknown as string[]).filter((t) => !found.has(t));
+  if (missing.length > 0) {
+    throw new Error(
+      `Required table(s) missing: ${missing.join(", ")}. Run migrations before starting the worker.`,
+    );
   }
 }
 
