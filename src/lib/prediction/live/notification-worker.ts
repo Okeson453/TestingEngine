@@ -26,11 +26,11 @@ const logger = getLogger("outbox-dispatcher");
 /** Tunables (env-overridable for tests). */
 // P2.5: Reduced default from 50ms to 25ms to halve max queue wait time.
 export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 10);
-export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 32);
+export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 8);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
 /** Max concurrent Telegram sends within a claimed batch (P0 / 6.5). */
-export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 8);
+export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 2);
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -480,7 +480,15 @@ export class OutboxDispatcher {
     const firstFailure = results.find((r) => !r.ok);
     // Only true client errors are permanent. 408/425/429 and 5xx retry.
     // 401 often means transient token misread — retry a few times before dead.
+    const errText = String(firstFailure?.error ?? "");
+    // not_configured / network / timeout are operational — never permanent.
+    const isOpsMiss =
+      errText === "not_configured" ||
+      firstFailure?.status === 0 ||
+      errText.startsWith("timeout_") ||
+      errText.includes("network");
     const isPermanent =
+      !isOpsMiss &&
       firstFailure != null &&
       typeof firstFailure.status === "number" &&
       (firstFailure.status === 400 ||

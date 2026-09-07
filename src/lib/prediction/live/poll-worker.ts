@@ -211,7 +211,7 @@ export class PollWorker {
         // Validation for newly inserted rounds — bounded parallelism
         const VALIDATE_CONCURRENCY = Math.max(
           1,
-          Math.min(4, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 2) || 2),
+          Math.min(2, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 1) || 1),
         );
         {
           const valT0 = performance.now();

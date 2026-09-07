@@ -989,11 +989,12 @@ export async function onGameEndPredict(
         const beganMs = new Date(targetBeganAt).getTime();
         const genMs = new Date(timestamp).getTime();
         if (Number.isFinite(beganMs) && Number.isFinite(genMs) && genMs >= beganMs - TEMPORAL_TOLERANCE_MS) {
-          logger.error(
-            { targetGameId, predictionId, targetBeganAt, generatedAt: timestamp },
-            "TEMPORAL INVARIANT VIOLATION: prediction_generated_at >= target_round_started_at",
-          );
-          throw new Error("TEMPORAL_INVARIANT_VIOLATION");
+          // Controlled skip — do not throw (throws were logged as onGameEndPredict failed
+          // and aborted the TX after the model already ran). Poll recovery often lands
+          // after target begin under WAF; surface as too_late instead.
+          const err = new Error("TEMPORAL_INVARIANT_SKIP");
+          (err as Error & { code?: string }).code = "TEMPORAL_INVARIANT_SKIP";
+          throw err;
         }
       }
 
@@ -1139,13 +1140,34 @@ export async function onGameEndPredict(
       remainingBeforeTargetMs: null,
     };
   } catch (e) {
+    const msg = String(e);
+    if (msg.includes("TEMPORAL_INVARIANT_SKIP") || (e as { code?: string })?.code === "TEMPORAL_INVARIANT_SKIP") {
+      logger.warn(
+        {
+          component: "live-predictor",
+          targetGameId,
+          sourceGameId: gameId,
+          recoveryMode,
+        },
+        "prediction skipped — target already started (temporal)",
+      );
+      recordPredictionOutcome(true);
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "too_late",
+        temporalValidity: "TEMPORALLY_INVALID",
+        sourceGameId: gameId,
+        sourceCrashAt: crashedAt,
+      };
+    }
     logger.error(
       {
         component: "live-predictor",
         targetGameId,
         sourceGameId: gameId,
         correlationId,
-        error: String(e),
+        error: msg,
       },
       "onGameEndPredict failed",
     );
