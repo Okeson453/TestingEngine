@@ -25,8 +25,8 @@ const RECONNECT_DELAY_MAX_MS = 30_000;
 const CONNECTION_TIMEOUT_MS = 20_000;
 // Lowered 60s → 15s so intermittent Cloudflare blocks recover inside a few
 // inter-round gaps instead of leaving the process on pure poll for minutes.
-const WAF_BACKOFF_MS = Number(process.env.BCGAME_SOCKET_WAF_BACKOFF_MS ?? 15_000) || 15_000;
-const DEGRADED_AFTER_MS = 45_000; // no ED/BG within this window → DEGRADED
+const WAF_BACKOFF_MS = Number(process.env.BCGAME_SOCKET_WAF_BACKOFF_MS ?? 10_000) || 10_000;
+const DEGRADED_AFTER_MS = Number(process.env.BCGAME_SOCKET_DEGRADED_AFTER_MS ?? 30_000) || 30_000; // no ED/BG → DEGRADED
 
 export type BcGameEvent = "pr" | "bg" | "pg" | "e" | "ed" | "st" | string;
 
@@ -400,7 +400,7 @@ export class BcGameSocketClient {
     // Exponential backoff for repeated WAF blocks (cap 5 minutes)
     const backoffMs = Math.min(
       WAF_BACKOFF_MS * Math.pow(2, Math.min(this.wafBlockCount - 1, 2)),
-      60_000,
+      30_000,
     );
     logger.error(
       {

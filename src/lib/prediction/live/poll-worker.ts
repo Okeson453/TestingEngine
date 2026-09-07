@@ -37,6 +37,9 @@ import {
   pollTickMs,
   validateBatchMs,
   predictionHandoffMs,
+  pollDeferMs,
+  crashEdLagMs,
+  socketHealthCheckMs,
 } from "@/lib/observability/performance/latency";
 import { isEdgeFresh } from "@/lib/prediction/live/edge-ingest";
 
@@ -445,19 +448,34 @@ export class PollWorker {
           }
 
           if (shouldDefer) {
-            logger.debug(
-              { component: "poll-worker", lagMs: lag, deferMs: HEALTHY_DEFER_MS },
+            try {
+              pollDeferMs.observe(lag);
+              crashEdLagMs.observe(lag);
+            } catch { /* soft */ }
+            logger.info(
+              {
+                component: "poll-worker",
+                lagMs: Math.round(lag),
+                deferThresholdMs: HEALTHY_DEFER_MS,
+                socketStatus: st.status,
+                lastCrashEd,
+              },
               "socket healthy and predictions current — defer prediction to ED path",
             );
             return false;
           }
 
+          try {
+            crashEdLagMs.observe(lag);
+          } catch { /* soft */ }
           logger.info(
             {
               component: "poll-worker",
-              lagMs: lag,
+              lagMs: Math.round(lag),
+              deferThresholdMs: HEALTHY_DEFER_MS,
               newestGameId: newest.gameId,
               recentPendingId: recentPending[0]?.target_game_id ?? null,
+              socketStatus: st.status,
             },
             "socket appears healthy but predictions are stale — forcing poll recovery",
           );
