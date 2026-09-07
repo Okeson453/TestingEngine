@@ -44,9 +44,9 @@ export const SLA_LAG_MS = Number(process.env.SLA_LAG_MS ?? 2_000);
  *  Lowered 800->250: prior floor systematically skipped hot-ED predictions when
  *  elapsedSinceEd + gate latency consumed a normal 3-5s inter-round gap,
  *  forcing poll recovery 1-3 rounds later (the observed signal lag). */
-export const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 250);
+export const MIN_REQUIRED_WINDOW_MS = Number(process.env.MIN_REQUIRED_WINDOW_MS ?? 150);
 /** Stronger short-circuit: only abandon when the window is truly gone. */
-export const SKIP_BELOW_MS = Number(process.env.SKIP_BELOW_MS ?? 150);
+export const SKIP_BELOW_MS = Number(process.env.SKIP_BELOW_MS ?? 80);
 /** Hard timeout for PredictionEngine.predict (ms). */
 export const PREDICT_TIMEOUT_MS = Number(process.env.PREDICT_TIMEOUT_MS ?? 80);
 /** Source-event staleness ceiling. If the crash event we're reacting to is
@@ -255,6 +255,31 @@ async function loadPriorRoundsStrict(
   beganAt: string,
   limit: number,
 ): Promise<HistoricalRound[]> {
+  // Hot path: prefer in-memory rolling buffer (zero DB RTT).
+  // Buffer is warmed at boot and appended on every completed ED.
+  try {
+    const {
+      getPriorRoundsSync,
+      isLiveHistoryWarmed,
+      warmLiveHistoryBuffer,
+    } = await import("@/lib/prediction/live/live-history-buffer");
+    if (isLiveHistoryWarmed()) {
+      const fromMem = getPriorRoundsSync(limit, undefined, beganAt);
+      if (fromMem.length >= Math.min(limit, MIN_HISTORY)) {
+        return fromMem;
+      }
+    } else {
+      // One-shot warm on cold path; subsequent calls hit memory.
+      await warmLiveHistoryBuffer(sql, Math.max(limit, 100));
+      const fromMem = getPriorRoundsSync(limit, undefined, beganAt);
+      if (fromMem.length >= Math.min(limit, MIN_HISTORY)) {
+        return fromMem;
+      }
+    }
+  } catch {
+    /* fall through to SQL */
+  }
+
   const rows = await sql<PriorRow>`
     select game_id, multiplier, began_at, crashed_at
     from crash_rounds
@@ -468,7 +493,7 @@ export async function onGameStart(
               slaViolated: false,
               kind: "prediction",
             })},
-            'pending', 2,
+            'pending', 3,
             0, now(), ${deadlineAt}::timestamptz
           )
         `;
@@ -527,6 +552,14 @@ export async function onGameStart(
       ? "prediction persisted; SLA-gate suppressed outbox writes"
       : "prediction generated and persisted for next round",
   );
+
+  if (outboxEnqueued > 0 && !slaViolated) {
+    setImmediate(() => {
+      void import("@/lib/prediction/live/outbox-wake")
+        .then(({ notifyOutbox }) => notifyOutbox())
+        .catch(() => undefined);
+    });
+  }
 
   if (slaViolated) {
     return {
@@ -621,6 +654,20 @@ export async function onGameEndPredict(
   const generatedAt = new Date().toISOString();
   const recoveryMode = deps.recoveryMode === true;
 
+  // Keep the in-memory history buffer current so subsequent predicts are O(1).
+  try {
+    const { appendCompletedRound } = await import(
+      "@/lib/prediction/live/live-history-buffer"
+    );
+    appendCompletedRound({
+      gameId,
+      multiplier,
+      crashedAt,
+    });
+  } catch {
+    /* soft — buffer is best-effort */
+  }
+
   // P0.1: Stale source gate removed for Socket.IO path.
   // BC.Game retransmits ed events on reconnect; Crash rounds last 3-5s,
   // so a 30s gate was absurdly conservative and caused 6-12s signal lag.
@@ -644,8 +691,8 @@ export async function onGameEndPredict(
     }
   }
 
-  const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 150);
-  const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 100);
+  const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 100);
+  const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 80);
   // P1.3: Hoist liveLifecycle outside the try block so the transaction
   // section below can reuse it without re-querying live_round_state.
   let liveLifecycle: Array<{ lifecycle: string | null; began_at: string | Date | null }> = [];
@@ -958,7 +1005,7 @@ export async function onGameEndPredict(
               kind: "prediction",
               recoveryMode,
             })},
-            'pending', 2,
+            'pending', 3,
             0, now(), ${deadlineAt}::timestamptz
           )
         `;
@@ -989,6 +1036,15 @@ export async function onGameEndPredict(
       },
       "prediction generated and persisted for next round",
     );
+
+    // Wake outbox dispatcher immediately (do not wait up to TICK_MS).
+    // setImmediate so the TX is fully committed and any dispatcher
+    // waitForOutboxWake listener is registered before we emit.
+    setImmediate(() => {
+      void import("@/lib/prediction/live/outbox-wake")
+        .then(({ notifyOutbox }) => notifyOutbox())
+        .catch(() => undefined);
+    });
 
     return {
       predictionId,

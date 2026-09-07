@@ -105,6 +105,11 @@ export interface GameEndEvent {
    * Spec: Diagnosis §3 — eliminate poll-batch prediction cascade.
    */
   skipPredict?: boolean;
+  /**
+   * When true, caller already applied globalIncrementalState.update for this
+   * crash (parallel ED path). Skip duplicate state updates.
+   */
+  skipStateUpdate?: boolean;
 }
 
 export type OnGameEndResult =
@@ -363,9 +368,24 @@ export async function onGameEnd(
     return { kind: "bg_arrived_late", targetGameId: evt.gameId };
   }
 
+  // Keep live history buffer current (zero-RTT prior rounds for N+1 predict).
+  try {
+    const { appendCompletedRound } = await import(
+      "@/lib/prediction/live/live-history-buffer"
+    );
+    appendCompletedRound({
+      gameId: evt.gameId,
+      multiplier: evt.multiplier,
+      crashedAt: evt.endTime,
+    });
+  } catch {
+    /* soft */
+  }
+
   // P0.1: Connect Incremental State to Live Data
   // Update incremental state for EVERY crash, not just when pending==null
-  if (state.pending != null) {
+  // (unless caller already updated via parallel ED path)
+  if (!evt.skipStateUpdate && state.pending != null) {
     try {
       globalIncrementalState.update(evt.multiplier);
     } catch {
@@ -379,10 +399,12 @@ export async function onGameEnd(
     // the caller (poll worker) explicitly suppressed cascade.
     if (!evt.skipPredict) {
       // No pending row — still update incremental state for this crash, then predict
-      try {
-        globalIncrementalState.update(evt.multiplier);
-      } catch {
-        /* soft */
+      if (!evt.skipStateUpdate) {
+        try {
+          globalIncrementalState.update(evt.multiplier);
+        } catch {
+          /* soft */
+        }
       }
       try {
         const eng = (
@@ -470,6 +492,13 @@ export async function onGameEnd(
       state.pending.correlation_id,
     );
   }
+
+  // Wake outbox dispatcher for the validation notification row.
+  setImmediate(() => {
+    void import("@/lib/prediction/live/outbox-wake")
+      .then(({ notifyOutbox }) => notifyOutbox())
+      .catch(() => undefined);
+  });
 
   return {
     kind: "resolved",

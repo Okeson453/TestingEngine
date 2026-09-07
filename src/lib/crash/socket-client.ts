@@ -21,7 +21,9 @@ const SOCKET_PATH = process.env.BCGAME_SOCKET_PATH ?? "/socket.io";
 const RECONNECT_DELAY_MS = 1_000;
 const RECONNECT_DELAY_MAX_MS = 30_000;
 const CONNECTION_TIMEOUT_MS = 20_000;
-const WAF_BACKOFF_MS = Number(process.env.BCGAME_SOCKET_WAF_BACKOFF_MS ?? 60_000) || 60_000;
+// Lowered 60s → 15s so intermittent Cloudflare blocks recover inside a few
+// inter-round gaps instead of leaving the process on pure poll for minutes.
+const WAF_BACKOFF_MS = Number(process.env.BCGAME_SOCKET_WAF_BACKOFF_MS ?? 15_000) || 15_000;
 const DEGRADED_AFTER_MS = 45_000; // no ED/BG within this window → DEGRADED
 
 export type BcGameEvent = "bg" | "pg" | "ed" | string;
@@ -331,6 +333,12 @@ export class BcGameSocketClient {
           component: "BcGameSocketClient",
           error: error.message,
           description: (error as Error & { description?: unknown }).description,
+          transport:
+            (this.socket?.io?.engine as { transport?: { name?: string } } | undefined)?.transport
+              ?.name ?? null,
+          url: SOCKET_URL,
+          path: SOCKET_PATH,
+          wafBlockCount: this.wafBlockCount,
         },
         "Socket connect blocked (likely Cloudflare). Poll worker remains primary recovery path.",
       );

@@ -483,6 +483,24 @@ class LiveBoot {
       // Pre-warm the PredictionEngine so the first live prediction avoids
       // constructor + module-resolution cost on the hot path.
       prewarmPredictionEngine();
+
+      // Warm the live rolling history buffer so the first ED predict hits
+      // memory instead of a crash_rounds SQL round-trip.
+      try {
+        const { warmLiveHistoryBuffer } = await import(
+          "@/lib/prediction/live/live-history-buffer"
+        );
+        await warmLiveHistoryBuffer(sql, 200);
+        logger.info(
+          { component: "live-boot" },
+          "live history buffer warmed",
+        );
+      } catch (e) {
+        logger.warn(
+          { component: "live-boot", error: String(e) },
+          "live history buffer warm failed — first predicts may use SQL fallback",
+        );
+      }
     } catch (e) {
       logger.error(
         { component: "live-boot", error: String(e) },
