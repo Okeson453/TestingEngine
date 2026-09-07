@@ -414,7 +414,7 @@ export class PollWorker {
         const lag = Date.now() - new Date(lastCrashEd).getTime();
         // Latency fix: defer window 10s → 2.5s so a missed ED is recovered
         // inside one inter-round gap instead of 2–3 rounds later.
-        const HEALTHY_DEFER_MS = Number(process.env.POLL_HEALTHY_DEFER_MS ?? 2_500);
+        const HEALTHY_DEFER_MS = Number(process.env.POLL_HEALTHY_DEFER_MS ?? 1_500);
         if (lag < HEALTHY_DEFER_MS) {
           const recentPending = await sql<{ target_game_id: string }>`
             SELECT target_game_id FROM pending_predictions

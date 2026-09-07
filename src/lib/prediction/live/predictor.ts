@@ -731,9 +731,14 @@ export async function onGameEndPredict(
         setEffectiveSkipBelowMs,
       } = await import("@/lib/prediction/live/gate-cache");
 
+      // Soft-cap: never let worker_state re-inflate the residual floor above 200ms.
+      // Historical effective_skip_below_ms values of 800–3000ms caused systematic
+      // skipped_late → poll recovery (~2.5–5s lag), which is the dominant
+      // operator-visible delay when Socket.IO is healthy.
       const cachedSkip = getEffectiveSkipBelowMs();
-      if (cachedSkip != null && cachedSkip >= 300 && cachedSkip <= 5_000) {
-        skipThreshold = Math.max(skipThreshold, cachedSkip);
+      if (cachedSkip != null && Number.isFinite(cachedSkip)) {
+        const capped = Math.min(200, Math.max(SKIP_BELOW_MS, cachedSkip));
+        skipThreshold = Math.max(skipThreshold, capped);
       }
 
       // Expose cache values for residual math below via getWorkerValue shim
@@ -766,8 +771,9 @@ export async function onGameEndPredict(
           if (row.key === "effective_skip_below_ms") setEffectiveSkipBelowMs(n);
         }
         const t = getEffectiveSkipBelowMs();
-        if (t != null && t >= 300 && t <= 5_000) {
-          skipThreshold = Math.max(skipThreshold, t);
+        if (t != null && Number.isFinite(t)) {
+          const capped = Math.min(200, Math.max(SKIP_BELOW_MS, t));
+          skipThreshold = Math.max(skipThreshold, capped);
         }
       }
     } catch {
