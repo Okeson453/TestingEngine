@@ -12,6 +12,36 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      - name: Guard against outbox/poll worker stubs
+        run: |
+          set -euo pipefail
+          for f in src/lib/prediction/live/notification-worker.ts src/lib/prediction/live/poll-worker.ts; do
+            lines=$(wc -l < "$f")
+            echo "$f has $lines lines"
+            if [ "$lines" -lt 300 ]; then
+              echo "::error::$f is too short ($lines lines) — likely a stub regression"
+              exit 1
+            fi
+            if grep -qE 'PLACEHOLDER_WILL_BE_REPLACED|SEE_ARTIFACTS|use full file from' "$f"; then
+              echo "::error::$f contains stub marker text"
+              exit 1
+            fi
+            if ! grep -q 'async tickOnce' "$f"; then
+              echo "::error::$f missing tickOnce implementation"
+              exit 1
+            fi
+          done
+          # notification-worker must actually claim and send
+          if ! grep -q 'FOR UPDATE SKIP LOCKED' src/lib/prediction/live/notification-worker.ts; then
+            echo "::error::notification-worker.ts missing FOR UPDATE SKIP LOCKED claim"
+            exit 1
+          fi
+          if ! grep -q 'sendTelegramMessage' src/lib/prediction/live/notification-worker.ts; then
+            echo "::error::notification-worker.ts missing sendTelegramMessage"
+            exit 1
+          fi
+          echo "Worker implementations look real."
       - uses: actions/setup-node@v4
         with:
           node-version: "20"

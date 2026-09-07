@@ -25,7 +25,7 @@ const logger = getLogger("outbox-dispatcher");
 
 /** Tunables (env-overridable for tests). */
 // P2.5: Reduced default from 50ms to 25ms to halve max queue wait time.
-export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 15);
+export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 10);
 export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
@@ -381,6 +381,30 @@ export class OutboxDispatcher {
   /** Recover stale INFLIGHT (legacy status) or stuck pending rows. */
   async recoverStale(): Promise<number> {
     const sql = await this.getSqlFn();
+
+    // Health signal: pending rows older than 5s mean the dispatcher is lagging.
+    try {
+      const backlog = await sql<{ c: number; oldest_ms: number | null }>`
+        SELECT count(*)::int AS c,
+               EXTRACT(EPOCH FROM (now() - min(next_attempt_at))) * 1000 AS oldest_ms
+        FROM notification_outbox
+        WHERE status = 'pending'
+          AND next_attempt_at < now() - interval '5 seconds'
+      `.catch(() => [] as { c: number; oldest_ms: number | null }[]);
+      const row = backlog[0];
+      if (row && row.c > 0) {
+        logger.warn(
+          {
+            component: "outbox-dispatcher",
+            pendingOlderThan5s: row.c,
+            oldestPendingMs: row.oldest_ms != null ? Math.round(Number(row.oldest_ms)) : null,
+          },
+          "outbox backlog: pending rows older than 5s — dispatcher may be stalled",
+        );
+      }
+    } catch {
+      /* soft */
+    }
 
     // Dead-letter overdue prediction rows past telegram deadline (or very old).
     // Re-queueing them only produces permanent failure / noise and never helps.

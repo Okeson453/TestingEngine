@@ -73,3 +73,7 @@ Additional hot-path reductions after runtime review:
 4. **Boot prewarm** — eager-import predictor, validator, feedback, history buffer, outbox-wake, gate-cache.
 
 Previous stack retained: parallel ED, priority 3, history buffer, outbox wake, poll defer 2.5s, TICK 15ms.
+
+## Stub-regression guard (2026-09-07)
+
+Commit `1dd3b08` briefly replaced `notification-worker.ts` / `poll-worker.ts` with no-op stubs, which prevented Telegram delivery (operator-visible ~7s lag). Restored in `c44ae5f`. CI now fails if either file is under 300 lines or contains stub markers.
