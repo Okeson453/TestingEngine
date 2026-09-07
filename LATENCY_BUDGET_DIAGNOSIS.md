@@ -131,3 +131,10 @@ Live Crash data acquisition (Socket.IO ed)
 | Poll recovery | 5–10 s defer era | ≤ ~2.5–3.5 s |
 
 **Validation:** 100 consecutive rounds with socket `connected`; require `prediction_generated_at < target began_at` ≥ 99% and `edToPredictMs` p95 < 500.
+
+## Implementation follow-up (`c675834` + this commit)
+
+- Clock-skew monitor no longer writes `effective_skip_below_ms` above **200**.
+- Boot resets any DB value `> 200` down to **120** and warms gate-cache.
+- Poll healthy-defer default **1500 ms**.
+- Predictor soft-caps residual floor at **200 ms**.

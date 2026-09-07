@@ -504,6 +504,23 @@ class LiveBoot {
       prewarmPredictionEngine();
       await prewarmHotModules();
 
+      // Latency fix: collapse any historically inflated residual floor so the
+      // first live ED is not systematically skipped_late → poll recovery.
+      try {
+        await sql`
+          INSERT INTO worker_state (key, value, updated_at)
+          VALUES ('effective_skip_below_ms', '120', now())
+          ON CONFLICT (key) DO UPDATE
+            SET value = '120', updated_at = now()
+            WHERE worker_state.value::numeric > 200
+        `;
+        const { setEffectiveSkipBelowMs } = await import("@/lib/prediction/live/gate-cache");
+        setEffectiveSkipBelowMs(120);
+        logger.info({ component: "live-boot" }, "reset effective_skip_below_ms ceiling");
+      } catch {
+        /* soft */
+      }
+
       // Warm the live rolling history buffer so the first ED predict hits
       // memory instead of a crash_rounds SQL round-trip.
       try {
