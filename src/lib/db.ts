@@ -85,9 +85,9 @@ function createNeonSql(): Promise<Sql> {
     // P1.2: Warm DB Connections - set min to 1, idle timeout to 30s
     const poolMin = Math.min(
       poolMax,
-      Math.max(0, Number(process.env.PG_POOL_MIN ?? 1) || 1), // Default 1 (was 0)
+      Math.max(1, Number(process.env.PG_POOL_MIN ?? 2) || 2), // Keep ≥1 warm against Neon cold-start
     );
-    const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 30_000) || 30_000; // Default 30s (was 5s)
+    const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 60_000) || 60_000; // Hold warm conns longer on Neon
     // Fail fast on exhaustion instead of hanging the worker loop for 30s.
     const connectionTimeoutMillis =
       Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 8_000) || 8_000;
@@ -100,7 +100,7 @@ function createNeonSql(): Promise<Sql> {
       connectionTimeoutMillis,
       allowExitOnIdle: true,
       keepAlive: true,
-      keepAliveInitialDelayMillis: 10_000,
+      keepAliveInitialDelayMillis: 5_000,
       application_name:
         process.env.PG_APP_NAME ||
         process.env.RAILWAY_SERVICE_NAME ||
@@ -200,6 +200,27 @@ function createNeonSql(): Promise<Sql> {
 export function getPgPool(): import("pg").Pool | null {
   return globalRef.__pgPool__ ?? null;
 }
+
+/**
+ * Borrow a dedicated PoolClient for a critical multi-query path.
+ * Prefer single CTE/round-trip queries; use this only when you must
+ * run several statements without pool checkout between them.
+ */
+export async function withPinnedClient<T>(
+  fn: (client: import("pg").PoolClient) => Promise<T>,
+): Promise<T> {
+  const pool = getPgPool();
+  if (!pool) {
+    throw new Error("withPinnedClient requires Postgres pool (not PGLite)");
+  }
+  const client = await pool.connect();
+  try {
+    return await fn(client);
+  } finally {
+    client.release();
+  }
+}
+
 
 export interface PoolStats {
   totalCount: number;

@@ -26,11 +26,11 @@ const logger = getLogger("outbox-dispatcher");
 /** Tunables (env-overridable for tests). */
 // P2.5: Reduced default from 50ms to 25ms to halve max queue wait time.
 export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 10);
-export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
+export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 32);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
 /** Max concurrent Telegram sends within a claimed batch (P0 / 6.5). */
-export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 6); // P1.4: Changed from 2 to 4
+export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 8);
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -111,30 +111,51 @@ export class OutboxDispatcher {
 
     // Claim batch: SELECT FOR UPDATE SKIP LOCKED → set status=inflight → COMMIT.
     // Exclude rows past telegram_deadline_at so we never deliver "predicts the past".
+    // Single round-trip claim inside one TX (UPDATE…FROM…RETURNING).
+    // At ~800ms Neon RTT, N per-row UPDATEs were costing seconds per tick.
     const claimed = await runInTransaction(sql, async (tx) => {
-      const rows = await tx<OutboxRow>`
-        select id, notification_id, type, content, metadata, status, attempt_count,
-               next_attempt_at, telegram_deadline_at, priority
-        from notification_outbox
-        where status = 'pending'::text
-          and next_attempt_at <= now()
-          and (telegram_deadline_at is null or telegram_deadline_at > now())
-        order by priority desc, next_attempt_at asc, id asc
-        limit ${BATCH_SIZE}
-        for update skip locked
-      `;
-      for (const r of rows) {
-        await tx`
-          update notification_outbox
-          set status = 'inflight',
+      try {
+        return await tx<OutboxRow>`
+          WITH picked AS (
+            SELECT id
+            FROM notification_outbox
+            WHERE status = 'pending'::text
+              AND next_attempt_at <= now()
+              AND (telegram_deadline_at IS NULL OR telegram_deadline_at > now())
+            ORDER BY priority DESC, next_attempt_at ASC, id ASC
+            LIMIT ${BATCH_SIZE}
+            FOR UPDATE SKIP LOCKED
+          )
+          UPDATE notification_outbox n
+          SET status = 'inflight',
               attempt_count = attempt_count + 1
-          where id = ${r.id} and status = 'pending'
+          FROM picked
+          WHERE n.id = picked.id AND n.status = 'pending'
+          RETURNING n.id, n.notification_id, n.type, n.content, n.metadata, n.status,
+                    n.attempt_count, n.next_attempt_at, n.telegram_deadline_at, n.priority
         `;
-        // Keep in-memory attempt_count in sync with the DB increment so
-        // handleFailure does not double-count.
-        r.attempt_count = (r.attempt_count ?? 0) + 1;
+      } catch {
+        const rows = await tx<OutboxRow>`
+          select id, notification_id, type, content, metadata, status, attempt_count,
+                 next_attempt_at, telegram_deadline_at, priority
+          from notification_outbox
+          where status = 'pending'::text
+            and next_attempt_at <= now()
+            and (telegram_deadline_at is null or telegram_deadline_at > now())
+          order by priority desc, next_attempt_at asc, id asc
+          limit ${BATCH_SIZE}
+          for update skip locked
+        `;
+        for (const r of rows) {
+          await tx`
+            update notification_outbox
+            set status = 'inflight', attempt_count = attempt_count + 1
+            where id = ${r.id} and status = 'pending'
+          `;
+          r.attempt_count = (r.attempt_count ?? 0) + 1;
+        }
+        return rows;
       }
-      return rows;
     });
 
     if (claimed.length > 0) {

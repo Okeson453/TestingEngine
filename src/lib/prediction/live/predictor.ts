@@ -255,40 +255,39 @@ async function loadPriorRoundsStrict(
   beganAt: string,
   limit: number,
 ): Promise<HistoricalRound[]> {
-  // Hot path: prefer in-memory rolling buffer (zero DB RTT).
-  // Buffer is warmed at boot and appended on every completed ED.
+  // Hot path: MEMORY ONLY by default. At 800ms–1s Neon RTT, a SQL history
+  // fallback alone is a multi-hundred-ms regression. Buffer is warmed at boot
+  // and appended on every completed ED/poll insert.
   try {
     const {
       getPriorRoundsSync,
       isLiveHistoryWarmed,
       warmLiveHistoryBuffer,
     } = await import("@/lib/prediction/live/live-history-buffer");
-    if (isLiveHistoryWarmed()) {
-      const fromMem = getPriorRoundsSync(limit, undefined, beganAt);
-      if (fromMem.length >= Math.min(limit, MIN_HISTORY)) {
-        return fromMem;
-      }
-    } else {
-      // One-shot warm on cold path; subsequent calls hit memory.
+    if (!isLiveHistoryWarmed()) {
       await warmLiveHistoryBuffer(sql, Math.max(limit, 100));
-      const fromMem = getPriorRoundsSync(limit, undefined, beganAt);
-      if (fromMem.length >= Math.min(limit, MIN_HISTORY)) {
-        return fromMem;
-      }
+    }
+    const fromMem = getPriorRoundsSync(limit, undefined, beganAt);
+    if (fromMem.length > 0) {
+      return fromMem;
     }
   } catch {
-    /* fall through to SQL */
+    /* fall through only if forced */
   }
 
-  const rows = await sql<PriorRow>`
-    select game_id, multiplier, began_at, crashed_at
-    from crash_rounds
-    where crashed_at < ${beganAt}::timestamptz
-      and crashed_at is not null
-    order by crashed_at desc, game_id desc
-    limit ${limit}
-  `;
-  return rows.reverse().map(mapRowToHistorical);
+  // Escape hatch for cold empty buffer / tests — not the steady-state path.
+  if (process.env.FORCE_HISTORY_SQL === "1") {
+    const rows = await sql<PriorRow>`
+      select game_id, multiplier, began_at, crashed_at
+      from crash_rounds
+      where crashed_at < ${beganAt}::timestamptz
+        and crashed_at is not null
+      order by crashed_at desc, game_id desc
+      limit ${limit}
+    `;
+    return rows.reverse().map(mapRowToHistorical);
+  }
+  return [];
 }
 
 export async function onGameStart(
@@ -1074,18 +1073,21 @@ export async function onGameEndPredict(
         `;
       }
 
-      await tx`
-        insert into live_event_log (
-          correlation_id, event_kind, game_id, payload, received_at, processed_at,
-          processor_latency_ms, sla_violated
-        ) values (
-          ${correlationId}::text, 'PREDICT', ${targetGameId},
-          ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode })},
-          ${crashedAt}::timestamptz, now(),
-          ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
-        )
-      `;
+      // live_event_log moved outside TX — not required for correctness;
+      // saves one Neon RTT inside the critical transaction.
     });
+
+    void sql`
+      insert into live_event_log (
+        correlation_id, event_kind, game_id, payload, received_at, processed_at,
+        processor_latency_ms, sla_violated
+      ) values (
+        ${correlationId}::text, 'PREDICT', ${targetGameId},
+        ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode })},
+        ${crashedAt}::timestamptz, now(),
+        ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
+      )
+    `.catch(() => undefined);
 
     logger.info(
       {
