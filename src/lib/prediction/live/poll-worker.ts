@@ -46,7 +46,7 @@ const logger = getLogger("poll-worker");
  *  Lowered 1500→500 so recovery can catch a missed ED within ~1 inter-round
  *  gap. README previously documented PREDICTION_POLL_MS — that name is unused. */
 export const POLL_INTERVAL_MS = Number(
-  process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 500,
+  process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 300,
 );
 export const STALE_PREDICTED_MS = Number(process.env.STUCK_STALE_MS ?? 5 * 60 * 1_000);
 
@@ -66,7 +66,11 @@ export class PollWorker {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
   private getSqlFn: () => Promise<Sql> = getSql;
-  private fetchImpl: (pages: number) => Promise<FetchedRound[]> = fetchCrashHistory;
+  private fetchImpl: (pages: number) => Promise<FetchedRound[]> = (pages) =>
+    fetchCrashHistory(
+      pages,
+      Number(process.env.POLL_FETCH_TIMEOUT_MS ?? process.env.BCGAME_HISTORY_TIMEOUT_MS ?? 2_000) || 2_000,
+    );
   /** Default 1 page (50 rounds) — enough for newest-round recovery; was 2. */
   private pages = Math.max(
     1,
@@ -414,7 +418,7 @@ export class PollWorker {
         const lag = Date.now() - new Date(lastCrashEd).getTime();
         // Latency fix: defer window 10s → 2.5s so a missed ED is recovered
         // inside one inter-round gap instead of 2–3 rounds later.
-        const HEALTHY_DEFER_MS = Number(process.env.POLL_HEALTHY_DEFER_MS ?? 1_500);
+        const HEALTHY_DEFER_MS = Number(process.env.POLL_HEALTHY_DEFER_MS ?? 800);
         if (lag < HEALTHY_DEFER_MS) {
           const recentPending = await sql<{ target_game_id: string }>`
             SELECT target_game_id FROM pending_predictions
@@ -505,6 +509,7 @@ export class PollWorker {
 
   private async runOneTick(): Promise<void> {
     if (!this.running) return;
+    const tickStarted = performance.now();
     try {
       await this.tickOnce();
     } catch (e) {
@@ -513,8 +518,12 @@ export class PollWorker {
         "tick error — rescheduling (worker stays online)",
       );
     }
-    // Always reschedule so a single DB/network failure cannot stop the loop.
-    this.scheduleNext(this.nextIntervalMs());
+    // Cadence fix: subtract elapsed so a slow BC.Game fetch (1–3s) does not
+    // push the effective poll period to 3–4s (elapsed + full interval).
+    const elapsed = performance.now() - tickStarted;
+    const target = this.nextIntervalMs();
+    const delay = Math.max(50, Math.round(target - elapsed));
+    this.scheduleNext(delay);
   }
 
   private recentGapMs: number[] = [];
@@ -553,12 +562,19 @@ export class PollWorker {
       const st = bcGameSocket.getState().status;
       const med = this.medianGapMs();
       if (med != null) {
-        const adaptive = Math.round(med * 0.25);
+        // Target ~20% of inter-round gap, but never pile elapsed+interval to 3–4s.
+        const adaptive = Math.round(med * 0.2);
         const minMs =
-          st === "waf_blocked" || st === "degraded" ? 400 : 200;
-        return Math.max(minMs, Math.min(1_000, adaptive));
+          st === "waf_blocked" || st === "degraded" ? 250 : 150;
+        const maxMs =
+          st === "waf_blocked" || st === "degraded" ? 600 : 800;
+        return Math.max(minMs, Math.min(maxMs, adaptive));
       }
-      return Math.max(200, Math.min(1_000, base));
+      // Pure-poll: stay tight so recovery stays inside one Crash gap (~3–5s).
+      if (st === "waf_blocked" || st === "degraded" || st === "stopped") {
+        return Math.max(250, Math.min(500, base));
+      }
+      return Math.max(150, Math.min(800, base));
     } catch {
       /* socket optional in pure unit tests */
     }

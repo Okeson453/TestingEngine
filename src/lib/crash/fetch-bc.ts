@@ -95,10 +95,13 @@ async function postJson<T>(url: string, body: unknown, timeoutMs: number): Promi
       origin: "https://bc.game",
       referer: SOURCE_URL,
       "user-agent": UA,
+      connection: "keep-alive",
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
-  });
+    // Node undici: reuse TCP/TLS to cut multi-hundred-ms connect cost per poll.
+    keepalive: true,
+  } as RequestInit);
   if (!response.ok) {
     throw new Error(`BC.Game responded ${response.status}`);
   }
@@ -114,7 +117,7 @@ async function postJson<T>(url: string, body: unknown, timeoutMs: number): Promi
  */
 export async function fetchCrashHistory(
   maxPages = 20,
-  timeoutMs = Number(process.env.BCGAME_HISTORY_TIMEOUT_MS ?? 5_000) || 5_000,
+  timeoutMs = Number(process.env.BCGAME_HISTORY_TIMEOUT_MS ?? 2_500) || 2_500,
 ): Promise<FetchedRound[]> {
   const rounds: FetchedRound[] = [];
   const seen = new Set<string>();
