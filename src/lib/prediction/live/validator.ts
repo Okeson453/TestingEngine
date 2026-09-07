@@ -382,42 +382,33 @@ export async function onGameEnd(
     /* soft */
   }
 
-  // P0.1: Connect Incremental State to Live Data
-  // Update incremental state for EVERY crash, not just when pending==null
-  // (unless caller already updated via parallel ED path)
-  if (!evt.skipStateUpdate && state.pending != null) {
+  // Incremental state MUST update on every crash (ED or poll).
+  // Bug: poll path uses skipPredict=true; the old branch only updated when
+  // pending!=null OR !skipPredict — so under WAF (poll-only) the model froze
+  // at boot seed → identical probability/confidence every round.
+  if (!evt.skipStateUpdate) {
     try {
       globalIncrementalState.update(evt.multiplier);
+    } catch {
+      /* soft */
+    }
+    try {
+      const eng = (
+        globalThis as {
+          __acieEngine__?: {
+            observeRound: (r: { roundId: string; crashPoint: number }) => unknown;
+          };
+        }
+      ).__acieEngine__;
+      eng?.observeRound({ roundId: evt.gameId, crashPoint: evt.multiplier });
     } catch {
       /* soft */
     }
   }
 
   if (state.pending == null) {
-    // Even without a pending prediction for N, generate N+1 so cold-start
-    // and missed-bg recovery still produce the next prediction — unless
-    // the caller (poll worker) explicitly suppressed cascade.
+    // Cascade N+1 only when caller did not suppress (poll uses skipPredict).
     if (!evt.skipPredict) {
-      // No pending row — still update incremental state for this crash, then predict
-      if (!evt.skipStateUpdate) {
-        try {
-          globalIncrementalState.update(evt.multiplier);
-        } catch {
-          /* soft */
-        }
-      }
-      try {
-        const eng = (
-          globalThis as {
-            __acieEngine__?: {
-              observeRound: (r: { roundId: string; crashPoint: number }) => unknown;
-            };
-          }
-        ).__acieEngine__;
-        eng?.observeRound({ roundId: evt.gameId, crashPoint: evt.multiplier });
-      } catch {
-        /* soft */
-      }
       scheduleNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
     }
     if (state.crashRow && state.crashRow.began_at == null) {
