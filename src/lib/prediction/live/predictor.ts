@@ -31,6 +31,12 @@ const logger = getLogger("live-predictor");
 
 /** Prediction-related constants. */
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
+/** Require model P to beat fair odds (1/target) by this margin before emitting.
+ *  Without this, target 1.3x (~76.9% base rate) "hits" almost every round and
+ *  looks like the engine is always on. Set MIN_SIGNAL_EDGE=0 to disable. */
+const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.04);
+const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
+const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
 const MIN_HISTORY = 20;
 /** Reduced 100->50: halves history query cost on the hot ED path while
  *  remaining well above MIN_HISTORY for model stability. */
@@ -610,6 +616,7 @@ export interface OnGameEndPredictResult {
     | "error"
     | "skipped_stale_source"
     | "skipped_invalid_target"
+    | "skipped_no_edge"
     | "temporally_invalid";
   temporalValidity?: TemporalValidity;
   sourceGameId?: string;
@@ -978,6 +985,45 @@ export async function onGameEndPredict(
     predictionGenerationMs.observe(predictElapsed);
   } catch { /* metrics optional */ }
   const predictionId = signal.predictionId;
+
+  // Selectivity gate: only persist/notify when there is edge vs fair odds.
+  // Fair P for cash-out target T is ~1/T (Crash). Always emitting 1.3x signals
+  // produces ~75–85% WIN rate that is not skill — just the base rate.
+  {
+    const targetNum = Number(DEFAULT_TARGET);
+    const fair = targetNum > 1 ? 1 / targetNum : 0.5;
+    const needP = Math.max(MIN_SIGNAL_PROBABILITY, fair + MIN_SIGNAL_EDGE);
+    const p = signal.probability;
+    const c = signal.confidence;
+    if (
+      (Number.isFinite(MIN_SIGNAL_EDGE) && MIN_SIGNAL_EDGE > 0 && p < needP) ||
+      (MIN_SIGNAL_PROBABILITY > 0 && p < MIN_SIGNAL_PROBABILITY) ||
+      (MIN_SIGNAL_CONFIDENCE > 0 && c < MIN_SIGNAL_CONFIDENCE)
+    ) {
+      logger.info(
+        {
+          component: "live-predictor",
+          targetGameId,
+          sourceGameId: gameId,
+          probability: p,
+          confidence: c,
+          fair,
+          needP,
+          minEdge: MIN_SIGNAL_EDGE,
+          recoveryMode,
+        },
+        "skip signal — no edge vs fair odds (not every round should fire)",
+      );
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "skipped_no_edge",
+        temporalValidity: "TEMPORALLY_VALID",
+        sourceGameId: gameId,
+        sourceCrashAt: crashedAt,
+      };
+    }
+  }
 
   try {
     await runInTransaction(sql, async (tx) => {

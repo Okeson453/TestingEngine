@@ -209,7 +209,15 @@ export class BaselineStatisticalModel implements PredictiveModel {
       baseProb *= 0.9;
     }
 
-    const probability = Math.max(0, Math.min(1, baseProb));
+    // Fair odds for target T ≈ 1/T. Raw historical hit rate alone is not edge.
+    const fair = target > 1 ? 1 / target : 0.5;
+    let probability = Math.max(0, Math.min(1, baseProb));
+    // Mild shrink toward fair so "always 77% for 1.3x" does not look like a signal
+    // unless multipliers/features moved P away from the base rate.
+    const edge = probability - fair;
+    if (Math.abs(edge) < 0.02) {
+      probability = fair + edge * 0.5;
+    }
     const sampleFactor = Math.min(1, (v.sample_size ?? 0) / 50);
     const quality = features.meta.dataQualityScore;
     const confidence = Math.max(
