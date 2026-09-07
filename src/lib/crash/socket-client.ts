@@ -7,8 +7,10 @@
  *   STOPPED → CONNECTING → CONNECTED → DEGRADED → RECONNECTING → CONNECTED
  * Only intentional shutdown permanently enters STOPPED.
  *
- * Transport: ["polling", "websocket"] with withCredentials to survive
- * WAF / origin restrictions that break pure WebSocket.
+ * Transport: websocket-only by default (BC.Game forces transports:["websocket"]).
+ * Namespace: /g/cm (classic Crash) — confirmed 2026-09-07 RE report.
+ * Auth query: optional BCGAME_SOCKET_P / BCGAME_SOCKET_T (sign + token from /test/).
+ * Events: pr, bg, pg, e, ed, st (protobuf on wire; JSON after socket.io decode when available).
  */
 import { io, type Socket, type ManagerOptions, type SocketOptions } from "socket.io-client";
 import { getLogger } from "@/lib/observability/logger";
@@ -26,7 +28,7 @@ const CONNECTION_TIMEOUT_MS = 20_000;
 const WAF_BACKOFF_MS = Number(process.env.BCGAME_SOCKET_WAF_BACKOFF_MS ?? 15_000) || 15_000;
 const DEGRADED_AFTER_MS = 45_000; // no ED/BG within this window → DEGRADED
 
-export type BcGameEvent = "bg" | "pg" | "ed" | string;
+export type BcGameEvent = "pr" | "bg" | "pg" | "e" | "ed" | "st" | string;
 
 export interface BcGameEventPayload {
   gameId: string;
@@ -104,7 +106,7 @@ export class BcGameSocketClient {
   private lastEdAtByGame: Map<string, string> = new Map();
 
   constructor() {
-    for (const event of ["bg", "pg", "ed"] as const) {
+    for (const event of ["pr", "bg", "pg", "e", "ed", "st"] as const) {
       this.eventHandlers.set(event, new Set());
     }
   }
@@ -189,12 +191,25 @@ export class BcGameSocketClient {
         ? ["websocket", "polling"]
         : ["websocket"];
 
+      // Confirmed 2026-09-07: Crash lives on namespace /g/cm (not root).
+      // Optional p/t from env when an edge agent or browser bridge supplies a fresh sign.
+      const nsp =
+        process.env.BCGAME_SOCKET_NAMESPACE?.trim() || "/g/cm";
+      const query: Record<string, string> = {
+        "Accept-Language": process.env.BCGAME_SOCKET_ACCEPT_LANGUAGE ?? "en",
+      };
+      const signP = process.env.BCGAME_SOCKET_P?.trim();
+      const signT = process.env.BCGAME_SOCKET_T?.trim();
+      if (signP) query.p = signP;
+      if (signT) query.t = signT;
+
       const socketOptions: Partial<ManagerOptions & SocketOptions> = {
         path: SOCKET_PATH,
         reconnection: false, // manual lifecycle
         timeout: CONNECTION_TIMEOUT_MS,
         autoConnect: false,
         transports,
+        query,
         // Node workers are not browsers; withCredentials is optional.
         withCredentials: process.env.BCGAME_SOCKET_WITH_CREDENTIALS === "1",
         extraHeaders: {
@@ -203,21 +218,28 @@ export class BcGameSocketClient {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
           Origin: process.env.BCGAME_SOCKET_ORIGIN ?? "https://bc.game",
           Referer: process.env.BCGAME_SOCKET_REFERER ?? "https://bc.game/game/crash",
+          "Accept-Language": process.env.BCGAME_SOCKET_ACCEPT_LANGUAGE ?? "en",
         },
         upgrade: allowPolling,
         rememberUpgrade: true,
       };
 
-      this.socket = io(SOCKET_URL, socketOptions);
+      // socket.io-client: append namespace to URL path segment
+      const connectUrl = nsp.startsWith("/")
+        ? `${SOCKET_URL.replace(/\/$/, "")}${nsp}`
+        : SOCKET_URL;
+      this.socket = io(connectUrl, socketOptions);
       this.setupSocketHandlers();
       this.socket.connect();
 
       logger.info(
         {
           component: "BcGameSocketClient",
-          url: SOCKET_URL,
+          url: connectUrl,
           path: SOCKET_PATH,
+          namespace: nsp,
           transports: socketOptions.transports,
+          hasSign: Boolean(signP && signT),
           attempt: this.state.reconnectAttempts,
         },
         "Connecting to BC.Game Socket.IO",
@@ -273,9 +295,22 @@ export class BcGameSocketClient {
 
   private subscribeToCrashEvents(): void {
     if (!this.socket) return;
-    // BC.Game room join — documented in streaming investigation
-    this.socket.emit("join", "crash");
-    logger.info({ component: "BcGameSocketClient" }, "Subscribed to crash game events");
+    // On namespace /g/cm the server expects a bare join (RE report §5/§11).
+    // Keep legacy "crash" room emit only when using root namespace.
+    const nsp = process.env.BCGAME_SOCKET_NAMESPACE?.trim() || "/g/cm";
+    if (nsp === "/" || nsp === "") {
+      this.socket.emit("join", "crash");
+    } else {
+      try {
+        this.socket.emit("join");
+      } catch {
+        this.socket.emit("join", "crash");
+      }
+    }
+    logger.info(
+      { component: "BcGameSocketClient", namespace: nsp },
+      "Subscribed to crash game events",
+    );
   }
 
   private handleDisconnect(reason: string): void {
@@ -364,8 +399,8 @@ export class BcGameSocketClient {
     });
     // Exponential backoff for repeated WAF blocks (cap 5 minutes)
     const backoffMs = Math.min(
-      WAF_BACKOFF_MS * Math.pow(2, Math.min(this.wafBlockCount - 1, 4)),
-      5 * 60 * 1000,
+      WAF_BACKOFF_MS * Math.pow(2, Math.min(this.wafBlockCount - 1, 2)),
+      60_000,
     );
     logger.error(
       {
@@ -510,7 +545,10 @@ export class BcGameSocketClient {
         return null;
       }
       const data = payload as Record<string, unknown>;
-      const gameId = String(data.gameId ?? data.id ?? "");
+      // RE report §6: protobuf uses roundId; maxRate is x10000; odds is x100.
+      const gameId = String(
+        data.gameId ?? data.roundId ?? data.id ?? data.game_id ?? "",
+      );
       if (!gameId || !/^\d+$/.test(gameId)) {
         logger.warn(
           { component: "BcGameSocketClient", event, payload },
@@ -523,9 +561,25 @@ export class BcGameSocketClient {
       let crashedAt: number | string | undefined;
       let multiplier: number | undefined;
 
-      if (event === "bg") {
-        beganAt = (data.beganAt ?? data.beginTime ?? data.startTime) as number | string | undefined;
-      } else if (event === "ed") {
+      const scaleMaxRate = (v: unknown): number | undefined => {
+        if (typeof v === "number" && Number.isFinite(v)) {
+          // maxRate is int32 x10000 (10000 = 1.00x); values < 50 are already multipliers
+          return v >= 50 ? v / 10_000 : v;
+        }
+        if (typeof v === "string" && v.trim()) {
+          const n = parseFloat(v);
+          return Number.isFinite(n) ? (n >= 50 ? n / 10_000 : n) : undefined;
+        }
+        return undefined;
+      };
+
+      if (event === "pr" || event === "bg") {
+        beganAt = (data.beganAt ?? data.beginTime ?? data.startTime ?? data.prepareTime) as
+          | number
+          | string
+          | undefined;
+      }
+      if (event === "ed" || event === "st") {
         crashedAt = (data.crashedAt ?? data.endTime ?? data.crashTime) as
           | number
           | string
@@ -533,18 +587,19 @@ export class BcGameSocketClient {
         multiplier =
           typeof data.multiplier === "number"
             ? data.multiplier
-            : typeof data.rate === "number"
-              ? data.rate
-              : typeof data.multiplier === "string"
-                ? parseFloat(data.multiplier)
-                : undefined;
+            : scaleMaxRate(data.maxRate) ??
+              (typeof data.rate === "number"
+                ? data.rate
+                : typeof data.multiplier === "string"
+                  ? parseFloat(data.multiplier)
+                  : undefined);
       } else if (event === "pg") {
         multiplier =
           typeof data.multiplier === "number"
             ? data.multiplier
             : typeof data.current === "number"
               ? data.current
-              : undefined;
+              : scaleMaxRate(data.maxRate);
       }
 
       return { gameId, multiplier, beganAt, crashedAt, ...data };
