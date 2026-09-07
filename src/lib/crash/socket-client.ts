@@ -389,6 +389,9 @@ export class BcGameSocketClient {
   }
 
   private wafBlockCount = 0;
+  /** Last status written to worker_state (throttle identical writes). */
+  private lastPersistedSocketStatus: string | null = null;
+  private lastPersistAt = 0;
 
   private handleWafBlock(): void {
     this.wafBlockCount += 1;
@@ -636,10 +639,61 @@ export class BcGameSocketClient {
   }
 
   private updateState(updates: Partial<ConnectionState>): void {
+    const prevStatus = this.state.status;
     this.state = { ...this.state, ...updates };
     for (const handler of this.connectionHandlers) {
       void handler(this.state).catch(() => undefined);
     }
+    // Ops alert surface: persist status so dashboards/alerts can key off
+    // worker_state.socket_status without scraping logs. Leading indicator of
+    // Path B (~2–3.5s poll recovery) vs Path A (sub-second ED).
+    if (updates.status != null && updates.status !== prevStatus) {
+      if (updates.status === "waf_blocked" || updates.status === "degraded") {
+        logger.warn(
+          {
+            component: "BcGameSocketClient",
+            alert: "socket_path_at_risk",
+            status: updates.status,
+            lastError: this.state.lastError,
+            reconnectAttempts: this.state.reconnectAttempts,
+            wafBlockCount: this.wafBlockCount,
+          },
+          `Socket path at risk (${updates.status}) — poll recovery will dominate latency`,
+        );
+      }
+      this.persistSocketStatus(updates.status);
+    }
+  }
+
+  private persistSocketStatus(status: ConnectionStatus): void {
+    const now = Date.now();
+    if (status === this.lastPersistedSocketStatus && now - this.lastPersistAt < 5_000) {
+      return;
+    }
+    this.lastPersistedSocketStatus = status;
+    this.lastPersistAt = now;
+    void (async () => {
+      try {
+        const sql = await getSql();
+        await sql`
+          INSERT INTO worker_state (key, value, updated_at)
+          VALUES ('socket_status', ${status}, now())
+          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
+        `;
+        await sql`
+          INSERT INTO worker_state (key, value, updated_at)
+          VALUES ('socket_waf_blocked', ${status === "waf_blocked" ? "1" : "0"}, now())
+          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
+        `;
+        await sql`
+          INSERT INTO worker_state (key, value, updated_at)
+          VALUES ('socket_last_error', ${this.state.lastError ?? ""}, now())
+          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
+        `;
+      } catch {
+        /* soft — worker_state may be unavailable in unit tests */
+      }
+    })();
   }
 
   /**
