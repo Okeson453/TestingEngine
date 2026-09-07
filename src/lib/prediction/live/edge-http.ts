@@ -45,7 +45,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
-  const path = url.pathname.replace(/\/$/, "") || "/";
+  let path = url.pathname.replace(/\/$/, "") || "/";
+  // Aliases used by docs / userscripts
+  if (path === "/api/crash/edge" || path === "/api/edge/crash") path = "/edge/crash";
+  if (path === "/api/crash/edge/bg" || path === "/api/edge/bg") path = "/edge/bg";
+  if (path === "/api/edge/health") path = "/edge/health";
   const method = (req.method ?? "GET").toUpperCase();
 
   // CORS for browser agents (token still required)
@@ -112,11 +116,23 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 }
 
 export async function startEdgeHttpServer(): Promise<Server | null> {
-  const port = Number(process.env.EDGE_INGEST_PORT ?? "");
+  // Railway public networking hits $PORT. Prefer EDGE_INGEST_PORT; if only TOKEN
+  // is set, bind PORT so the browser can reach the worker without a private 8091.
+  const explicit = Number(process.env.EDGE_INGEST_PORT ?? "");
+  const fallbackPort = Number(process.env.PORT ?? "");
+  const tokenSet =
+    Boolean(process.env.EDGE_INGEST_TOKEN?.trim()) ||
+    process.env.EDGE_INGEST_ALLOW_INSECURE === "1";
+  const port =
+    Number.isFinite(explicit) && explicit > 0
+      ? explicit
+      : tokenSet && Number.isFinite(fallbackPort) && fallbackPort > 0
+        ? fallbackPort
+        : NaN;
   if (!Number.isFinite(port) || port <= 0) {
     logger.info(
       { component: "edge-http" },
-      "EDGE_INGEST_PORT not set — browser-edge HTTP ingest disabled",
+      "EDGE_INGEST_PORT not set (and no PORT+TOKEN fallback) — browser-edge HTTP ingest disabled",
     );
     return null;
   }
