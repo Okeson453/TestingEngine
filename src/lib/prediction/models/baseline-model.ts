@@ -174,14 +174,15 @@ export class BaselineStatisticalModel implements PredictiveModel {
     const expectedGap = 1 / Math.max(baseProb, 0.05);
     this.lastGapActive = since > expectedGap * 1.5;
     if (this.lastGapActive) {
-      baseProb = Math.min(0.95, baseProb * this.gapMultiplier);
+      // Ensure gap setups clear a small edge gate (~+2–5pp)
+      baseProb = Math.min(0.95, Math.max(baseProb * this.gapMultiplier, baseProb + 0.025));
     }
 
     const consecKey = target <= 1.3 ? 'consec_below_1_30' : 'consec_below_2_00';
     const consec = v[consecKey] ?? 0;
     this.lastStreakActive = consec >= 8;
     if (this.lastStreakActive) {
-      baseProb = Math.min(0.95, baseProb * this.streakMultiplier);
+      baseProb = Math.min(0.95, Math.max(baseProb * this.streakMultiplier, baseProb + 0.025));
     }
 
     // P1.7: Use Regime Dimensions in Baseline Model
@@ -209,15 +210,9 @@ export class BaselineStatisticalModel implements PredictiveModel {
       baseProb *= 0.9;
     }
 
-    // Fair odds for target T ≈ 1/T. Raw historical hit rate alone is not edge.
-    const fair = target > 1 ? 1 / target : 0.5;
-    let probability = Math.max(0, Math.min(1, baseProb));
-    // Mild shrink toward fair so "always 77% for 1.3x" does not look like a signal
-    // unless multipliers/features moved P away from the base rate.
-    const edge = probability - fair;
-    if (Math.abs(edge) < 0.02) {
-      probability = fair + edge * 0.5;
-    }
+    // Do not shrink toward fair here — that cancelled gap/streak edge and
+    // combined with MIN_SIGNAL_EDGE caused hour-long signal silence.
+    const probability = Math.max(0, Math.min(1, baseProb));
     const sampleFactor = Math.min(1, (v.sample_size ?? 0) / 50);
     const quality = features.meta.dataQualityScore;
     const confidence = Math.max(

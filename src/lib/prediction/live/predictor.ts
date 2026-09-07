@@ -32,9 +32,10 @@ const logger = getLogger("live-predictor");
 /** Prediction-related constants. */
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
 /** Require model P to beat fair odds (1/target) by this margin before emitting.
- *  Without this, target 1.3x (~76.9% base rate) "hits" almost every round and
- *  looks like the engine is always on. Set MIN_SIGNAL_EDGE=0 to disable. */
-const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.04);
+ *  Default 0.015 (~78.4% for 1.3x): filters pure base-rate spam without
+ *  silencing the engine for hours. Set MIN_SIGNAL_EDGE=0 to emit every round.
+ *  Prior default 0.04 needed ~81% which almost never fired with baseline P≈fair. */
+const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.015);
 const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
 const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
 const MIN_HISTORY = 20;
