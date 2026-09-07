@@ -275,8 +275,18 @@ async function loadPriorRoundsStrict(
     /* fall through only if forced */
   }
 
-  // Escape hatch for cold empty buffer / tests — not the steady-state path.
-  if (process.env.FORCE_HISTORY_SQL === "1") {
+  // Escape hatch / empty buffer — costs 700–1000ms on Neon; must be rare.
+  logger.warn(
+    { component: "live-predictor", beganAt, limit },
+    "HISTORY BUFFER MISS — SQL fallback (high latency on Neon)",
+  );
+  try {
+    const { dbFallbackCount } = await import("@/lib/observability/performance/latency");
+    dbFallbackCount.observe(1);
+  } catch { /* soft */ }
+
+  if (process.env.FORCE_HISTORY_SQL !== "0") {
+    const t0 = performance.now();
     const rows = await sql<PriorRow>`
       select game_id, multiplier, began_at, crashed_at
       from crash_rounds
@@ -285,6 +295,10 @@ async function loadPriorRoundsStrict(
       order by crashed_at desc, game_id desc
       limit ${limit}
     `;
+    try {
+      const { dbQueryMs } = await import("@/lib/observability/performance/latency");
+      dbQueryMs.observe(performance.now() - t0);
+    } catch { /* soft */ }
     return rows.reverse().map(mapRowToHistorical);
   }
   return [];

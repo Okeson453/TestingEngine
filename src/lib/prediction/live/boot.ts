@@ -524,18 +524,54 @@ class LiveBoot {
       // Warm the live rolling history buffer so the first ED predict hits
       // memory instead of a crash_rounds SQL round-trip.
       try {
-        const { warmLiveHistoryBuffer } = await import(
-          "@/lib/prediction/live/live-history-buffer"
-        );
+        const {
+          warmLiveHistoryBuffer,
+          isLiveHistoryWarmed,
+        } = await import("@/lib/prediction/live/live-history-buffer");
         await warmLiveHistoryBuffer(sql, 200);
-        logger.info(
-          { component: "live-boot" },
-          "live history buffer warmed",
+        if (!isLiveHistoryWarmed()) {
+          logger.error(
+            { component: "live-boot" },
+            "Live history buffer NOT warmed — hot path will hit Neon (~700–1000ms/query)",
+          );
+        } else {
+          logger.info(
+            { component: "live-boot" },
+            "live history buffer warmed (hot path avoids history SQL)",
+          );
+        }
+      } catch (e) {
+        logger.error(
+          { component: "live-boot", error: String(e) },
+          "live history buffer warm failed — predictions will pay Neon RTT",
         );
+      }
+
+      // Warm gate-cache so first predict skips worker_state SQL (another 700–1000ms).
+      try {
+        const {
+          setMedianInterRoundGapMs,
+          setWallClockSkewMs,
+          setEffectiveSkipBelowMs,
+        } = await import("@/lib/prediction/live/gate-cache");
+        const rows = await sql<{ key: string; value: string }>`
+          SELECT key, value FROM worker_state
+          WHERE key IN ('effective_skip_below_ms', 'median_inter_round_gap_ms', 'wall_clock_skew_ms')
+        `.catch(() => [] as { key: string; value: string }[]);
+        for (const row of rows) {
+          const n = Number(row.value);
+          if (!Number.isFinite(n)) continue;
+          if (row.key === "median_inter_round_gap_ms") setMedianInterRoundGapMs(n);
+          if (row.key === "wall_clock_skew_ms") setWallClockSkewMs(n);
+          if (row.key === "effective_skip_below_ms") {
+            setEffectiveSkipBelowMs(Math.min(200, Math.max(80, n)));
+          }
+        }
+        logger.info({ component: "live-boot", keys: rows.length }, "gate cache warmed");
       } catch (e) {
         logger.warn(
           { component: "live-boot", error: String(e) },
-          "live history buffer warm failed — first predicts may use SQL fallback",
+          "gate cache warm failed — first predict may query worker_state",
         );
       }
     } catch (e) {

@@ -56,6 +56,8 @@ export const predictionHandoffMs = makeRecorder("predictionHandoff");
 export const pollDeferMs = makeRecorder("pollDefer");
 export const socketHealthCheckMs = makeRecorder("socketHealthCheck");
 export const crashEdLagMs = makeRecorder("crashEdLag");
+export const dbFallbackCount = makeRecorder("dbFallback");
+export const dbQueryMs = makeRecorder("dbQuery");
 
 /** Alias for ACIE heavy path — real histogram may live in metrics-acie if prom is wired */
 export const acieHeavyEvidenceLatencyMs = makeRecorder("acieHeavyEvidence");
