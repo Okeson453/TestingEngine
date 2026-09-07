@@ -11,6 +11,10 @@ import { getSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
 import {
+  markLiveRoundStarted,
+  markLiveRoundEnded,
+} from "@/lib/prediction/live/live-round-state";
+import {
   edToPredictMs,
   predictionHandoffMs,
   roundDetectMs,
@@ -48,7 +52,6 @@ async function onBgEvent(payload: unknown): Promise<void> {
   try {
     const sql = await getSql();
     const corr = randomUUID();
-    const { markLiveRoundStarted } = await import("@/lib/prediction/live/live-round-state");
     await Promise.all([
       markLiveRoundStarted(gameId, beganAt, "socket", corr, sql).catch(() => undefined),
       sql`
@@ -127,7 +130,6 @@ async function onEdEvent(payload: unknown): Promise<void> {
       const sql = await getSql();
       const crashedAt = new Date(endIso);
       const beganAt = new Date(crashedAt.getTime() - 3_000);
-      const { markLiveRoundEnded } = await import("@/lib/prediction/live/live-round-state");
       await Promise.all([
         sql`
           INSERT INTO crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)

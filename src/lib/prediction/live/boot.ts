@@ -21,8 +21,23 @@ import { ClockSkewMonitor } from "./clock-skew-monitor";
 import { getLogger } from "@/lib/observability/logger";
 import { getSql, type Sql } from "@/lib/db";
 import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
+import { getSharedPredictionEngine } from "@/lib/prediction/live/predictor";
 
 const logger = getLogger("live-boot");
+
+/**
+ * Pre-warm the PredictionEngine singleton at boot so the first real
+ * prediction does not pay constructor + module-resolution cost under
+ * time pressure. Safe to call multiple times (singleton guard inside).
+ */
+function prewarmPredictionEngine(): void {
+  try {
+    getSharedPredictionEngine();
+    logger.info({ component: "live-boot" }, "PredictionEngine pre-warmed");
+  } catch {
+    /* soft — may fail in test contexts */
+  }
+}
 
 /** Event-loop lag probe (timing diagnosis 3.8 / 7.6). */
 let eventLoopProbeTimer: ReturnType<typeof setInterval> | null = null;
@@ -464,6 +479,10 @@ class LiveBoot {
 
       // P2.11: Restore incremental state after schema validation
       await restoreIncrementalState(sql);
+
+      // Pre-warm the PredictionEngine so the first live prediction avoids
+      // constructor + module-resolution cost on the hot path.
+      prewarmPredictionEngine();
     } catch (e) {
       logger.error(
         { component: "live-boot", error: String(e) },

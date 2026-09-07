@@ -21,6 +21,10 @@ import { runInTransaction } from "@/lib/prediction/live/tx";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEndPredict } from "@/lib/prediction/live/predictor";
+import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
+import { markPredictionResolved } from "@/lib/prediction/live/live-round-state";
+import { edProcessingLatencyMs } from "@/lib/observability/metrics/lifecycle-metrics";
+import { processResolvedPredictionFeedback } from "@/lib/prediction/live/feedback";
 
 const logger = getLogger("live-validator");
 
@@ -363,8 +367,6 @@ export async function onGameEnd(
   // Update incremental state for EVERY crash, not just when pending==null
   if (state.pending != null) {
     try {
-      const { globalIncrementalState } =
-        await import("@/lib/prediction/state/incremental-state-engine");
       globalIncrementalState.update(evt.multiplier);
     } catch {
       /* soft */
@@ -378,8 +380,6 @@ export async function onGameEnd(
     if (!evt.skipPredict) {
       // No pending row — still update incremental state for this crash, then predict
       try {
-        const { globalIncrementalState } =
-          await import("@/lib/prediction/state/incremental-state-engine");
         globalIncrementalState.update(evt.multiplier);
       } catch {
         /* soft */
@@ -420,7 +420,6 @@ export async function onGameEnd(
 
   // Phase 11 — prediction resolved for this round
   try {
-    const { markPredictionResolved } = await import("@/lib/prediction/live/live-round-state");
     await markPredictionResolved(evt.gameId);
   } catch {
     /* soft */
@@ -428,7 +427,6 @@ export async function onGameEnd(
 
   // Phase 18 — ed processing latency
   try {
-    const { edProcessingLatencyMs } = await import("@/lib/observability/metrics/lifecycle-metrics");
     const lat = Math.max(0, now() - new Date(evt.receivedAt).getTime());
     edProcessingLatencyMs.observe(lat);
   } catch {
@@ -439,33 +437,28 @@ export async function onGameEnd(
   // Feedback is for learning (incremental state, calibration, model performance),
   // not correctness. The N+1 prediction can proceed without waiting for it.
   const pendingSnapshot = state.pending; // capture for async closure
-  try {
-    const { processResolvedPredictionFeedback } = await import("@/lib/prediction/live/feedback");
-    setImmediate(() => {
-      if (!pendingSnapshot) return;
-      void processResolvedPredictionFeedback({
-        predictionId: pendingSnapshot.prediction_id,
-        targetGameId: evt.gameId,
-        predictedProbability: Number(pendingSnapshot.probability),
-        predictedConfidence:
-          pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
-        targetMultiplier: Number(pendingSnapshot.target_multiplier),
-        actualMultiplier: evt.multiplier,
-        result,
-        regimeAtPrediction: pendingSnapshot.regime_name ?? null,
-        modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
-        correlationId: pendingSnapshot.correlation_id ?? null,
-        resolvedAt,
-      }).catch((fbErr) => {
-        logger.warn(
-          { component: "live-validator", error: String(fbErr) },
-          "async closed-loop feedback failed",
-        );
-      });
+  setImmediate(() => {
+    if (!pendingSnapshot) return;
+    void processResolvedPredictionFeedback({
+      predictionId: pendingSnapshot.prediction_id,
+      targetGameId: evt.gameId,
+      predictedProbability: Number(pendingSnapshot.probability),
+      predictedConfidence:
+        pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
+      targetMultiplier: Number(pendingSnapshot.target_multiplier),
+      actualMultiplier: evt.multiplier,
+      result,
+      regimeAtPrediction: pendingSnapshot.regime_name ?? null,
+      modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
+      correlationId: pendingSnapshot.correlation_id ?? null,
+      resolvedAt,
+    }).catch((fbErr) => {
+      logger.warn(
+        { component: "live-validator", error: String(fbErr) },
+        "async closed-loop feedback failed",
+      );
     });
-  } catch {
-    /* import failed — feedback is best-effort */
-  }
+  });
 
   // Spec §2/§3.2: trigger N+1 prediction after Round N is processed.
   // Poll recovery path sets skipPredict to prevent historical cascade.

@@ -148,7 +148,7 @@ function mapRowToHistorical(r: PriorRow): HistoricalRound {
 }
 
 let cachedEngine: PredictionEngine | null = null;
-function getSharedPredictionEngine(): PredictionEngine {
+export function getSharedPredictionEngine(): PredictionEngine {
   cachedEngine ??= new PredictionEngine();
   return cachedEngine;
 }
