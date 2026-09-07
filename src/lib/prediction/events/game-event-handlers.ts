@@ -115,9 +115,19 @@ async function onEdEvent(payload: unknown): Promise<void> {
 
   const predictPromise = onGameEndPredict(gameId, endIso, multiplier, correlationId)
     .then((result) => {
-      edToPredictMs.observe(Math.max(0, performance.now() - new Date(receivedAt).getTime()));
+      // Same clock domain (performance.now) — never mix with Date.now()/ISO timestamps.
+      const engineMs = Math.max(0, performance.now() - handoffT0);
+      edToPredictMs.observe(engineMs);
       logger.info(
-        { event: "ed", gameId, kind: result.kind, correlationId, path: "parallel-predict" },
+        {
+          event: "ed",
+          gameId,
+          kind: result.kind,
+          correlationId,
+          path: "parallel-predict",
+          engineMs: Math.round(engineMs),
+          predictionLatencyMs: result && "predictionLatencyMs" in result ? result.predictionLatencyMs : undefined,
+        },
         "ed prediction complete",
       );
       return result;

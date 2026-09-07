@@ -553,12 +553,14 @@ export async function onGameStart(
       : "prediction generated and persisted for next round",
   );
 
+  // Wake dispatcher immediately after TX commit (no setImmediate boundary).
   if (outboxEnqueued > 0 && !slaViolated) {
-    setImmediate(() => {
-      void import("@/lib/prediction/live/outbox-wake")
-        .then(({ notifyOutbox }) => notifyOutbox())
-        .catch(() => undefined);
-    });
+    try {
+      const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
+      notifyOutbox();
+    } catch {
+      /* soft */
+    }
   }
 
   if (slaViolated) {
@@ -617,6 +619,7 @@ export async function onGameEndPredict(
   const predictFn = deps.predictFn ?? defaultPredictFn;
   const sql = await getSqlFn();
 
+  const engineT0 = performance.now();
   let targetGameId: string;
   try {
     if (typeof gameId !== "string" || !/^\d+$/.test(gameId)) {
@@ -946,9 +949,9 @@ export async function onGameEndPredict(
 
   const timestamp = generatedAt;
   // P0.4 + P3.1: Measure prediction generation time and wire latency metric
-  const predictT0 = Date.now();
+  const predictT0 = performance.now();
   const signal = predictFn(priorRounds, targetGameId, timestamp, DEFAULT_TARGET);
-  const predictElapsed = Date.now() - predictT0;
+  const predictElapsed = performance.now() - predictT0;
   if (predictElapsed > PREDICT_TIMEOUT_MS) {
     logger.warn(
       { targetGameId, predictElapsedMs: predictElapsed, budgetMs: PREDICT_TIMEOUT_MS },
@@ -1089,19 +1092,19 @@ export async function onGameEndPredict(
         sourceGameId: gameId,
         correlationId,
         recoveryMode,
-        latencyMs: Date.now() - new Date(crashedAt).getTime(),
+        engineMs: Math.round(performance.now() - engineT0),
+        sourceAgeMs: Math.max(0, Date.now() - new Date(crashedAt).getTime()),
       },
       "prediction generated and persisted for next round",
     );
 
-    // Wake outbox dispatcher immediately (do not wait up to TICK_MS).
-    // setImmediate so the TX is fully committed and any dispatcher
-    // waitForOutboxWake listener is registered before we emit.
-    setImmediate(() => {
-      void import("@/lib/prediction/live/outbox-wake")
-        .then(({ notifyOutbox }) => notifyOutbox())
-        .catch(() => undefined);
-    });
+    // Wake outbox dispatcher immediately after TX commit.
+    try {
+      const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
+      notifyOutbox();
+    } catch {
+      /* soft */
+    }
 
     return {
       predictionId,
@@ -1112,7 +1115,7 @@ export async function onGameEndPredict(
       sourceCrashAt: crashedAt,
       targetStartedAt: null,
       predictionGeneratedAt: timestamp,
-      predictionLatencyMs: Date.now() - new Date(crashedAt).getTime(),
+      predictionLatencyMs: Math.round(performance.now() - engineT0),
       availableWindowMs: null,
       remainingBeforeTargetMs: null,
     };

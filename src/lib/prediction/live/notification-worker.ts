@@ -185,7 +185,12 @@ export class OutboxDispatcher {
                   (meta.targetGameId as string) ||
                   (meta.target_game_id as string) ||
                   null;
-                if (targetGameId) {
+                // Latency: only hit DB when close to deadline; otherwise trust
+                // telegram_deadline_at already checked above.
+                const needTargetDb =
+                  process.env.OUTBOX_FORCE_TARGET_DB_CHECK === "1" ||
+                  (Number.isFinite(remainingMs) && remainingMs < 800);
+                if (targetGameId && needTargetDb) {
                   // P1.7: Consolidated pre-send check — 1 query instead of 2.
                   // LEFT JOIN live_round_state and crash_rounds in a single pass.
                   const live = await sql<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
