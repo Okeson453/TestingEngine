@@ -129,6 +129,10 @@ export class ClockSkewMonitor {
         insert into worker_state (key, value) values ('wall_clock_skew_ms', ${String(wallClockSkewMs)})
         on conflict (key) do update set value = excluded.value, updated_at = now()
       `;
+      try {
+        const { setWallClockSkewMs } = await import("@/lib/prediction/live/gate-cache");
+        setWallClockSkewMs(wallClockSkewMs);
+      } catch { /* soft */ }
       if (Math.abs(wallClockSkewMs) > WALL_CLOCK_SKEW_WARN_MS) {
         logger.error(
           { component: "clock-skew-monitor", wallClockSkewMs, threshold: WALL_CLOCK_SKEW_WARN_MS },

@@ -62,3 +62,14 @@
 - Temporal invariant (`prediction_generated_at < target_round_started_at`)
 - Outbox deadline expiry
 - Sheath mode
+
+## Follow-up (2026-09-07 later)
+
+Additional hot-path reductions after runtime review:
+
+1. **gate-cache.ts** — in-memory median gap / skew / skip threshold; avoids worker_state SQL on warm path.
+2. **Combined eligibility query** — one SQL for pending + lifecycle + crashed (was 3).
+3. **fetchCrashHistory** — first 2 pages fetched in parallel.
+4. **Boot prewarm** — eager-import predictor, validator, feedback, history buffer, outbox-wake, gate-cache.
+
+Previous stack retained: parallel ED, priority 3, history buffer, outbox wake, poll defer 2.5s, TICK 15ms.

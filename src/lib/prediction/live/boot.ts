@@ -39,6 +39,25 @@ function prewarmPredictionEngine(): void {
   }
 }
 
+/** Eager-load lazy modules so first ED never pays import cost. */
+async function prewarmHotModules(): Promise<void> {
+  const mods = [
+    import("@/lib/prediction/live/live-history-buffer"),
+    import("@/lib/prediction/live/outbox-wake"),
+    import("@/lib/prediction/live/gate-cache"),
+    import("@/lib/prediction/live/predictor"),
+    import("@/lib/prediction/live/validator"),
+    import("@/lib/prediction/live/feedback"),
+    import("@/lib/prediction/live/live-round-state"),
+  ];
+  const results = await Promise.allSettled(mods);
+  const failed = results.filter((r) => r.status === "rejected").length;
+  logger.info(
+    { component: "live-boot", modules: results.length, failed },
+    "hot-path modules pre-warmed",
+  );
+}
+
 /** Event-loop lag probe (timing diagnosis 3.8 / 7.6). */
 let eventLoopProbeTimer: ReturnType<typeof setInterval> | null = null;
 function startEventLoopLagMonitor(): void {
@@ -483,6 +502,7 @@ class LiveBoot {
       // Pre-warm the PredictionEngine so the first live prediction avoids
       // constructor + module-resolution cost on the hot path.
       prewarmPredictionEngine();
+      await prewarmHotModules();
 
       // Warm the live rolling history buffer so the first ED predict hits
       // memory instead of a crash_rounds SQL round-trip.

@@ -169,6 +169,12 @@ export class PollWorker {
                 VALUES ('median_inter_round_gap_ms', ${String(med)})
                 ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
               `;
+              try {
+                const { setMedianInterRoundGapMs } = await import(
+                  "@/lib/prediction/live/gate-cache"
+                );
+                setMedianInterRoundGapMs(med);
+              } catch { /* soft */ }
             } catch { /* soft */ }
           }
         } catch { /* ignore */ }

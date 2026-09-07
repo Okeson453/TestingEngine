@@ -119,22 +119,10 @@ export async function fetchCrashHistory(
   const rounds: FetchedRound[] = [];
   const seen = new Set<string>();
 
-  for (let page = 1; page <= maxPages; page++) {
-    const payload = await postJson<HistoryResponse>(
-      HISTORY_URL,
-      { gameUrl: "crash", page, pageSize: 50 },
-      timeoutMs,
-    );
-    if (payload.code !== 0) {
-      if (page === 1) {
-        throw new Error(payload.msg || "BC.Game history request failed");
-      }
-      break; // Stop paginating if later pages error
-    }
-
+  const ingestPage = (payload: HistoryResponse): boolean => {
+    if (payload.code !== 0) return false;
     const list = payload.data?.list ?? [];
-    if (list.length === 0) break; // No more history
-
+    if (list.length === 0) return false;
     for (const row of list) {
       const parsed = parseFetchedRound(row.gameId, row.gameDetail);
       if (!parsed) continue;
@@ -142,6 +130,41 @@ export async function fetchCrashHistory(
       seen.add(parsed.gameId);
       rounds.push(parsed);
     }
+    return true;
+  };
+
+  // Latency fix: fetch first two pages in parallel (covers poll path default).
+  // Remaining pages (cold-start / deep fetch) stay sequential.
+  const parallelPages = Math.min(2, maxPages);
+  if (parallelPages >= 1) {
+    const results = await Promise.all(
+      Array.from({ length: parallelPages }, (_, i) =>
+        postJson<HistoryResponse>(
+          HISTORY_URL,
+          { gameUrl: "crash", page: i + 1, pageSize: 50 },
+          timeoutMs,
+        ).catch((e: unknown) => {
+          if (i === 0) throw e;
+          return { code: -1, msg: String(e), data: { list: [] } } as HistoryResponse;
+        }),
+      ),
+    );
+    if (results[0] && results[0].code !== 0) {
+      throw new Error(results[0].msg || "BC.Game history request failed");
+    }
+    for (const payload of results) {
+      if (!ingestPage(payload)) break;
+    }
+  }
+
+  for (let page = parallelPages + 1; page <= maxPages; page++) {
+    const payload = await postJson<HistoryResponse>(
+      HISTORY_URL,
+      { gameUrl: "crash", page, pageSize: 50 },
+      timeoutMs,
+    );
+    if (payload.code !== 0) break;
+    if (!ingestPage(payload)) break;
   }
 
   return rounds;

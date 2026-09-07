@@ -717,46 +717,97 @@ export async function onGameEndPredict(
     // - 3 worker_state lookups merged into 1 query
     // - redundant live_round_state SELECT (residualRows) removed;
     //   liveLifecycle already fetches began_at
-    const [workerStateRows, existingPending, _liveLifecycle, alreadyCrashedRows] =
-      await Promise.all([
-        sql<{ key: string; value: string }>`
+    // Latency fix: prefer in-memory gate cache; one combined eligibility query.
+    // worker_state is only hit when cache is cold (boot / long gap).
+    let getWorkerValue = (key: string): string | undefined => undefined;
+    try {
+      const {
+        getMedianInterRoundGapMs,
+        getWallClockSkewMs,
+        getEffectiveSkipBelowMs,
+        isGateCacheWarm,
+        setMedianInterRoundGapMs,
+        setWallClockSkewMs,
+        setEffectiveSkipBelowMs,
+      } = await import("@/lib/prediction/live/gate-cache");
+
+      const cachedSkip = getEffectiveSkipBelowMs();
+      if (cachedSkip != null && cachedSkip >= 300 && cachedSkip <= 5_000) {
+        skipThreshold = Math.max(skipThreshold, cachedSkip);
+      }
+
+      // Expose cache values for residual math below via getWorkerValue shim
+      getWorkerValue = (key: string): string | undefined => {
+        if (key === "median_inter_round_gap_ms") {
+          const v = getMedianInterRoundGapMs();
+          return Number.isFinite(v) ? String(v) : undefined;
+        }
+        if (key === "wall_clock_skew_ms") {
+          const v = getWallClockSkewMs();
+          return Number.isFinite(v) ? String(v) : undefined;
+        }
+        if (key === "effective_skip_below_ms") {
+          const v = getEffectiveSkipBelowMs();
+          return v != null ? String(v) : undefined;
+        }
+        return undefined;
+      };
+
+      if (!isGateCacheWarm()) {
+        const workerStateRows = await sql<{ key: string; value: string }>`
           SELECT key, value FROM worker_state
           WHERE key IN ('effective_skip_below_ms', 'median_inter_round_gap_ms', 'wall_clock_skew_ms')
-        `.catch(() => [] as { key: string; value: string }[]),
-        sql<{ prediction_id: string }>`
-          SELECT prediction_id FROM pending_predictions
-          WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1
-        `.catch(() => []),
-        sql<{ lifecycle: string | null; began_at: string | Date | null }>`
-          SELECT lifecycle, began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-        `.catch(() => []),
-        sql<{ game_id: string }>`
-          SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
-        `.catch(() => []),
-      ]);
-
-    // P1.3: Assign to hoisted variable for use outside the try block
-    liveLifecycle = _liveLifecycle;
-
-    // Extract worker_state values from consolidated query
-    const getWorkerValue = (key: string): string | undefined =>
-      workerStateRows.find((r) => r.key === key)?.value;
-
-    if (getWorkerValue('effective_skip_below_ms')) {
-      const t = Number(getWorkerValue('effective_skip_below_ms'));
-      if (Number.isFinite(t) && t >= 300 && t <= 5_000) {
-        skipThreshold = Math.max(skipThreshold, t);
+        `.catch(() => [] as { key: string; value: string }[]);
+        for (const row of workerStateRows) {
+          const n = Number(row.value);
+          if (!Number.isFinite(n)) continue;
+          if (row.key === "median_inter_round_gap_ms") setMedianInterRoundGapMs(n);
+          if (row.key === "wall_clock_skew_ms") setWallClockSkewMs(n);
+          if (row.key === "effective_skip_below_ms") setEffectiveSkipBelowMs(n);
+        }
+        const t = getEffectiveSkipBelowMs();
+        if (t != null && t >= 300 && t <= 5_000) {
+          skipThreshold = Math.max(skipThreshold, t);
+        }
       }
+    } catch {
+      /* gate-cache optional */
     }
 
-    if (existingPending.length > 0) {
+    // Single combined eligibility query (pending + lifecycle + crashed)
+    const eligibility = await sql<{
+      pending_id: string | null;
+      lifecycle: string | null;
+      began_at: string | Date | null;
+      crashed_game_id: string | null;
+    }>`
+      SELECT
+        (SELECT prediction_id::text FROM pending_predictions
+           WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1) AS pending_id,
+        (SELECT lifecycle FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1) AS lifecycle,
+        (SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1) AS began_at,
+        (SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1) AS crashed_game_id
+    `.catch(() => [] as {
+      pending_id: string | null;
+      lifecycle: string | null;
+      began_at: string | Date | null;
+      crashed_game_id: string | null;
+    }[]);
+
+    const el = eligibility[0];
+    liveLifecycle =
+      el && (el.lifecycle != null || el.began_at != null)
+        ? [{ lifecycle: el.lifecycle, began_at: el.began_at }]
+        : [];
+
+    if (el?.pending_id) {
       return {
-        predictionId: existingPending[0]!.prediction_id,
+        predictionId: el.pending_id,
         targetGameId,
         kind: "duplicate",
       };
     }
-    if (alreadyCrashedRows.length > 0) {
+    if (el?.crashed_game_id) {
       logger.warn({ targetGameId }, "Target round N+1 already crashed - too late");
       recordPredictionOutcome(true);
       return { predictionId: null, targetGameId, kind: "too_late" };
