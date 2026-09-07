@@ -104,18 +104,40 @@ export class FeatureEngineV2 {
     const e = this.engine;
     const s = e.snapshot();
     const variance = e.variance();
+    // Empirical ≥1.3x rates from incremental state (true crash base-rate ≈ 1/1.3 ≈ 0.77).
+    const short13 = e.shortHitRate13();
+    const ewma13 = s.ewmaHit13;
+    // BaselineModel still reads fv-1 keys (hit_1_30_50 etc.). Without these
+    // aliases every live signal collapsed to the hard-coded default 0.30 /
+    // ~0.596 confidence — identical on every row in Live Validation.
     return {
       n: s.count,
+      sample_size: s.count,
       mean_cp: s.welford.mean,
       var_cp: variance,
       std_cp: Math.sqrt(variance),
       last_cp: s.lastCrash ?? 0,
       ewma_cp: s.ewma,
-      ewma_hit_13: s.ewmaHit13,
+      ewma_hit_13: ewma13,
       short_mean: e.shortMean(),
       short_var: e.shortVariance(),
-      short_hit_13: e.shortHitRate13(),
+      short_hit_13: short13,
       quality_score: Math.min(1, s.count / 100),
+      // fv-1 aliases for BaselineModel / registry default
+      hit_1_30_50: short13,
+      hit_1_30_100: ewma13 > 0 ? ewma13 : short13,
+      hit_2_00_50: e.hitRate(2.0),
+      hit_2_00_100: e.hitRate(2.0),
+      hit_5_00_50: e.hitRate(5.0),
+      hit_5_00_100: e.hitRate(5.0),
+      hit_10_00_50: Math.max(0, e.hitRate(5.0) * 0.4),
+      hit_10_00_100: Math.max(0, e.hitRate(5.0) * 0.4),
+      // rounds-since not tracked in incremental engine yet
+      since_1_30: 0,
+      since_2_00: 0,
+      since_5_00: 0,
+      since_10_00: 0,
+      roll_std_50: Math.sqrt(e.shortVariance() || variance || 0),
     };
   }
 }

@@ -141,8 +141,16 @@ export class BaselineStatisticalModel implements PredictiveModel {
     const targetKey =
       target === 1.3 ? '1_30' : target === 2.0 ? '2_00' : target === 5.0 ? '5_00' : '10_00';
 
-    let baseProb = v[`hit_${targetKey}_50`] ?? 0.3;
-    const longProb = v[`hit_${targetKey}_100`] ?? baseProb;
+    // Prefer target-specific hit rate; fall back to short_hit_13 / ewma for 1.3x
+    // (FeatureEngineV2 primary keys) so we never silently stick at 0.30.
+    let baseProb =
+      v[`hit_${targetKey}_50`] ??
+      (target === 1.3 ? (v.short_hit_13 ?? v.ewma_hit_13) : undefined) ??
+      0.3;
+    const longProb =
+      v[`hit_${targetKey}_100`] ??
+      (target === 1.3 ? (v.ewma_hit_13 ?? v.short_hit_13) : undefined) ??
+      baseProb;
     baseProb = this.shortWeight * baseProb + this.longWeight * longProb;
 
     // P1.6: Consume More Features in Baseline Model
