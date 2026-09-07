@@ -37,3 +37,17 @@ Monitor worker_state keys:
 - effective_skip_below_ms — must stay <= 200
 
 Alert when socket_status != connected. Feed BCGAME_SOCKET_P / BCGAME_SOCKET_T via browser edge agent when WAF blocks Node egress.
+
+
+## Neon / max_client_conn (Worker Offline)
+
+If the dashboard shows no more connections allowed (max_client_conn):
+
+1. Use Neon pooled connection string (-pooler host), not the direct one.
+2. Set low pools:
+   PG_POOL_MAX=3
+   PG_POOL_MIN=1
+   PG_POOL_IDLE_MS=15000
+   AUTH_PG_POOL_MAX=1
+3. Run one worker replica only (each replica opens its own pool).
+4. Restart the worker service after changing env so old connections release.

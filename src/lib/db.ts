@@ -66,8 +66,10 @@ function toSql(run: Run): Sql {
  * Keep the worker pool small; prefer queueing over opening new clients.
  */
 function readPoolMax(): number {
-  const raw = Number(process.env.PG_POOL_MAX ?? 10);
-  return Math.max(1, Math.min(Number.isFinite(raw) ? raw : 10, 20));
+  const raw = Number(process.env.PG_POOL_MAX ?? 3);
+  // Cap hard at 5 — Neon/PgBouncer max_client_conn is often ≤15 shared by
+  // worker + dashboard auth pool + replicas. Default 10 caused offline worker.
+  return Math.max(1, Math.min(Number.isFinite(raw) ? raw : 3, 5));
 }
 
 function createNeonSql(): Promise<Sql> {
@@ -85,12 +87,12 @@ function createNeonSql(): Promise<Sql> {
     // P1.2: Warm DB Connections - set min to 1, idle timeout to 30s
     const poolMin = Math.min(
       poolMax,
-      Math.max(1, Number(process.env.PG_POOL_MIN ?? 2) || 2), // Keep ≥1 warm against Neon cold-start
+      Math.max(0, Number(process.env.PG_POOL_MIN ?? 1) || 1), // One warm conn; min 0 allowed under pressure
     );
-    const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 60_000) || 60_000; // Hold warm conns longer on Neon
+    const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 15_000) || 15_000; // Release idle fast under max_client_conn
     // Fail fast on exhaustion instead of hanging the worker loop for 30s.
     const connectionTimeoutMillis =
-      Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 8_000) || 8_000;
+      Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 5_000) || 5_000;
 
     const pool = new Pool({
       connectionString: databaseUrl,
@@ -171,10 +173,18 @@ function createNeonSql(): Promise<Sql> {
           msg.includes("Connection terminated") ||
           msg.includes("timeout exceeded when trying to connect")
         ) {
-          // P2.16: Enhanced pool exhaustion logging
           console.error(
             `[db] POOL EXHAUSTION: ${msg} | pool total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${poolMax}`,
           );
+          // Soft reset: drop the saturated pool so the next getSql() opens a
+          // fresh one under the lower max. Avoids stuck "Worker Offline".
+          void (async () => {
+            try {
+              globalRef.__pgPool__ = undefined;
+              globalRef.__pgSqlPromise__ = undefined;
+              await pool.end().catch(() => undefined);
+            } catch { /* soft */ }
+          })();
         }
         throw err;
       }
