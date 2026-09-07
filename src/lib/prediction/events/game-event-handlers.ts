@@ -10,6 +10,8 @@ import { bcGameSocket } from "@/lib/crash/socket-client";
 import { getSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
+import { onGameEndPredict } from "@/lib/prediction/live/predictor";
+import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
 import {
   markLiveRoundStarted,
   markLiveRoundEnded,
@@ -101,27 +103,53 @@ async function onEdEvent(payload: unknown): Promise<void> {
   const correlationId = randomUUID();
   const handoffT0 = performance.now();
 
-  // Schedule immediately. No DB acquisition or lifecycle write precedes this.
-  setImmediate(() => {
-    void onGameEnd({
-      gameId,
-      endTime: endIso,
-      multiplier,
-      receivedAt,
-      skipPredict: false,
+  // Parallel critical path (latency fix 2026-09-07):
+  // 1) Update incremental state immediately so N+1 features see this crash.
+  // 2) Fire prediction and validation concurrently (no sequential stall).
+  // 3) No setImmediate — async work yields on first await without blocking Socket.IO.
+  try {
+    globalIncrementalState.update(multiplier);
+  } catch {
+    /* soft */
+  }
+
+  const predictPromise = onGameEndPredict(gameId, endIso, multiplier, correlationId)
+    .then((result) => {
+      edToPredictMs.observe(Math.max(0, performance.now() - new Date(receivedAt).getTime()));
+      logger.info(
+        { event: "ed", gameId, kind: result.kind, correlationId, path: "parallel-predict" },
+        "ed prediction complete",
+      );
+      return result;
     })
-      .then((result) => {
-        edToPredictMs.observe(Math.max(0, performance.now() - new Date(receivedAt).getTime()));
-        logger.info({ event: "ed", gameId, kind: result.kind, correlationId }, "ed processed");
-      })
-      .catch((error) => {
-        logger.error(
-          { event: "ed", gameId, error: String(error), correlationId },
-          "ed processing failed",
-        );
-      })
-      .finally(() => inFlightEd.delete(gameId));
-  });
+    .catch((error) => {
+      logger.error(
+        { event: "ed", gameId, error: String(error), correlationId, path: "parallel-predict" },
+        "ed prediction failed",
+      );
+    });
+
+  const validatePromise = onGameEnd({
+    gameId,
+    endTime: endIso,
+    multiplier,
+    receivedAt,
+    skipPredict: true, // prediction handled above
+    skipStateUpdate: true, // state updated above
+  })
+    .then((result) => {
+      logger.info({ event: "ed", gameId, kind: result.kind, correlationId, path: "parallel-validate" }, "ed validation complete");
+      return result;
+    })
+    .catch((error) => {
+      logger.error(
+        { event: "ed", gameId, error: String(error), correlationId, path: "parallel-validate" },
+        "ed validation failed",
+      );
+    });
+
+  // Do not block Socket.IO callback; both pipelines run concurrently.
+  void Promise.all([predictPromise, validatePromise]).finally(() => inFlightEd.delete(gameId));
   predictionHandoffMs.observe(performance.now() - handoffT0);
 
   // Durable receipt and lifecycle updates run independently and concurrently.

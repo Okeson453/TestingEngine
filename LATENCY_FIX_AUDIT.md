@@ -1,72 +1,64 @@
 # Prediction Signal Latency Fix — Audit & Changes
 
-**Date:** 2026-09-05  
+**Date:** 2026-09-07  
 **Repo:** Okeson453/TestingEngine  
-**Symptom:** Prediction signal reaches output after BC.Game has advanced 2–3 rounds.
+**Symptom:** ~7,000 ms end-to-end lag; signal after Crash round advances.
 
-## Root cause (source-traced)
+## Root causes addressed
 
-Primary latency was **not** network, poll interval, or model CPU time.
+1. Per-prediction SQL history load (remote DB RTT)
+2. Poll healthy-defer 10 s on "socket healthy"
+3. Residual gate floors causing skipped_late → recovery lag
+4. Outbox dispatcher tick wait after enqueue
+5. **Priority inversion**: validation rows (prio 2) claimed before predictions (prio 1/2)
+6. **Sequential ED path**: validation TX completed before N+1 prediction started
+7. Socket WAF backoff 60 s leaving pure-poll for minutes
 
-1. **Residual / predictive-deadline gate** in `onGameEndPredict`  
-   - Defaults: `MIN_REQUIRED_WINDOW_MS=800`, `SKIP_BELOW_MS=500`,  
-     `GENERATION_BUDGET_MS=500 + DELIVERY_BUDGET_MS=200` → effective floor ≈ **700 ms**.  
-   - When `remainingMs = medianGap − elapsedSinceEd` fell below that floor,  
-     generation was **skipped** (`kind: "skipped_late"`).  
-   - No pending row → no signal until recovery.
+## Changes (2026-09-07)
 
-2. **Poll recovery deferred for 30 s** while socket reported “healthy”  
-   - Missed ED predictions were only recovered after ~2–3 full inter-round gaps.
+### New modules
+- `src/lib/prediction/live/live-history-buffer.ts` — memory history for hot path
+- `src/lib/prediction/live/outbox-wake.ts` — EventEmitter wake for immediate drain
 
-Secondary contributors (smaller):
-- Poll interval default 1500 ms  
-- Adaptive band clamped to 1000–1500 ms  
-- History fetch limited to 100 rows  
-- `onGameEnd` ran synchronously on the Socket.IO callback
+### `predictor.ts`
+- History: memory buffer first, SQL fallback
+- Residual: MIN_REQUIRED 150, SKIP_BELOW 80, GENERATION 100, DELIVERY 80
+- **Outbox priority for predictions: 3** (validations stay 2) — eliminates inversion
+- `notifyOutbox()` after successful persist
 
-## Changes implemented
+### `poll-worker.ts`
+- Healthy defer **10 s → 2.5 s**; pending current window ≤1 game ID
 
-### `src/lib/prediction/live/predictor.ts`
-| Constant / logic | Before | After |
-|------------------|--------|-------|
-| `MAX_HISTORY` | 100 | **50** |
-| `MIN_REQUIRED_WINDOW_MS` | 800 | **250** |
-| `SKIP_BELOW_MS` | 500 | **150** |
-| `GENERATION_BUDGET_MS` | 500 | **150** |
-| `DELIVERY_BUDGET_MS` | 200 | **100** |
-| Hard skip floor | max(skip, gen+deliv) ≈ 700 | **skipThreshold only (150–250)** |
-| Tight residual | hard skip | generate + let outbox expire if needed |
+### `validator.ts`
+- `skipStateUpdate` support for parallel ED path
+- Append to live history buffer; `notifyOutbox` after validation row
+- Validations remain priority 2
 
-`PREDICT_TIMEOUT_MS=80` already applied via `Promise.race` on the hot path.
+### `game-event-handlers.ts`
+- **Parallel ED path**: incremental state update → `onGameEndPredict` + `onGameEnd({ skipPredict, skipStateUpdate })` concurrently
+- Removed `setImmediate` wrapper on critical path
 
-### `src/lib/prediction/live/poll-worker.ts`
-| Setting | Before | After |
-|---------|--------|-------|
-| Default `POLL_INTERVAL_MS` | 1500 | **500** |
-| Adaptive multiplier | 0.3 / 0.5 | **0.25** |
-| Adaptive clamp | 1000–1500 ms | **200–1000 ms** |
-| Socket-healthy defer lag | 30_000 ms | **10_000 ms** |
+### `notification-worker.ts`
+- Wake channel race with timer
+- **TICK_MS 25 → 15**; **BATCH_PARALLELISM 4 → 6**
 
-### `src/lib/prediction/events/game-event-handlers.ts`
-- `onGameEnd` (validate + N+1 predict) offloaded via `setImmediate` so the Socket.IO event loop is not blocked by DB / model work.  
-- Fast path (`markLiveRoundEnded`) remains on the event callback.
+### `socket-client.ts`
+- WAF backoff default **60 s → 15 s**; richer connect_error logs
 
-### Not changed (intentionally)
-- **Validator transaction** — single-tx validate + match preserves the 1:1:1 invariant; splitting would risk races.  
-- **History in gate `Promise.all`** — running the history query before the skip decision would waste work on skipped_late paths.  
-- **DB index** — `crash_rounds(crashed_at DESC)` already exists in `0002_crash_rounds.sql`.
+### `boot.ts`
+- Warms live history buffer after schema validation
 
-## Expected end-to-end latency
+## Expected latency
 
 | Path | Target |
 |------|--------|
-| Healthy hot ED → outbox claim | **~100–350 ms** |
-| Poll recovery after skip / socket lag | **≤ ~10 s** (was 30 s+) |
-| Rounds of signal lag | **0–1** (was 2–3) |
+| Healthy ED → outbox claim | ~80–350 ms |
+| Poll recovery | ≤ ~2.5–3 s |
+| Outbox enqueue → claim | 0–5 ms |
+| Catch-up (no priority inversion) | predictions drain before validation backlog |
 
-## Validation checklist
-- [ ] Unit: `predictor.test.ts`, `validator.test.ts`, `poll-worker` paths  
-- [ ] Integration / temporal-invariant tests  
-- [ ] Runtime: `live_event_log` `processor_latency_ms`, outbox delivery timing  
-- [ ] Confirm `skipped_late` rate drops under continuous operation  
-
+## Invariants preserved
+- 1:1:1 validator transaction
+- Temporal invariant (`prediction_generated_at < target_round_started_at`)
+- Outbox deadline expiry
+- Sheath mode
