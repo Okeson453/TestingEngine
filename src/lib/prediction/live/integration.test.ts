@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { onGameStart } from "@/lib/prediction/live/predictor";
-import { onGameEnd } from "@/lib/prediction/live/validator";
+import { onGameEnd, waitForInFlightPredictions } from "@/lib/prediction/live/validator";
 import { getInvariantStatus } from "@/lib/prediction/live/server";
 import { getSql } from "@/lib/db";
 import { fetchCrashHistory, type FetchedRound } from "@/lib/crash/fetch-bc";
@@ -107,6 +107,7 @@ test("§9.1: strict invariant holds after a simulated bg→ed cycle", async () =
     receivedAt: await ts(3_000),
   });
   assert.equal(edResult.kind, "resolved", `expected resolved, got ${JSON.stringify(edResult)}`);
+  await waitForInFlightPredictions();
 
   // After ed, crash_rounds.crashed_at must be set and the invariant still holds.
   const r = await sql<{ began_at: string; crashed_at: string }>`

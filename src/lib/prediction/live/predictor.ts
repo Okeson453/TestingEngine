@@ -649,6 +649,20 @@ export async function onGameEndPredict(
   // P1.3: Hoist liveLifecycle outside the try block so the transaction
   // section below can reuse it without re-querying live_round_state.
   let liveLifecycle: Array<{ lifecycle: string | null; began_at: string | Date | null }> = [];
+  // Latency report §4.2: start the history read concurrently with the gate
+  // queries. It depends only on `crashedAt` (known here), so it can run in
+  // parallel and be awaited only after the gates pass — removing one DB
+  // round-trip from the critical path. If a gate short-circuits
+  // (duplicate/too_late), the abandoned read is harmless (read-only).
+  let historyError: unknown = null;
+  const historyPromise: Promise<HistoricalRound[]> = loadPriorRoundsStrict(
+    sql,
+    crashedAt,
+    MAX_HISTORY,
+  ).catch((e: unknown) => {
+    historyError = e;
+    return [] as HistoricalRound[];
+  });
   try {
     let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
 
@@ -800,18 +814,17 @@ export async function onGameEndPredict(
     }
   } catch {}
 
-  const sql2 = sql; // P1.2: reuse existing connection — no second getSqlFn() call
-  const priorRounds = await loadPriorRoundsStrict(
-    sql2,
-    crashedAt,
-    MAX_HISTORY,
-  ).catch((e) => {
+  // P1.2: reuse the existing sql connection (no second getSqlFn() call).
+  // The history read was already started in parallel with the gate queries
+  // above; just await it here.
+  const priorRounds = await historyPromise;
+  if (historyError) {
     logger.error(
-      { targetGameId, error: String(e) },
+      { targetGameId, error: String(historyError) },
       "loadPriorRoundsStrict failed",
     );
-    throw e;
-  });
+    throw historyError;
+  }
 
   if (priorRounds.length < MIN_HISTORY) {
     logger.warn(

@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { onGameEnd } from "@/lib/prediction/live/validator";
+import { onGameEnd, waitForInFlightPredictions } from "@/lib/prediction/live/validator";
 import { onGameStart } from "@/lib/prediction/live/predictor";
 import { getSql } from "@/lib/db";
 import { insertNewRounds } from "@/lib/crash/ingest";
@@ -115,6 +115,7 @@ test("validator: idempotent on duplicate ed (UNIQUE prediction_id)", async () =>
   });
   await onGameEnd({ gameId: targetGameId, endTime: await ts(2_900), multiplier: 2.0, receivedAt: await ts(3_000) });
   await onGameEnd({ gameId: targetGameId, endTime: await ts(2_900), multiplier: 2.0, receivedAt: await ts(3_100) });
+  await waitForInFlightPredictions();
 
   const rows = await sql<{ count: number }>`
     select count(*)::int as count from prediction_validations where game_id = ${targetGameId}
@@ -131,6 +132,7 @@ test("validator: bg_arrived_late when ed arrives without a pending row", async (
     multiplier: 1.5,
     receivedAt: await ts(3_000),
   });
+  await waitForInFlightPredictions();
   // If the round also doesn't exist in crash_rounds, this is orphaned
   // (no began_at). If we pre-insert it, it's bg_arrived_late. Either
   // way, NO prediction row is created.

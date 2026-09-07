@@ -27,6 +27,7 @@ const logger = getLogger("live-validator");
 /** Spec §2 / §3.2: always attempt N+1 prediction after Round N is known.
  *  Non-blocking; failures never affect validation. Enables cold-start first
  *  prediction when there was no prior pending row for N. */
+
 /**
  * Generate N+1 after learning for N has completed (audit §40).
  * Still non-fatal: prediction failure does not roll back validation.
@@ -46,6 +47,47 @@ async function triggerNextPrediction(
       "Failed to generate N+1 prediction after ed processing",
     );
   }
+}
+
+/**
+ * Latency report §4.1: the N+1 prediction must NOT be awaited on the ed
+ * critical path. Validation of round N and generation of the prediction for
+ * round N+1 are independent transactions; awaiting one after the other
+ * serialized two DB pipelines and delayed the signal release.
+ *
+ * Correctness is preserved because:
+ * - `globalIncrementalState.update(N)` runs (synchronously awaited) BEFORE
+ *   the prediction is scheduled, so the model already observed round N;
+ * - `onGameEndPredict` runs its own transaction with the temporal-invariant
+ *   check (`prediction_generated_at < target_round_started_at`) and aborts
+ *   if the target round has already started;
+ * - failures are caught inside `triggerNextPrediction` and never affect the
+ *   already-committed validation.
+ *
+ * In-flight predictions are tracked so tests and graceful shutdown can await
+ * them deterministically via `waitForInFlightPredictions()`.
+ */
+const inFlightPredictions = new Set<Promise<void>>();
+
+export async function waitForInFlightPredictions(): Promise<void> {
+  while (inFlightPredictions.size > 0) {
+    await Promise.all([...inFlightPredictions]);
+  }
+}
+
+function scheduleNextPrediction(
+  gameId: string,
+  endTime: string,
+  multiplier: number,
+  correlationId: string | null | undefined,
+): void {
+  const p = triggerNextPrediction(gameId, endTime, multiplier, correlationId).finally(() => {
+    inFlightPredictions.delete(p);
+  });
+  inFlightPredictions.add(p);
+  // triggerNextPrediction never rejects (errors are caught inside), but guard
+  // against future changes introducing an unhandled rejection.
+  p.catch(() => {});
 }
 
 export interface GameEndEvent {
@@ -354,7 +396,7 @@ export async function onGameEnd(
       } catch {
         /* soft */
       }
-      await triggerNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
+      scheduleNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
     }
     if (state.crashRow && state.crashRow.began_at == null) {
       return { kind: "orphaned", targetGameId: evt.gameId };
@@ -428,7 +470,7 @@ export async function onGameEnd(
   // Spec §2/§3.2: trigger N+1 prediction after Round N is processed.
   // Poll recovery path sets skipPredict to prevent historical cascade.
   if (!evt.skipPredict) {
-    await triggerNextPrediction(
+    scheduleNextPrediction(
       evt.gameId,
       evt.endTime,
       evt.multiplier,
