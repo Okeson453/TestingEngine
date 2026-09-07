@@ -338,12 +338,26 @@ export class PollWorker {
         ? newest.crashedAt
         : new Date(newest.crashedAt as string);
     const sourceAgeMs = Date.now() - crashedAtDate.getTime();
-    if (Number.isFinite(sourceAgeMs) && sourceAgeMs > 30_000) {
+    // When Socket is WAF-blocked, poll is the only path — allow older sources
+    // (history RTT + backoff can push newest past 30s). Cap still prevents
+    // predicting from minutes-old backlog.
+    let maxSourceAgeMs = Number(process.env.POLL_MAX_SOURCE_AGE_MS ?? 60_000) || 60_000;
+    try {
+      const st = bcGameSocket.getState().status;
+      if (st === "waf_blocked" || st === "degraded" || st === "stopped") {
+        maxSourceAgeMs = Math.max(
+          maxSourceAgeMs,
+          Number(process.env.POLL_MAX_SOURCE_AGE_WAF_MS ?? 90_000) || 90_000,
+        );
+      }
+    } catch { /* soft */ }
+    if (Number.isFinite(sourceAgeMs) && sourceAgeMs > maxSourceAgeMs) {
       logger.info(
         {
           component: "poll-worker",
           sourceGameId: newest.gameId,
-          sourceAgeMs,
+          sourceAgeMs: Math.round(sourceAgeMs),
+          maxSourceAgeMs,
         },
         "skip poll prediction: source round too old for reliable N+1",
       );

@@ -156,7 +156,7 @@ export class OutboxDispatcher {
             const remainingMs = Number.isFinite(deadlineMs)
               ? deadlineMs - this.now()
               : Number.POSITIVE_INFINITY;
-            if (remainingMs < 50) {
+            if (Number.isFinite(remainingMs) && remainingMs < 0) {
               await sql`
                 update notification_outbox
                 set status = 'dead_letter',
@@ -457,12 +457,15 @@ export class OutboxDispatcher {
     // attempt_count was already incremented at claim time
     const attempts = row.attempt_count;
     const firstFailure = results.find((r) => !r.ok);
+    // Only true client errors are permanent. 408/425/429 and 5xx retry.
+    // 401 often means transient token misread — retry a few times before dead.
     const isPermanent =
       firstFailure != null &&
       typeof firstFailure.status === "number" &&
-      firstFailure.status >= 400 &&
-      firstFailure.status < 500 &&
-      firstFailure.status !== 429;
+      (firstFailure.status === 400 ||
+        firstFailure.status === 403 ||
+        firstFailure.status === 404 ||
+        firstFailure.status === 422);
     const lastError = firstFailure?.error ?? "send_failed";
 
     if (isPermanent || attempts >= MAX_ATTEMPTS) {

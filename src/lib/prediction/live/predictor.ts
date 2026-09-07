@@ -473,7 +473,7 @@ export async function onGameStart(
           `Generated: ${predictionGeneratedAt}`,
         ].join("\n");
         // P1.6: Populate telegram_deadline_at for onGameStart path too.
-        const deadlineAt = new Date(Date.now() + 2_000).toISOString();
+        const deadlineAt = new Date(Date.now() + Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000)).toISOString();
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
@@ -1043,7 +1043,10 @@ export async function onGameEndPredict(
         // Priority 2 = high; next_attempt_at must be timestamptz (use now()), not Date.now() number
         // P1.6: Populate telegram_deadline_at so the outbox dispatcher can expire
         // stale signals before wasting a Telegram API round-trip.
-        const deadlineAt = new Date(Date.now() + 2_000).toISOString();
+        const deadlineMs = recoveryMode
+          ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 12_000)
+          : Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000);
+        const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
