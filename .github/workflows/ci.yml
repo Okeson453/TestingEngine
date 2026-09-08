@@ -42,6 +42,46 @@ jobs:
             exit 1
           fi
           echo "Worker implementations look real."
+
+      - name: Guard against committed EDGE_INGEST_TOKEN in userscripts
+        run: |
+          set -euo pipefail
+          failed=0
+          for f in scripts/bcgame-crash-edge-forwarder.user.js agents/browser-edge-observer.user.js; do
+            if [ ! -f "$f" ]; then
+              echo "::warning::$f missing"
+              continue
+            fi
+            # Extract AUTH_TOKEN string literal
+            token=$(python3 - <<'PY' "$f"
+import re, sys
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+m = re.search(r"const\s+AUTH_TOKEN\s*=\s*['\"]([^'\"]+)['\"]", text)
+if not m:
+    print("")
+    sys.exit(0)
+print(m.group(1))
+PY
+)
+            echo "$f AUTH_TOKEN=$token"
+            if [ -z "$token" ]; then
+              echo "::error::$f missing AUTH_TOKEN assignment"
+              failed=1
+              continue
+            fi
+            case "$token" in
+              PASTE_EDGE_INGEST_TOKEN_HERE|YOUR-*|CHANGE_ME*|placeholder*)
+                echo "$f uses placeholder token (ok)"
+                ;;
+              *)
+                echo "::error::$f AUTH_TOKEN looks like a real secret (length ${#token}). Use PASTE_EDGE_INGEST_TOKEN_HERE."
+                failed=1
+                ;;
+            esac
+          done
+          exit "$failed"
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
