@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TestingEngine BC.Game Edge Forwarder
 // @namespace    https://github.com/Okeson453/TestingEngine
-// @version      1.3.0
+// @version      1.3.1
 // @description  Forward Crash end/start events to TestingEngine edge ingest (bypasses Cloudflare WAF on Railway)
 // @match        https://bc.game/*
 // @match        https://*.bc.game/*
@@ -15,13 +15,15 @@
  * 1. Railway: set EDGE_INGEST_TOKEN + public domain on the worker service.
  * 2. Open this script in Tampermonkey → edit WORKER_URL and AUTH_TOKEN below.
  * 3. Save → open https://bc.game/game/crash → green "TE Edge ✓" pill = working.
+ *
+ * Never commit a real EDGE_INGEST_TOKEN. Tokens in git are public.
  */
 (function () {
   'use strict';
 
   // ========== EDIT THESE TWO LINES (Tampermonkey editor) ==========
   const WORKER_URL = 'https://testingengine-production.up.railway.app'; // public worker URL, no trailing slash
-  const AUTH_TOKEN = '7fK2mQ9xL4vN8pR3sT6wY1zA5cD0eH2j';      // same as Railway EDGE_INGEST_TOKEN
+  const AUTH_TOKEN = 'PASTE_EDGE_INGEST_TOKEN_HERE';      // same as Railway EDGE_INGEST_TOKEN — do not commit real values
   // ================================================================
 
   const CONFIG = Object.assign(
@@ -42,7 +44,7 @@
     !CONFIG.url ||
     !CONFIG.token ||
     CONFIG.token.includes('PASTE_EDGE') ||
-    (CONFIG.token.includes('YOUR-') && CONFIG.token.includes('WORKER'))
+    CONFIG.token.includes('YOUR-')
   ) {
     console.warn(
       '[TE-EDGE] Disabled. Edit WORKER_URL and AUTH_TOKEN at the top of the Tampermonkey script, then Save.',

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TestingEngine BC.Game Edge Forwarder
 // @namespace    https://github.com/Okeson453/TestingEngine
-// @version      1.3.0
+// @version      1.3.1
 // @description  Forward Crash end/start events to TestingEngine edge ingest (bypasses Cloudflare WAF on Railway)
 // @match        https://bc.game/*
 // @match        https://*.bc.game/*
@@ -15,13 +15,15 @@
  * 1. Railway: set EDGE_INGEST_TOKEN + public domain on the worker service.
  * 2. Open this script in Tampermonkey → edit WORKER_URL and AUTH_TOKEN below.
  * 3. Save → open https://bc.game/game/crash → green "TE Edge ✓" pill = working.
+ *
+ * Never commit a real EDGE_INGEST_TOKEN. Tokens in git are public.
  */
 (function () {
   'use strict';
 
   // ========== EDIT THESE TWO LINES (Tampermonkey editor) ==========
   const WORKER_URL = 'https://testingengine-production.up.railway.app'; // public worker URL, no trailing slash
-  const AUTH_TOKEN = '7fK2mQ9xL4vN8pR3sT6wY1zA5cD0eH2j';      // same as Railway EDGE_INGEST_TOKEN
+  const AUTH_TOKEN = 'PASTE_EDGE_INGEST_TOKEN_HERE';      // same as Railway EDGE_INGEST_TOKEN — do not commit real values
   // ================================================================
 
   const CONFIG = Object.assign(
@@ -34,7 +36,6 @@
       debugFrameTypes: false,
       forwardBinary: true,
     },
-    // Optional override if someone does use console later
     typeof window !== 'undefined' ? window.__TE_EDGE__ || {} : {},
   );
 
@@ -42,12 +43,11 @@
     !CONFIG.url ||
     !CONFIG.token ||
     CONFIG.token.includes('PASTE_EDGE') ||
-    (CONFIG.token.includes('YOUR-') && CONFIG.token.includes('WORKER'))
+    CONFIG.token.includes('YOUR-')
   ) {
     console.warn(
       '[TE-EDGE] Disabled. Edit WORKER_URL and AUTH_TOKEN at the top of the Tampermonkey script, then Save.',
     );
-    // Visible on-page hint so no console is required
     try {
       const tip = document.createElement('div');
       tip.id = 'te-edge-indicator';
@@ -200,7 +200,6 @@
     }
   }
 
-  // Observe WebSocket — BC.Game crash uses binary protobuf frames (not JSON text).
   try {
     const OrigWS = window.WebSocket;
     window.WebSocket = function (...args) {
@@ -241,7 +240,6 @@
     log('WS patch failed', e);
   }
 
-  // Poll in-page crash history (fallback when WS frames are binary/protobuf)
   function pollHistory() {
     try {
       const roots = [window.crash, window.game && window.game.crash, window.__CRASH__];
@@ -265,7 +263,6 @@
   }
   setTimeout(pollHistory, 2000);
 
-  // Heartbeat health
   setInterval(() => {
     fetch(base + '/edge/health', { mode: 'cors' })
       .then((r) => setIndicator(r.ok))
