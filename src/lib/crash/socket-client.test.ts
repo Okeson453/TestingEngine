@@ -24,10 +24,8 @@ test("disconnect is intentional and blocks reconnect until reset", async () => {
   c.disconnect();
   assert.equal(c.getState().status, "stopped");
   await c.connect();
-  // connect is ignored while intentional shutdown is set
   assert.equal(c.getState().status, "stopped");
   c.resetShutdownFlag();
-  // Do not call real connect() here — would hit network; only verify flag reset
   assert.equal(c.getState().status, "stopped");
   assert.equal(c.isActive(), false);
 });
@@ -52,34 +50,27 @@ test("connection state exposes transport and event lag fields", () => {
 });
 
 test("decodeBinaryPacket parses namespace CONNECT envelope", () => {
-  // 04 00 05 /g/cm  (EIO marker, type CONNECT, ns len 5, ns)
   const nsp = Buffer.from("/g/cm", "utf8");
   const buf = Buffer.concat([
     Buffer.from([0x04, 0x00, nsp.length]),
     nsp,
-    Buffer.from([0]), // empty event len
+    Buffer.from([0]),
   ]);
   const pkt = decodeBinaryPacket(buf);
-  assert.equal(pkt.type, 0); // CONNECT
+  assert.equal(pkt.type, 0);
   assert.equal(pkt.namespace, "/g/cm");
 });
 
 test("decodeBinaryPacket parses EVENT with ackId (join shape)", () => {
-  // join request shape from RE report:
-  // 04 82 00 00 00 00 05 2f 67 2f 63 6d 04 6a 6f 69 6e
-  const buf = Buffer.from(
-    "048200000000052f672f636d046a6f696e",
-    "hex",
-  );
+  const buf = Buffer.from("048200000000052f672f636d046a6f696e", "hex");
   const pkt = decodeBinaryPacket(buf);
-  assert.equal(pkt.type, 2); // EVENT (0x82 & 0x7f)
+  assert.equal(pkt.type, 2);
   assert.equal(pkt.ackId, 0);
   assert.equal(pkt.namespace, "/g/cm");
   assert.equal(pkt.event, "join");
 });
 
 test("decodeEnd maps maxRate to multiplier / 100", () => {
-  // field 1 = roundId 9586584, field 6 = maxRate 370
   function writeVarint(n: number): number[] {
     const out: number[] = [];
     while (n > 0x7f) {
@@ -90,10 +81,8 @@ test("decodeEnd maps maxRate to multiplier / 100", () => {
     return out;
   }
   const bytes: number[] = [];
-  // tag field 1 wire 0
   bytes.push(...writeVarint((1 << 3) | 0));
   bytes.push(...writeVarint(9586584));
-  // tag field 6 wire 0
   bytes.push(...writeVarint((6 << 3) | 0));
   bytes.push(...writeVarint(370));
   const decoded = decodeEnd(new Uint8Array(bytes));
@@ -136,4 +125,27 @@ test("on() registers and returns unsubscribe", async () => {
 test("getDiscoveredEvents starts empty", () => {
   const c = new BcGameSocketClient();
   assert.deepEqual(c.getDiscoveredEvents(), []);
+});
+
+test("decodeBegin preserves full epoch-ms timestamps (not 32-bit truncated)", () => {
+  function writeVarint(n: number): number[] {
+    const out: number[] = [];
+    let v = n;
+    while (v >= 0x80) {
+      out.push((v & 0x7f) | 0x80);
+      v = Math.floor(v / 128);
+    }
+    out.push(v);
+    return out;
+  }
+  const epochMs = 1_725_820_800_000;
+  const bytes: number[] = [];
+  bytes.push(...writeVarint((1 << 3) | 0));
+  bytes.push(...writeVarint(9586585));
+  bytes.push(...writeVarint((4 << 3) | 0));
+  bytes.push(...writeVarint(epochMs));
+  const decoded = decodeBegin(new Uint8Array(bytes));
+  assert.equal(decoded.roundId, 9586585);
+  assert.equal(decoded.startTime, epochMs);
+  assert.ok(decoded.startTime > 1e12, `startTime too small: ${decoded.startTime}`);
 });
