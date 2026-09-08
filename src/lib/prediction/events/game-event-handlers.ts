@@ -27,12 +27,21 @@ const inFlightEd = new Set<string>();
 const inFlightBg = new Set<string>();
 
 function toIsoString(timestamp: number | string | undefined): string | null {
-  if (!timestamp) return null;
+  if (timestamp == null || timestamp === "") return null;
   if (typeof timestamp === "string") {
     const date = new Date(timestamp);
     return Number.isNaN(date.getTime()) ? null : date.toISOString();
   }
-  const date = new Date(timestamp < 1e10 ? timestamp * 1000 : timestamp);
+  // Epoch-ms (~1e12) vs epoch-seconds (~1e9). Prefer ms; only scale seconds when clearly small.
+  let ms = timestamp;
+  if (timestamp > 0 && timestamp < 1e11) {
+    ms = timestamp * 1000;
+  }
+  // Guard: reject timestamps more than 1 day from wall clock (corrupt decode)
+  if (Math.abs(ms - Date.now()) > 86_400_000) {
+    return new Date().toISOString();
+  }
+  const date = new Date(ms);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
@@ -54,9 +63,7 @@ async function findSourceRoundForTarget(
   sql: import("@/lib/db").Sql,
 ): Promise<{ sourceGameId: string; crashedAt: string; multiplier: number } | null> {
   try {
-    // Look for the round immediately before the target
     const sourceGameId = String(BigInt(targetGameId) - 1n);
-    
     const row = await sql<{
       game_id: string;
       multiplier: number;
@@ -68,106 +75,66 @@ async function findSourceRoundForTarget(
       ORDER BY crashed_at DESC
       LIMIT 1
     `;
-    
-    if (row.length > 0 && row[0]!.crashed_at) {
+    if (row[0]) {
       return {
-        sourceGameId: row[0]!.game_id,
-        crashedAt: row[0]!.crashed_at,
-        multiplier: row[0]!.multiplier,
+        sourceGameId: row[0].game_id,
+        crashedAt: row[0].crashed_at,
+        multiplier: Number(row[0].multiplier),
       };
     }
-    
-    // Fallback: find the most recent crashed round
-    const recent = await sql<{
+    const fallback = await sql<{
       game_id: string;
       multiplier: number;
       crashed_at: string;
     }>`
       SELECT game_id, multiplier, crashed_at::text
       FROM crash_rounds
-      WHERE crashed_at IS NOT NULL
-      ORDER BY crashed_at DESC, game_id DESC
+      WHERE game_id < ${targetGameId}
+      ORDER BY game_id DESC
       LIMIT 1
     `;
-    
-    if (recent.length > 0 && recent[0]!.crashed_at) {
+    if (fallback[0]) {
       return {
-        sourceGameId: recent[0]!.game_id,
-        crashedAt: recent[0]!.crashed_at,
-        multiplier: recent[0]!.multiplier,
+        sourceGameId: fallback[0].game_id,
+        crashedAt: fallback[0].crashed_at,
+        multiplier: Number(fallback[0].multiplier),
       };
     }
-    
     return null;
-  } catch (error) {
-    logger.error(
-      { targetGameId, error: String(error) },
-      "findSourceRoundForTarget failed",
-    );
+  } catch {
     return null;
   }
 }
 
-async function onBgEvent(payload: unknown): Promise<void> {
+async function bgHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
   if (!gameId) return;
-  const p = (payload ?? {}) as Record<string, unknown>;
-  const beganAt = toIsoString((p.beganAt ?? p.beginTime) as number | string | undefined);
-  if (!beganAt) return;
-
   if (inFlightBg.has(gameId)) return;
   inFlightBg.add(gameId);
 
-  const receivedAt = new Date().toISOString();
   const correlationId = randomUUID();
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const beganAt =
+    toIsoString((p.beganAt ?? p.beginTime) as number | string | undefined) ??
+    new Date().toISOString();
 
   try {
     const sql = await getSql();
-    
-    // Check if this bg event has already been processed (persistent deduplication)
-    const alreadyProcessed = await sql<{ count: number }>`
-      SELECT count(*)::int AS count
-      FROM live_event_log
-      WHERE event_kind = 'BG' AND game_id = ${gameId} AND payload->>'beganAt' = ${beganAt}
-    `;
-    if ((alreadyProcessed[0]?.count ?? 0) > 0) {
-      inFlightBg.delete(gameId);
-      return;
-    }
-    
-    // Backfill target_round_started_at for any existing predictions
-    await sql`
-      UPDATE pending_predictions
-      SET target_round_started_at = ${beganAt}::timestamptz
-      WHERE target_game_id = ${gameId}
-        AND status = 'PENDING'
-        AND target_round_started_at IS NULL
-    `.catch(() => undefined);
-
-    // Find source round for prediction
     const source = await findSourceRoundForTarget(gameId, sql);
-    
+
     if (source) {
-      // Generate prediction for this target round using the bg event data
       const evt: GameStartEvent = {
         gameId,
         beginTime: beganAt,
-        hash: p.hash as string | null ?? null,
-        salt: p.salt as string | null ?? null,
+        receivedAt: new Date().toISOString(),
         sourceRoundGameId: source.sourceGameId,
-        receivedAt,
       };
-      
-      // Call onGameStart to create the prediction
-      // This ensures prediction_generated_at < target_round_started_at
-      // because we're generating the prediction when we receive the bg event
-      void onGameStart(evt, { recoveryMode: false })
-        .then((result) => {
+      void onGameStart(evt)
+        .then(() => {
           logger.info(
             {
               event: "bg",
               gameId,
-              kind: result.kind,
               correlationId,
               sourceGameId: source.sourceGameId,
             },
@@ -201,160 +168,70 @@ async function onBgEvent(payload: unknown): Promise<void> {
   }
 }
 
-/**
- * The Socket.IO callback must not wait for durable receipt writes. Those writes
- * are idempotent safety-net work; the predictor/validator transaction is the
- * correctness boundary. This removes DB RTT from the ED→prediction critical path.
- */
-async function onEdEvent(payload: unknown): Promise<void> {
-  const detectT0 = performance.now();
+async function edHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
   if (!gameId) return;
-  const p = (payload ?? {}) as Record<string, unknown>;
-  const endIso =
-    toIsoString((p.crashedAt ?? p.endTime) as number | string | undefined) ??
-    new Date().toISOString();
-  const raw = (p.multiplier ?? p.rate) as number | string | undefined;
-  const multiplier =
-    typeof raw === "number" ? raw : typeof raw === "string" ? Number.parseFloat(raw) : 0;
-  if (!Number.isFinite(multiplier) || multiplier <= 0) return;
-  roundDetectMs.observe(performance.now() - detectT0);
-
   if (inFlightEd.has(gameId)) return;
   inFlightEd.add(gameId);
-  const receivedAt = new Date().toISOString();
-  const correlationId = randomUUID();
-  const handoffT0 = performance.now();
 
-  // Check if this ed event has already been processed (persistent deduplication)
+  const correlationId = randomUUID();
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const multiplier =
+    typeof p.multiplier === "number"
+      ? p.multiplier
+      : typeof p.maxRate === "number"
+        ? p.maxRate / 100
+        : null;
+  const crashedAt =
+    toIsoString((p.crashedAt ?? p.endTime) as number | string | undefined) ??
+    new Date().toISOString();
+
   try {
     const sql = await getSql();
-    const alreadyProcessed = await sql<{ count: number }>`
-      SELECT count(*)::int AS count
-      FROM live_event_log
-      WHERE event_kind = 'ED_RECEIVED' AND game_id = ${gameId}
-    `;
-    if ((alreadyProcessed[0]?.count ?? 0) > 0) {
-      inFlightEd.delete(gameId);
-      return;
+
+    if (multiplier != null && Number.isFinite(multiplier)) {
+      try {
+        globalIncrementalState.observeRound({
+          gameId,
+          multiplier,
+          crashedAt,
+        });
+      } catch {
+        /* soft */
+      }
+
+      const crashedAtDate = new Date(crashedAt);
+      if (!Number.isNaN(crashedAtDate.getTime())) {
+        const beganAt = new Date(crashedAtDate.getTime() - 3_000);
+        await sql`
+          INSERT INTO crash_rounds (game_id, multiplier, hash, seed, began_at, crashed_at)
+          VALUES (${gameId}, ${multiplier}, null, null, ${beganAt}, ${crashedAtDate})
+          ON CONFLICT (game_id) DO UPDATE SET
+            multiplier = EXCLUDED.multiplier,
+            crashed_at = EXCLUDED.crashed_at
+        `.catch(() => undefined);
+      }
+
+      void onGameEnd({
+        gameId,
+        multiplier,
+        crashedAt,
+        receivedAt: new Date().toISOString(),
+      }).catch((error) => {
+        logger.error({ event: "ed", gameId, error: String(error), correlationId }, "ed validation failed");
+      });
     }
+
+    await markLiveRoundEnded(gameId, crashedAt, "socket", correlationId, sql).catch(() => undefined);
   } catch (error) {
-    logger.debug({ event: "ed", gameId, error: String(error) }, "ed deduplication check failed");
+    logger.error({ event: "ed", gameId, error: String(error) }, "ed observability failed");
+  } finally {
+    inFlightEd.delete(gameId);
   }
-
-  // Update incremental state immediately so features see this crash.
-  try {
-    globalIncrementalState.update(multiplier);
-  } catch {
-    /* soft */
-  }
-
-  // Only validation - prediction is now handled in onBgEvent
-  const validatePromise = onGameEnd({
-    gameId,
-    endTime: endIso,
-    multiplier,
-    receivedAt,
-    skipPredict: true,
-    skipStateUpdate: true,
-  })
-    .then((result) => {
-      logger.info({ event: "ed", gameId, kind: result.kind, correlationId, path: "validate" }, "ed validation complete");
-      return result;
-    })
-    .catch((error) => {
-      logger.error(
-        { event: "ed", gameId, error: String(error), correlationId, path: "validate" },
-        "ed validation failed",
-      );
-    });
-
-  // Do not block Socket.IO callback
-  void Promise.resolve(validatePromise).finally(() => inFlightEd.delete(gameId));
-  predictionHandoffMs.observe(performance.now() - handoffT0);
-
-  // Durable receipt and lifecycle updates run independently and concurrently.
-  void (async () => {
-    try {
-      const sql = await getSql();
-      const crashedAt = new Date(endIso);
-      const beganAt = new Date(crashedAt.getTime() - 3_000);
-      await Promise.all([
-        sql`
-          INSERT INTO crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
-          VALUES (${gameId}, ${multiplier}, null, null, ${beganAt}, ${crashedAt})
-          ON CONFLICT (game_id) DO UPDATE
-            SET crashed_at = COALESCE(crash_rounds.crashed_at, excluded.crashed_at),
-                multiplier = COALESCE(crash_rounds.multiplier, excluded.multiplier)
-        `.catch(() => undefined),
-        sql`
-          INSERT INTO live_event_log (
-            correlation_id, event_kind, game_id, payload, received_at, processed_at,
-            processor_latency_ms, sla_violated
-          ) VALUES (
-            ${correlationId}::text, 'ED_RECEIVED', ${gameId},
-            ${JSON.stringify({ endTime: endIso, multiplier, source: "socket" })},
-            ${receivedAt}::timestamptz, now(), 0, false
-          ) ON CONFLICT DO NOTHING
-        `.catch(() => undefined),
-        markLiveRoundEnded(gameId, endIso, multiplier, undefined, "socket").catch(() => undefined),
-      ]);
-    } catch (error) {
-      logger.debug({ event: "ed", gameId, error: String(error) }, "ed receipt persistence failed");
-    }
-  })();
 }
 
-function onPgEvent(payload: unknown): void {
-  logger.debug({ event: "pg", gameId: extractLastGameId(payload) }, "pg received");
-}
-
-const bgHandler = (payload: unknown): void => {
-  void onBgEvent(payload);
-};
-const edHandler = (payload: unknown): void => {
-  void onEdEvent(payload);
-};
-const pgHandler = (payload: unknown): void => {
-  onPgEvent(payload);
-};
-
-export function initializeEventHandlers(): void {
-  const sock = bcGameSocket as unknown as {
-    off?: (ev: string, fn: (...args: unknown[]) => void) => void;
-    removeListener?: (ev: string, fn: (...args: unknown[]) => void) => void;
-  };
-  const rem = sock.off ?? sock.removeListener;
-  if (typeof rem === "function") {
-    rem.call(bcGameSocket, "bg", bgHandler as (...args: unknown[]) => void);
-    rem.call(bcGameSocket, "ed", edHandler as (...args: unknown[]) => void);
-    rem.call(bcGameSocket, "pg", pgHandler as (...args: unknown[]) => void);
-  }
+export function wireGameEventHandlers(): void {
   bcGameSocket.on("bg", bgHandler);
   bcGameSocket.on("ed", edHandler);
-  bcGameSocket.on("pg", pgHandler);
   logger.info({ component: "game-event-handlers" }, "event handlers wired");
 }
-
-export async function startEventDrivenPipeline(): Promise<void> {
-  initializeEventHandlers();
-  await bcGameSocket.connect();
-}
-
-export async function stopEventDrivenPipeline(): Promise<void> {
-  const sock = bcGameSocket as unknown as {
-    off?: (ev: string, fn: (...args: unknown[]) => void) => void;
-    removeListener?: (ev: string, fn: (...args: unknown[]) => void) => void;
-  };
-  const rem = sock.off ?? sock.removeListener;
-  if (typeof rem === "function") {
-    rem.call(bcGameSocket, "bg", bgHandler as (...args: unknown[]) => void);
-    rem.call(bcGameSocket, "ed", edHandler as (...args: unknown[]) => void);
-    rem.call(bcGameSocket, "pg", pgHandler as (...args: unknown[]) => void);
-  }
-  inFlightEd.clear();
-  inFlightBg.clear();
-  bcGameSocket.disconnect();
-}
-
-export { bcGameSocket, onBgEvent as onGameStartLegacy, onEdEvent as onGameEndLegacy };
