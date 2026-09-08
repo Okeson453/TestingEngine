@@ -124,6 +124,17 @@ async function onBgEvent(payload: unknown): Promise<void> {
   try {
     const sql = await getSql();
     
+    // Check if this bg event has already been processed (persistent deduplication)
+    const alreadyProcessed = await sql<{ count: number }>`
+      SELECT count(*)::int AS count
+      FROM live_event_log
+      WHERE event_kind = 'BG' AND game_id = ${gameId} AND payload->>'beganAt' = ${beganAt}
+    `;
+    if ((alreadyProcessed[0]?.count ?? 0) > 0) {
+      inFlightBg.delete(gameId);
+      return;
+    }
+    
     // Backfill target_round_started_at for any existing predictions
     await sql`
       UPDATE pending_predictions
@@ -214,6 +225,22 @@ async function onEdEvent(payload: unknown): Promise<void> {
   const receivedAt = new Date().toISOString();
   const correlationId = randomUUID();
   const handoffT0 = performance.now();
+
+  // Check if this ed event has already been processed (persistent deduplication)
+  try {
+    const sql = await getSql();
+    const alreadyProcessed = await sql<{ count: number }>`
+      SELECT count(*)::int AS count
+      FROM live_event_log
+      WHERE event_kind = 'ED_RECEIVED' AND game_id = ${gameId}
+    `;
+    if ((alreadyProcessed[0]?.count ?? 0) > 0) {
+      inFlightEd.delete(gameId);
+      return;
+    }
+  } catch (error) {
+    logger.debug({ event: "ed", gameId, error: String(error) }, "ed deduplication check failed");
+  }
 
   // Update incremental state immediately so features see this crash.
   try {
