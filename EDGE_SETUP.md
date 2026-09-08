@@ -1,76 +1,49 @@
-# Edge Ingest setup (bypass Cloudflare WAF)
+# Edge Ingest (no browser console)
 
-Railway Node → `socketv4.bc.game` is WAF-blocked. A browser on bc.game (residential IP)
-forwards Crash events to the worker over HTTPS.
+Bypasses Cloudflare WAF: browser on bc.game forwards Crash events to your Railway worker.
 
-## 1. Railway (worker service)
+## A. Railway (worker service)
 
-```bash
-EDGE_INGEST_TOKEN=<random-32-byte-hex>
-# Optional; if unset but TOKEN is set, worker listens on $PORT (Railway public port)
-EDGE_INGEST_PORT=8091
-```
-
-Enable **public networking** on the **worker** service (or set TOKEN and use the service’s public URL on `$PORT`).
+1. Variables:
+   ```
+   EDGE_INGEST_TOKEN=<long-random-secret>
+   ```
+2. Enable **public networking** on the **worker** service.
+3. Redeploy. Log line:
+   ```
+   browser-edge ingest listening on http://0.0.0.0:...
+   ```
+4. Copy the public URL, e.g. `https://something.up.railway.app`
 
 Generate token:
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-Redeploy. Logs should show:
-```text
-browser-edge ingest listening on http://0.0.0.0:...
+## B. Tampermonkey only (no console)
+
+1. Install [Tampermonkey](https://www.tampermonkey.net/).
+2. Dashboard → **Create a new script**.
+3. Paste contents of `agents/browser-edge-observer.user.js`.
+4. At the top of the script, change **only these two lines**:
+   ```js
+   const WORKER_URL = 'https://YOUR-WORKER.up.railway.app';
+   const AUTH_TOKEN = 'PASTE_EDGE_INGEST_TOKEN_HERE';
+   ```
+   to your real worker URL and the same token as `EDGE_INGEST_TOKEN`.
+5. **File → Save** (Ctrl+S).
+6. Open **https://bc.game/game/crash** (logged in).
+7. Look at the **top-right pill**:
+   - **TE Edge ✓** (green) = forwarding works
+   - **TE Edge ✗** (red) = URL/token/network problem
+   - Orange tip = you still have placeholder URL/token in the script
+
+## C. Confirm on Railway
+
+Logs should show:
 ```
-
-## 2. Userscript
-
-1. Install Tampermonkey.
-2. Add `agents/browser-edge-observer.user.js` (or `scripts/bcgame-crash-edge-forwarder.user.js`).
-3. In the BC.Game tab console:
-```js
-window.__TE_EDGE__ = {
-  url: 'https://YOUR-WORKER.up.railway.app',  // public worker URL, no :8091 if using $PORT
-  token: 'SAME_AS_EDGE_INGEST_TOKEN',
-};
-location.reload();
-```
-4. Open https://bc.game/game/crash — green **TE Edge ✓** pill = OK.
-
-## 3. Verify
-
-Railway logs:
-```text
 edge crash ingested (...)
 ```
+or frame decode activity after each crash.
 
-Worker health may still show socket `waf_blocked` — that is expected; edge is the live path.
-
-## Paths accepted
-
-- `POST /edge/crash`, `POST /edge/bg`, `GET /edge/health`
-- Aliases: `/api/crash/edge`, `/api/edge/crash`, `/api/crash/edge/bg`
-
-
-## Binary frames (critical)
-
-BC.Game Crash Socket.IO payloads are **binary protobuf**, not JSON text.
-Userscript v1.2+ posts base64 frames to `POST /edge/frame`; the worker
-decodes with `bcgame-crash-transport.ts` (`decodeBinaryPacket` / `decodeEnd`).
-
-### Diagnose frame type (no Railway change needed)
-
-```js
-window.__TE_EDGE__ = { url: 'https://YOUR-WORKER...', token: '...', debugFrameTypes: true };
-location.reload();
-```
-
-Console should show `frame type: ArrayBuffer` then server logs `edge crash ingested`.
-
-### Optional: run server-side transport demo
-
-```bash
-npx tsx src/lib/crash/transport/demo.ts
-```
-
-May still be WAF-blocked from Railway; edge userscript remains the reliable path.
+Socket may still show `waf_blocked` — that is expected; edge is the live path.

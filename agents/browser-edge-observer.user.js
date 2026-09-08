@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TestingEngine BC.Game Edge Forwarder
 // @namespace    https://github.com/Okeson453/TestingEngine
-// @version      1.2.0
+// @version      1.3.0
 // @description  Forward Crash end/start events to TestingEngine edge ingest (bypasses Cloudflare WAF on Railway)
 // @match        https://bc.game/*
 // @match        https://*.bc.game/*
@@ -10,37 +10,53 @@
 // ==/UserScript==
 
 /**
- * Setup:
- *   1. Railway worker: EDGE_INGEST_TOKEN=<secret>, public domain on worker service
- *   2. In browser console once (or edit CONFIG below):
- *        window.__TE_EDGE__ = {
- *          url: 'https://YOUR-WORKER.up.railway.app',  // no :8091 if Railway $PORT
- *          token: 'same-as-EDGE_INGEST_TOKEN',
- *        };
- *   3. Reload bc.game/game/crash — green pill top-right means active.
+ * NO CONSOLE NEEDED.
+ *
+ * 1. Railway: set EDGE_INGEST_TOKEN + public domain on the worker service.
+ * 2. Open this script in Tampermonkey → edit WORKER_URL and AUTH_TOKEN below.
+ * 3. Save → open https://bc.game/game/crash → green "TE Edge ✓" pill = working.
  */
 (function () {
   'use strict';
 
+  // ========== EDIT THESE TWO LINES (Tampermonkey editor) ==========
+  const WORKER_URL = 'https://YOUR-WORKER.up.railway.app'; // public worker URL, no trailing slash
+  const AUTH_TOKEN = 'PASTE_EDGE_INGEST_TOKEN_HERE';      // same as Railway EDGE_INGEST_TOKEN
+  // ================================================================
+
   const CONFIG = Object.assign(
     {
-      url: '',
-      token: '',
+      url: WORKER_URL,
+      token: AUTH_TOKEN,
       dedupeMs: 45_000,
       pollMs: 1200,
       debug: true,
-      /** Log WS frame types for one session (binary vs string) */
       debugFrameTypes: false,
-      /** Forward binary frames as base64 to /edge/frame for server protobuf decode */
       forwardBinary: true,
     },
+    // Optional override if someone does use console later
     typeof window !== 'undefined' ? window.__TE_EDGE__ || {} : {},
   );
 
-  if (!CONFIG.url || !CONFIG.token) {
+  if (
+    !CONFIG.url ||
+    !CONFIG.token ||
+    CONFIG.url.includes('YOUR-WORKER') ||
+    CONFIG.token.includes('PASTE_EDGE')
+  ) {
     console.warn(
-      '[TE-EDGE] Disabled. Set window.__TE_EDGE__ = { url: "https://YOUR-WORKER.up.railway.app", token: "..." } and reload.',
+      '[TE-EDGE] Disabled. Edit WORKER_URL and AUTH_TOKEN at the top of the Tampermonkey script, then Save.',
     );
+    // Visible on-page hint so no console is required
+    try {
+      const tip = document.createElement('div');
+      tip.id = 'te-edge-indicator';
+      tip.style.cssText =
+        'position:fixed;top:12px;right:12px;z-index:999999;padding:8px 12px;border-radius:8px;font:12px/1.3 system-ui;color:#fff;background:#b45309;max-width:280px;box-shadow:0 2px 8px rgba(0,0,0,.3)';
+      tip.textContent =
+        'TE Edge: edit WORKER_URL + AUTH_TOKEN in Tampermonkey script, then Save & reload';
+      document.documentElement.appendChild(tip);
+    } catch (_) {}
     return;
   }
 
