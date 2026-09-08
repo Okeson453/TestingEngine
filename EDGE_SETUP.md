@@ -27,7 +27,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 3. Paste contents of `agents/browser-edge-observer.user.js`.
 4. At the top of the script, change **only these two lines**:
    ```js
-   const WORKER_URL = 'https://YOUR-WORKER.up.railway.app';
+   const WORKER_URL = 'https://testingengine-production.up.railway.app';
    const AUTH_TOKEN = 'PASTE_EDGE_INGEST_TOKEN_HERE';
    ```
    to your real worker URL and the same token as `EDGE_INGEST_TOKEN`.
