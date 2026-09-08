@@ -199,8 +199,25 @@ async function edHandler(payload: unknown): Promise<void> {
   }
 }
 
-export function wireGameEventHandlers(): void {
+export function initializeEventHandlers(): void {
   bcGameSocket.on("bg", bgHandler);
   bcGameSocket.on("ed", edHandler);
   logger.info({ component: "game-event-handlers" }, "event handlers wired");
+}
+
+/** Called by worker boot — wires handlers and opens the BC.Game crash socket. */
+export async function startEventDrivenPipeline(): Promise<void> {
+  initializeEventHandlers();
+  await bcGameSocket.connect();
+}
+
+export async function stopEventDrivenPipeline(): Promise<void> {
+  inFlightEd.clear();
+  inFlightBg.clear();
+  bcGameSocket.disconnect();
+}
+
+// Back-compat alias
+export function wireGameEventHandlers(): void {
+  initializeEventHandlers();
 }
