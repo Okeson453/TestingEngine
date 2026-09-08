@@ -42,7 +42,25 @@ async function main() {
     return;
   }
 
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+  // Mirror the connection hardening from src/lib/db.ts / worker.mjs:
+  // Neon/Supabase poolers need TLS (often a chain Node does not trust by
+  // default -> "self-signed certificate in certificate chain"), cold starts
+  // exceed short timeouts, and dual-stack DNS can fail mid-handshake.
+  // PG_SSL_REJECT_UNAUTHORIZED=1 re-enables full certificate verification.
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    max: 1,
+    connectionTimeoutMillis: Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 30_000) || 30_000,
+    ssl:
+      process.env.PG_SSL === "0"
+        ? undefined
+        : {
+            rejectUnauthorized:
+              process.env.PG_SSL_REJECT_UNAUTHORIZED === "1" ||
+              process.env.PG_SSL_REJECT_UNAUTHORIZED === "true",
+          },
+    family: process.env.PG_FAMILY === "0" ? undefined : Number(process.env.PG_FAMILY ?? 4) || 4,
+  });
   const client = await pool.connect();
   try {
     await client.query(
