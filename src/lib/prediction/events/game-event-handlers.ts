@@ -108,15 +108,23 @@ async function bgHandler(payload: unknown): Promise<void> {
         sourceRoundGameId: source.sourceGameId,
       };
       void onGameStart(evt)
-        .then(() => {
-          logger.info(
-            { event: "bg", gameId, correlationId, sourceGameId: source.sourceGameId },
-            "bg prediction complete",
-          );
+        .then((result) => {
+          const kind = result && typeof result === "object" && "kind" in result ? (result as { kind: string }).kind : "ok";
+          if (kind === "temporal_violation" || kind === "insufficient_history") {
+            logger.warn(
+              { event: "bg", gameId, correlationId, sourceGameId: source.sourceGameId, resultKind: kind, result },
+              `bg prediction skipped (${kind})`,
+            );
+          } else {
+            logger.info(
+              { event: "bg", gameId, correlationId, sourceGameId: source.sourceGameId, resultKind: kind },
+              "bg prediction complete",
+            );
+          }
         })
         .catch((error) => {
           logger.error(
-            { event: "bg", gameId, error: String(error), correlationId },
+            { event: "bg", gameId, error: String(error), correlationId, stack: error instanceof Error ? error.stack?.slice(0, 500) : undefined },
             "bg prediction failed",
           );
         });
@@ -183,15 +191,16 @@ async function edHandler(payload: unknown): Promise<void> {
 
       void onGameEnd({
         gameId,
+        endTime: crashedAt,
         multiplier,
-        crashedAt,
         receivedAt: new Date().toISOString(),
       }).catch((error) => {
         logger.error({ event: "ed", gameId, error: String(error), correlationId }, "ed validation failed");
       });
     }
 
-    await markLiveRoundEnded(gameId, crashedAt, "socket", correlationId, sql).catch(() => undefined);
+    // Signature: (gameId, crashedAt, multiplier, sql?, source?)
+    await markLiveRoundEnded(gameId, crashedAt, multiplier ?? 0, sql, "socket").catch(() => undefined);
   } catch (error) {
     logger.error({ event: "ed", gameId, error: String(error) }, "ed observability failed");
   } finally {
