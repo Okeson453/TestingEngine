@@ -71,6 +71,21 @@ function readPoolMin(): number {
   return Math.max(0, Math.min(Number.isFinite(raw) ? raw : 1, readPoolMax()));
 }
 
+function readSsl(): false | { rejectUnauthorized: boolean } {
+  if (process.env.PG_SSL === "0") return false;
+  return {
+    rejectUnauthorized:
+      process.env.PG_SSL_REJECT_UNAUTHORIZED === "1" ||
+      process.env.PG_SSL_REJECT_UNAUTHORIZED === "true",
+  };
+}
+
+function readFamily(): number | undefined {
+  if (process.env.PG_FAMILY === "0") return undefined;
+  const n = Number(process.env.PG_FAMILY ?? 4);
+  return Number.isFinite(n) && n > 0 ? n : 4;
+}
+
 async function createNeonSql(): Promise<Sql> {
   const { Pool, types } = await import("pg");
   types.setTypeParser(OID_INT8, identity);
@@ -79,10 +94,12 @@ async function createNeonSql(): Promise<Sql> {
   const poolMax = readPoolMax();
   const poolMin = readPoolMin();
   const idleTimeoutMillis = Number(process.env.PG_IDLE_TIMEOUT_MS ?? 15_000) || 15_000;
-  const connectionTimeoutMillis = Number(process.env.PG_CONN_TIMEOUT_MS ?? 30_000) || 30_000;
+  const connectionTimeoutMillis =
+    Number(process.env.PG_CONN_TIMEOUT_MS ?? process.env.PG_POOL_CONN_TIMEOUT_MS ?? 30_000) ||
+    30_000;
 
   console.log(
-    `[db] Pool configured max=${poolMax} min=${poolMin} idleMs=${idleTimeoutMillis} connTimeoutMs=${connectionTimeoutMillis}`,
+    `[db] Pool configured max=${poolMax} min=${poolMin} idleMs=${idleTimeoutMillis} connTimeoutMs=${connectionTimeoutMillis} family=${readFamily() ?? "auto"}`,
   );
 
   const pool = new Pool({
@@ -91,7 +108,8 @@ async function createNeonSql(): Promise<Sql> {
     min: poolMin,
     idleTimeoutMillis,
     connectionTimeoutMillis,
-    ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
+    ssl: readSsl(),
+    family: readFamily(),
   });
   globalRef.__pgPool__ = pool;
 
