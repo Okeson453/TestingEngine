@@ -33,6 +33,62 @@ if (!process.env.PG_APP_NAME) {
   process.env.PG_APP_NAME = "testingengine-worker";
 }
 
+
+/** Apply pending SQL migrations on a fresh DATABASE_URL (e.g. new Neon). */
+async function ensureMigrations() {
+  const { readdir, readFile } = await import("node:fs/promises");
+  const { dirname, join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const pg = (await import("pg")).default;
+  const { pendingMigrations } = await import("./migration-plan.mjs");
+
+  const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  let entries;
+  try {
+    entries = await readdir(migrationsDir);
+  } catch {
+    console.warn("[worker] no migrations/ directory — skip migrate");
+    return;
+  }
+
+  const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 1 });
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    );
+    const applied = (await client.query("SELECT name FROM _migrations")).rows.map((r) => r.name);
+    let count = 0;
+    for (const { name } of pendingMigrations(entries, applied)) {
+      const text = await readFile(join(migrationsDir, name), "utf8");
+      try {
+        await client.query("BEGIN");
+        await client.query(text);
+        await client.query("INSERT INTO _migrations (name) VALUES ($1)", [name]);
+        await client.query("COMMIT");
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          /* soft */
+        }
+        console.error(`[worker] migrate failed on ${name}:`, err?.message ?? err);
+        throw err;
+      }
+      console.log(`[worker] applied migration ${name}`);
+      count += 1;
+    }
+    console.log(
+      count
+        ? `[worker] migrations done — ${count} applied`
+        : "[worker] migrations up to date",
+    );
+  } finally {
+    client.release();
+    await pool.end();
+  }
+}
+
 const liveBoot = await import("@/lib/prediction/live/boot");
 const events = await import("@/lib/prediction/events/game-event-handlers");
 const db = await import("@/lib/db");
@@ -85,6 +141,14 @@ async function bootWithRetry(maxAttempts = 8) {
     }
   }
   throw lastErr;
+}
+
+// New / empty Neon: create schema before schema validation in LiveBoot.
+try {
+  await ensureMigrations();
+} catch (e) {
+  console.error("[worker] ensureMigrations failed:", e?.message ?? e);
+  process.exit(1);
 }
 
 const result = await bootWithRetry();
