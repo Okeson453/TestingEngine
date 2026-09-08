@@ -73,7 +73,11 @@ jobs:
           node-version: "22"
           cache: npm
       - name: Install
-        run: npm ci
+        # --legacy-peer-deps: the committed lockfile omits an optional peer
+        # subtree (nitro -> lru-cache@11) that strict `npm ci` demands since a
+        # registry metadata refresh. Verified: `npm ci --legacy-peer-deps`
+        # installs the full tree (432 pkgs, 0 vulns) from the committed lock.
+        run: npm ci --legacy-peer-deps
       - name: Typecheck
         run: npm run typecheck
       - name: Lint
