@@ -9,6 +9,7 @@
  *   EDGE_INGEST_TOKEN   — required Bearer token (reject if unset in production)
  *   EDGE_STALE_MS       — poll defers N+1 when last edge event younger than this (default 8000)
  */
+import { timingSafeEqual } from "node:crypto";
 import { getSql, type Sql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
@@ -40,6 +41,13 @@ export type EdgeIngestResult =
   | { ok: true; kind: string; gameId?: string; lagMs?: number }
   | { ok: false; error: string; status: number };
 
+function tokensEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
 function requireToken(authHeader: string | null | undefined): EdgeIngestResult | null {
   const expected = process.env.EDGE_INGEST_TOKEN?.trim();
   if (!expected) {
@@ -54,7 +62,7 @@ function requireToken(authHeader: string | null | undefined): EdgeIngestResult |
   const token = raw.toLowerCase().startsWith("bearer ")
     ? raw.slice(7).trim()
     : raw;
-  if (!token || token !== expected) {
+  if (!token || !tokensEqual(token, expected)) {
     return { ok: false, error: "unauthorized", status: 401 };
   }
   return null;
@@ -163,7 +171,6 @@ export async function ingestEdgeCrash(
 
   await touchEdgeHealth(gameId);
 
-  // Durable lifecycle (best-effort)
   try {
     const { markLiveRoundEnded } = await import(
       "@/lib/prediction/live/live-round-state"
@@ -319,7 +326,6 @@ export async function ingestEdgeFrame(
       );
     }
 
-    // Unknown event — acknowledge so agent does not retry forever
     logger.info(
       { component: "edge-ingest", event: pkt.event, ns: pkt.namespace, payloadLen: payload.length },
       "edge frame ignored (not ed/bg)",
