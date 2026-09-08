@@ -50,3 +50,27 @@ Worker health may still show socket `waf_blocked` — that is expected; edge is 
 
 - `POST /edge/crash`, `POST /edge/bg`, `GET /edge/health`
 - Aliases: `/api/crash/edge`, `/api/edge/crash`, `/api/crash/edge/bg`
+
+
+## Binary frames (critical)
+
+BC.Game Crash Socket.IO payloads are **binary protobuf**, not JSON text.
+Userscript v1.2+ posts base64 frames to `POST /edge/frame`; the worker
+decodes with `bcgame-crash-transport.ts` (`decodeBinaryPacket` / `decodeEnd`).
+
+### Diagnose frame type (no Railway change needed)
+
+```js
+window.__TE_EDGE__ = { url: 'https://YOUR-WORKER...', token: '...', debugFrameTypes: true };
+location.reload();
+```
+
+Console should show `frame type: ArrayBuffer` then server logs `edge crash ingested`.
+
+### Optional: run server-side transport demo
+
+```bash
+npx tsx src/lib/crash/transport/demo.ts
+```
+
+May still be WAF-blocked from Railway; edge userscript remains the reliable path.

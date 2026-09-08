@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TestingEngine BC.Game Edge Forwarder
 // @namespace    https://github.com/Okeson453/TestingEngine
-// @version      1.1.0
+// @version      1.2.0
 // @description  Forward Crash end/start events to TestingEngine edge ingest (bypasses Cloudflare WAF on Railway)
 // @match        https://bc.game/*
 // @match        https://*.bc.game/*
@@ -29,6 +29,10 @@
       dedupeMs: 45_000,
       pollMs: 1200,
       debug: true,
+      /** Log WS frame types for one session (binary vs string) */
+      debugFrameTypes: false,
+      /** Forward binary frames as base64 to /edge/frame for server protobuf decode */
+      forwardBinary: true,
     },
     typeof window !== 'undefined' ? window.__TE_EDGE__ || {} : {},
   );
@@ -155,13 +159,63 @@
     }
   }
 
-  // Observe WebSocket text frames
+  function arrayBufferToBase64(buf) {
+    const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer || buf);
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  function postBinaryFrame(data) {
+    if (!CONFIG.forwardBinary) return;
+    try {
+      const b64 = arrayBufferToBase64(data);
+      if (!b64 || b64.length < 8) return;
+      void post('/edge/frame', {
+        frame: b64,
+        observedAt: Date.now(),
+        source: 'userscript-binary',
+      });
+    } catch (e) {
+      log('binary forward failed', e);
+    }
+  }
+
+  // Observe WebSocket — BC.Game crash uses binary protobuf frames (not JSON text).
   try {
     const OrigWS = window.WebSocket;
     window.WebSocket = function (...args) {
       const ws = new OrigWS(...args);
+      try {
+        ws.binaryType = 'arraybuffer';
+      } catch (_) {}
       ws.addEventListener('message', (ev) => {
-        if (typeof ev.data === 'string') tryParseFrame(ev.data);
+        const d = ev.data;
+        if (CONFIG.debugFrameTypes) {
+          const kind =
+            typeof d === 'string'
+              ? 'string'
+              : d instanceof ArrayBuffer
+                ? 'ArrayBuffer'
+                : d && d.constructor
+                  ? d.constructor.name
+                  : typeof d;
+          log('frame type:', kind, typeof d === 'string' ? d.slice(0, 40) : (d && d.byteLength));
+        }
+        if (typeof d === 'string') {
+          tryParseFrame(d);
+          return;
+        }
+        if (d instanceof ArrayBuffer) {
+          postBinaryFrame(d);
+          return;
+        }
+        if (typeof Blob !== 'undefined' && d instanceof Blob) {
+          d.arrayBuffer().then(postBinaryFrame).catch(() => {});
+        }
       });
       return ws;
     };

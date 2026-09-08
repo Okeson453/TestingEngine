@@ -288,7 +288,7 @@ interface DecodedPacket {
  * and is stripped before parsing. For ACK frames from the server, the type has
  * the 0x80 bit set with a 4-byte big-endian ackId following.
  */
-function decodeBinaryPacket(data: ArrayBuffer | Buffer): DecodedPacket {
+export function decodeBinaryPacket(data: ArrayBuffer | Buffer): DecodedPacket {
   const bytes = data instanceof Buffer ? new Uint8Array(data) : new Uint8Array(data);
   let off = 0;
 
@@ -502,7 +502,7 @@ function decodePrepare(buf: Uint8Array): Omit<PrepareEvent, "event" | "receivedA
 }
 
 /** Decode Begin (bg) protobuf */
-function decodeBegin(buf: Uint8Array): Omit<BeginEvent, "event" | "receivedAt"> {
+export function decodeBegin(buf: Uint8Array): Omit<BeginEvent, "event" | "receivedAt"> {
   const r = new ProtobufReader(buf);
   let roundId = 0, startTime = 0;
   let tag: [number, number] | null;
@@ -558,7 +558,7 @@ function decodeEscape(buf: Uint8Array): Omit<EscapeEvent, "event" | "receivedAt"
 }
 
 /** Decode End (ed) protobuf */
-function decodeEnd(buf: Uint8Array): Omit<EndEvent, "event" | "receivedAt"> {
+export function decodeEnd(buf: Uint8Array): Omit<EndEvent, "event" | "receivedAt"> {
   const r = new ProtobufReader(buf);
   let roundId = 0, maxRate = 0;
   let hash = "";

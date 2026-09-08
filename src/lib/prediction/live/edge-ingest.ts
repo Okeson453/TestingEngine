@@ -37,7 +37,7 @@ export type EdgeBgPayload = {
 };
 
 export type EdgeIngestResult =
-  | { ok: true; kind: string; gameId: string; lagMs?: number }
+  | { ok: true; kind: string; gameId?: string; lagMs?: number }
   | { ok: false; error: string; status: number };
 
 function requireToken(authHeader: string | null | undefined): EdgeIngestResult | null {
@@ -244,4 +244,89 @@ export async function ingestEdgeBg(
 
 export function verifyEdgeAuth(authHeader?: string | null): EdgeIngestResult | null {
   return requireToken(authHeader);
+}
+
+
+/**
+ * Decode a base64-encoded binary Socket.IO frame from the browser agent and
+ * dispatch ed/bg through the same path as JSON edge ingest.
+ * BC.Game crash frames are binary protobuf — text-only userscripts miss them.
+ */
+export async function ingestEdgeFrame(
+  body: unknown,
+  authHeader?: string | null,
+): Promise<EdgeIngestResult> {
+  const authErr = requireToken(authHeader);
+  if (authErr) return authErr;
+
+  const p = (body ?? {}) as Record<string, unknown>;
+  const b64 = typeof p.frame === "string" ? p.frame : typeof p.data === "string" ? p.data : null;
+  if (!b64) return { ok: false, error: "frame (base64) required", status: 400 };
+
+  let bytes: Uint8Array;
+  try {
+    bytes = Uint8Array.from(Buffer.from(b64, "base64"));
+  } catch {
+    return { ok: false, error: "invalid base64 frame", status: 400 };
+  }
+  if (bytes.byteLength < 4 || bytes.byteLength > 256_000) {
+    return { ok: false, error: "frame size out of range", status: 400 };
+  }
+
+  try {
+    const { decodeBinaryPacket, decodeEnd, decodeBegin } = await import(
+      "@/lib/crash/transport/bcgame-crash-transport"
+    );
+    const pkt = decodeBinaryPacket(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    const event = String(pkt.event || "").toLowerCase();
+    const payload = pkt.payload;
+
+    if (event === "ed" || event === "end") {
+      const end = decodeEnd(payload);
+      const gameId = String(end.roundId);
+      const multiplier = Number(end.multiplier);
+      if (!gameId || !Number.isFinite(multiplier) || multiplier <= 0) {
+        return { ok: false, error: "ed payload missing roundId/multiplier", status: 400 };
+      }
+      return ingestEdgeCrash(
+        {
+          gameId,
+          multiplier,
+          crashedAt: new Date().toISOString(),
+          observedAt: p.observedAt ?? Date.now(),
+          hash: end.hash,
+          source: "userscript-binary-frame",
+        },
+        authHeader,
+      );
+    }
+
+    if (event === "bg" || event === "begin") {
+      const bg = decodeBegin(payload);
+      const gameId = String(bg.roundId);
+      const beganAt = bg.startTime
+        ? new Date(bg.startTime < 1e12 ? bg.startTime * 1000 : bg.startTime).toISOString()
+        : new Date().toISOString();
+      if (!gameId) return { ok: false, error: "bg payload missing roundId", status: 400 };
+      return ingestEdgeBg(
+        {
+          gameId,
+          beganAt,
+          observedAt: p.observedAt ?? Date.now(),
+          source: "userscript-binary-frame",
+        },
+        authHeader,
+      );
+    }
+
+    // Unknown event — acknowledge so agent does not retry forever
+    logger.info(
+      { component: "edge-ingest", event: pkt.event, ns: pkt.namespace, payloadLen: payload.length },
+      "edge frame ignored (not ed/bg)",
+    );
+    return { ok: true, kind: "ignored", gameId: undefined };
+  } catch (e) {
+    logger.error({ error: String(e) }, "edge frame decode failed");
+    return { ok: false, error: String(e), status: 500 };
+  }
 }

@@ -11,6 +11,7 @@ import { getLogger } from "@/lib/observability/logger";
 import {
   ingestEdgeBg,
   ingestEdgeCrash,
+  ingestEdgeFrame,
   isEdgeFresh,
   verifyEdgeAuth,
 } from "@/lib/prediction/live/edge-ingest";
@@ -49,6 +50,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // Aliases used by docs / userscripts
   if (path === "/api/crash/edge" || path === "/api/edge/crash") path = "/edge/crash";
   if (path === "/api/crash/edge/bg" || path === "/api/edge/bg") path = "/edge/bg";
+  if (path === "/api/edge/frame" || path === "/edge/raw") path = "/edge/frame";
   if (path === "/api/edge/health") path = "/edge/health";
   const method = (req.method ?? "GET").toUpperCase();
 
@@ -99,6 +101,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     const result = await ingestEdgeBg(body, req.headers.authorization);
     sendJson(res, result.ok ? 200 : result.status, result);
+    return;
+  }
+
+  if (method === "POST" && path === "/edge/frame") {
+    let body: unknown = {};
+    try {
+      const raw = await readBody(req);
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      sendJson(res, 400, { ok: false, error: "invalid JSON" });
+      return;
+    }
+    const result = await ingestEdgeFrame(body, req.headers.authorization);
+    sendJson(res, result.ok ? 200 : (result.status ?? 500), result);
     return;
   }
 
