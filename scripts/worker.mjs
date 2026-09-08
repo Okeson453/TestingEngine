@@ -51,8 +51,34 @@ async function ensureMigrations() {
     return;
   }
 
-  const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 1 });
-  const client = await pool.connect();
+  const pool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 1,
+    connectionTimeoutMillis: Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 30_000) || 30_000,
+    ssl:
+      process.env.PG_SSL === "0"
+        ? undefined
+        : { rejectUnauthorized: process.env.PG_SSL_REJECT_UNAUTHORIZED !== "0" },
+    family: process.env.PG_FAMILY === "0" ? undefined : Number(process.env.PG_FAMILY ?? 4) || 4,
+  });
+  let client;
+  let lastConnErr;
+  for (let i = 1; i <= 5; i += 1) {
+    try {
+      client = await pool.connect();
+      lastConnErr = null;
+      break;
+    } catch (e) {
+      lastConnErr = e;
+      const msg = String(e?.message ?? e);
+      console.warn(`[worker] DB connect attempt ${i}/5 failed: ${msg}`);
+      if (i < 5) await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+  if (!client) {
+    await pool.end().catch(() => undefined);
+    throw lastConnErr ?? new Error("DB connect failed");
+  }
   try {
     await client.query(
       "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",

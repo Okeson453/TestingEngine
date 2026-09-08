@@ -91,8 +91,15 @@ function createNeonSql(): Promise<Sql> {
     );
     const idleTimeoutMillis = Number(process.env.PG_POOL_IDLE_MS ?? 15_000) || 15_000; // Release idle fast under max_client_conn
     // Fail fast on exhaustion instead of hanging the worker loop for 30s.
+    // Neon cold-start + TLS handshake often exceeds 5s; short timeout surfaces as
+    // "Client network socket disconnected before secure TLS connection was established".
     const connectionTimeoutMillis =
-      Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 5_000) || 5_000;
+      Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? 30_000) || 30_000;
+
+    // Prefer pooled Neon URL (-pooler). Force IPv4 when PG_FAMILY=4 (default on
+    // Railway — dual-stack DNS can fail mid-TLS to Neon).
+    const familyRaw = process.env.PG_FAMILY ?? "4";
+    const family = familyRaw === "0" ? undefined : Number(familyRaw) || 4;
 
     const pool = new Pool({
       connectionString: databaseUrl,
@@ -103,6 +110,13 @@ function createNeonSql(): Promise<Sql> {
       allowExitOnIdle: true,
       keepAlive: true,
       keepAliveInitialDelayMillis: 5_000,
+      // Neon requires TLS; pg enables ssl from sslmode in URL. Explicit option
+      // avoids some handshake drops when URL omits sslmode.
+      ssl:
+        process.env.PG_SSL === "0"
+          ? undefined
+          : { rejectUnauthorized: process.env.PG_SSL_REJECT_UNAUTHORIZED !== "0" },
+      ...(family != null ? { family } : {}),
       application_name:
         process.env.PG_APP_NAME ||
         process.env.RAILWAY_SERVICE_NAME ||
@@ -171,7 +185,12 @@ function createNeonSql(): Promise<Sql> {
           msg.includes("too many clients") ||
           msg.includes("remaining connection slots") ||
           msg.includes("Connection terminated") ||
-          msg.includes("timeout exceeded when trying to connect")
+          msg.includes("timeout exceeded when trying to connect") ||
+          msg.includes("before secure TLS") ||
+          msg.includes("ECONNRESET") ||
+          msg.includes("ECONNREFUSED") ||
+          msg.includes("ENOTFOUND") ||
+          msg.includes("socket hang up")
         ) {
           console.error(
             `[db] POOL EXHAUSTION: ${msg} | pool total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${poolMax}`,
