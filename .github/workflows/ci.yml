@@ -52,19 +52,8 @@ jobs:
               echo "::warning::$f missing"
               continue
             fi
-            # Extract AUTH_TOKEN string literal
-            token=$(python3 - <<'PY' "$f"
-import re, sys
-path = sys.argv[1]
-text = open(path, encoding='utf-8').read()
-m = re.search(r"const\s+AUTH_TOKEN\s*=\s*['\"]([^'\"]+)['\"]", text)
-if not m:
-    print("")
-    sys.exit(0)
-print(m.group(1))
-PY
-)
-            echo "$f AUTH_TOKEN=$token"
+            token=$(python3 -c 'import re,sys; t=open(sys.argv[1],encoding="utf-8").read(); m=re.search(r"const\\s+AUTH_TOKEN\\s*=\\s*[\047\"']([^\047\"']+)[\047\"']", t); print(m.group(1) if m else "")' "$f")
+            echo "$f AUTH_TOKEN length=${#token}"
             if [ -z "$token" ]; then
               echo "::error::$f missing AUTH_TOKEN assignment"
               failed=1
