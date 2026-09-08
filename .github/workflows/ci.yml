@@ -52,22 +52,19 @@ jobs:
               echo "::warning::$f missing"
               continue
             fi
-            token=$(python3 -c 'import re,sys; t=open(sys.argv[1],encoding="utf-8").read(); m=re.search(r"const\\s+AUTH_TOKEN\\s*=\\s*[\047\"']([^\047\"']+)[\047\"']", t); print(m.group(1) if m else "")' "$f")
-            echo "$f AUTH_TOKEN length=${#token}"
-            if [ -z "$token" ]; then
+            line=$(grep -E 'const[[:space:]]+AUTH_TOKEN[[:space:]]*=' "$f" | head -n1 || true)
+            echo "$f: $line"
+            if [ -z "$line" ]; then
               echo "::error::$f missing AUTH_TOKEN assignment"
               failed=1
               continue
             fi
-            case "$token" in
-              PASTE_EDGE_INGEST_TOKEN_HERE|YOUR-*|CHANGE_ME*|placeholder*)
-                echo "$f uses placeholder token (ok)"
-                ;;
-              *)
-                echo "::error::$f AUTH_TOKEN looks like a real secret (length ${#token}). Use PASTE_EDGE_INGEST_TOKEN_HERE."
-                failed=1
-                ;;
-            esac
+            if echo "$line" | grep -qE 'PASTE_EDGE_INGEST_TOKEN_HERE|YOUR-|CHANGE_ME|placeholder'; then
+              echo "$f uses placeholder token (ok)"
+            else
+              echo "::error::$f AUTH_TOKEN is not a documented placeholder. Do not commit a live token."
+              failed=1
+            fi
           done
           exit "$failed"
 
