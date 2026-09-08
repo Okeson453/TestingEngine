@@ -52,6 +52,17 @@ export type EventHandler = (payload: BcGameEventPayload, event: BcGameEvent) => 
 export type ConnectionHandler = (state: ConnectionState) => Promise<void>;
 export type ErrorHandler = (error: Error, context: string) => Promise<void>;
 
+/** Normalize BC.Game epoch values to ms. Reject values that are clearly not epoch-ms. */
+function normalizeEpochMs(value: number | undefined | null, fallbackMs: number): number {
+  if (value == null || !Number.isFinite(value) || value <= 0) return fallbackMs;
+  // Seconds-scale (10 digits) → convert to ms
+  let ms = value < 1e11 ? value * 1000 : value;
+  // Must be within ±1 day of "now"; otherwise treat as corrupt and use fallback
+  const skew = Math.abs(ms - fallbackMs);
+  if (skew > 86_400_000) return fallbackMs;
+  return ms;
+}
+
 function isAuthOrWaf(message: string): boolean {
   const lower = message.toLowerCase();
   return (
@@ -65,9 +76,15 @@ function crashEventToPayload(ev: CrashEvent): BcGameEventPayload | null {
   const receivedAt = ev.receivedAt;
   switch (ev.event) {
     case "pr":
-      return { gameId: String(ev.roundId), beganAt: ev.startTime || ev.prepareTime || receivedAt };
+      return {
+        gameId: String(ev.roundId),
+        beganAt: normalizeEpochMs(ev.startTime || ev.prepareTime, receivedAt),
+      };
     case "bg":
-      return { gameId: String(ev.roundId), beganAt: ev.startTime || receivedAt };
+      return {
+        gameId: String(ev.roundId),
+        beganAt: normalizeEpochMs(ev.startTime, receivedAt),
+      };
     case "pg":
       return { gameId: ev.roundId ? String(ev.roundId) : "", multiplier: ev.multiplier, elapsedMs: ev.elapsed };
     case "e":
@@ -300,7 +317,10 @@ export class BcGameSocketClient {
   }
 
   private handleError(error: Error, context: string): void {
-    logger.warn({ component: "BcGameSocketClient", context, error: error.message }, "Socket error");
+    logger.warn(
+      { component: "BcGameSocketClient", context, error: error.message, stack: error.stack?.slice(0, 400) },
+      `Handler error: ${error.message}`,
+    );
     for (const handler of this.errorHandlers) void handler(error, context).catch(() => {});
   }
 
