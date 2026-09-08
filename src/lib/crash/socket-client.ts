@@ -1,32 +1,34 @@
 /**
- * BC.Game Socket.IO Client
+ * BC.Game Socket Client — production facade over the confirmed transport.
  *
- * Spec: TestingEngine_Comprehensive_Diagnosis_and_Solution.md §2 (P0 Socket.IO)
+ * Spec: docs/bcgame-crash-transport-report.md §6 (confirmed defects fixed)
+ *
+ * This module preserves the public API used by ingest / diagnostics / health
+ * while delegating the wire protocol to BcGameCrashTransport:
+ *   - Engine.IO v3 + custom T8 binary parser
+ *   - WASM t1/t2 sign → /test/ → p/t query
+ *   - Namespace /g/cm + ack-based join (no "crash" arg)
+ *   - Protobuf payloads for pr/bg/pg/e/ed/st
  *
  * State machine:
  *   STOPPED → CONNECTING → CONNECTED → DEGRADED → RECONNECTING → CONNECTED
- * Only intentional shutdown permanently enters STOPPED.
- *
- * Transport: websocket-only by default (BC.Game forces transports:["websocket"]).
- * Namespace: /g/cm (classic Crash) — confirmed 2026-09-07 RE report.
- * Auth query: optional BCGAME_SOCKET_P / BCGAME_SOCKET_T (sign + token from /test/).
- * Events: pr, bg, pg, e, ed, st (protobuf on wire; JSON after socket.io decode when available).
+ *   WAF/auth failures → waf_blocked → backoff → probe
  */
-import { io, type Socket, type ManagerOptions, type SocketOptions } from "socket.io-client";
 import { getLogger } from "@/lib/observability/logger";
 import { getSql } from "@/lib/db";
+import {
+  BcGameCrashTransport,
+  type CrashEvent,
+  type CrashEventName,
+  type TransportState,
+} from "./transport/bcgame-crash-transport";
 
 const logger = getLogger("bcgame-socket");
 
-const SOCKET_URL = process.env.BCGAME_SOCKET_URL ?? "wss://socketv4.bc.game";
-const SOCKET_PATH = process.env.BCGAME_SOCKET_PATH ?? "/socket.io";
 const RECONNECT_DELAY_MS = 1_000;
 const RECONNECT_DELAY_MAX_MS = 30_000;
-const CONNECTION_TIMEOUT_MS = 20_000;
-// Lowered 60s → 15s so intermittent Cloudflare blocks recover inside a few
-// inter-round gaps instead of leaving the process on pure poll for minutes.
 const WAF_BACKOFF_MS = Number(process.env.BCGAME_SOCKET_WAF_BACKOFF_MS ?? 10_000) || 10_000;
-const DEGRADED_AFTER_MS = Number(process.env.BCGAME_SOCKET_DEGRADED_AFTER_MS ?? 30_000) || 30_000; // no ED/BG → DEGRADED
+const DEGRADED_AFTER_MS = Number(process.env.BCGAME_SOCKET_DEGRADED_AFTER_MS ?? 30_000) || 30_000;
 
 export type BcGameEvent = "pr" | "bg" | "pg" | "e" | "ed" | "st" | string;
 
@@ -35,6 +37,8 @@ export interface BcGameEventPayload {
   multiplier?: number;
   beganAt?: number | string;
   crashedAt?: number | string;
+  hash?: string | null;
+  elapsedMs?: number | null;
   [key: string]: unknown;
 }
 
@@ -73,11 +77,86 @@ export type EventHandler = (payload: BcGameEventPayload, event: BcGameEvent) => 
 export type ConnectionHandler = (state: ConnectionState) => Promise<void>;
 export type ErrorHandler = (error: Error, context: string) => Promise<void>;
 
+function isAuthOrWaf(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("401") ||
+    lower.includes("403") ||
+    lower.includes("503") ||
+    lower.includes("auth") ||
+    lower.includes("cloudflare") ||
+    lower.includes("waf") ||
+    lower.includes("forbidden") ||
+    lower.includes("just a moment") ||
+    lower.includes("sign")
+  );
+}
+
+/** Map transport CrashEvent → legacy BcGameEventPayload for existing handlers. */
+function crashEventToPayload(ev: CrashEvent): BcGameEventPayload | null {
+  const receivedAt = ev.receivedAt;
+  switch (ev.event) {
+    case "pr":
+      return {
+        gameId: String(ev.roundId),
+        beganAt: ev.startTime || ev.prepareTime || receivedAt,
+        multiplier: undefined,
+      };
+    case "bg":
+      return {
+        gameId: String(ev.roundId),
+        beganAt: ev.startTime || receivedAt,
+        multiplier: undefined,
+      };
+    case "pg":
+      if (!ev.roundId) {
+        return {
+          gameId: "",
+          multiplier: ev.multiplier,
+          elapsedMs: ev.elapsed,
+        };
+      }
+      return {
+        gameId: String(ev.roundId),
+        multiplier: ev.multiplier,
+        elapsedMs: ev.elapsed,
+      };
+    case "e":
+      return {
+        gameId: "",
+        userId: ev.userId,
+        betId: ev.betId,
+        odds: ev.odds,
+        force: ev.force,
+        betIndex: ev.betIndex,
+        multiplier: ev.odds / 100,
+      };
+    case "ed":
+      return {
+        gameId: String(ev.roundId),
+        multiplier: ev.multiplier,
+        hash: ev.hash || null,
+        crashedAt: receivedAt,
+      };
+    case "st":
+      return {
+        gameId: String(ev.roundId),
+        multiplier: ev.multiplier,
+        hash: ev.hash || null,
+        crashedAt: receivedAt,
+        escapes: ev.escapes,
+      };
+    default:
+      return null;
+  }
+}
+
 export class BcGameSocketClient {
-  private socket: Socket | null = null;
+  private transport: BcGameCrashTransport | null = null;
   private eventHandlers: Map<BcGameEvent, Set<EventHandler>> = new Map();
   private connectionHandlers: Set<ConnectionHandler> = new Set();
   private errorHandlers: Set<ErrorHandler> = new Set();
+  private unsubs: Array<() => void> = [];
   private state: ConnectionState = {
     status: "stopped",
     lastError: null,
@@ -97,13 +176,14 @@ export class BcGameSocketClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private wafBackoffTimer: ReturnType<typeof setTimeout> | null = null;
   private healthTimer: ReturnType<typeof setInterval> | null = null;
-  /** Only true after intentional stop(); never set by reconnect cleanup. */
   private intentionalShutdown = false;
   private discoveredEvents: Set<string> = new Set();
-  /** Per-game last ED timestamp. Global lastEdAt is still updated for
-   *  backward compatibility, but poll-worker must use Crash-specific lag
-   *  to avoid false deferral when Dice/Limbo emit ed events. */
   private lastEdAtByGame: Map<string, string> = new Map();
+  private currentGameId: string | null = null;
+  private wafBlockCount = 0;
+  private lastPersistedSocketStatus: string | null = null;
+  private lastPersistAt = 0;
+  private statePollTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     for (const event of ["pr", "bg", "pg", "e", "ed", "st"] as const) {
@@ -136,8 +216,6 @@ export class BcGameSocketClient {
     };
   }
 
-  /** Crash-specific last ED time (or null). Prefer this over getState().lastEdAt
-   *  when deciding whether the poll worker should defer. */
   getLastEdAtForGame(gameKey: string = "crash"): string | null {
     return this.lastEdAtByGame.get(gameKey) ?? null;
   }
@@ -150,23 +228,16 @@ export class BcGameSocketClient {
     return Array.from(this.discoveredEvents);
   }
 
-  /**
-   * Connect (or reconnect). Never treats cleanup as intentional shutdown.
-   */
   async connect(): Promise<void> {
     if (this.intentionalShutdown) {
       logger.info({ component: "BcGameSocketClient" }, "connect ignored — intentional shutdown");
       return;
     }
-    if (this.socket?.connected && this.state.status === "connected") {
-      logger.info({ component: "BcGameSocketClient" }, "Already connected");
+    if (this.state.status === "connected" || this.state.status === "connecting") {
       return;
     }
     if (this.state.status === "waf_blocked") {
       logger.info({ component: "BcGameSocketClient" }, "WAF blocked — waiting backoff");
-      return;
-    }
-    if (this.state.status === "connecting" || this.state.status === "reconnecting") {
       return;
     }
 
@@ -181,224 +252,176 @@ export class BcGameSocketClient {
     });
 
     try {
-      this.cleanupSocket(/* intentional */ false);
+      this.teardownTransport();
 
-      // BC.Game enforces WebSocket-only (see streaming investigation).
-      // Production logs showed "xhr poll error" when polling was preferred.
-      // Polling only when BCGAME_SOCKET_ALLOW_POLLING=1.
-      const allowPolling = process.env.BCGAME_SOCKET_ALLOW_POLLING === "1";
-      const transports: ("websocket" | "polling")[] = allowPolling
-        ? ["websocket", "polling"]
-        : ["websocket"];
-
-      // Confirmed 2026-09-07: Crash lives on namespace /g/cm (not root).
-      // Optional p/t from env when an edge agent or browser bridge supplies a fresh sign.
-      const nsp =
-        process.env.BCGAME_SOCKET_NAMESPACE?.trim() || "/g/cm";
-      const query: Record<string, string> = {
-        "Accept-Language": process.env.BCGAME_SOCKET_ACCEPT_LANGUAGE ?? "en",
-      };
-      const signP = process.env.BCGAME_SOCKET_P?.trim();
-      const signT = process.env.BCGAME_SOCKET_T?.trim();
-      if (signP) query.p = signP;
-      if (signT) query.t = signT;
-
-      const socketOptions: Partial<ManagerOptions & SocketOptions> = {
-        path: SOCKET_PATH,
-        reconnection: false, // manual lifecycle
-        timeout: CONNECTION_TIMEOUT_MS,
-        autoConnect: false,
-        transports,
-        query,
-        // Node workers are not browsers; withCredentials is optional.
-        withCredentials: process.env.BCGAME_SOCKET_WITH_CREDENTIALS === "1",
-        extraHeaders: {
-          "User-Agent":
-            process.env.BCGAME_SOCKET_UA ??
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Origin: process.env.BCGAME_SOCKET_ORIGIN ?? "https://bc.game",
-          Referer: process.env.BCGAME_SOCKET_REFERER ?? "https://bc.game/game/crash",
-          "Accept-Language": process.env.BCGAME_SOCKET_ACCEPT_LANGUAGE ?? "en",
+      const transport = new BcGameCrashTransport({
+        socketHost: process.env.BCGAME_SOCKET_URL ?? "wss://socketv4.bc.game",
+        userAgent:
+          process.env.BCGAME_SOCKET_UA ??
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        autoReconnect: false,
+        log: (msg, data) => {
+          logger.info({ component: "BcGameCrashTransport", data }, msg);
         },
-        upgrade: allowPolling,
-        rememberUpgrade: true,
-      };
-
-      // socket.io-client: append namespace to URL path segment
-      const connectUrl = nsp.startsWith("/")
-        ? `${SOCKET_URL.replace(/\/$/, "")}${nsp}`
-        : SOCKET_URL;
-      this.socket = io(connectUrl, socketOptions);
-      this.setupSocketHandlers();
-      this.socket.connect();
-
-      logger.info(
-        {
-          component: "BcGameSocketClient",
-          url: connectUrl,
-          path: SOCKET_PATH,
-          namespace: nsp,
-          transports: socketOptions.transports,
-          hasSign: Boolean(signP && signT),
-          attempt: this.state.reconnectAttempts,
-        },
-        "Connecting to BC.Game Socket.IO",
-      );
-    } catch (error) {
-      this.handleError(error as Error, "connect");
-      this.updateState({
-        status: "stopped",
-        lastError: (error as Error).message,
       });
-      this.scheduleReconnect();
+
+      for (const name of ["pr", "bg", "pg", "e", "ed", "st"] as CrashEventName[]) {
+        this.unsubs.push(
+          transport.on(name, (ev) => {
+            void this.handleTransportEvent(ev);
+          }),
+        );
+      }
+
+      this.transport = transport;
+      this.startStatePoll();
+
+      await transport.connect();
+
+      const ts = transport.getState();
+      if (ts.status === "connected") {
+        this.onTransportConnected(ts);
+      } else if (ts.lastError && isAuthOrWaf(ts.lastError)) {
+        this.handleWafBlock(ts.lastError);
+      } else if (ts.status === "error" || ts.lastError) {
+        this.updateState({
+          status: "reconnecting",
+          lastError: ts.lastError,
+          lastDisconnectedAt: new Date().toISOString(),
+        });
+        this.scheduleReconnect();
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.handleError(error instanceof Error ? error : new Error(msg), "connect");
+      if (isAuthOrWaf(msg)) {
+        this.handleWafBlock(msg);
+      } else {
+        this.updateState({
+          status: "reconnecting",
+          lastError: msg,
+          lastDisconnectedAt: new Date().toISOString(),
+        });
+        this.scheduleReconnect();
+      }
     }
   }
 
-  private setupSocketHandlers(): void {
-    if (!this.socket) return;
-
-    this.socket.on("connect", () => this.handleConnect());
-    this.socket.on("disconnect", (reason) => this.handleDisconnect(reason));
-    this.socket.on("connect_error", (error) => this.handleConnectError(error));
-    this.socket.on("error", (error) => this.handleError(error as Error, "socket_error"));
-    this.socket.onAny((event, payload) => this.handleIncomingEvent(event, payload));
-  }
-
-  private handleConnect(): void {
-    if (!this.socket) return;
-
-    const transport =
-      (this.socket.io?.engine as { transport?: { name?: string } } | undefined)?.transport
-        ?.name ?? null;
-
+  private onTransportConnected(ts: TransportState): void {
     this.updateState({
       status: "connected",
       lastConnectedAt: new Date().toISOString(),
       lastError: null,
-      socketId: this.socket.id ?? null,
-      transport,
+      socketId: ts.sid,
+      transport: "websocket",
       reconnectAttempts: 0,
     });
-
+    this.wafBlockCount = 0;
+    this.startHealthMonitor();
     logger.info(
       {
         component: "BcGameSocketClient",
-        socketId: this.socket.id,
-        transport,
+        socketId: ts.sid,
+        transport: "websocket",
       },
-      "Connected to BC.Game Socket.IO",
-    );
-
-    this.subscribeToCrashEvents();
-    this.startHealthMonitor();
-  }
-
-  private subscribeToCrashEvents(): void {
-    if (!this.socket) return;
-    // Always request Crash room; also emit bare join for /g/cm servers.
-    const nsp = process.env.BCGAME_SOCKET_NAMESPACE?.trim() || "/g/cm";
-    try {
-      if (nsp !== "/" && nsp !== "") {
-        this.socket.emit("join");
-      }
-    } catch { /* soft */ }
-    try {
-      this.socket.emit("join", "crash");
-    } catch { /* soft */ }
-    logger.info(
-      { component: "BcGameSocketClient", namespace: nsp },
-      "Subscribed to crash game events",
+      "Connected to BC.Game (confirmed transport)",
     );
   }
 
-  private handleDisconnect(reason: string): void {
-    if (this.intentionalShutdown) {
-      this.updateState({
-        status: "stopped",
-        lastDisconnectedAt: new Date().toISOString(),
-        lastError: `Shutdown: ${reason}`,
-        socketId: null,
-        transport: null,
-      });
+  private handleTransportEvent(ev: CrashEvent): void {
+    const name = ev.event as BcGameEvent;
+    if (!this.discoveredEvents.has(name)) {
+      this.discoveredEvents.add(name);
+      logger.info({ component: "BcGameSocketClient", event: name }, "Discovered crash event");
+    }
+
+    if (ev.event === "pr" || ev.event === "bg") {
+      this.currentGameId = String(ev.roundId);
+    }
+
+    let payload = crashEventToPayload(ev);
+    if (!payload) return;
+
+    if (!payload.gameId && this.currentGameId) {
+      payload = { ...payload, gameId: this.currentGameId };
+    }
+
+    if ((name === "pg" || name === "e") && !payload.gameId) {
       return;
     }
 
-    this.updateState({
-      status: "reconnecting",
-      lastDisconnectedAt: new Date().toISOString(),
-      lastError: `Disconnected: ${reason}`,
-      socketId: null,
-      transport: null,
-      totalReconnects: this.state.totalReconnects + 1,
-    });
-
-    logger.warn(
-      { component: "BcGameSocketClient", reason },
-      "Disconnected from BC.Game Socket.IO — will reconnect",
-    );
-
-    if (reason === "transport error" || reason.includes("403") || reason.includes("forbidden")) {
-      this.handleWafBlock();
-    } else {
-      this.scheduleReconnect();
+    if (["pr", "bg", "ed", "st"].includes(name) && (!payload.gameId || !/^\d+$/.test(payload.gameId))) {
+      return;
     }
-  }
 
-  private handleConnectError(error: Error): void {
-    this.handleError(error, "connect_error");
-    const msg = (error.message || String(error)).toLowerCase();
-    const desc = String((error as Error & { description?: unknown }).description ?? "").toLowerCase();
-    const combined = `${msg} ${desc}`;
-    // Cloudflare bot challenge on socketv4.bc.game — common from datacenter IPs.
-    if (
-      combined.includes("403") ||
-      combined.includes("forbidden") ||
-      combined.includes("waf") ||
-      combined.includes("cloudflare") ||
-      combined.includes("cf-") ||
-      combined.includes("just a moment") ||
-      combined.includes("websocket error") ||
-      combined.includes("xhr poll error") ||
-      combined.includes("transport error")
-    ) {
-      logger.warn(
-        {
-          component: "BcGameSocketClient",
-          error: error.message,
-          description: (error as Error & { description?: unknown }).description,
-          transport:
-            (this.socket?.io?.engine as { transport?: { name?: string } } | undefined)?.transport
-              ?.name ?? null,
-          url: SOCKET_URL,
-          path: SOCKET_PATH,
-          wafBlockCount: this.wafBlockCount,
-        },
-        "Socket connect blocked (likely Cloudflare). Poll worker remains primary recovery path.",
-      );
-      this.handleWafBlock();
-    } else {
-      this.updateState({
-        status: "reconnecting",
-        lastError: error.message,
-        lastDisconnectedAt: new Date().toISOString(),
+    const now = new Date().toISOString();
+    const updates: Partial<ConnectionState> = {
+      lastEventAt: now,
+      lastEventKind: name,
+      eventLagMs: 0,
+    };
+    if (name === "ed") updates.lastEdAt = now;
+    if (name === "bg") updates.lastBgAt = now;
+    if (this.state.status === "degraded") updates.status = "connected";
+    this.updateState(updates);
+
+    if (name === "ed" && payload.gameId) {
+      this.lastEdAtByGame.set(String(payload.gameId), now);
+      this.lastEdAtByGame.set("crash", now);
+    }
+
+    const handlers = this.eventHandlers.get(name);
+    if (!handlers || handlers.size === 0) return;
+    for (const handler of handlers) {
+      void handler(payload, name).catch((error) => {
+        this.handleError(error as Error, `handler_${name}`);
       });
-      this.scheduleReconnect();
     }
   }
 
-  private wafBlockCount = 0;
-  /** Last status written to worker_state (throttle identical writes). */
-  private lastPersistedSocketStatus: string | null = null;
-  private lastPersistAt = 0;
+  private startStatePoll(): void {
+    this.stopStatePoll();
+    this.statePollTimer = setInterval(() => {
+      if (!this.transport || this.intentionalShutdown) return;
+      const ts = this.transport.getState();
+      if (ts.status === "connected" && this.state.status !== "connected" && this.state.status !== "degraded") {
+        this.onTransportConnected(ts);
+      } else if (
+        (ts.status === "reconnecting" || ts.status === "error") &&
+        this.state.status === "connected"
+      ) {
+        this.updateState({
+          status: "reconnecting",
+          lastError: ts.lastError,
+          lastDisconnectedAt: new Date().toISOString(),
+          socketId: null,
+          transport: null,
+          totalReconnects: this.state.totalReconnects + 1,
+        });
+        if (ts.lastError && isAuthOrWaf(ts.lastError)) {
+          this.handleWafBlock(ts.lastError);
+        } else {
+          this.scheduleReconnect();
+        }
+      }
+    }, 2_000);
+    this.statePollTimer.unref?.();
+  }
 
-  private handleWafBlock(): void {
+  private stopStatePoll(): void {
+    if (this.statePollTimer) {
+      clearInterval(this.statePollTimer);
+      this.statePollTimer = null;
+    }
+  }
+
+  private handleWafBlock(message?: string): void {
     this.wafBlockCount += 1;
     this.updateState({
       status: "waf_blocked",
-      lastError: "WAF blocked connection",
+      lastError: message ?? "WAF blocked connection",
       lastDisconnectedAt: new Date().toISOString(),
     });
-    // Exponential backoff for repeated WAF blocks (cap 5 minutes)
     const backoffMs = Math.min(
       WAF_BACKOFF_MS * Math.pow(2, Math.min(this.wafBlockCount - 1, 2)),
       30_000,
@@ -409,19 +432,13 @@ export class BcGameSocketClient {
         wafBlockCount: this.wafBlockCount,
         backoffMs,
       },
-      "WAF blocked connection — backing off then probing recovery",
+      "WAF/auth blocked — backing off then probing recovery",
     );
     this.clearTimers();
+    this.teardownTransport();
     this.wafBackoffTimer = setTimeout(() => {
       this.wafBackoffTimer = null;
       if (!this.intentionalShutdown) {
-        logger.info(
-          {
-            component: "BcGameSocketClient",
-            wafBlockCount: this.wafBlockCount,
-          },
-          "WAF backoff elapsed — active recovery probe (reconnect)",
-        );
         this.updateState({ status: "stopped", lastError: null });
         void this.connect();
       }
@@ -433,14 +450,12 @@ export class BcGameSocketClient {
     this.clearReconnectTimer();
 
     const attempts = this.state.reconnectAttempts;
-    const delay = Math.min(
-      RECONNECT_DELAY_MS * Math.pow(2, attempts),
-      RECONNECT_DELAY_MAX_MS,
-    );
+    const delay = Math.min(RECONNECT_DELAY_MS * Math.pow(2, attempts), RECONNECT_DELAY_MAX_MS);
 
     this.updateState({
       reconnectAttempts: attempts + 1,
       status: "reconnecting",
+      totalReconnects: this.state.totalReconnects + (attempts === 0 ? 1 : 0),
     });
 
     this.reconnectTimer = setTimeout(() => {
@@ -475,7 +490,7 @@ export class BcGameSocketClient {
           this.updateState({ status: "degraded", eventLagMs: lag });
           logger.warn(
             { component: "BcGameSocketClient", lagMs: lag },
-            "No ED/BG events — marking DEGRADED",
+            "No events — marking DEGRADED",
           );
         } else {
           this.updateState({ eventLagMs: lag });
@@ -492,154 +507,26 @@ export class BcGameSocketClient {
     }
   }
 
-  private handleIncomingEvent(event: string, payload: unknown): void {
-    if (!this.discoveredEvents.has(event)) {
-      this.discoveredEvents.add(event);
-      void this.logDiscoveredEvent(event, payload);
-    }
-
-    const now = new Date().toISOString();
-    const updates: Partial<ConnectionState> = {
-      lastEventAt: now,
-      lastEventKind: event,
-      eventLagMs: 0,
-    };
-    if (event === "ed") {
-      updates.lastEdAt = now;
-      // Do NOT stamp lastEdAtByGame("crash") here — non-Crash ed (or empty
-      // payloads) used to refresh the crash key and made poll-worker DEFER
-      // forever while Crash never arrived. Stamp only after normalize below.
-    }
-    if (event === "bg") updates.lastBgAt = now;
-    if (this.state.status === "degraded") updates.status = "connected";
-    this.updateState(updates);
-
-    if (this.eventHandlers.has(event as BcGameEvent)) {
-      const handlers = this.eventHandlers.get(event as BcGameEvent)!;
-      const eventPayload = this.normalizePayload(event, payload);
-      if (eventPayload) {
-        // Crash-specific ED health for poll defer (only normalized crash rounds).
-        if (event === "ed" && "gameId" in eventPayload && eventPayload.gameId) {
-          const ts = new Date().toISOString();
-          this.lastEdAtByGame.set(String(eventPayload.gameId), ts);
-          this.lastEdAtByGame.set("crash", ts);
-        }
-        for (const handler of handlers) {
-          void handler(eventPayload, event as BcGameEvent).catch((error) => {
-            this.handleError(error as Error, `handler_${event}`);
-          });
-        }
-      }
-    }
-  }
-
-  private normalizePayload(event: string, payload: unknown): BcGameEventPayload | null {
-    try {
-      if (typeof payload !== "object" || payload === null) {
-        logger.warn({ component: "BcGameSocketClient", event }, "Invalid payload type");
-        return null;
-      }
-      const data = payload as Record<string, unknown>;
-      // RE report §6: protobuf uses roundId; maxRate is x10000; odds is x100.
-      const gameId = String(
-        data.gameId ?? data.roundId ?? data.id ?? data.game_id ?? "",
-      );
-      if (!gameId || !/^\d+$/.test(gameId)) {
-        logger.warn(
-          { component: "BcGameSocketClient", event, payload },
-          "Invalid or missing gameId",
-        );
-        return null;
-      }
-
-      let beganAt: number | string | undefined;
-      let crashedAt: number | string | undefined;
-      let multiplier: number | undefined;
-
-      const scaleMaxRate = (v: unknown): number | undefined => {
-        if (typeof v === "number" && Number.isFinite(v)) {
-          // maxRate is int32 x10000 (10000 = 1.00x); values < 50 are already multipliers
-          return v >= 50 ? v / 10_000 : v;
-        }
-        if (typeof v === "string" && v.trim()) {
-          const n = parseFloat(v);
-          return Number.isFinite(n) ? (n >= 50 ? n / 10_000 : n) : undefined;
-        }
-        return undefined;
-      };
-
-      if (event === "pr" || event === "bg") {
-        beganAt = (data.beganAt ?? data.beginTime ?? data.startTime ?? data.prepareTime) as
-          | number
-          | string
-          | undefined;
-      }
-      if (event === "ed" || event === "st") {
-        crashedAt = (data.crashedAt ?? data.endTime ?? data.crashTime) as
-          | number
-          | string
-          | undefined;
-        multiplier =
-          typeof data.multiplier === "number"
-            ? data.multiplier
-            : scaleMaxRate(data.maxRate) ??
-              (typeof data.rate === "number"
-                ? data.rate
-                : typeof data.multiplier === "string"
-                  ? parseFloat(data.multiplier)
-                  : undefined);
-      } else if (event === "pg") {
-        multiplier =
-          typeof data.multiplier === "number"
-            ? data.multiplier
-            : typeof data.current === "number"
-              ? data.current
-              : scaleMaxRate(data.maxRate);
-      }
-
-      return { gameId, multiplier, beganAt, crashedAt, ...data };
-    } catch (error) {
-      logger.error(
-        { component: "BcGameSocketClient", event, error },
-        "Failed to normalize payload",
-      );
-      return null;
-    }
-  }
-
-  private async logDiscoveredEvent(event: string, payload: unknown): Promise<void> {
-    try {
-      const sql = await getSql();
-      await sql`
-        insert into socket_event_discovery (event_name, payload, received_at)
-        values (${event}, ${JSON.stringify(payload)}, now())
-        on conflict (event_name) do nothing
-      `;
-    } catch (error) {
-      logger.warn(
-        { component: "BcGameSocketClient", error: String(error) },
-        "Failed to log discovered event",
-      );
-    }
-  }
-
   private handleError(error: Error, context: string): void {
-    logger.error({ component: "BcGameSocketClient", context, error: error.message }, error.message);
+    logger.warn(
+      { component: "BcGameSocketClient", context, error: error.message },
+      "Socket error",
+    );
     for (const handler of this.errorHandlers) {
-      void handler(error, context).catch(() => undefined);
+      void handler(error, context).catch(() => {});
     }
   }
 
   private updateState(updates: Partial<ConnectionState>): void {
-    const prevStatus = this.state.status;
     this.state = { ...this.state, ...updates };
     for (const handler of this.connectionHandlers) {
-      void handler(this.state).catch(() => undefined);
+      void handler(this.state).catch(() => {});
     }
-    // Ops alert surface: persist status so dashboards/alerts can key off
-    // worker_state.socket_status without scraping logs. Leading indicator of
-    // Path B (~2–3.5s poll recovery) vs Path A (sub-second ED).
-    if (updates.status != null && updates.status !== prevStatus) {
+    if (
+      updates.status === "waf_blocked" ||
+      updates.status === "degraded" ||
+      updates.status === "reconnecting"
+    ) {
       if (updates.status === "waf_blocked" || updates.status === "degraded") {
         logger.warn(
           {
@@ -653,6 +540,8 @@ export class BcGameSocketClient {
           `Socket path at risk (${updates.status}) — poll recovery will dominate latency`,
         );
       }
+      this.persistSocketStatus(updates.status);
+    } else if (updates.status === "connected" || updates.status === "stopped") {
       this.persistSocketStatus(updates.status);
     }
   }
@@ -683,29 +572,27 @@ export class BcGameSocketClient {
           ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
         `;
       } catch {
-        /* soft — worker_state may be unavailable in unit tests */
+        /* soft */
       }
     })();
   }
 
-  /**
-   * Internal cleanup of the socket instance without marking intentional shutdown.
-   * Used by reconnect path so scheduleReconnect still works.
-   */
-  private cleanupSocket(intentional: boolean): void {
-    this.clearTimers();
-    this.stopHealthMonitor();
-    if (this.socket) {
+  private teardownTransport(): void {
+    for (const off of this.unsubs) {
       try {
-        this.socket.removeAllListeners();
-        this.socket.disconnect();
+        off();
       } catch {
         /* ignore */
       }
-      this.socket = null;
     }
-    if (intentional) {
-      this.intentionalShutdown = true;
+    this.unsubs = [];
+    if (this.transport) {
+      try {
+        this.transport.disconnect();
+      } catch {
+        /* ignore */
+      }
+      this.transport = null;
     }
   }
 
@@ -718,17 +605,18 @@ export class BcGameSocketClient {
 
   private clearTimers(): void {
     this.clearReconnectTimer();
+    this.stopHealthMonitor();
+    this.stopStatePoll();
     if (this.wafBackoffTimer) {
       clearTimeout(this.wafBackoffTimer);
       this.wafBackoffTimer = null;
     }
   }
 
-  /**
-   * Intentional permanent disconnect (worker shutdown only).
-   */
   disconnect(): void {
-    this.cleanupSocket(/* intentional */ true);
+    this.intentionalShutdown = true;
+    this.clearTimers();
+    this.teardownTransport();
     this.updateState({
       status: "stopped",
       lastDisconnectedAt: new Date().toISOString(),
@@ -738,9 +626,6 @@ export class BcGameSocketClient {
     logger.info({ component: "BcGameSocketClient" }, "Intentional disconnect — STOPPED");
   }
 
-  /**
-   * Allow a later connect() after an intentional stop (e.g. tests).
-   */
   resetShutdownFlag(): void {
     this.intentionalShutdown = false;
   }
