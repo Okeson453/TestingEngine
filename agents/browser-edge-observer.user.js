@@ -21,7 +21,7 @@
 
   // ========== EDIT THESE TWO LINES (Tampermonkey editor) ==========
   const WORKER_URL = 'https://testingengine-production.up.railway.app'; // public worker URL, no trailing slash
-  const AUTH_TOKEN = 'PASTE_EDGE_INGEST_TOKEN_HERE';      // same as Railway EDGE_INGEST_TOKEN
+  const AUTH_TOKEN = '7fK2mQ9xL4vN8pR3sT6wY1zA5cD0eH2j';      // same as Railway EDGE_INGEST_TOKEN
   // ================================================================
 
   const CONFIG = Object.assign(
@@ -42,7 +42,7 @@
     !CONFIG.url ||
     !CONFIG.token ||
     CONFIG.token.includes('PASTE_EDGE') ||
-    CONFIG.token.includes('YOUR-')
+    (CONFIG.token.includes('YOUR-') && CONFIG.token.includes('WORKER'))
   ) {
     console.warn(
       '[TE-EDGE] Disabled. Edit WORKER_URL and AUTH_TOKEN at the top of the Tampermonkey script, then Save.',
