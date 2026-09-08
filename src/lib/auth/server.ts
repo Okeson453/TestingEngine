@@ -149,8 +149,16 @@ const database = databaseUrl
       max: Number(process.env.AUTH_PG_POOL_MAX ?? 1) || 1,
       min: 0,
       idleTimeoutMillis: 5_000,
-      connectionTimeoutMillis: 5_000,
+      connectionTimeoutMillis: 30_000,
       allowExitOnIdle: true,
+      ssl:
+        process.env.PG_SSL === "0"
+          ? undefined
+          : {
+              rejectUnauthorized:
+                process.env.PG_SSL_REJECT_UNAUTHORIZED === "1" ||
+                process.env.PG_SSL_REJECT_UNAUTHORIZED === "true",
+            },
       application_name: "testingengine-auth",
     })
   : { dialect: pgliteDialect(() => getPglite()), type: "postgres" as const };

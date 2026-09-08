@@ -112,10 +112,17 @@ function createNeonSql(): Promise<Sql> {
       keepAliveInitialDelayMillis: 5_000,
       // Neon requires TLS; pg enables ssl from sslmode in URL. Explicit option
       // avoids some handshake drops when URL omits sslmode.
+      // Supabase/Neon poolers often present a chain Node does not trust by default
+      // → "self-signed certificate in certificate chain". Default: do not reject.
+      // Set PG_SSL_REJECT_UNAUTHORIZED=1 to enforce full verify in strict environments.
       ssl:
         process.env.PG_SSL === "0"
           ? undefined
-          : { rejectUnauthorized: process.env.PG_SSL_REJECT_UNAUTHORIZED !== "0" },
+          : {
+              rejectUnauthorized:
+                process.env.PG_SSL_REJECT_UNAUTHORIZED === "1" ||
+                process.env.PG_SSL_REJECT_UNAUTHORIZED === "true",
+            },
       ...(family != null ? { family } : {}),
       application_name:
         process.env.PG_APP_NAME ||

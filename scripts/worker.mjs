@@ -58,7 +58,11 @@ async function ensureMigrations() {
     ssl:
       process.env.PG_SSL === "0"
         ? undefined
-        : { rejectUnauthorized: process.env.PG_SSL_REJECT_UNAUTHORIZED !== "0" },
+        : {
+            rejectUnauthorized:
+              process.env.PG_SSL_REJECT_UNAUTHORIZED === "1" ||
+              process.env.PG_SSL_REJECT_UNAUTHORIZED === "true",
+          },
     family: process.env.PG_FAMILY === "0" ? undefined : Number(process.env.PG_FAMILY ?? 4) || 4,
   });
   let client;
