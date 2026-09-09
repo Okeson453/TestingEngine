@@ -38,22 +38,34 @@ g.addEventListener = () => {};
 g.removeEventListener = () => {};
 
 async function main() {
-  const htmlRes = await fetch("https://bc.game/game/crash", {
-    headers: { "user-agent": UA, accept: "text/html" },
-    signal: AbortSignal.timeout(8000),
-  });
+  const step = (s) => (e) => { throw new Error(s + ": " + (e && e.message ? e.message : e)); };
+  let htmlRes;
+  try {
+    htmlRes = await fetch("https://bc.game/game/crash", {
+      headers: { "user-agent": UA, accept: "text/html" },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (e) { throw step("crash page fetch")(e); }
+  if (!htmlRes.ok) throw new Error("crash page http " + htmlRes.status + " (waf/cloudflare?)");
   const html = await htmlRes.text();
   const indexMatch = html.match(/\\/assets\\/index-[^"']+\\.js/);
   const indexPath = indexMatch?.[0] ?? "/assets/index-ChLSFpM-.js";
-  const jsRes = await fetch("https://bc.game" + indexPath, {
-    headers: { "user-agent": UA },
-    signal: AbortSignal.timeout(12000),
-  });
+  let jsRes;
+  try {
+    jsRes = await fetch("https://bc.game" + indexPath, {
+      headers: { "user-agent": UA },
+      signal: AbortSignal.timeout(12000),
+    });
+  } catch (e) { throw step("index bundle fetch " + indexPath)(e); }
+  if (!jsRes.ok) throw new Error("index bundle http " + jsRes.status + " " + indexPath);
   const js = await jsRes.text();
-  const wr = js.match(/wr_utils-[\\\\w-]+\\\\.js/)?.[0] ?? "wr_utils-BY40daAC.js";
+  const wr = js.match(/wr_utils-[\\w-]+\\.js/)?.[0] ?? "wr_utils-BY40daAC.js";
   const url = "https://bc.game/assets/" + wr;
-  const res = await fetch(url, { headers: { "user-agent": UA }, signal: AbortSignal.timeout(12000) });
-  if (!res.ok) throw new Error("wr_utils fetch " + res.status);
+  let res;
+  try {
+    res = await fetch(url, { headers: { "user-agent": UA }, signal: AbortSignal.timeout(12000) });
+  } catch (e) { throw step("wr_utils fetch " + wr)(e); }
+  if (!res.ok) throw new Error("wr_utils fetch " + wr + " http " + res.status);
   const body = await res.text();
   const blob = new Blob([body], { type: "text/javascript" });
   const mod = await import(URL.createObjectURL(blob));
