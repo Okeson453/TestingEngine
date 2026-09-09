@@ -23,6 +23,77 @@ const logger = getLogger("prediction-attempt");
 
 export type PredictionSource = "ED" | "RECOVERY";
 
+// ── Batch 3: rejection telemetry ────────────────────────────────────────────
+// Every N+1 attempt that does NOT produce a signal is counted by
+// (source, kind) so the "why did 20:50:26 ED not produce a prediction?"
+// question is answerable from counters, not log archaeology. The last
+// rejection is also persisted to worker_state (fire-and-forget) so the
+// evidence survives process restarts.
+const attemptCounts = new Map<string, number>();
+let lastRejection: {
+  at: string;
+  source: PredictionSource;
+  sourceGameId: string;
+  targetGameId: string | null;
+  kind: string | null;
+} | null = null;
+
+function recordAttempt(
+  source: PredictionSource,
+  sourceGameId: string,
+  targetGameId: string | null,
+  kind: string | null,
+  attempted: boolean,
+): void {
+  const key = `${source}:${attempted ? "predicted" : kind ?? "unknown"}`;
+  attemptCounts.set(key, (attemptCounts.get(key) ?? 0) + 1);
+  if (!attempted) {
+    lastRejection = {
+      at: new Date().toISOString(),
+      source,
+      sourceGameId,
+      targetGameId,
+      kind,
+    };
+  }
+}
+
+/** Counters per (source, kind) + the most recent non-produced attempt. */
+export function getN1AttemptStats(): {
+  counts: Record<string, number>;
+  lastRejection: typeof lastRejection;
+} {
+  return { counts: Object.fromEntries(attemptCounts), lastRejection };
+}
+
+function persistLastRejectionFireAndForget(
+  source: PredictionSource,
+  sourceGameId: string,
+  targetGameId: string | null,
+  kind: string | null,
+): void {
+  void (async () => {
+    try {
+      const { getSql } = await import("@/lib/db");
+      const sql = await getSql();
+      const payload = JSON.stringify({
+        source,
+        sourceGameId,
+        targetGameId,
+        kind,
+        at: new Date().toISOString(),
+      });
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_n1_rejection', ${payload})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+    } catch {
+      /* soft — telemetry must never throw on the hot path */
+    }
+  })();
+}
+
 export interface AttemptNPlusOneInput {
   sourceRoundId: string;
   sourceCrashAt: string;
@@ -61,6 +132,23 @@ export async function attemptNPlusOnePrediction(
 
     const attempted =
       result?.predictionId != null && result.kind !== "duplicate";
+
+    recordAttempt(
+      source,
+      sourceRoundId,
+      result?.targetGameId ?? null,
+      result?.kind ?? null,
+      attempted,
+    );
+    if (!attempted) {
+      // Fire-and-forget durable evidence for post-mortem (batch 3 P0).
+      persistLastRejectionFireAndForget(
+        source,
+        sourceRoundId,
+        result?.targetGameId ?? null,
+        result?.kind ?? null,
+      );
+    }
 
     logger.info(
       {

@@ -26,11 +26,17 @@ const logger = getLogger("outbox-dispatcher");
 /** Tunables (env-overridable for tests). */
 // P2.5: Reduced default from 50ms to 25ms to halve max queue wait time.
 export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 10);
-export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 8);
+export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
-/** Max concurrent Telegram sends within a claimed batch (P0 / 6.5). */
-export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 2);
+/**
+ * Max concurrent Telegram sends within a claimed batch (P0 / 6.5).
+ * Batch 3 fix: with a ~800ms Neon RTT per DB round-trip, parallelism 2 meant
+ * a full batch took multiple seconds per drain pass — the direct cause of the
+ * repeated "outbox backlog >5s" warnings. 8 concurrent sends drain a full
+ * batch in roughly one RTT. Env-overridable as before.
+ */
+export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 8);
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -54,6 +60,8 @@ export interface DispatcherStats {
   delivered: number;
   dead: number;
   requeued: number;
+  /** Times the backlog health check found rows pending >5s. */
+  backlogWarnings: number;
   lastError: string | null;
 }
 
@@ -67,6 +75,7 @@ export class OutboxDispatcher {
     delivered: 0,
     dead: 0,
     requeued: 0,
+    backlogWarnings: 0,
     lastError: null,
   };
   private getSqlFn: () => Promise<Sql> = getSql;
@@ -444,6 +453,7 @@ export class OutboxDispatcher {
       `.catch(() => [] as { c: number; oldest_ms: number | null }[]);
       const row = backlog[0];
       if (row && row.c > 0) {
+        this.stats.backlogWarnings += 1;
         logger.warn(
           {
             component: "outbox-dispatcher",
