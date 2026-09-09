@@ -72,3 +72,6 @@ export {
 } from './state/state-persistence.ts';
 export { BrowserWorkerHttpClient, shouldUseRemoteBrowserWorker } from '../browser/worker/http-client.ts';
 export type { RiskInputProvider } from '../betting/risk-input-provider.ts';
+
+export { registerPrediction, resolvePrediction, getPredictionForTarget, bindTargetStarted } from './prediction-record-store.ts';
+export { recordOutcome, getLearningMode, rollingSnapshot, allowAcieLearning } from './rolling-performance.ts';

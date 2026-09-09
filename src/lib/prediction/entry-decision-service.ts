@@ -24,6 +24,18 @@ import {
 import type { OpportunityRanker as DecisionOpportunityRanker } from '../opportunity/ranker.ts';
 import { bridgeOpportunityToDecisionRanker } from '../opportunity/prediction-bridge.ts';
 import { globalCalibrationState } from './calibration/calibration-state.ts';
+import {
+  registerPrediction,
+  resolvePrediction,
+  checkTemporalValidity,
+  type PredictionRecord,
+} from './prediction-record-store.ts';
+import {
+  recordOutcome,
+  allowAcieLearning,
+  getLearningMode,
+  rollingSnapshot,
+} from './rolling-performance.ts';
 
 import { RoundRepository } from '../persistence/repositories/round-repo.ts';
 import { ACIEEngine } from './acie/engine.ts';
@@ -169,13 +181,32 @@ export class EntryDecisionService {
     this.ensureAcieSeeded();
     // O(1) incremental feature update (feeds hot feature cache)
     globalIncrementalFeatures.onCrash(crashPoint);
-    // Phase 4: feed last emitted probability into calibration (if present on snapshot)
+    // P0: feedback by targetRoundId lineage — not lastEmittedProbability
     try {
       const actual: 0 | 1 = crashPoint >= 1.3 ? 1 : 0;
-      if (this.lastEmittedProbability != null && this.lastEmittedProbability > 0) {
-        globalCalibrationState.observe(this.lastEmittedProbability, actual, 'global');
-        feedbackPredictionPipeline(this.lastEmittedProbability, actual);
-        const div = globalLiveDivergence.observe(this.lastEmittedProbability, actual);
+      const rec = resolvePrediction(roundId, crashPoint);
+      const pFeedback =
+        rec && rec.temporalValidity !== 'TEMPORALLY_INVALID'
+          ? rec.finalProbability
+          : null;
+      // Skip training on temporally invalid predictions
+      if (rec?.temporalValidity === 'TEMPORALLY_INVALID') {
+        this.logger.warn(
+          {
+            component: 'EntryDecisionService',
+            roundId,
+            predictionId: rec.predictionId,
+            createdAt: rec.createdAt,
+            targetStartedAt: rec.targetStartedAt,
+          },
+          'Skip feedback — TEMPORALLY_INVALID prediction',
+        );
+      } else if (pFeedback != null && pFeedback > 0) {
+        const regimeKey = rec?.regime ?? 'global';
+        globalCalibrationState.observe(pFeedback, actual, regimeKey);
+        feedbackPredictionPipeline(pFeedback, actual);
+        recordOutcome(pFeedback, actual);
+        const div = globalLiveDivergence.observe(pFeedback, actual);
         if (div.actions.fullSheathHaltEntries) {
           this.logger.warn(
             { component: 'EntryDecisionService', level: div.level, reason: div.reason },
@@ -224,14 +255,22 @@ export class EntryDecisionService {
     if (this.crashCountForSnapshot % 25 === 0) {
       void saveSnapshotToFile(undefined, this.acie).catch(() => undefined);
     }
+    // P2: circuit-breaker — observe always, restrict weight updates when degraded
+    const learningOk = allowAcieLearning();
     const result = this.acie.onCrash(
       {
         roundId,
         crashPoint,
         timestamp: new Date().toISOString(),
       },
-      riskState
+      learningOk ? riskState : { ...(riskState ?? {}), learningRestricted: true } as never
     );
+    if (!learningOk) {
+      this.logger.info(
+        { component: 'EntryDecisionService', mode: getLearningMode(), rolling: rollingSnapshot() },
+        'ACIE learning restricted by rolling performance',
+      );
+    }
     this.logger.debug(
       {
         component: 'EntryDecisionService',
@@ -244,8 +283,24 @@ export class EntryDecisionService {
       'ACIE onCrash learning tick'
     );
 
-    // Consecutive Loss Streak Sheath Trigger
+    // Rolling performance + consecutive loss sheath
     try {
+      const snap = rollingSnapshot();
+      if (getLearningMode() === 'FROZEN' || getLearningMode() === 'LEARNING_RESTRICTED') {
+        this.logger.warn(
+          { component: 'EntryDecisionService', rolling: snap },
+          'Rolling performance sheath — conservative lock',
+        );
+        this.sheathMode?.reportTriggers([
+          {
+            id: 'rolling_performance_degraded',
+            severity: getLearningMode() === 'FROZEN' ? 'critical' : 'high',
+            message: `learningMode=${getLearningMode()}`,
+            detectedAt: new Date().toISOString(),
+            metadata: snap as never,
+          },
+        ]);
+      }
       const cl = this.acie.getConsecutiveLosses?.() ?? 0;
       if (cl >= 4) {
         this.logger.warn(
@@ -373,6 +428,9 @@ export class EntryDecisionService {
             regimeVersion: stateSnapshot.regimeVersion,
             calibrationVersion: stateSnapshot.calibrationVersion,
             psiProbability: p,
+            rawAcieProbability: p,
+            calibratedProbability: calibrated,
+            pipelineProbability: calibrated,
             modelUncertainty: acieEval.psi.modelUncertainty,
             dataUncertainty: acieEval.psi.dataUncertainty,
           }),
@@ -421,7 +479,60 @@ export class EntryDecisionService {
         signal = null;
       } else if (signal) {
         this.lastSignal = signal;
-        this.lastEmittedProbability = signal.probability;
+        this.lastEmittedProbability = signal.probability; // legacy telemetry only
+        // P0: register immutable prediction identity for feedback lineage
+        try {
+          const createdAtMs = Date.now();
+          const createdAt = new Date(createdAtMs).toISOString();
+          const fs = (signal.featureSummary ?? {}) as Record<string, unknown>;
+          const rawP = Number(
+            fs.rawAcieProbability ?? fs.rawPipelineProbability ?? signal.probability,
+          );
+          const calP = Number(fs.calibratedProbability ?? signal.probability);
+          const pipeP = Number(fs.pipelineProbability ?? signal.probability);
+          const temporal = checkTemporalValidity(createdAtMs, null);
+          const rec: PredictionRecord = {
+            predictionId: signal.predictionId,
+            sourceRoundId: ctx.externalRoundId ?? null,
+            targetRoundId: ctx.roundId,
+            createdAt,
+            createdAtMs,
+            targetStartedAt: null,
+            targetEndedAt: null,
+            rawProbability: Number.isFinite(rawP) ? rawP : signal.probability,
+            calibratedProbability: Number.isFinite(calP) ? calP : signal.probability,
+            pipelineProbability: Number.isFinite(pipeP) ? pipeP : signal.probability,
+            finalProbability: signal.probability,
+            regime: String(signal.regimeId ?? acieEval?.regime ?? 'global'),
+            modelVersion: signal.modelVersion,
+            featureVersion: signal.featureVersion,
+            calibrationVersion: String(globalCalibrationState.version ?? ''),
+            temporalValidity: temporal,
+            resolved: false,
+          };
+          if (temporal === 'TEMPORALLY_INVALID') {
+            this.logger.warn(
+              { component: 'EntryDecisionService', targetRoundId: ctx.roundId },
+              'Reject signal — TEMPORALLY_INVALID at emit',
+            );
+            signal = null;
+          } else {
+            registerPrediction(rec);
+            (signal as unknown as Record<string, unknown>).pRaw = rec.rawProbability;
+            (signal as unknown as Record<string, unknown>).pCalibrated = rec.calibratedProbability;
+            (signal as unknown as Record<string, unknown>).pPipeline = rec.pipelineProbability;
+            (signal as unknown as Record<string, unknown>).pFinal = rec.finalProbability;
+            (signal as unknown as Record<string, unknown>).temporalValidity = temporal;
+          }
+        } catch (e) {
+          this.logger.warn(
+            { component: 'EntryDecisionService', error: String(e) },
+            'prediction record register failed',
+          );
+        }
+        if (!signal) {
+          // discarded as temporally invalid
+        } else {
         // Honest prediction quality labels (P1)
         ((signal as unknown) as Record<string, unknown>).modelFamily = 'acie-heuristic-ensemble';
         ((signal as unknown) as Record<string, unknown>).heuristic = true;
@@ -434,6 +545,7 @@ export class EntryDecisionService {
           );
           ((signal as unknown) as Record<string, unknown>).ewmaBrier = this.acie.getOnlineState().ewmaBrier;
         } catch { /* */ }
+        } // end signal still valid after temporal check
 
       }
     } else {
@@ -639,6 +751,8 @@ export class EntryDecisionService {
         ...signal.featureSummary,
         metaProbability: pipeline.metaProbability,
         rawPipelineProbability: pipeline.rawProbability,
+        pipelineProbability: pipeline.calibratedProbability,
+        calibratedProbability: pipeline.calibratedProbability,
         opportunityScore: pipeline.opportunity.score,
         opportunityRank: pipeline.opportunity.rank,
         pipelineThreshold: pipeline.threshold,
