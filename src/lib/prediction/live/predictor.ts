@@ -995,6 +995,49 @@ export async function onGameEndPredict(
   // Keep the promise alive so it doesn't become an unhandled rejection.
   void persistPromise.catch(() => undefined);
 
+  // P0 (identity): register the immutable prediction record keyed by target
+  // round. Feedback resolves against THIS record — never "last emitted".
+  try {
+    const { globalPredictionRegistry } = await import(
+      "@/lib/prediction/identity/prediction-registry"
+    );
+    const fs = signal.featureSummary as Record<string, unknown> | null | undefined;
+    const featureVersionOf = (signal as { featureVersion?: string | null }).featureVersion ?? null;
+    globalPredictionRegistry.register({
+      predictionId,
+      sourceRoundId: gameId,
+      targetRoundId: targetGameId,
+      createdAt: timestamp,
+      targetStartedAt: null,
+      targetEndedAt: null,
+      rawProbability: signal.probability,
+      calibratedProbability: null,
+      pipelineProbability: null,
+      finalProbability: signal.probability,
+      confidence: signal.confidence,
+      target: Number(DEFAULT_TARGET),
+      regime: signal.regimeId ?? null,
+      modelVersion: signal.modelVersion,
+      featureVersion: featureVersionOf,
+      featurePath: null,
+      temporalValidity: "TEMPORALLY_UNVERIFIED",
+      provenance: {
+        stateVersion: (fs?.stateVersion as string | number | undefined) ?? null,
+        acieStateVersion: (fs?.stateVersion as string | number | undefined) ?? null,
+        calibrationVersion: (fs?.calibrationVersion as string | number | undefined) ?? null,
+        regimeVersion: (fs?.regimeVersion as string | number | undefined) ?? null,
+        pipelineVersion: null,
+      },
+      stages: {
+        acieSignal: true,
+        calibrationApplied: null,
+        pipelineApplied: null,
+        finalSignal: true,
+      },
+      resolved: false,
+    });
+  } catch { /* soft — registry is best-effort */ }
+
   return {
     predictionId,
     targetGameId,

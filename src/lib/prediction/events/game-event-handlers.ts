@@ -20,7 +20,6 @@ import {
   markLiveRoundEnded,
 } from "@/lib/prediction/live/live-round-state";
 import { appendCompletedRound } from "@/lib/prediction/live/live-history-buffer";
-import { bindTargetStarted } from "@/lib/prediction/prediction-record-store";
 import {
   claimTarget,
   completeTarget,
@@ -97,12 +96,6 @@ async function bgHandler(payload: unknown): Promise<void> {
   );
 
   try {
-    // Bind target start for temporal validity (prediction must be before BG).
-    try {
-      bindTargetStarted(gameId, beganAt);
-    } catch {
-      /* soft */
-    }
     const sql = await getSql();
     // Backfill began_at when known from BG (authoritative round start).
     await sql`
@@ -113,6 +106,13 @@ async function bgHandler(payload: unknown): Promise<void> {
 
     await Promise.all([
       markLiveRoundStarted(gameId, beganAt, "socket", correlationId, sql).catch(() => undefined),
+      // P0 (temporal validity): authoritative round-start backfill on the
+      // prediction registry — re-evaluates createdAt < targetStartedAt.
+      import("@/lib/prediction/identity/prediction-registry")
+        .then(({ globalPredictionRegistry }) => {
+          globalPredictionRegistry.noteTargetStarted(gameId, beganAt);
+        })
+        .catch(() => undefined),
       sql`
         INSERT INTO live_event_log (
           correlation_id, event_kind, game_id, payload, received_at, processed_at,

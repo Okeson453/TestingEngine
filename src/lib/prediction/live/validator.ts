@@ -382,31 +382,6 @@ export async function onGameEnd(
       "validator.onGameEnd failed",
     );
     try {
-      const sql = await getSqlFn();
-      await sql`
-        INSERT INTO worker_state (key, value, updated_at)
-        VALUES (
-          'last_validator_error',
-          ${JSON.stringify({
-            name: err.name,
-            message: err.message,
-            stack: err.stack?.slice(0, 1500) ?? null,
-            gameId: evt.gameId,
-            endTime: evt.endTime,
-            multiplier: evt.multiplier,
-            skipPredict: evt.skipPredict ?? false,
-            at: new Date().toISOString(),
-          })},
-          now()
-        )
-        ON CONFLICT (key) DO UPDATE
-        SET value = EXCLUDED.value, updated_at = now()
-      `;
-    } catch {
-      /* soft */
-    }
-
-    try {
       // Fix 9: persist full error context in worker_state for post-mortem.
       const errJson = JSON.stringify({
         name: err.name,
@@ -534,25 +509,72 @@ export async function onGameEnd(
   const pendingSnapshot = state.pending; // capture for async closure
   setImmediate(() => {
     if (!pendingSnapshot) return;
-    void processResolvedPredictionFeedback({
-      predictionId: pendingSnapshot.prediction_id,
-      targetGameId: evt.gameId,
-      predictedProbability: Number(pendingSnapshot.probability),
-      predictedConfidence:
-        pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
-      targetMultiplier: Number(pendingSnapshot.target_multiplier),
-      actualMultiplier: evt.multiplier,
-      result,
-      regimeAtPrediction: pendingSnapshot.regime_name ?? null,
-      modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
-      correlationId: pendingSnapshot.correlation_id ?? null,
-      resolvedAt,
-    }).catch((fbErr) => {
-      logger.warn(
-        { component: "live-validator", error: String(fbErr) },
-        "async closed-loop feedback failed",
-      );
-    });
+    // P0 (identity + temporal validity): resolve the EXACT registered
+    // prediction for this target round and observe rolling metrics.
+    // Temporally invalid predictions never feed learning or performance.
+    void (async () => {
+      try {
+        const { globalPredictionRegistry, globalRollingPerformance } = await import(
+          "@/lib/prediction/identity/prediction-registry"
+        );
+        const resolution = globalPredictionRegistry.resolve(
+          evt.gameId,
+          evt.multiplier,
+          Number(pendingSnapshot.target_multiplier) || 1.3,
+        );
+        const rec =
+          resolution?.record ?? globalPredictionRegistry.getByTarget(evt.gameId);
+        if (rec?.temporalValidity !== "TEMPORALLY_INVALID") {
+          globalRollingPerformance.observe(
+            resolution?.probability ?? Number(pendingSnapshot.probability),
+            result === "WIN",
+            pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
+          );
+        }
+      } catch { /* soft — registry is best-effort */ }
+    })();
+    // P0 (Problem 6): hard temporal-validity gate — a prediction generated
+    // after its target round already started must never train the models.
+    void (async () => {
+      try {
+        const { globalPredictionRegistry } = await import(
+          "@/lib/prediction/identity/prediction-registry"
+        );
+        const rec = globalPredictionRegistry.getByTarget(evt.gameId);
+        if (rec?.temporalValidity === "TEMPORALLY_INVALID") {
+          logger.warn(
+            {
+              component: "live-validator",
+              predictionId: pendingSnapshot.prediction_id,
+              targetGameId: evt.gameId,
+              createdAt: rec.createdAt,
+              targetStartedAt: rec.targetStartedAt,
+            },
+            "skipping closed-loop feedback — prediction TEMPORALLY_INVALID",
+          );
+          return;
+        }
+      } catch { /* soft */ }
+      void processResolvedPredictionFeedback({
+        predictionId: pendingSnapshot.prediction_id,
+        targetGameId: evt.gameId,
+        predictedProbability: Number(pendingSnapshot.probability),
+        predictedConfidence:
+          pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
+        targetMultiplier: Number(pendingSnapshot.target_multiplier),
+        actualMultiplier: evt.multiplier,
+        result,
+        regimeAtPrediction: pendingSnapshot.regime_name ?? null,
+        modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
+        correlationId: pendingSnapshot.correlation_id ?? null,
+        resolvedAt,
+      }).catch((fbErr) => {
+        logger.warn(
+          { component: "live-validator", error: String(fbErr) },
+          "async closed-loop feedback failed",
+        );
+      });
+    })();
   });
 
   // N+1 already scheduled at function entry (parallel with validation).

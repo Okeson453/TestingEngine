@@ -174,14 +174,20 @@ export class ACIEEngine {
    */
   onCrash(
     round: ACIERoundInput,
-    riskState?: Partial<StrategyRiskState>
+    riskState?: Partial<StrategyRiskState>,
+    learnOpts?: { learn?: boolean }
   ): CrashLearningResult {
     if (riskState) this.lastRiskState = riskState;
-    const result = this.ingestCrash(round, { skipDecision: false, riskState: this.lastRiskState });
+    // Drift-controller gate (diagnosis Problem 2): when learning is
+    // restricted/frozen, the outcome is still RECORDED (SOL, sequence,
+    // regime) but online weight adaptation and calibration updates are
+    // skipped — observation and model update are separated.
+    const learn = learnOpts?.learn !== false;
+    const result = this.ingestCrash(round, { skipDecision: false, riskState: this.lastRiskState, learn });
     // §5.1 Persist online state asynchronously — never blocks the hot path.
     scheduleAcieStateSave(this);
     // §5.2 Update Platt from the outcome just observed.
-    this.observeCalibrationPair(round.crashPoint >= ACIE_TARGET ? 1 : 0);
+    if (learn) this.observeCalibrationPair(round.crashPoint >= ACIE_TARGET ? 1 : 0);
     return result;
   }
 
@@ -324,7 +330,7 @@ export class ACIEEngine {
 
   private ingestCrash(
     round: ACIERoundInput,
-    opts: { skipDecision: boolean; riskState?: Partial<StrategyRiskState> }
+    opts: { skipDecision: boolean; riskState?: Partial<StrategyRiskState>; learn?: boolean }
   ): CrashLearningResult {
     // Idempotent: ignore duplicate crash events for the same round
     if (round.roundId && this.processedRoundIds.has(round.roundId)) {
@@ -385,14 +391,18 @@ export class ACIEEngine {
     else this.consecutiveLosses = 0;
 
     // 3) ONLINE ADAPTATION (every crash) — weights, EWMA, calibration buckets, drift
-    this.online = applyOnlineUpdate(this.online, {
-      crashPoint: round.crashPoint,
-      psiProbability: ctx.psiProbability,
-      modelProbabilities: this.lastModelProbabilities,
-      sequenceState,
-      regime,
-      alpha: this.ewmaAlpha,
-    });
+    // Gated by the drift controller when learn === false (Problem 2 fix):
+    // outcomes are still recorded; weight adaptation is what freezes.
+    if (opts.learn !== false) {
+      this.online = applyOnlineUpdate(this.online, {
+        crashPoint: round.crashPoint,
+        psiProbability: ctx.psiProbability,
+        modelProbabilities: this.lastModelProbabilities,
+        sequenceState,
+        regime,
+        alpha: this.ewmaAlpha,
+      });
+    }
 
     // 4) Heavy validation — FLAG ONLY on hot path (never O(n) evaluate here)
     let heavyValidationRan = false;
