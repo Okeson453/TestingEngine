@@ -48,7 +48,14 @@ import { isEdgeFresh } from "@/lib/prediction/live/edge-ingest";
 function liveSocketSnapshot(): { status: string; lastEdAt: number | null } {
   const nativeStatus = nativeBcGameSocket.getStatus();
   const nativeEd = nativeBcGameSocket.getLastEdAt();
-  if (nativeStatus === "connected" || nativeStatus === "degraded") {
+  // Connected but never received ed → not a healthy live path; keep poll active.
+  if (nativeStatus === "connected") {
+    if (nativeEd && Date.now() - nativeEd < 90_000) {
+      return { status: "connected", lastEdAt: nativeEd };
+    }
+    return { status: "degraded", lastEdAt: nativeEd };
+  }
+  if (nativeStatus === "degraded") {
     return { status: nativeStatus, lastEdAt: nativeEd };
   }
   const st = bcGameSocket.getState();

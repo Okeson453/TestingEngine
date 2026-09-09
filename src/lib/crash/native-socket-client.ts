@@ -24,11 +24,13 @@ import { getRealtimePipeline } from "@/lib/realtime/realtime-pipeline";
 const logger = getLogger("native-bc-socket");
 
 const SOCKET_HOST = process.env.BCGAME_SOCKET_HOST ?? "socketv4.bc.game";
-const RECONNECT_DELAY_MS = 200;
-const RECONNECT_DELAY_MAX_MS = 4_000;
-const WAF_BACKOFF_MS = Number(process.env.WAF_BACKOFF_MS ?? 20_000);
-const DEGRADED_AFTER_MS = 20_000;
-/** 5s keepalive (ported from tested workspace) — faster dead-socket detection. */
+const RECONNECT_DELAY_MS = 150;
+const RECONNECT_DELAY_MAX_MS = 1_500;
+const WAF_BACKOFF_MS = Number(process.env.WAF_BACKOFF_MS ?? 12_000);
+/** No crash events while "connected" → force reconnect (keep path hot). */
+const STALE_EVENT_RECONNECT_MS = Number(process.env.NATIVE_WS_STALE_MS ?? 25_000);
+const DEGRADED_AFTER_MS = 12_000;
+/** 5s keepalive — match BC.Game Engine.IO pingInterval. */
 const PING_MS = 5_000;
 const TRACKED = new Set(["pr", "bg", "pg", "ed", "st"]);
 
@@ -67,7 +69,9 @@ export class NativeBcGameSocket {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private intentionalStop = false;
   private joined = false;
+  private joinedAt: number | null = null;
   private currentGameId: string | null = null;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private handlers = new Set<EventHandler>();
   private statusHandlers = new Set<StatusHandler>();
   private status: string = "stopped";
@@ -107,6 +111,10 @@ export class NativeBcGameSocket {
   async stop(): Promise<void> {
     this.intentionalStop = true;
     this.clearTimers();
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
     try {
       this.socket?.close();
     } catch {
@@ -134,6 +142,7 @@ export class NativeBcGameSocket {
     const isReconnect = this.reconnectAttempts > 0 || this.status === "reconnecting";
     this.setStatus(isReconnect ? "reconnecting" : "connecting");
     this.joined = false;
+    this.joinedAt = null;
     this.currentGameId = null;
 
     try {
@@ -195,7 +204,13 @@ export class NativeBcGameSocket {
           { component: "native-bc-socket", code, reason: reason?.toString?.() },
           "close",
         );
-        if (!this.intentionalStop) this.scheduleReconnect();
+        this.joined = false;
+        this.joinedAt = null;
+        // 1006 = abnormal; reconnect immediately (not WAF)
+        if (!this.intentionalStop) {
+          if (code === 1006 || code === 1001) this.reconnectAttempts = 0;
+          this.scheduleReconnect();
+        }
       });
 
       socket.on("error", (err) => {
@@ -267,6 +282,7 @@ export class NativeBcGameSocket {
       );
       if ((packet.nsp === NSP || packet.nsp === "") && !this.joined) {
         this.joined = true;
+        this.joinedAt = Date.now();
         this.socket?.send(encodeJoin(NSP));
         logger.info({ component: "native-bc-socket" }, "joined /g/cm");
       }
@@ -348,14 +364,61 @@ export class NativeBcGameSocket {
     if (this.healthTimer) clearInterval(this.healthTimer);
     this.healthTimer = setInterval(() => {
       const last = this.lastEventAt;
-      if (!last) return;
-      const lag = Date.now() - last;
-      if (lag > DEGRADED_AFTER_MS && this.status === "connected") {
-        this.setStatus("degraded", `no events ${lag}ms`);
-      } else {
-        prefetchSign();
+      if (last) {
+        const lag = Date.now() - last;
+        if (lag > DEGRADED_AFTER_MS && this.status === "connected") {
+          this.setStatus("degraded", `no events ${lag}ms`);
+        }
+      }
+      prefetchSign();
+    }, 5_000);
+    this.startWatchdog();
+  }
+
+  /**
+   * Always-on watchdog: if we never join, or join but receive no crash events,
+   * tear down and reconnect so the live path stays primary over poll.
+   */
+  private startWatchdog(): void {
+    if (this.watchdogTimer) return;
+    this.watchdogTimer = setInterval(() => {
+      if (this.intentionalStop) return;
+      if (this.status === "waf_blocked" || this.status === "connecting" || this.status === "reconnecting") {
+        return;
+      }
+      const now = Date.now();
+      // Opened but never joined namespace
+      if (this.status === "connected" && !this.joined) {
+        logger.warn({ component: "native-bc-socket" }, "watchdog: connected but not joined — reconnect");
+        this.forceReconnect("not_joined");
+        return;
+      }
+      // Joined but silent too long (missed ed cycle)
+      const anchor = this.lastEventAt ?? this.joinedAt;
+      if (this.joined && anchor && now - anchor > STALE_EVENT_RECONNECT_MS) {
+        logger.warn(
+          { component: "native-bc-socket", silentMs: now - anchor },
+          "watchdog: no crash events — reconnect",
+        );
+        this.forceReconnect("stale_events");
       }
     }, 5_000);
+  }
+
+  private forceReconnect(reason: string): void {
+    logger.info({ component: "native-bc-socket", reason }, "force reconnect");
+    try {
+      this.socket?.close();
+    } catch {
+      /* soft */
+    }
+    this.socket = null;
+    this.joined = false;
+    this.joinedAt = null;
+    this.clearPing();
+    // Immediate reconnect (bypass exponential if we had a prior session)
+    this.reconnectAttempts = Math.min(this.reconnectAttempts, 2);
+    this.scheduleReconnect();
   }
 
   private scheduleReconnect(): void {
@@ -384,6 +447,7 @@ export class NativeBcGameSocket {
     this.wafTimer = setTimeout(() => {
       this.wafTimer = null;
       if (!this.intentionalStop) {
+        this.reconnectAttempts = 0;
         this.setStatus("stopped");
         void this.connect();
       }
@@ -403,6 +467,7 @@ export class NativeBcGameSocket {
     this.wafTimer = null;
     if (this.healthTimer) clearInterval(this.healthTimer);
     this.healthTimer = null;
+    // Keep watchdog alive across reconnects while start() is active
   }
 }
 
