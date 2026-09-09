@@ -220,8 +220,11 @@ export class NativeBcGameSocket {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.warn({ component: "native-bc-socket", error: message }, "connect failed");
-      if (message.includes("sign unavailable")) {
-        this.setStatus("waf_blocked", message);
+      // Sign miss is transient — retry quickly; do not mark waf_blocked (blocks reconnect).
+      if (message.includes("sign unavailable") || message.includes("sign failed")) {
+        this.setStatus("reconnecting", message);
+        this.reconnectAttempts = Math.min(this.reconnectAttempts + 1, 5);
+        this.scheduleReconnect();
         return;
       }
       if (isAuthOrWaf(err)) this.handleWaf(message);
