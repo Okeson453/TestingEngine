@@ -43,6 +43,35 @@ jobs:
           fi
           echo "Worker implementations look real."
 
+      - name: Guard against PLACEHOLDER wipe of live-path sources
+        run: |
+          set -euo pipefail
+          for f in src/lib/db.ts src/lib/crash/socket-client.ts src/lib/prediction/events/game-event-handlers.ts src/lib/prediction/live/edge-ingest.ts; do
+            lines=$(wc -l < "$f")
+            echo "$f has $lines lines"
+            if [ "$lines" -lt 80 ]; then
+              echo "::error::$f is too short ($lines lines) — likely a PLACEHOLDER wipe"
+              exit 1
+            fi
+            if grep -qE 'PLACEHOLDER_WILL_BE_REPLACED|PLACEHOLDER_WILL_REPLACE|SEE_ARTIFACTS' "$f"; then
+              echo "::error::$f contains stub marker text"
+              exit 1
+            fi
+          done
+          if ! grep -q 'createNeonSql' src/lib/db.ts; then
+            echo "::error::src/lib/db.ts missing createNeonSql"
+            exit 1
+          fi
+          if ! grep -q 'startEventDrivenPipeline' src/lib/prediction/events/game-event-handlers.ts; then
+            echo "::error::handlers missing startEventDrivenPipeline"
+            exit 1
+          fi
+          if ! grep -q 'timingSafeEqual' src/lib/prediction/live/edge-ingest.ts; then
+            echo "::error::edge-ingest.ts missing timingSafeEqual"
+            exit 1
+          fi
+          echo "Live-path sources look real."
+
       - name: Guard against committed EDGE_INGEST_TOKEN in userscripts
         run: |
           set -euo pipefail
