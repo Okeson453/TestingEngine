@@ -9,6 +9,7 @@
  *   EDGE_INGEST_TOKEN   — required Bearer token (reject if unset in production)
  *   EDGE_STALE_MS       — poll defers N+1 when last edge event younger than this (default 8000)
  */
+import { timingSafeEqual } from "node:crypto";
 import { getSql, type Sql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
@@ -40,6 +41,17 @@ export type EdgeIngestResult =
   | { ok: true; kind: string; gameId?: string; lagMs?: number }
   | { ok: false; error: string; status: number };
 
+function tokensEqual(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) {
+    const dummy = a.length > 0 ? a : Buffer.from([0]);
+    timingSafeEqual(dummy, dummy);
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
 function requireToken(authHeader: string | null | undefined): EdgeIngestResult | null {
   const expected = process.env.EDGE_INGEST_TOKEN?.trim();
   if (!expected) {
@@ -54,7 +66,7 @@ function requireToken(authHeader: string | null | undefined): EdgeIngestResult |
   const token = raw.toLowerCase().startsWith("bearer ")
     ? raw.slice(7).trim()
     : raw;
-  if (!token || token !== expected) {
+  if (!token || !tokensEqual(token, expected)) {
     return { ok: false, error: "unauthorized", status: 401 };
   }
   return null;
