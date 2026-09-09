@@ -382,6 +382,31 @@ export async function onGameEnd(
       "validator.onGameEnd failed",
     );
     try {
+      const sql = await getSqlFn();
+      await sql`
+        INSERT INTO worker_state (key, value, updated_at)
+        VALUES (
+          'last_validator_error',
+          ${JSON.stringify({
+            name: err.name,
+            message: err.message,
+            stack: err.stack?.slice(0, 1500) ?? null,
+            gameId: evt.gameId,
+            endTime: evt.endTime,
+            multiplier: evt.multiplier,
+            skipPredict: evt.skipPredict ?? false,
+            at: new Date().toISOString(),
+          })},
+          now()
+        )
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+      `;
+    } catch {
+      /* soft */
+    }
+
+    try {
       // Fix 9: persist full error context in worker_state for post-mortem.
       const errJson = JSON.stringify({
         name: err.name,

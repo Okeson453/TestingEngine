@@ -97,6 +97,12 @@ async function bgHandler(payload: unknown): Promise<void> {
   );
 
   try {
+    // Bind target start for temporal validity (prediction must be before BG).
+    try {
+      bindTargetStarted(gameId, beganAt);
+    } catch {
+      /* soft */
+    }
     const sql = await getSql();
     // Backfill began_at when known from BG (authoritative round start).
     await sql`
