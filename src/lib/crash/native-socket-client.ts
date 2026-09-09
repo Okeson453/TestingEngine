@@ -159,8 +159,19 @@ export class NativeBcGameSocket {
       });
 
       socket.on("message", (data, isBinary) => {
-        if (!isBinary && typeof data === "string") {
-          this.onText(data);
+        // node `ws` delivers text frames as Buffer with isBinary=false.
+        // Treating those as binary skipped EIO open (0{sid...}) → never
+        // encodeConnect/join → server 1006 close ~60s later (seen in prod).
+        if (!isBinary) {
+          const text =
+            typeof data === "string"
+              ? data
+              : Buffer.isBuffer(data)
+                ? data.toString("utf8")
+                : data instanceof ArrayBuffer
+                  ? Buffer.from(data).toString("utf8")
+                  : String(data);
+          this.onText(text);
           return;
         }
         const buf =
@@ -206,21 +217,39 @@ export class NativeBcGameSocket {
   private onText(asText: string): void {
     if (asText.charCodeAt(0) === 0x30 && asText.charCodeAt(1) === 0x7b) {
       try {
-        JSON.parse(asText.slice(1));
+        const payload = JSON.parse(asText.slice(1)) as { sid?: string; pingInterval?: number };
         this.reconnectAttempts = 0;
         this.setStatus("connected");
+        logger.info(
+          {
+            component: "native-bc-socket",
+            sid: payload.sid ?? null,
+            pingInterval: payload.pingInterval ?? null,
+          },
+          "EIO open — connecting namespace /g/cm",
+        );
         this.socket?.send(encodeConnect(NSP));
-        this.startPing();
+        // Match server pingInterval when present (BC.Game typically 5000).
+        const pingMs =
+          typeof payload.pingInterval === "number" && payload.pingInterval > 0
+            ? Math.max(2_000, Math.min(payload.pingInterval, 25_000))
+            : PING_MS;
+        this.startPing(pingMs);
         this.startHealthMonitor();
         prefetchSign();
-      } catch {
-        /* ignore */
+      } catch (e) {
+        logger.warn(
+          { component: "native-bc-socket", error: String(e), head: asText.slice(0, 80) },
+          "EIO open parse failed",
+        );
       }
       return;
     }
     if (asText === "2") {
       this.socket?.send("3");
+      return;
     }
+    // Some stacks send ping as "2probe" style — ignore unknowns
   }
 
   private onBinary(buf: Uint8Array): void {
@@ -232,7 +261,11 @@ export class NativeBcGameSocket {
 
     const packet = parsePacket(buf);
     if (packet.kind === "connect") {
-      if (packet.nsp === NSP && !this.joined) {
+      logger.info(
+        { component: "native-bc-socket", nsp: packet.nsp, alreadyJoined: this.joined },
+        "namespace connect packet",
+      );
+      if ((packet.nsp === NSP || packet.nsp === "") && !this.joined) {
         this.joined = true;
         this.socket?.send(encodeJoin(NSP));
         logger.info({ component: "native-bc-socket" }, "joined /g/cm");
@@ -269,6 +302,12 @@ export class NativeBcGameSocket {
       if (gameId) this.currentGameId = gameId;
     }
     if (!gameId) return;
+    if (packet.event === "ed" || packet.event === "bg") {
+      logger.info(
+        { component: "native-bc-socket", event: packet.event, gameId, multiplier },
+        "crash event from native WS",
+      );
+    }
 
     const receivedAt = Date.now();
     this.lastEventAt = receivedAt;
@@ -298,11 +337,11 @@ export class NativeBcGameSocket {
     }
   }
 
-  private startPing(): void {
+  private startPing(intervalMs: number = PING_MS): void {
     this.clearPing();
     this.pingTimer = setInterval(() => {
       if (this.socket?.readyState === WebSocket.OPEN) this.socket.send("2");
-    }, PING_MS);
+    }, intervalMs);
   }
 
   private startHealthMonitor(): void {
