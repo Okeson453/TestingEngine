@@ -172,15 +172,29 @@ export async function attemptNPlusOnePrediction(
     };
   } catch (error) {
     if (trace) trace.marks.prediction_completed = performance.now();
+    const err = error instanceof Error ? error : new Error(String(error));
+    const kind = "exception";
+    recordAttempt(source, sourceRoundId, null, kind, false);
+    persistLastRejectionFireAndForget(source, sourceRoundId, null, `${kind}:${err.message}`);
+    // P0: always surface the root cause in production logs (message + stack + name).
     logger.error(
       {
         source,
         sourceGameId: sourceRoundId,
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
+        errorName: err.name,
+        errorMessage: err.message,
+        errorStack: err.stack?.slice(0, 2000) ?? null,
+        errorCode: (err as { code?: string }).code ?? null,
       },
       "N+1 prediction attempt failed",
     );
-    throw error;
+    // Do not rethrow — ED must release the claim and schedule recovery; a throw
+    // collapsed the failure reason into a single line in some log pipelines.
+    return {
+      attempted: false,
+      predictionId: null,
+      targetGameId: null,
+      kind: `exception:${err.name}:${err.message}`.slice(0, 200),
+    };
   }
 }

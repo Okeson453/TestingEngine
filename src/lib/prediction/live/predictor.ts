@@ -243,8 +243,11 @@ const defaultPredictFn = (
         `pipeline_reason=${pipe.reason}`,
         `threshold=${pipe.threshold}`,
       );
-    } catch {
-      /* keep baseline - pipeline may be unavailable in pure unit tests */
+    } catch (e) {
+      logger.warn(
+        { component: "live-predictor", error: e instanceof Error ? e.message : String(e) },
+        "advanced pipeline failed — explicit fallback to baseline PredictionEngine",
+      );
     }
   }
 

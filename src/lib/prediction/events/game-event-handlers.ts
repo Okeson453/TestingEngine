@@ -266,13 +266,37 @@ async function edHandler(payload: unknown): Promise<void> {
             },
             "ED→N+1 soft result",
           );
+          // Immediate recovery retry when ED soft-failed/exception before target starts.
+          if (result.kind && (result.kind.startsWith("exception") || result.kind === "insufficient_history")) {
+            scheduleImmediateN1Recovery({
+              sourceRoundId: gameId,
+              sourceCrashAt: crashedAt,
+              sourceMultiplier: multiplier,
+              correlationId,
+            });
+          }
         }
       } catch (error) {
         releaseTarget(targetGameId, `ed:${gameId}`);
+        const err = error instanceof Error ? error : new Error(String(error));
         logger.error(
-          { event: sourceEvent, gameId, targetGameId, error: String(error), correlationId },
+          {
+            event: sourceEvent,
+            gameId,
+            targetGameId,
+            correlationId,
+            errorName: err.name,
+            errorMessage: err.message,
+            errorStack: err.stack?.slice(0, 2000) ?? null,
+          },
           "ED→N+1 prediction failed",
         );
+        scheduleImmediateN1Recovery({
+          sourceRoundId: gameId,
+          sourceCrashAt: crashedAt,
+          sourceMultiplier: multiplier,
+          correlationId,
+        });
       }
     } else {
       logger.info(

@@ -453,12 +453,31 @@ export class PollWorker {
     `.catch(() => [] as { lifecycle: string }[]);
     if (live.length > 0) {
       const lc = live[0]!.lifecycle;
-      if (lc === "STARTED" || lc === "RUNNING" || lc === "ENDED" || lc === "RECONCILED") {
+      if (lc === "ENDED" || lc === "RECONCILED") {
         logger.info(
           { component: "poll-worker", targetGameId, lifecycle: lc },
-          "newest target already live — skip poll prediction",
+          "newest target already finished — skip poll prediction",
         );
         return false;
+      }
+      if (lc === "STARTED" || lc === "RUNNING") {
+        // ED may have thrown before insert; if no pending row, allow recovery
+        // (recoveryMode uses relaxed residual). Otherwise skip to avoid duplicates.
+        const pending = await sql<{ c: number }>`
+          SELECT count(*)::int AS c FROM pending_predictions
+          WHERE target_game_id = ${targetGameId} AND matched = false
+        `.catch(() => [{ c: 1 }]);
+        if ((pending[0]?.c ?? 1) > 0) {
+          logger.info(
+            { component: "poll-worker", targetGameId, lifecycle: lc },
+            "newest target already live — skip poll prediction",
+          );
+          return false;
+        }
+        logger.warn(
+          { component: "poll-worker", targetGameId, lifecycle: lc },
+          "target live but no pending prediction — forcing recovery attempt",
+        );
       }
     }
 
