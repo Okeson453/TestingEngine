@@ -9,6 +9,7 @@
  *   EDGE_INGEST_TOKEN   — required Bearer token (reject if unset in production)
  *   EDGE_STALE_MS       — poll defers N+1 when last edge event younger than this (default 8000)
  */
+import { timingSafeEqual } from "node:crypto";
 import { getSql, type Sql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
@@ -40,13 +41,23 @@ export type EdgeIngestResult =
   | { ok: true; kind: string; gameId?: string; lagMs?: number }
   | { ok: false; error: string; status: number };
 
+function tokensEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  const n = Math.max(ab.length, bb.length, 1);
+  const ap = Buffer.alloc(n);
+  const bp = Buffer.alloc(n);
+  ab.copy(ap);
+  bb.copy(bp);
+  return timingSafeEqual(ap, bp) && ab.length === bb.length;
+}
+
 function requireToken(authHeader: string | null | undefined): EdgeIngestResult | null {
   const expected = process.env.EDGE_INGEST_TOKEN?.trim();
   if (!expected) {
     if (process.env.NODE_ENV === "production") {
       return { ok: false, error: "EDGE_INGEST_TOKEN not configured", status: 503 };
     }
-    // Dev: allow without token only if explicitly opted in
     if (process.env.EDGE_INGEST_ALLOW_INSECURE === "1") return null;
     return { ok: false, error: "EDGE_INGEST_TOKEN not configured", status: 503 };
   }
@@ -54,7 +65,7 @@ function requireToken(authHeader: string | null | undefined): EdgeIngestResult |
   const token = raw.toLowerCase().startsWith("bearer ")
     ? raw.slice(7).trim()
     : raw;
-  if (!token || token !== expected) {
+  if (!token || !tokensEqual(token, expected)) {
     return { ok: false, error: "unauthorized", status: 401 };
   }
   return null;
@@ -78,7 +89,6 @@ function toIso(v: string | number | Date | null | undefined): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-/** Record edge heartbeat for poll deferral. */
 export async function touchEdgeHealth(
   gameId: string,
   sql?: Sql,
@@ -98,7 +108,6 @@ export async function touchEdgeHealth(
   }
 }
 
-/** True when a browser-edge event arrived recently — poll should defer N+1. */
 export async function isEdgeFresh(sql?: Sql): Promise<{
   fresh: boolean;
   ageMs: number | null;
@@ -163,7 +172,6 @@ export async function ingestEdgeCrash(
 
   await touchEdgeHealth(gameId);
 
-  // Durable lifecycle (best-effort)
   try {
     const { markLiveRoundEnded } = await import(
       "@/lib/prediction/live/live-round-state"
@@ -246,12 +254,6 @@ export function verifyEdgeAuth(authHeader?: string | null): EdgeIngestResult | n
   return requireToken(authHeader);
 }
 
-
-/**
- * Decode a base64-encoded binary Socket.IO frame from the browser agent and
- * dispatch ed/bg through the same path as JSON edge ingest.
- * BC.Game crash frames are binary protobuf — text-only userscripts miss them.
- */
 export async function ingestEdgeFrame(
   body: unknown,
   authHeader?: string | null,
@@ -319,7 +321,6 @@ export async function ingestEdgeFrame(
       );
     }
 
-    // Unknown event — acknowledge so agent does not retry forever
     logger.info(
       { component: "edge-ingest", event: pkt.event, ns: pkt.namespace, payloadLen: payload.length },
       "edge frame ignored (not ed/bg)",

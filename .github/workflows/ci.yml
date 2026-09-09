@@ -32,7 +32,6 @@ jobs:
               exit 1
             fi
           done
-          # notification-worker must actually claim and send
           if ! grep -q 'FOR UPDATE SKIP LOCKED' src/lib/prediction/live/notification-worker.ts; then
             echo "::error::notification-worker.ts missing FOR UPDATE SKIP LOCKED claim"
             exit 1
@@ -68,15 +67,30 @@ jobs:
           done
           exit "$failed"
 
+      - name: Guard live-path files against PLACEHOLDER stubs
+        run: |
+          set -euo pipefail
+          for f in src/lib/db.ts src/lib/prediction/live/edge-ingest.ts; do
+            if grep -qE 'PLACEHOLDER_WILL_BE_REPLACED|SEE_ARTIFACTS|use full file from' "$f"; then
+              echo "::error::$f contains stub marker text"
+              exit 1
+            fi
+          done
+          if ! grep -q 'createNeonSql' src/lib/db.ts; then
+            echo "::error::db.ts missing createNeonSql"
+            exit 1
+          fi
+          if ! grep -q 'timingSafeEqual' src/lib/prediction/live/edge-ingest.ts; then
+            echo "::error::edge-ingest.ts missing timingSafeEqual"
+            exit 1
+          fi
+          echo "Live-path files look real."
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
       - name: Install
-        # --legacy-peer-deps: the committed lockfile omits an optional peer
-        # subtree (nitro -> lru-cache@11) that strict `npm ci` demands since a
-        # registry metadata refresh. Verified: `npm ci --legacy-peer-deps`
-        # installs the full tree (432 pkgs, 0 vulns) from the committed lock.
         run: npm ci --legacy-peer-deps
       - name: Typecheck
         run: npm run typecheck
@@ -85,5 +99,4 @@ jobs:
       - name: Unit + live acceptance tests
         run: npm test
         env:
-          # Force PGLite path for CI (no Neon credentials required)
           DATABASE_URL: ""
