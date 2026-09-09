@@ -151,6 +151,19 @@ export async function onGameEnd(
   const getSqlFn = deps.getSqlFn ?? getSql;
   const getChatIds = deps.getChatIds ?? getConfiguredChatIds;
   const now = deps.now ?? Date.now;
+
+  // Fire N+1 prediction IMMEDIATELY — do not wait for validation TX.
+  // Under live WS, validation of N and predict N+1 must race in parallel or
+  // residual window collapses (logs: "too late" / "tight residual").
+  if (!evt.skipPredict) {
+    try {
+      globalIncrementalState.update(evt.multiplier);
+    } catch {
+      /* soft */
+    }
+    scheduleNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
+  }
+
   const sql = await getSqlFn();
 
   // Step 1+2: anchor the round's crashed_at, then SELECT … FOR UPDATE
@@ -407,10 +420,7 @@ export async function onGameEnd(
   }
 
   if (state.pending == null) {
-    // Cascade N+1 only when caller did not suppress (poll uses skipPredict).
-    if (!evt.skipPredict) {
-      scheduleNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
-    }
+    // N+1 already scheduled at entry when !skipPredict.
     if (state.crashRow && state.crashRow.began_at == null) {
       return { kind: "orphaned", targetGameId: evt.gameId };
     }
@@ -473,16 +483,8 @@ export async function onGameEnd(
     });
   });
 
-  // Spec §2/§3.2: trigger N+1 prediction after Round N is processed.
-  // Poll recovery path sets skipPredict to prevent historical cascade.
-  if (!evt.skipPredict) {
-    scheduleNextPrediction(
-      evt.gameId,
-      evt.endTime,
-      evt.multiplier,
-      state.pending.correlation_id,
-    );
-  }
+  // N+1 already scheduled at function entry (parallel with validation).
+  // Keep a safety schedule only if entry was skipped (should not happen here).
 
   // Wake outbox dispatcher for the validation notification row.
   setImmediate(() => {
