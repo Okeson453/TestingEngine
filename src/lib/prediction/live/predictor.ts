@@ -14,6 +14,8 @@
  * Socket.IO handlers must NOT call it to create predictions.
  */
 import { randomUUID } from "node:crypto";
+import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
+import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
 import { getSql, getPgPool, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
@@ -371,15 +373,17 @@ export async function onGameStart(
 
   const sql = await getSqlFn();
 
-  let refNow = now();
+  // Boot-synced DB clock offset — no hot-path SELECT now().
+  let refNow = authoritativeNowMs();
   try {
-    const dbNow = await sql<{ now: string | Date }>`select now() as now`;
-    if (dbNow[0]?.now) {
-      const v = dbNow[0].now;
-      const dbMs = v instanceof Date ? v.getTime() : new Date(v).getTime();
-      if (Number.isFinite(dbMs)) refNow = dbMs;
+    const n = now();
+    if (Number.isFinite(n)) {
+      // Prefer deps.now when tests inject a clock; otherwise offset-aware wall.
+      refNow = n === Date.now() ? authoritativeNowMs() : n;
     }
-  } catch {}
+  } catch {
+    /* soft */
+  }
 
   if (beginMs > refNow + temporalToleranceMs) {
     logger.error(
@@ -675,8 +679,23 @@ export async function onGameEndPredict(
     };
   }
 
+  // In-memory claim: only first path (ED preferred) runs model compute.
+  const owner = deps.recoveryMode ? `poll:${gameId}` : `ed:${gameId}`;
+  const claim = claimTarget(targetGameId, owner);
+  if (!claim.owned) {
+    return {
+      predictionId: null,
+      targetGameId,
+      kind: "duplicate",
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
+    };
+  }
+
   const generatedAt = new Date().toISOString();
   const recoveryMode = deps.recoveryMode === true;
+
+  let predictionSucceeded = false;
 
   // Keep the in-memory history buffer current so subsequent predicts are O(1).
   try {
@@ -1186,7 +1205,9 @@ export async function onGameEndPredict(
       /* soft */
     }
 
-    return {
+    predictionSucceeded = true;
+  try { completeTarget(targetGameId, owner); } catch { /* soft */ }
+  return {
       predictionId,
       targetGameId,
       kind: "predicted",
@@ -1227,6 +1248,9 @@ export async function onGameEndPredict(
       msg.includes("too_late") ||
       msg.includes("DUPLICATE") ||
       msg.includes("skipped_");
+    if (!predictionSucceeded) {
+      try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+    }
     if (soft) {
       logger.warn(
         {

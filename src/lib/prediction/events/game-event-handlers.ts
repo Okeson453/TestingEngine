@@ -1,9 +1,9 @@
 /**
- * BC.Game Socket.IO → live prediction pipeline bridge.
+ * BC.Game native WS → live prediction pipeline.
  *
- * bg  → prediction generation + observability + target start persistence
- * ed  → immediate async validation only
- * pg  → observability only
+ * ED(N)  → owns N+1 prediction (signal-first)
+ * BG(N+1) → reconciliation only (no prediction)
+ * Poll   → recovery only
  */
 import { randomUUID } from "node:crypto";
 import { bcGameSocket } from "@/lib/crash/socket-client";
@@ -13,17 +13,25 @@ import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtim
 import { getSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
-import { onGameStart, type GameStartEvent } from "@/lib/prediction/live/predictor";
+import { onGameEndPredict } from "@/lib/prediction/live/predictor";
 import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
 import {
   markLiveRoundStarted,
   markLiveRoundEnded,
 } from "@/lib/prediction/live/live-round-state";
+import { appendCompletedRound } from "@/lib/prediction/live/live-history-buffer";
 import {
-  edToPredictMs,
-  predictionHandoffMs,
-  roundDetectMs,
-} from "@/lib/observability/performance/latency";
+  claimTarget,
+  completeTarget,
+  releaseTarget,
+} from "@/lib/prediction/live/target-coordinator";
+import {
+  startTrace,
+  mark,
+  finishSignalReady,
+  logLatencyBudgetSnapshot,
+} from "@/lib/prediction/live/latency-trace";
+import { syncDbClockOffset, shouldResyncClock } from "@/lib/prediction/live/clock-offset";
 
 const logger = getLogger("game-event-handlers");
 const inFlightEd = new Set<string>();
@@ -50,43 +58,23 @@ function extractLastGameId(payload: unknown): string | null {
   if (typeof payload !== "object" || payload === null) return null;
   const p = payload as Record<string, unknown>;
   const id = p.gameId ?? p.id;
-  if (typeof id === "string" && /^\d+$/.test(id)) return id;
-  if (typeof id === "number" && Number.isFinite(id)) return String(id);
+  if (typeof id === "string" && id.length > 0) return id;
+  if (typeof id === "number" && Number.isFinite(id)) return String(Math.trunc(id));
   return null;
 }
 
-async function findSourceRoundForTarget(
-  targetGameId: string,
-  sql: import("@/lib/db").Sql,
-): Promise<{ sourceGameId: string; crashedAt: string; multiplier: number } | null> {
+function nextTargetGameId(sourceGameId: string): string {
   try {
-    const sourceGameId = String(BigInt(targetGameId) - 1n);
-    const row = await sql<{ game_id: string; multiplier: number; crashed_at: string }>`
-      SELECT game_id, multiplier, crashed_at::text
-      FROM crash_rounds
-      WHERE game_id = ${sourceGameId}
-      ORDER BY crashed_at DESC
-      LIMIT 1
-    `;
-    if (row[0]) {
-      return { sourceGameId: row[0].game_id, crashedAt: row[0].crashed_at, multiplier: Number(row[0].multiplier) };
-    }
-    const fallback = await sql<{ game_id: string; multiplier: number; crashed_at: string }>`
-      SELECT game_id, multiplier, crashed_at::text
-      FROM crash_rounds
-      WHERE game_id < ${targetGameId}
-      ORDER BY game_id DESC
-      LIMIT 1
-    `;
-    if (fallback[0]) {
-      return { sourceGameId: fallback[0].game_id, crashedAt: fallback[0].crashed_at, multiplier: Number(fallback[0].multiplier) };
-    }
-    return null;
+    return String(BigInt(sourceGameId) + 1n);
   } catch {
-    return null;
+    const n = Number(sourceGameId);
+    return Number.isFinite(n) ? String(n + 1) : sourceGameId;
   }
 }
 
+/**
+ * BG: reconcile target start only — never create a new prediction.
+ */
 async function bgHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
   if (!gameId) return;
@@ -101,37 +89,12 @@ async function bgHandler(payload: unknown): Promise<void> {
 
   try {
     const sql = await getSql();
-    const source = await findSourceRoundForTarget(gameId, sql);
-
-    if (source) {
-      const evt: GameStartEvent = {
-        gameId,
-        beginTime: beganAt,
-        receivedAt: new Date().toISOString(),
-        sourceRoundGameId: source.sourceGameId,
-      };
-      void onGameStart(evt)
-        .then((result) => {
-          const kind = result && typeof result === "object" && "kind" in result ? (result as { kind: string }).kind : "ok";
-          if (kind === "temporal_violation" || kind === "insufficient_history") {
-            logger.warn(
-              { event: "bg", gameId, correlationId, sourceGameId: source.sourceGameId, resultKind: kind, result },
-              `bg prediction skipped (${kind})`,
-            );
-          } else {
-            logger.info(
-              { event: "bg", gameId, correlationId, sourceGameId: source.sourceGameId, resultKind: kind },
-              "bg prediction complete",
-            );
-          }
-        })
-        .catch((error) => {
-          logger.error(
-            { event: "bg", gameId, error: String(error), correlationId, stack: error instanceof Error ? error.stack?.slice(0, 500) : undefined },
-            "bg prediction failed",
-          );
-        });
-    }
+    // Backfill began_at when known from BG (do not invent 3s duration).
+    await sql`
+      UPDATE crash_rounds
+      SET began_at = COALESCE(began_at, ${new Date(beganAt)})
+      WHERE game_id = ${gameId}
+    `.catch(() => undefined);
 
     await Promise.all([
       markLiveRoundStarted(gameId, beganAt, "socket", correlationId, sql).catch(() => undefined),
@@ -140,11 +103,16 @@ async function bgHandler(payload: unknown): Promise<void> {
           correlation_id, event_kind, game_id, payload, received_at, processed_at,
           processor_latency_ms, sla_violated
         ) VALUES (
-          ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt })},
+          ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: true })},
           ${beganAt}::timestamptz, now(), 0, false
         ) ON CONFLICT DO NOTHING
       `.catch(() => undefined),
     ]);
+
+    logger.info(
+      { event: "bg", gameId, correlationId },
+      "bg reconcile complete (no prediction)",
+    );
   } catch (error) {
     logger.error({ event: "bg", gameId, error: String(error) }, "bg observability failed");
   } finally {
@@ -152,6 +120,9 @@ async function bgHandler(payload: unknown): Promise<void> {
   }
 }
 
+/**
+ * ED(N): owns N+1 prediction — signal first, persistence async.
+ */
 async function edHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
   if (!gameId) return;
@@ -159,81 +130,173 @@ async function edHandler(payload: unknown): Promise<void> {
   inFlightEd.add(gameId);
 
   const correlationId = randomUUID();
+  const trace = startTrace(correlationId, gameId);
+  mark(trace, "decoded");
+  mark(trace, "normalized");
+
   const p = (payload ?? {}) as Record<string, unknown>;
-  const multiplier =
+  let multiplier =
     typeof p.multiplier === "number"
       ? p.multiplier
       : typeof p.maxRate === "number"
         ? p.maxRate / 100
         : null;
+  // Hundredths heuristic (BC.Game sometimes sends 150 for 1.50x)
+  if (multiplier != null && multiplier > 50 && Number.isInteger(multiplier)) {
+    multiplier = multiplier / 100;
+  }
   const crashedAt =
     toIsoString((p.crashedAt ?? p.endTime) as number | string | undefined) ??
     new Date().toISOString();
 
   try {
-    const sql = await getSql();
-
-    if (multiplier != null && Number.isFinite(multiplier)) {
-      try {
-        globalIncrementalState.observeRound({ gameId, multiplier, crashedAt });
-      } catch {
-        /* soft */
-      }
-
-      const crashedAtDate = new Date(crashedAt);
-      if (!Number.isNaN(crashedAtDate.getTime())) {
-        const beganAt = new Date(crashedAtDate.getTime() - 3_000);
-        await sql`
-          INSERT INTO crash_rounds (game_id, multiplier, hash, seed, began_at, crashed_at)
-          VALUES (${gameId}, ${multiplier}, null, null, ${beganAt}, ${crashedAtDate})
-          ON CONFLICT (game_id) DO UPDATE SET
-            multiplier = EXCLUDED.multiplier,
-            crashed_at = EXCLUDED.crashed_at
-        `.catch(() => undefined);
-      }
-
-      void onGameEnd({
-        gameId,
-        endTime: crashedAt,
-        multiplier,
-        receivedAt: new Date().toISOString(),
-      }).catch((error) => {
-        logger.error({ event: "ed", gameId, error: String(error), correlationId }, "ed validation failed");
-      });
+    if (multiplier == null || !Number.isFinite(multiplier)) {
+      logger.warn({ event: "ed", gameId }, "ed missing multiplier — skip predict");
+      return;
     }
 
-    // Signature: (gameId, crashedAt, multiplier, sql?, source?)
-    await markLiveRoundEnded(gameId, crashedAt, multiplier ?? 0, sql, "socket").catch(() => undefined);
+    // --- P0 REALTIME path (no await on DB before signal) ---
+    try {
+      globalIncrementalState.observeRound({ gameId, multiplier, crashedAt });
+    } catch {
+      /* soft */
+    }
+    try {
+      appendCompletedRound({
+        gameId,
+        multiplier,
+        crashedAt,
+      });
+    } catch {
+      /* soft */
+    }
+    mark(trace, "state_updated");
+
+    const targetGameId = nextTargetGameId(gameId);
+    trace.targetGameId = targetGameId;
+    const claim = claimTarget(targetGameId, `ed:${gameId}`);
+    mark(trace, "target_claimed");
+
+    if (claim.owned) {
+      mark(trace, "prediction_started");
+      try {
+        const result = await onGameEndPredict(gameId, crashedAt, multiplier, correlationId, {
+          recoveryMode: false,
+        });
+        mark(trace, "prediction_completed");
+        const totalMs = finishSignalReady(trace);
+        if (result?.kind === "ok" || result?.predictionId) {
+          completeTarget(targetGameId, `ed:${gameId}`);
+          logger.info(
+            {
+              event: "ed",
+              gameId,
+              targetGameId,
+              predictionId: result?.predictionId ?? null,
+              kind: result?.kind ?? null,
+              ed_to_signal_ms: Math.round(totalMs * 100) / 100,
+              correlationId,
+            },
+            "ED→N+1 signal ready",
+          );
+        } else {
+          // soft miss — release so poll can recover if needed
+          releaseTarget(targetGameId, `ed:${gameId}`);
+          logger.info(
+            {
+              event: "ed",
+              gameId,
+              targetGameId,
+              kind: result?.kind ?? "unknown",
+              ed_to_signal_ms: Math.round(totalMs * 100) / 100,
+            },
+            "ED→N+1 soft result",
+          );
+        }
+      } catch (error) {
+        releaseTarget(targetGameId, `ed:${gameId}`);
+        logger.error(
+          { event: "ed", gameId, targetGameId, error: String(error), correlationId },
+          "ED→N+1 prediction failed",
+        );
+      }
+    } else {
+      logger.info(
+        {
+          event: "ed",
+          gameId,
+          targetGameId,
+          reason: claim.reason,
+          owner: claim.owner,
+        },
+        "ED skip predict — target already claimed",
+      );
+    }
+
+    // --- P2 DURABILITY / validation async (must not block signal) ---
+    void (async () => {
+      mark(trace, "persist_started");
+      try {
+        const sql = await getSql();
+        const crashedAtDate = new Date(crashedAt);
+        // began_at NULL until BG arrives (no invented 3s duration)
+        if (!Number.isNaN(crashedAtDate.getTime())) {
+          await sql`
+            INSERT INTO crash_rounds (game_id, multiplier, hash, seed, began_at, crashed_at)
+            VALUES (${gameId}, ${multiplier}, null, null, null, ${crashedAtDate})
+            ON CONFLICT (game_id) DO UPDATE SET
+              multiplier = EXCLUDED.multiplier,
+              crashed_at = COALESCE(EXCLUDED.crashed_at, crash_rounds.crashed_at)
+          `.catch(() => undefined);
+        }
+        await markLiveRoundEnded(gameId, crashedAt, multiplier, sql, "socket").catch(
+          () => undefined,
+        );
+        // Validation of N (separate from N+1 predict)
+        await onGameEnd({
+          gameId,
+          endTime: crashedAt,
+          multiplier,
+          receivedAt: new Date().toISOString(),
+          skipPredict: true, // ED already owns N+1
+        }).catch((error) => {
+          logger.error(
+            { event: "ed", gameId, error: String(error), correlationId },
+            "ed validation failed",
+          );
+        });
+        mark(trace, "persist_completed");
+      } catch (error) {
+        logger.error({ event: "ed", gameId, error: String(error) }, "ed async persist failed");
+      }
+    })();
   } catch (error) {
-    logger.error({ event: "ed", gameId, error: String(error) }, "ed observability failed");
+    logger.error({ event: "ed", gameId, error: String(error) }, "ed handler failed");
   } finally {
     inFlightEd.delete(gameId);
   }
 }
 
+let handlersWired = false;
+
 export function initializeEventHandlers(): void {
+  if (handlersWired) return;
+  handlersWired = true;
+
   bcGameSocket.on("bg", bgHandler);
   bcGameSocket.on("ed", edHandler);
 
-  // Native binary WS (tested workspace client) → same handlers
   nativeBcGameSocket.onEvent((ev) => {
-    // Latency budget: e2e sample at the point the prediction bridge sees it.
-    getRealtimePipeline().markE2e(ev.receivedAt);
     if (ev.event === "bg" || ev.event === "pr") {
       void bgHandler({
         gameId: ev.gameId,
-        beginTime: ev.beginTime ?? Date.now(),
-        beganAt: ev.beginTime ?? Date.now(),
+        beginTime: ev.beginTime ?? ev.receivedAt,
+        beganAt: ev.beginTime ?? ev.receivedAt,
       });
-      return;
-    }
-    if (ev.event === "ed" || ev.event === "st") {
-      // BC protobuf maxRate is hundredths (162 → 1.62x); tolerate already-scaled values.
-      let mult = ev.multiplier;
-      if (typeof mult === "number" && Number.isFinite(mult) && mult > 50) mult = mult / 100;
+    } else if (ev.event === "ed" || ev.event === "st") {
       void edHandler({
         gameId: ev.gameId,
-        multiplier: mult,
+        multiplier: ev.multiplier,
         endTime: ev.endTime ?? ev.receivedAt,
         crashedAt: ev.endTime ?? ev.receivedAt,
         hash: ev.hash,
@@ -247,16 +310,17 @@ export function initializeEventHandlers(): void {
     );
   });
 
-  logger.info({ component: "game-event-handlers" }, "event handlers wired");
+  logger.info({ component: "game-event-handlers" }, "event handlers wired (ED-first)");
 }
 
 /** Called by worker boot — native WS primary; socket.io optional fallback. */
 export async function startEventDrivenPipeline(): Promise<void> {
   initializeEventHandlers();
-  // Hydrate the realtime validator with recent round ids so a restart
-  // doesn't count history as missed rounds or replay duplicates.
   try {
     const sql = await getSql();
+    if (shouldResyncClock(0)) {
+      await syncDbClockOffset(sql).catch(() => undefined);
+    }
     const rows = await sql<{ game_id: string }>`
       SELECT game_id FROM crash_rounds ORDER BY crashed_at DESC LIMIT 100
     `;
@@ -264,15 +328,27 @@ export async function startEventDrivenPipeline(): Promise<void> {
   } catch (e) {
     logger.warn({ error: String(e) }, "realtime validator hydration failed");
   }
-  // Periodic latency-budget snapshot so the budget is visible in logs.
-  const snapshotTimer = setInterval(logRealtimeSnapshot, 5 * 60_000);
+
+  const snapshotTimer = setInterval(() => {
+    logRealtimeSnapshot();
+    logLatencyBudgetSnapshot();
+    void (async () => {
+      try {
+        if (shouldResyncClock()) {
+          const sql = await getSql();
+          await syncDbClockOffset(sql);
+        }
+      } catch {
+        /* soft */
+      }
+    })();
+  }, 5 * 60_000);
   snapshotTimer.unref?.();
 
   const useNative = process.env.USE_NATIVE_BC_WS !== "0";
   if (useNative) {
     try {
       prewarmSign();
-      // Give sign child a short head-start without blocking boot forever.
       await Promise.race([
         new Promise((r) => setTimeout(r, 1_500)),
         new Promise((r) => setTimeout(r, 0)),
@@ -310,7 +386,6 @@ export async function stopEventDrivenPipeline(): Promise<void> {
   bcGameSocket.disconnect();
 }
 
-// Back-compat alias
 export function wireGameEventHandlers(): void {
   initializeEventHandlers();
 }

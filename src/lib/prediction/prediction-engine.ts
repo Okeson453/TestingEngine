@@ -64,10 +64,12 @@ export class PredictionEngine {
       : this.registry.getDefault();
     const output = model.predict(features, target, regime);
     const signal = toSignal(output);
-    this.logger.info({
-      component: 'PredictionEngine', predictionId: signal.predictionId, target: signal.target,
-      probability: signal.probability, confidence: signal.confidence, model: signal.modelVersion, regime: regime.name,
-    }, 'Prediction generated');
+    if (Math.random() < Number(process.env.PRED_LOG_SAMPLE_RATE ?? 0.05)) {
+      logger.info({
+        component: 'PredictionEngine', predictionId: signal.predictionId, target: signal.target,
+        probability: signal.probability, confidence: signal.confidence, model: signal.modelVersion, regime: regime.name,
+      }, 'Prediction generated');
+    }
     return signal;
   }
 
