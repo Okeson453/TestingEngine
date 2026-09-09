@@ -35,7 +35,7 @@ const DEFAULT_TARGET: ThresholdTarget = 1.3;
  *  Default 0.015 (~78.4% for 1.3x): filters pure base-rate spam without
  *  silencing the engine for hours. Set MIN_SIGNAL_EDGE=0 to emit every round.
  *  Prior default 0.04 needed ~81% which almost never fired with baseline P≈fair. */
-const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.01);
+const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
 const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
 const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
 const MIN_HISTORY = 20;
@@ -926,19 +926,26 @@ export async function onGameEndPredict(
   }
 
   try {
-    const sheath = evaluateSheath();
-    if (sheath.decision === "halt") {
-      logger.warn(
-        { targetGameId, sheathLevel: sheath.level, sheathReason: sheath.reason },
-        "Sheath mode HALT - skipping prediction due to elevated late rate",
-      );
-      recordPredictionOutcome(true);
-      return {
-        predictionId: null,
-        targetGameId,
-        kind: "skipped_late",
-        temporalValidity: "TEMPORALLY_UNVERIFIED",
-      };
+    // Under poll recovery, late-rate sheath must not silence the only working path.
+    if (!recoveryMode) {
+      const sheath = evaluateSheath();
+      if (sheath.decision === "halt") {
+        logger.warn(
+          {
+            targetGameId,
+            lateRate: sheath.rate,
+            sampleTotal: sheath.total,
+          },
+          "Sheath mode HALT - skipping prediction due to elevated late rate",
+        );
+        // Do NOT recordOutcome(true) here — that inflates late rate and locks HALT.
+        return {
+          predictionId: null,
+          targetGameId,
+          kind: "skipped_late",
+          temporalValidity: "TEMPORALLY_UNVERIFIED",
+        };
+      }
     }
   } catch {}
 
@@ -1015,6 +1022,7 @@ export async function onGameEndPredict(
         },
         "skip signal — no edge vs fair odds (not every round should fire)",
       );
+      // Intentionally do not recordPredictionOutcome(true) — not a timing late.
       return {
         predictionId: null,
         targetGameId,

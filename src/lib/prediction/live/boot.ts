@@ -518,6 +518,24 @@ class LiveBoot {
         const { setEffectiveSkipBelowMs } = await import("@/lib/prediction/live/gate-cache");
         setEffectiveSkipBelowMs(120);
         logger.info({ component: "live-boot" }, "reset effective_skip_below_ms ceiling");
+        try {
+          const { clearSheathSamples } = await import("@/lib/core/sheath-mode");
+          clearSheathSamples();
+          logger.info({ component: "live-boot" }, "cleared sheath late-rate window");
+        } catch { /* soft */ }
+        try {
+          const { globalProductionController } = await import(
+            "@/lib/prediction/lifecycle/production-controller"
+          );
+          globalProductionController.manualRecoverDivergence();
+          logger.info({ component: "live-boot" }, "divergence sheath recovered to level 0");
+        } catch { /* soft */ }
+        try {
+          const { globalLiveDivergence } = await import(
+            "@/lib/prediction/validation/live-divergence-monitor"
+          );
+          globalLiveDivergence.manualRecover(true);
+        } catch { /* soft */ }
       } catch {
         /* soft */
       }

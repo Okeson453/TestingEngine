@@ -18,9 +18,11 @@ export interface SheathMode {
 }
 
 export const defaultSheathMode: SheathMode = {
-  enabled: true,
-  warnThreshold: Number(process.env.SHEATH_WARN_RATE ?? 0.05),
-  haltThreshold: Number(process.env.SHEATH_HALT_RATE ?? 0.2),
+  // Poll/WAF path marks many outcomes "late"; a 20% halt threshold permanently
+  // silenced the engine for hours. Default halt is effectively off unless set.
+  enabled: process.env.SHEATH_ENABLED !== "0",
+  warnThreshold: Number(process.env.SHEATH_WARN_RATE ?? 0.5),
+  haltThreshold: Number(process.env.SHEATH_HALT_RATE ?? 0.95),
   windowMs: Number(process.env.SHEATH_WINDOW_MS ?? 60_000),
 };
 
@@ -35,6 +37,11 @@ const MAX_SAMPLES = 500;
 export function recordPredictionOutcome(late: boolean, at: number = Date.now()): void {
   samples.push({ at, late });
   if (samples.length > MAX_SAMPLES) samples.shift();
+}
+
+/** Boot / recovery: wipe rolling late window so a poll-path spike cannot keep HALT forever. */
+export function clearSheathSamples(): void {
+  samples.length = 0;
 }
 
 export function getLateRate(windowMs: number = defaultSheathMode.windowMs): {
