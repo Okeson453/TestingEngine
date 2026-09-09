@@ -126,19 +126,34 @@ export async function sampleProductionInvariants(
   }
 
   if (violations.length > 0) {
-    logger.warn(
-      {
-        component: "production-invariants",
-        violationCount: violations.length,
-        violations: violations.map((v) => ({
-          invariant: v.id,
-          detail: v.detail,
-          gameId: v.gameId,
-          predictionId: v.predictionId,
-        })),
-      },
-      "production invariant violations detected",
-    );
+    const fp = violations
+      .map((v) => `${v.id}:${v.gameId ?? ""}:${v.predictionId ?? ""}`)
+      .join("|");
+    const now = Date.now();
+    const g = globalThis as { __teInvFp?: string; __teInvAt?: number };
+    if (g.__teInvFp === fp && g.__teInvAt != null && now - g.__teInvAt < 60_000) {
+      logger.debug(
+        { component: "production-invariants", count: violations.length },
+        "production invariant violations (deduped)",
+      );
+    } else {
+      g.__teInvFp = fp;
+      g.__teInvAt = now;
+      logger.warn(
+        {
+          component: "production-invariants",
+          violationCount: violations.length,
+          violations: violations.map((v) => ({
+            invariant: v.id,
+            severity: v.id === "prediction_before_target_start" ? "P0" : "P1",
+            detail: v.detail,
+            gameId: v.gameId,
+            predictionId: v.predictionId,
+          })),
+        },
+        "production invariant violations detected",
+      );
+    }
   }
 
   return { ok: violations.length === 0, violations };
