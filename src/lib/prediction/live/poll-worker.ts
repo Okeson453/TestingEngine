@@ -31,6 +31,7 @@ import {
   markLiveRoundEnded,
 } from "@/lib/prediction/live/live-round-state";
 import { bcGameSocket } from "@/lib/crash/socket-client";
+import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
 import {
   interRoundGapMs,
   httpFetchMs,
@@ -42,6 +43,26 @@ import {
   socketHealthCheckMs,
 } from "@/lib/observability/performance/latency";
 import { isEdgeFresh } from "@/lib/prediction/live/edge-ingest";
+
+/** Prefer native WS health (workspace breakthrough) over socket.io-client state. */
+function liveSocketSnapshot(): { status: string; lastEdAt: number | null } {
+  const nativeStatus = nativeBcGameSocket.getStatus();
+  const nativeEd = nativeBcGameSocket.getLastEdAt();
+  if (nativeStatus === "connected" || nativeStatus === "degraded") {
+    return { status: nativeStatus, lastEdAt: nativeEd };
+  }
+  const st = bcGameSocket.getState();
+  const lastEdMs =
+    (typeof bcGameSocket.getLastEdAtForGame === "function"
+      ? bcGameSocket.getLastEdAtForGame("crash")
+      : null) ||
+    (st.lastEdAt ? Date.parse(st.lastEdAt) : null);
+  return {
+    status: st.status,
+    lastEdAt: Number.isFinite(lastEdMs as number) ? (lastEdMs as number) : nativeEd,
+  };
+}
+
 
 const logger = getLogger("poll-worker");
 
@@ -343,7 +364,7 @@ export class PollWorker {
     // predicting from minutes-old backlog.
     let maxSourceAgeMs = Number(process.env.POLL_MAX_SOURCE_AGE_MS ?? 60_000) || 60_000;
     try {
-      const st = bcGameSocket.getState().status;
+      const st = liveSocketSnapshot().status;
       if (st === "waf_blocked" || st === "degraded" || st === "stopped") {
         maxSourceAgeMs = Math.max(
           maxSourceAgeMs,
@@ -428,15 +449,14 @@ export class PollWorker {
     }
 
     // Stream health: only defer if ED path is generating current predictions
+    // Prefer native WS (workspace) lastEd / status over socket.io-client.
     try {
-      const st = bcGameSocket.getState();
-      const lastCrashEd =
-        (typeof bcGameSocket.getLastEdAtForGame === "function"
-          ? bcGameSocket.getLastEdAtForGame("crash")
-          : null) || st.lastEdAt;
+      const snap = liveSocketSnapshot();
+      const st = { status: snap.status, lastEdAt: snap.lastEdAt };
+      const lastCrashEd = snap.lastEdAt;
 
       if (st.status === "connected" && lastCrashEd) {
-        const lag = Date.now() - new Date(lastCrashEd).getTime();
+        const lag = Date.now() - lastCrashEd;
         // Latency fix: defer window 10s → 2.5s so a missed ED is recovered
         // inside one inter-round gap instead of 2–3 rounds later.
         const HEALTHY_DEFER_MS = Number(process.env.POLL_HEALTHY_DEFER_MS ?? 800);
@@ -597,7 +617,7 @@ export class PollWorker {
       return backoff;
     }
     try {
-      const st = bcGameSocket.getState().status;
+      const st = liveSocketSnapshot().status;
       const med = this.medianGapMs();
       if (med != null) {
         // Target ~20% of inter-round gap, but never pile elapsed+interval to 3–4s.
