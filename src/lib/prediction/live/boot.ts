@@ -22,6 +22,8 @@ import { getLogger } from "@/lib/observability/logger";
 import { getSql, type Sql } from "@/lib/db";
 import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
 import { getSharedPredictionEngine } from "@/lib/prediction/live/predictor";
+// Fix 6/1/14: WORKER_ID + persistIncrementalState live in the supervisor now.
+import { WORKER_ID, LiveSupervisor, persistIncrementalState } from "@/lib/prediction/live/live-supervisor";
 
 const logger = getLogger("live-boot");
 
@@ -69,53 +71,10 @@ async function prewarmHotModules(): Promise<void> {
   );
 }
 
-/** Event-loop lag probe (timing diagnosis 3.8 / 7.6). */
-let eventLoopProbeTimer: ReturnType<typeof setInterval> | null = null;
-function startEventLoopLagMonitor(): void {
-  if (eventLoopProbeTimer) return;
-  eventLoopProbeTimer = setInterval(() => {
-    const start = process.hrtime.bigint();
-    setImmediate(() => {
-      const lagMs = Number(process.hrtime.bigint() - start) / 1_000_000;
-      if (lagMs > 50) {
-        logger.warn({ eventLoopLagMs: Math.round(lagMs) }, "Event loop lag detected");
-      }
-      try {
-        (globalThis as { __eventLoopLagMs__?: number }).__eventLoopLagMs__ = lagMs;
-      } catch { /* ignore */ }
-    });
-  }, 2_000);
-  if (typeof eventLoopProbeTimer.unref === "function") eventLoopProbeTimer.unref();
-}
+/** Event-loop lag probe — moved into LiveSupervisor (fix 6). */
 
-/** Keep one connection warm so first critical-path query avoids cold connect. */
-let connectionWarmerTimer: ReturnType<typeof setInterval> | null = null;
-function startConnectionWarmer(getSqlFn: () => Promise<Sql>): void {
-  if (connectionWarmerTimer) return;
-  connectionWarmerTimer = setInterval(() => {
-    void getSqlFn()
-      .then((sql) => sql`SELECT 1`)
-      .catch(() => undefined);
-  }, 3_000);
-  if (typeof connectionWarmerTimer.unref === "function") connectionWarmerTimer.unref();
-}
-
-function stopConnectionWarmer(): void {
-  if (connectionWarmerTimer) {
-    clearInterval(connectionWarmerTimer);
-    connectionWarmerTimer = null;
-  }
-}
-
-
-/** Distributed single-writer lock (P0). Uses worker_locks table from 0006. */
-const WORKER_ID =
-  process.env.RAILWAY_REPLICA_ID ||
-  process.env.WORKER_ID ||
-  `worker-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
 const LOCK_KEY = "prediction_worker";
 const LOCK_TTL_SECONDS = 8;
-let lockHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 async function acquireWorkerLock(sql: Sql): Promise<boolean> {
   // Drop clearly dead rows first (expired or heartbeat stalled > 2× TTL).
@@ -150,15 +109,6 @@ async function acquireWorkerLock(sql: Sql): Promise<boolean> {
   return rows[0]?.owner_id === WORKER_ID;
 }
 
-async function heartbeatWorkerLock(sql: Sql): Promise<void> {
-  await sql`
-    UPDATE worker_locks
-    SET heartbeat_at = now(),
-        expires_at = now() + (${LOCK_TTL_SECONDS}::int * interval '1 second')
-    WHERE lock_key = ${LOCK_KEY} AND owner_id = ${WORKER_ID}
-  `;
-}
-
 /** Rolling deploy: previous container still heartbeats until SIGTERM drains.
  *  After a short wait, new instance takes the lock so live path is not blocked ~20s+. */
 async function forceStealWorkerLock(sql: Sql): Promise<boolean> {
@@ -166,36 +116,6 @@ async function forceStealWorkerLock(sql: Sql): Promise<boolean> {
     DELETE FROM worker_locks WHERE lock_key = ${LOCK_KEY}
   `.catch(() => undefined);
   return acquireWorkerLock(sql);
-}
-
-// P2.11: Persist Incremental State
-// Save incremental state alongside worker health
-async function persistIncrementalState(sql: Sql): Promise<void> {
-  try {
-    const { globalIncrementalState } = await import(
-      "@/lib/prediction/state/incremental-state-engine"
-    );
-    const snap = globalIncrementalState.snapshot();
-    const stateJson = JSON.stringify({
-      count: snap.count,
-      ewma: snap.ewma,
-      ewmaHit13: snap.ewmaHit13,
-      welford: snap.welford,
-      runs: snap.runs,
-      timestamp: new Date().toISOString(),
-    });
-    await sql`
-      INSERT INTO worker_state (key, value, updated_at)
-      VALUES ('incremental_state', ${stateJson}, now())
-      ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = now()
-    `;
-  } catch (e) {
-    logger.debug(
-      { component: "live-boot", error: String(e) },
-      "incremental state persistence failed (soft)",
-    );
-  }
 }
 
 /**
@@ -252,86 +172,6 @@ async function restoreIncrementalState(sql: Sql): Promise<void> {
   }
 }
 
-async function writeWorkerHealth(sql: Sql, cycle: number): Promise<void> {
-  let poolInfo = "";
-  try {
-    const { getPoolStats } = await import("@/lib/db");
-    const s = getPoolStats();
-    if (s) {
-      poolInfo = `total=${s.totalCount} idle=${s.idleCount} waiting=${s.waitingCount} max=${s.max}`;
-    }
-  } catch {
-    /* optional */
-  }
-  const payload = JSON.stringify({
-    workerId: WORKER_ID,
-    cycle,
-    at: new Date().toISOString(),
-    pool: poolInfo,
-    pid: process.pid,
-  });
-  await sql`
-    INSERT INTO worker_state (key, value, updated_at)
-    VALUES ('worker_heartbeat', ${payload}, now())
-    ON CONFLICT (key) DO UPDATE
-    SET value = EXCLUDED.value, updated_at = now()
-  `;
-  await sql`
-    INSERT INTO worker_state (key, value, updated_at)
-    VALUES ('worker_status', 'online', now())
-    ON CONFLICT (key) DO UPDATE
-    SET value = EXCLUDED.value, updated_at = now()
-  `;
-
-  // P2.11: Persist incremental state on each heartbeat
-  await persistIncrementalState(sql);
-
-  // Phase 17 — invariant checks moved to periodic interval (Fix 11).
-  // Do NOT run invariant DB queries during boot or on the realtime path.
-  // They run on their own 30s timer so DB checks never block ED prediction.
-  try {
-    const { sampleProductionInvariants } = await import(
-      "@/lib/prediction/live/invariants"
-    );
-    const invariantTimer = setInterval(() => {
-      void sampleProductionInvariants().catch((error) => {
-        logger.error(
-          { component: "live-boot", error: String(error) },
-          "production invariant check failed",
-        );
-      });
-    }, 30_000);
-    if (typeof invariantTimer.unref === "function") invariantTimer.unref();
-    // Run once immediately so we don't wait 30s for the first check
-    void sampleProductionInvariants(sql).catch(() => undefined);
-  } catch {
-    /* soft */
-  }
-
-  // Phase 14 — sample pool pressure; log if PG_POOL_MAX should rise
-  try {
-    const { logPoolSizingAdvice } = await import("@/lib/db/pool-sizing");
-    logPoolSizingAdvice();
-  } catch {
-    /* soft */
-  }
-
-  // Phase 18 — log lifecycle metrics snapshot periodically
-  if (cycle % 6 === 0) {
-    try {
-      const { getLifecycleMetricsSnapshot } = await import(
-        "@/lib/observability/metrics/lifecycle-metrics"
-      );
-      logger.info(
-        { component: "live-boot", metrics: getLifecycleMetricsSnapshot() },
-        "lifecycle metrics snapshot",
-      );
-    } catch {
-      /* soft */
-    }
-  }
-}
-
 async function releaseWorkerLock(sql: Sql): Promise<void> {
   await sql`
     DELETE FROM worker_locks
@@ -344,34 +184,6 @@ async function releaseWorkerLock(sql: Sql): Promise<void> {
     SET value = EXCLUDED.value, updated_at = now()
   `;
 }
-
-function startLockHeartbeat(getSqlFn: () => Promise<Sql>): void {
-  if (lockHeartbeatTimer) return;
-  let cycle = 0;
-  lockHeartbeatTimer = setInterval(() => {
-    cycle += 1;
-    void getSqlFn()
-      .then(async (sql) => {
-        await heartbeatWorkerLock(sql);
-        await writeWorkerHealth(sql, cycle);
-      })
-      .catch((e) => {
-        logger.warn(
-          { component: "live-boot", error: String(e), cycle },
-          "worker lock/health heartbeat failed — will retry next interval",
-        );
-      });
-  }, 10_000);
-  lockHeartbeatTimer.unref?.();
-}
-
-function stopLockHeartbeat(): void {
-  if (lockHeartbeatTimer) {
-    clearInterval(lockHeartbeatTimer);
-    lockHeartbeatTimer = null;
-  }
-}
-
 
 /** Spec §3.10 — startup schema validation. Verifies every required table
  *  exists before any worker role is started. A missing table is a hard
@@ -682,7 +494,11 @@ class LiveBoot {
       { component: "live-boot", workerId: WORKER_ID },
       "distributed worker lock acquired",
     );
-    startLockHeartbeat(getSql);
+    // Fix 6: supervisor owns ALL control-loop timers — lock heartbeat +
+    // worker health (10s), invariant monitor (30s, exactly ONE timer — fix 1),
+    // connection warmer (3s), event-loop probe (2s).
+    const supervisor = getLiveSupervisor();
+    supervisor.start();
 
     await dispatcher.start();
     if (deps.startSubscriber) {
@@ -695,8 +511,6 @@ class LiveBoot {
         );
       }
     }
-    startEventLoopLagMonitor();
-    startConnectionWarmer(getSql);
     await pollWorker.start();
     await clockMonitor.start();
 
@@ -706,6 +520,7 @@ class LiveBoot {
     } catch (err) {
       // Cleanup partial init so retry can rebuild cleanly
       this.started = false;
+      try { await getLiveSupervisor().stop(); } catch { /* */ }
       try { await this.dispatcher?.stop(); } catch { /* */ }
       try { await this.pollWorker?.stop(); } catch { /* */ }
       try { await this.clockMonitor?.stop(); } catch { /* */ }
@@ -723,7 +538,8 @@ class LiveBoot {
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
-    stopLockHeartbeat();
+    // Fix 6: supervisor stops ALL timers (heartbeat, invariants, warmer, probe)
+    await getLiveSupervisor().stop();
     if (this.dispatcher) {
       try { await this.dispatcher.stop(); } catch { /* best effort */ }
     }
@@ -745,6 +561,24 @@ class LiveBoot {
       );
     }
   }
+}
+
+/**
+ * Fix 6/1/14 — LiveSupervisor owns ALL control-loop timers:
+ *   - worker lock heartbeat + derived worker health (10s)
+ *   - production invariant monitor (30s) — created EXACTLY ONCE (fix 1)
+ *   - connection warmer (3s), event-loop lag probe (2s)
+ * and derives the authoritative WorkerHealth record (fix 14).
+ */
+export { WORKER_ID, persistIncrementalState } from "@/lib/prediction/live/live-supervisor";
+export { LiveSupervisor } from "@/lib/prediction/live/live-supervisor";
+
+const globalSupervisorRef = globalThis as typeof globalThis & {
+  __liveSupervisor__?: LiveSupervisor;
+};
+export function getLiveSupervisor(): LiveSupervisor {
+  globalSupervisorRef.__liveSupervisor__ ??= new LiveSupervisor();
+  return globalSupervisorRef.__liveSupervisor__;
 }
 
 const globalRef = globalThis as typeof globalThis & {

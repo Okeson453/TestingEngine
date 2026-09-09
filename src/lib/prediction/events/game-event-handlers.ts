@@ -13,7 +13,7 @@ import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtim
 import { getSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
-import { onGameEndPredict } from "@/lib/prediction/live/predictor";
+import { attemptNPlusOnePrediction } from "@/lib/prediction/live/prediction-attempt";
 import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
 import {
   markLiveRoundStarted,
@@ -83,13 +83,21 @@ async function bgHandler(payload: unknown): Promise<void> {
 
   const correlationId = randomUUID();
   const p = (payload ?? {}) as Record<string, unknown>;
+  // BG is the ONLY authoritative source of the real round start time.
   const beganAt =
     toIsoString((p.beganAt ?? p.beginTime) as number | string | undefined) ??
     new Date().toISOString();
+  // Fix 10: `received_at` must be the worker's actual receipt time, not the
+  // event's game-start time — otherwise latency telemetry is corrupted.
+  const receivedAt = new Date().toISOString();
+  const processorLatencyMs = Math.max(
+    0,
+    new Date(receivedAt).getTime() - new Date(beganAt).getTime(),
+  );
 
   try {
     const sql = await getSql();
-    // Backfill began_at when known from BG (do not invent 3s duration).
+    // Backfill began_at when known from BG (authoritative round start).
     await sql`
       UPDATE crash_rounds
       SET began_at = COALESCE(began_at, ${new Date(beganAt)})
@@ -104,7 +112,7 @@ async function bgHandler(payload: unknown): Promise<void> {
           processor_latency_ms, sla_violated
         ) VALUES (
           ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: true })},
-          ${beganAt}::timestamptz, now(), 0, false
+          ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
         ) ON CONFLICT DO NOTHING
       `.catch(() => undefined),
     ]);
@@ -118,6 +126,41 @@ async function bgHandler(payload: unknown): Promise<void> {
   } finally {
     inFlightBg.delete(gameId);
   }
+}
+
+/**
+ * Fix 11: single canonical crash-final normalization.
+ *
+ * `ed` (round ended) and `st` (settled) are the same semantic event on the
+ * BC.Game protocol (see native-protocol.ts: both carry endTime/multiplier
+ * with identical payload shape). They MUST be normalized to one canonical
+ * shape here so exactly one handler (edHandler) owns crash finalization —
+ * no second decision path.
+ */
+interface NormalizedCrashEnd {
+  gameId: string;
+  multiplier: number | null;
+  crashedAt: string;
+  hash: string | null;
+  /** Original protocol event name, for telemetry only. */
+  sourceEvent: "ed" | "st";
+}
+
+function normalizeCrashEnd(
+  raw: { gameId: string; multiplier?: number | null; endTime?: number | string | null; crashedAt?: number | string | null; hash?: string | null },
+  sourceEvent: "ed" | "st",
+): NormalizedCrashEnd | null {
+  if (!raw.gameId) return null;
+  const crashedAt =
+    toIsoString((raw.crashedAt ?? raw.endTime) as number | string | undefined) ??
+    new Date().toISOString();
+  return {
+    gameId: raw.gameId,
+    multiplier: raw.multiplier ?? null,
+    crashedAt,
+    hash: raw.hash ?? null,
+    sourceEvent,
+  };
 }
 
 /**
@@ -135,6 +178,7 @@ async function edHandler(payload: unknown): Promise<void> {
   mark(trace, "normalized");
 
   const p = (payload ?? {}) as Record<string, unknown>;
+  const sourceEvent = (p.sourceEvent as "ed" | "st" | undefined) ?? "ed";
   let multiplier =
     typeof p.multiplier === "number"
       ? p.multiplier
@@ -151,7 +195,7 @@ async function edHandler(payload: unknown): Promise<void> {
 
   try {
     if (multiplier == null || !Number.isFinite(multiplier)) {
-      logger.warn({ event: "ed", gameId }, "ed missing multiplier — skip predict");
+      logger.warn({ event: sourceEvent, gameId }, "crash event missing multiplier — skip predict");
       return;
     }
 
@@ -178,22 +222,25 @@ async function edHandler(payload: unknown): Promise<void> {
     mark(trace, "target_claimed");
 
     if (claim.owned) {
-      mark(trace, "prediction_started");
+      // Fix 8: the authoritative shared attempt path (same function poll uses).
       try {
-        const result = await onGameEndPredict(gameId, crashedAt, multiplier, correlationId, {
-          recoveryMode: false,
+        const result = await attemptNPlusOnePrediction({
+          sourceRoundId: gameId,
+          sourceCrashAt: crashedAt,
+          sourceMultiplier: multiplier,
+          source: "ED",
+          correlationId,
+          trace,
         });
-        mark(trace, "prediction_completed");
         const totalMs = finishSignalReady(trace);
-        if (result?.kind === "ok" || result?.predictionId) {
+        if (result.attempted) {
           completeTarget(targetGameId, `ed:${gameId}`);
           logger.info(
             {
-              event: "ed",
+              event: sourceEvent,
               gameId,
               targetGameId,
-              predictionId: result?.predictionId ?? null,
-              kind: result?.kind ?? null,
+              predictionId: result.predictionId,
               ed_to_signal_ms: Math.round(totalMs * 100) / 100,
               correlationId,
             },
@@ -204,10 +251,10 @@ async function edHandler(payload: unknown): Promise<void> {
           releaseTarget(targetGameId, `ed:${gameId}`);
           logger.info(
             {
-              event: "ed",
+              event: sourceEvent,
               gameId,
               targetGameId,
-              kind: result?.kind ?? "unknown",
+              kind: result.kind,
               ed_to_signal_ms: Math.round(totalMs * 100) / 100,
             },
             "ED→N+1 soft result",
@@ -216,14 +263,14 @@ async function edHandler(payload: unknown): Promise<void> {
       } catch (error) {
         releaseTarget(targetGameId, `ed:${gameId}`);
         logger.error(
-          { event: "ed", gameId, targetGameId, error: String(error), correlationId },
+          { event: sourceEvent, gameId, targetGameId, error: String(error), correlationId },
           "ED→N+1 prediction failed",
         );
       }
     } else {
       logger.info(
         {
-          event: "ed",
+          event: sourceEvent,
           gameId,
           targetGameId,
           reason: claim.reason,
@@ -239,7 +286,7 @@ async function edHandler(payload: unknown): Promise<void> {
       try {
         const sql = await getSql();
         const crashedAtDate = new Date(crashedAt);
-        // began_at NULL until BG arrives (no invented 3s duration)
+        // began_at NULL until BG arrives (BG is the authoritative round start)
         if (!Number.isNaN(crashedAtDate.getTime())) {
           await sql`
             INSERT INTO crash_rounds (game_id, multiplier, hash, seed, began_at, crashed_at)
@@ -261,17 +308,17 @@ async function edHandler(payload: unknown): Promise<void> {
           skipPredict: true, // ED already owns N+1
         }).catch((error) => {
           logger.error(
-            { event: "ed", gameId, error: String(error), correlationId },
+            { event: sourceEvent, gameId, error: String(error), correlationId },
             "ed validation failed",
           );
         });
         mark(trace, "persist_completed");
       } catch (error) {
-        logger.error({ event: "ed", gameId, error: String(error) }, "ed async persist failed");
+        logger.error({ event: sourceEvent, gameId, error: String(error) }, "ed async persist failed");
       }
     })();
   } catch (error) {
-    logger.error({ event: "ed", gameId, error: String(error) }, "ed handler failed");
+    logger.error({ event: sourceEvent, gameId, error: String(error) }, "ed handler failed");
   } finally {
     inFlightEd.delete(gameId);
   }
@@ -294,13 +341,28 @@ export function initializeEventHandlers(): void {
         beganAt: ev.beginTime ?? ev.receivedAt,
       });
     } else if (ev.event === "ed" || ev.event === "st") {
-      void edHandler({
-        gameId: ev.gameId,
-        multiplier: ev.multiplier,
-        endTime: ev.endTime ?? ev.receivedAt,
-        crashedAt: ev.endTime ?? ev.receivedAt,
-        hash: ev.hash,
-      });
+      // Fix 11: ed and st normalize to ONE canonical crash-final event —
+      // a single edHandler owns finalization for both protocol events.
+      const normalized = normalizeCrashEnd(
+        {
+          gameId: ev.gameId,
+          multiplier: ev.multiplier,
+          endTime: ev.endTime ?? ev.receivedAt,
+          crashedAt: ev.endTime ?? ev.receivedAt,
+          hash: ev.hash,
+        },
+        ev.event === "st" ? "st" : "ed",
+      );
+      if (normalized) {
+        void edHandler({
+          gameId: normalized.gameId,
+          multiplier: normalized.multiplier,
+          endTime: normalized.crashedAt,
+          crashedAt: normalized.crashedAt,
+          hash: normalized.hash,
+          sourceEvent: normalized.sourceEvent,
+        });
+      }
     }
   });
   nativeBcGameSocket.onStatus((status, detail) => {

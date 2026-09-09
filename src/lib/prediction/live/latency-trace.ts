@@ -30,6 +30,9 @@ export type Trace = {
 const MAX_SAMPLES = 200;
 const samples: number[] = []; // signal_ready - ws_received
 const stageSamples: Record<string, number[]> = {};
+// Fix 13/14: authoritative timing chain includes signal + delivery legs.
+let lastSignalAt: number | null = null;
+const deliverySamples: number[] = []; // outbox claim → telegram accepted
 
 function mono(): number {
   return typeof performance !== "undefined" && performance.now
@@ -53,6 +56,7 @@ export function finishSignalReady(trace: Trace): number {
   const total = end - start;
   samples.push(total);
   if (samples.length > MAX_SAMPLES) samples.shift();
+  lastSignalAt = Date.now();
 
   const stages: Array<[string, Stage, Stage]> = [
     ["ws_to_state", "ws_received", "state_updated"],
@@ -90,6 +94,12 @@ export function snapshotLatencyBudget(): Record<string, unknown> {
       p99: percentile(samples, 99),
       max: n ? Math.max(...samples) : 0,
     },
+    delivery_ms: {
+      p50: percentile(deliverySamples, 50),
+      p95: percentile(deliverySamples, 95),
+      n: deliverySamples.length,
+    },
+    lastSignalAt: lastSignalAt != null ? new Date(lastSignalAt).toISOString() : null,
     stages: Object.fromEntries(
       Object.entries(stageSamples).map(([k, arr]) => [
         k,
@@ -104,4 +114,15 @@ export function logLatencyBudgetSnapshot(): void {
     { component: "latency-trace", ...snapshotLatencyBudget() },
     "ED→signal latency budget snapshot",
   );
+}
+
+/** Fix 13: record the delivery leg (outbox claimed → Telegram accepted, ms). */
+export function recordDeliveryLatency(latencyMs: number): void {
+  deliverySamples.push(Math.max(0, latencyMs));
+  if (deliverySamples.length > MAX_SAMPLES) deliverySamples.shift();
+}
+
+/** Fix 13/14: last SIGNAL_READY wall-clock time (ms epoch or null). */
+export function getLastSignalAt(): number | null {
+  return lastSignalAt;
 }

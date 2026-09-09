@@ -19,7 +19,7 @@ import { getSql, type Sql } from "@/lib/db";
 import { fetchCrashHistory, type FetchedRound } from "@/lib/crash/fetch-bc";
 import { insertNewRounds } from "@/lib/crash/ingest";
 import { onGameEnd } from "@/lib/prediction/live/validator";
-import { onGameEndPredict } from "@/lib/prediction/live/predictor";
+import { attemptNPlusOnePrediction } from "@/lib/prediction/live/prediction-attempt";
 import { getLogger } from "@/lib/observability/logger";
 import { runColdStartSeeder } from "@/lib/prediction/live/cold-start-seeder";
 import {
@@ -48,9 +48,9 @@ import { isEdgeFresh } from "@/lib/prediction/live/edge-ingest";
 function liveSocketSnapshot(): { status: string; lastEdAt: number | null } {
   const nativeStatus = nativeBcGameSocket.getStatus();
   const nativeEd = nativeBcGameSocket.getLastEdAt();
-  // Connected but never received ed → not a healthy live path; keep poll active.
-  if (nativeStatus === "connected") {
-    if (nativeEd && Date.now() - nativeEd < 90_000) {
+  // Fix 4/7: "socket_open" (transport open, /g/cm not joined) is NOT healthy.
+  if (nativeStatus === "connected" || nativeStatus === "socket_open") {
+    if (nativeStatus === "connected" && nativeEd && Date.now() - nativeEd < 90_000) {
       return { status: "connected", lastEdAt: nativeEd };
     }
     return { status: "degraded", lastEdAt: nativeEd };
@@ -68,6 +68,24 @@ function liveSocketSnapshot(): { status: string; lastEdAt: number | null } {
     status: st.status,
     lastEdAt: Number.isFinite(lastEdMs as number) ? (lastEdMs as number) : nativeEd,
   };
+}
+
+/**
+ * Fix 7: poll cadence is a function of native WS health.
+ *   healthy   → 2–5s (dormant light verification, WS owns prediction)
+ *   degraded  → 500–1000ms (recovery mode)
+ *   dead/waf  → 500ms (active recovery)
+ */
+function wsStreamState(): "healthy" | "degraded" | "dead" {
+  const snap = liveSocketSnapshot();
+  if (snap.status === "connected" && snap.lastEdAt != null) {
+    const age = Date.now() - snap.lastEdAt;
+    if (age < 15_000) return "healthy";
+    if (age < 90_000) return "degraded";
+    return "dead";
+  }
+  if (snap.status === "degraded") return "degraded";
+  return "dead";
 }
 
 
@@ -545,13 +563,14 @@ export class PollWorker {
     );
 
     try {
-      await onGameEndPredict(
-        newest.gameId,
-        crashedAt,
-        Number(newest.multiplier),
-        randomUUID(),
-        { recoveryMode: true },
-      );
+      // Fix 8: one authoritative attempt path for ED and recovery alike.
+      await attemptNPlusOnePrediction({
+        sourceRoundId: newest.gameId,
+        sourceCrashAt: crashedAt,
+        sourceMultiplier: Number(newest.multiplier),
+        source: "RECOVERY",
+        correlationId: randomUUID(),
+      });
       return true;
     } catch (e) {
       logger.warn(
@@ -624,22 +643,18 @@ export class PollWorker {
       return backoff;
     }
     try {
-      const st = liveSocketSnapshot().status;
-      const med = this.medianGapMs();
-      if (med != null) {
-        // Target ~20% of inter-round gap, but never pile elapsed+interval to 3–4s.
-        const adaptive = Math.round(med * 0.2);
-        const minMs =
-          st === "waf_blocked" || st === "degraded" ? 250 : 150;
-        const maxMs =
-          st === "waf_blocked" || st === "degraded" ? 600 : 800;
-        return Math.max(minMs, Math.min(maxMs, adaptive));
+      // Fix 7: cadence driven by WS stream health.
+      const wsState = wsStreamState();
+      if (wsState === "healthy") {
+        // WS owns the prediction path; poll is dormant light verification.
+        return Math.max(2_000, Math.min(5_000, base));
       }
-      // Pure-poll: stay tight so recovery stays inside one Crash gap (~3–5s).
-      if (st === "waf_blocked" || st === "degraded" || st === "stopped") {
-        return Math.max(250, Math.min(500, base));
+      if (wsState === "degraded") {
+        // Recovery mode: aggressive but not thrashing.
+        return Math.max(500, Math.min(1_000, base));
       }
-      return Math.max(150, Math.min(800, base));
+      // dead / waf / stopped: poll IS the live path — active recovery.
+      return Math.max(250, Math.min(500, base));
     } catch {
       /* socket optional in pure unit tests */
     }

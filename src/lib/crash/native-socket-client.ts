@@ -27,9 +27,18 @@ const SOCKET_HOST = process.env.BCGAME_SOCKET_HOST ?? "socketv4.bc.game";
 const RECONNECT_DELAY_MS = 150;
 const RECONNECT_DELAY_MAX_MS = 1_500;
 const WAF_BACKOFF_MS = Number(process.env.WAF_BACKOFF_MS ?? 12_000);
-/** No crash events while "connected" → force reconnect (keep path hot). */
-const STALE_EVENT_RECONNECT_MS = Number(process.env.NATIVE_WS_STALE_MS ?? 25_000);
-const DEGRADED_AFTER_MS = 12_000;
+/**
+ * WS lifecycle state machine (Diagnosis fix 4/5). Explicit states:
+ *   stopped → connecting → socket_open → connected(=namespace joined) →
+ *   degraded → reconnecting. `socket_open` means the Engine.IO transport is
+ *   open but /g/cm is NOT joined yet — that is NOT a live crash stream.
+ * Statuses surfaced to consumers: "connected" only once the namespace is
+ * joined AND fresh ED events confirm the stream (see poll/health snapshot).
+ */
+/** No crash events for this long → status "degraded" (fix 5: event age, not timer cycles). */
+const LIVE_EVENT_TIMEOUT_MS = Number(process.env.NATIVE_WS_DEGRADED_MS ?? 15_000);
+/** No crash events for this long → force reconnect (keep path hot). */
+const RECONNECT_TIMEOUT_MS = Number(process.env.NATIVE_WS_STALE_MS ?? 25_000);
 /** 5s keepalive — match BC.Game Engine.IO pingInterval. */
 const PING_MS = 5_000;
 const TRACKED = new Set(["pr", "bg", "pg", "ed", "st"]);
@@ -102,9 +111,19 @@ export class NativeBcGameSocket {
     return this.lastEventAt;
   }
 
+  /** Fix 4/14: health consumers must know whether /g/cm is actually joined. */
+  isJoined(): boolean {
+    return this.joined;
+  }
+
   async start(): Promise<void> {
     this.intentionalStop = false;
-    if (this.status === "connected" || this.status === "connecting") return;
+    if (
+      this.status === "connected" ||
+      this.status === "connecting" ||
+      this.status === "socket_open"
+    )
+      return;
     await this.connect();
   }
 
@@ -237,7 +256,9 @@ export class NativeBcGameSocket {
       try {
         const payload = JSON.parse(asText.slice(1)) as { sid?: string; pingInterval?: number };
         this.reconnectAttempts = 0;
-        this.setStatus("connected");
+        // Fix 4: EIO open ≠ live. Transport open is "socket_open"; the
+        // crash stream is only "connected" after /g/cm is joined.
+        this.setStatus("socket_open");
         logger.info(
           {
             component: "native-bc-socket",
@@ -287,7 +308,9 @@ export class NativeBcGameSocket {
         this.joined = true;
         this.joinedAt = Date.now();
         this.socket?.send(encodeJoin(NSP));
-        logger.info({ component: "native-bc-socket" }, "joined /g/cm");
+        // Fix 4: namespace joined → crash stream is now actually live.
+        this.setStatus("connected");
+        logger.info({ component: "native-bc-socket" }, "joined /g/cm — stream live");
       }
       return;
     }
@@ -331,7 +354,8 @@ export class NativeBcGameSocket {
     const receivedAt = Date.now();
     this.lastEventAt = receivedAt;
     if (packet.event === "ed") this.lastEdAt = receivedAt;
-    if (this.status === "degraded") this.setStatus("connected");
+    // Fix 5: recover from degraded purely on fresh event evidence.
+    if (this.status === "degraded" && this.joined) this.setStatus("connected");
 
     const ev: NativeCrashEvent = {
       event: packet.event,
@@ -372,7 +396,10 @@ export class NativeBcGameSocket {
       const last = this.lastEventAt;
       if (last) {
         const lag = Date.now() - last;
-        if (lag > DEGRADED_AFTER_MS && this.status === "connected") {
+        // Fix 5: degrade on event AGE (LIVE_EVENT_TIMEOUT_MS), regardless of
+        // whether the transport is socket_open or joined.
+        const streamState = this.status === "connected" || this.status === "socket_open";
+        if (lag > LIVE_EVENT_TIMEOUT_MS && streamState) {
           this.setStatus("degraded", `no events ${lag}ms`);
         }
       }
@@ -384,6 +411,8 @@ export class NativeBcGameSocket {
   /**
    * Always-on watchdog: if we never join, or join but receive no crash events,
    * tear down and reconnect so the live path stays primary over poll.
+   * Fix 5: the 5s tick is only a SAMPLING interval — the reconnect decision
+   * is based on event age (RECONNECT_TIMEOUT_MS), never on timer cycles.
    */
   private startWatchdog(): void {
     if (this.watchdogTimer) return;
@@ -394,14 +423,17 @@ export class NativeBcGameSocket {
       }
       const now = Date.now();
       // Opened but never joined namespace
-      if (this.status === "connected" && !this.joined) {
-        logger.warn({ component: "native-bc-socket" }, "watchdog: connected but not joined — reconnect");
+      if (
+        (this.status === "connected" || this.status === "socket_open") &&
+        !this.joined
+      ) {
+        logger.warn({ component: "native-bc-socket" }, "watchdog: transport open but not joined — reconnect");
         this.forceReconnect("not_joined");
         return;
       }
-      // Joined but silent too long (missed ed cycle)
+      // Joined but silent too long (missed ed cycle) — event-age decision
       const anchor = this.lastEventAt ?? this.joinedAt;
-      if (this.joined && anchor && now - anchor > STALE_EVENT_RECONNECT_MS) {
+      if (this.joined && anchor && now - anchor > RECONNECT_TIMEOUT_MS) {
         logger.warn(
           { component: "native-bc-socket", silentMs: now - anchor },
           "watchdog: no crash events — reconnect",

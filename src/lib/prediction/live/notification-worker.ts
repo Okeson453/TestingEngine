@@ -321,6 +321,13 @@ export class OutboxDispatcher {
                 if (Number.isFinite(claimedAt)) {
                   outboxDeliveryMs.observe(Math.max(0, t0 - claimedAt));
                 }
+                // Fix 13: feed the delivery leg into the latency trace chain
+                const { recordDeliveryLatency } = await import(
+                  "@/lib/prediction/live/latency-trace"
+                );
+                if (Number.isFinite(claimedAt)) {
+                  recordDeliveryLatency(Math.max(0, t0 - claimedAt));
+                }
               } catch { /* metrics optional */ }
 
               // Phase 19 — record lead times when target_round_started_at is known

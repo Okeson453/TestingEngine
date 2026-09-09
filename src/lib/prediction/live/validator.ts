@@ -183,7 +183,10 @@ export async function onGameEnd(
       {
         const endDate = new Date(evt.endTime);
         const crashedParam = Number.isNaN(endDate.getTime()) ? new Date() : endDate;
-        const beganParam = new Date(crashedParam.getTime() - 3_000);
+        // Fix 3: do NOT fabricate began_at = crash - 3s. When ED arrives
+        // before BG, began_at stays NULL; the BG handler is the ONLY
+        // authoritative source of the real round start (COALESCE backfill).
+        const beganParam: Date | null = null;
         const upserted = await tx<{
           began_at: string | Date | null;
           crashed_at: string | Date | null;
@@ -361,18 +364,62 @@ export async function onGameEnd(
       `;
     });
   } catch (e) {
+    // Fix 9: structured error telemetry — name, message, stack, game,
+    // correlation and event context. `String(e)` alone is not enough to
+    // diagnose production failures.
+    const err = e instanceof Error ? e : new Error(String(e));
     logger.error(
       {
         component: "live-validator",
         targetGameId: evt.gameId,
-        error: String(e),
+        errorName: err.name,
+        errorMessage: err.message,
+        errorStack: err.stack,
+        endTime: evt.endTime,
+        multiplier: evt.multiplier,
+        skipPredict: evt.skipPredict === true,
       },
       "validator.onGameEnd failed",
     );
     try {
+      // Fix 9: persist full error context in worker_state for post-mortem.
+      const errJson = JSON.stringify({
+        name: err.name,
+        message: err.message,
+        stack: err.stack,
+        gameId: evt.gameId,
+        endTime: evt.endTime,
+        multiplier: evt.multiplier,
+        at: new Date().toISOString(),
+      });
       await sql`
         insert into worker_state (key, value)
-        values ('last_error', ${String(e)})
+        values ('last_error', ${errJson})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_name', ${err.name})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_message', ${err.message})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_stack', ${err.stack ?? ''})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_game_id', ${evt.gameId})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_at', ${new Date().toISOString()})
         on conflict (key) do update set value = excluded.value, updated_at = now()
       `;
     } catch {
