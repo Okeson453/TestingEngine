@@ -130,7 +130,7 @@ export function getPriorRoundsSync(
   beforeCrashedAt?: string,
 ): HistoricalRound[] {
   if (!buffer.isWarmed()) return [];
-  let prior = buffer.getPrior(limit, excludeGameId, excludeGameId);
+  let prior = buffer.getPrior(limit, excludeGameId, beforeCrashedAt);
   if (beforeCrashedAt) {
     const cutoff = new Date(beforeCrashedAt).getTime();
     if (Number.isFinite(cutoff)) {

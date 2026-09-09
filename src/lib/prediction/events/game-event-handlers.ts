@@ -157,7 +157,7 @@ async function edHandler(payload: unknown): Promise<void> {
 
     // --- P0 REALTIME path (no await on DB before signal) ---
     try {
-      globalIncrementalState.observeRound({ gameId, multiplier, crashedAt });
+      globalIncrementalState.update(multiplier);
     } catch {
       /* soft */
     }

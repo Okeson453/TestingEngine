@@ -127,7 +127,16 @@ export async function sampleProductionInvariants(
 
   if (violations.length > 0) {
     logger.warn(
-      { component: "production-invariants", count: violations.length, violations },
+      {
+        component: "production-invariants",
+        violationCount: violations.length,
+        violations: violations.map((v) => ({
+          invariant: v.id,
+          detail: v.detail,
+          gameId: v.gameId,
+          predictionId: v.predictionId,
+        })),
+      },
       "production invariant violations detected",
     );
   }

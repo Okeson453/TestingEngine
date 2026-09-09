@@ -49,6 +49,17 @@ async function prewarmHotModules(): Promise<void> {
     import("@/lib/prediction/live/validator"),
     import("@/lib/prediction/live/feedback"),
     import("@/lib/prediction/live/live-round-state"),
+    // Fix 15: Prewarm all modules used by PredictionEngine.predict()
+    import("@/lib/prediction/prediction-engine"),
+    import("@/lib/prediction/state/incremental-state-engine"),
+    import("@/lib/prediction/calibration/calibration-state"),
+    import("@/lib/prediction/prediction-pipeline"),
+    import("@/lib/prediction/models/baseline-model"),
+    import("@/lib/prediction/ensemble/model-performance"),
+    import("@/lib/prediction/features/feature-engine-v2"),
+    import("@/lib/prediction/regimes/regime-detector"),
+    import("@/lib/prediction/models/model-registry"),
+    import("@/lib/prediction/signals/signal"),
   ];
   const results = await Promise.allSettled(mods);
   const failed = results.filter((r) => r.status === "rejected").length;
@@ -275,12 +286,24 @@ async function writeWorkerHealth(sql: Sql, cycle: number): Promise<void> {
   // P2.11: Persist incremental state on each heartbeat
   await persistIncrementalState(sql);
 
-  // Phase 17 — sample production invariants on heartbeat (non-blocking soft)
+  // Phase 17 — invariant checks moved to periodic interval (Fix 11).
+  // Do NOT run invariant DB queries during boot or on the realtime path.
+  // They run on their own 30s timer so DB checks never block ED prediction.
   try {
     const { sampleProductionInvariants } = await import(
       "@/lib/prediction/live/invariants"
     );
-    await sampleProductionInvariants(sql);
+    const invariantTimer = setInterval(() => {
+      void sampleProductionInvariants().catch((error) => {
+        logger.error(
+          { component: "live-boot", error: String(error) },
+          "production invariant check failed",
+        );
+      });
+    }, 30_000);
+    if (typeof invariantTimer.unref === "function") invariantTimer.unref();
+    // Run once immediately so we don't wait 30s for the first check
+    void sampleProductionInvariants(sql).catch(() => undefined);
   } catch {
     /* soft */
   }

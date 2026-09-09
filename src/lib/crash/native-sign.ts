@@ -64,14 +64,28 @@ async function discoverWrUtilsUrl(): Promise<string> {
   const html = await htmlRes.text();
   const indexMatch = html.match(/\/assets\/index-[^"']+\.js/);
   const indexPath = indexMatch?.[0] ?? "/assets/index-ChLSFpM-.js";
-  const jsRes = await fetch(`https://bc.game${indexPath}`, {
+  const indexUrl = `https://bc.game${indexPath}`;
+  // Validate URL before fetch to prevent crashes from malformed paths
+  try {
+    new URL(indexUrl);
+  } catch {
+    throw new Error(`invalid index URL constructed: ${indexUrl}`);
+  }
+  const jsRes = await fetch(indexUrl, {
     headers: { "user-agent": UA, "accept-language": "en" },
     signal: AbortSignal.timeout(15_000),
   });
   if (!jsRes.ok) throw new Error(`index bundle ${jsRes.status}`);
   const js = await jsRes.text();
   const wr = js.match(/wr_utils-[\w-]+\.js/)?.[0] ?? FALLBACK_WR;
-  return `https://bc.game/assets/${wr}`;
+  const wrUrl = `https://bc.game/assets/${wr}`;
+  // Validate wr_utils URL too
+  try {
+    new URL(wrUrl);
+  } catch {
+    throw new Error(`invalid wr_utils URL constructed: ${wrUrl}`);
+  }
+  return wrUrl;
 }
 
 async function loadSignUtils(): Promise<SignUtils> {

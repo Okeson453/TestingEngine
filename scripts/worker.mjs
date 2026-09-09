@@ -208,17 +208,22 @@ console.log(
  * potentially corrupted process alive is worse than a short outage.
  */
 process.on("uncaughtException", (err) => {
-  const stack = String(err?.stack ?? err);
+  const errorObj = err instanceof Error ? err : { message: String(err), name: "Unknown" };
   console.error(
     JSON.stringify({
-      level: "error",
+      level: "fatal",
       time: new Date().toISOString(),
       component: "worker-entry",
-      msg: "uncaughtException — continuing (live WS must stay up)",
-      error: stack.slice(0, 2000),
+      msg: "uncaughtException",
+      error: {
+        name: errorObj.name,
+        message: errorObj.message,
+        stack: String(errorObj.stack ?? "").slice(0, 4000),
+      },
     }),
   );
   // Only hard-exit on explicit fatal / OOM-style errors.
+  const stack = String(err?.stack ?? err);
   const fatal =
     process.env.WORKER_FATAL_ON_UNCAUGHT === "1" ||
     /out of memory|Cannot find module|FATAL/i.test(stack);
@@ -233,14 +238,18 @@ process.on("uncaughtException", (err) => {
 });
 
 process.on("unhandledRejection", (reason) => {
-  const stack = String(reason?.stack ?? reason);
+  const reasonObj = reason instanceof Error ? reason : { message: String(reason), name: "Unknown" };
   console.error(
     JSON.stringify({
-      level: "error",
+      level: "fatal",
       time: new Date().toISOString(),
       component: "worker-entry",
-      msg: "unhandledRejection — continuing",
-      error: stack.slice(0, 2000),
+      msg: "unhandledRejection",
+      error: {
+        name: reasonObj.name,
+        message: reasonObj.message,
+        stack: String(reasonObj.stack ?? "").slice(0, 4000),
+      },
     }),
   );
   if (process.env.WORKER_FATAL_ON_UNCAUGHT === "1") {

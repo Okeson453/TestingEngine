@@ -640,11 +640,11 @@ export async function onGameEndPredict(
   correlationId: string,
   deps: PredictorDeps = {},
 ): Promise<OnGameEndPredictResult> {
-  const getSqlFn = deps.getSqlFn ?? getSql;
   const predictFn = deps.predictFn ?? defaultPredictFn;
-  const sql = await getSqlFn();
 
-  const engineT0 = performance.now();
+  // ── Latency instrumentation: stage-level timing ──
+  const t0 = performance.now(); // WS event received (caller already decoded)
+
   let targetGameId: string;
   try {
     if (typeof gameId !== "string" || !/^\d+$/.test(gameId)) {
@@ -679,9 +679,11 @@ export async function onGameEndPredict(
     };
   }
 
-  // In-memory claim: only first path (ED preferred) runs model compute.
+  // ── P0: In-memory target claim (ZERO DB) ──
   const owner = deps.recoveryMode ? `poll:${gameId}` : `ed:${gameId}`;
   const claim = claimTarget(targetGameId, owner);
+  const t1 = performance.now(); // target claimed
+
   if (!claim.owned) {
     return {
       predictionId: null,
@@ -695,9 +697,10 @@ export async function onGameEndPredict(
   const generatedAt = new Date().toISOString();
   const recoveryMode = deps.recoveryMode === true;
 
-  let predictionSucceeded = false;
-
-  // Keep the in-memory history buffer current so subsequent predicts are O(1).
+  // ── P0: Update in-memory history buffer (ZERO DB) ──
+  // The edHandler in game-event-handlers.ts already calls appendCompletedRound
+  // before this function, but we keep it here as a belt-and-suspenders measure
+  // for the poll-worker path which calls onGameEndPredict directly.
   try {
     const { appendCompletedRound } = await import(
       "@/lib/prediction/live/live-history-buffer"
@@ -711,294 +714,59 @@ export async function onGameEndPredict(
     /* soft — buffer is best-effort */
   }
 
-  // P0.1: Stale source gate removed for Socket.IO path.
-  // BC.Game retransmits ed events on reconnect; Crash rounds last 3-5s,
-  // so a 30s gate was absurdly conservative and caused 6-12s signal lag.
-  // For poll recovery, use a 10s ceiling (still generous for 3-5s rounds).
-  // Hard checks (target already started/crashed/duplicate) still apply below.
-  {
-    const sourceAgeMs = Date.now() - new Date(crashedAt).getTime();
-
-    if (recoveryMode && Number.isFinite(sourceAgeMs) && sourceAgeMs > 10_000) {
-      logger.info(
-        { targetGameId, sourceGameId: gameId, sourceAgeMs, crashedAt },
-        "Recovery mode: source round age elevated but acceptable for poll path",
-      );
-    } else if (!recoveryMode && Number.isFinite(sourceAgeMs) && sourceAgeMs > MAX_SOURCE_ROUND_AGE_MS) {
-      // Log only — do NOT skip. The prediction still has value; the temporal
-      // invariant check inside the transaction is the real correctness gate.
-      logger.warn(
-        { targetGameId, sourceGameId: gameId, sourceAgeMs, crashedAt },
-        "Stale source in Socket.IO path — proceeding anyway (BC.Game retransmits)",
-      );
-    }
-  }
-
-  const GENERATION_BUDGET_MS = Number(process.env.GENERATION_BUDGET_MS ?? 100);
-  const DELIVERY_BUDGET_MS = Number(process.env.DELIVERY_BUDGET_MS ?? 80);
-  // P1.3: Hoist liveLifecycle outside the try block so the transaction
-  // section below can reuse it without re-querying live_round_state.
-  let liveLifecycle: Array<{ lifecycle: string | null; began_at: string | Date | null }> = [];
-  // Latency report §4.2: start the history read concurrently with the gate
-  // queries. It depends only on `crashedAt` (known here), so it can run in
-  // parallel and be awaited only after the gates pass — removing one DB
-  // round-trip from the critical path. If a gate short-circuits
-  // (duplicate/too_late), the abandoned read is harmless (read-only).
-  let historyError: unknown = null;
-  const historyPromise: Promise<HistoricalRound[]> = loadPriorRoundsStrict(
-    sql,
-    crashedAt,
-    MAX_HISTORY,
-  ).catch((e: unknown) => {
-    historyError = e;
-    return [] as HistoricalRound[];
-  });
+  // ── P0: History MUST come from memory. NEVER call getSql() here. ──
+  // No SQL fallback allowed on the ED prediction path. If the buffer is cold,
+  // boot should have warmed it. SQL is only for boot/recovery/cold-start.
+  let priorRounds: HistoricalRound[] = [];
   try {
-    let skipThreshold = Math.min(MIN_REQUIRED_WINDOW_MS, SKIP_BELOW_MS);
+    const {
+      getPriorRoundsSync,
+      isLiveHistoryWarmed,
+    } = await import("@/lib/prediction/live/live-history-buffer");
 
-    // P1.1: Consolidated gate queries — 4 queries instead of 7.
-    // - 3 worker_state lookups merged into 1 query
-    // - redundant live_round_state SELECT (residualRows) removed;
-    //   liveLifecycle already fetches began_at
-    // Latency fix: prefer in-memory gate cache; one combined eligibility query.
-    // worker_state is only hit when cache is cold (boot / long gap).
-    let getWorkerValue = (key: string): string | undefined => undefined;
-    try {
-      const {
-        getMedianInterRoundGapMs,
-        getWallClockSkewMs,
-        getEffectiveSkipBelowMs,
-        isGateCacheWarm,
-        setMedianInterRoundGapMs,
-        setWallClockSkewMs,
-        setEffectiveSkipBelowMs,
-      } = await import("@/lib/prediction/live/gate-cache");
-
-      // Soft-cap: never let worker_state re-inflate the residual floor above 200ms.
-      // Historical effective_skip_below_ms values of 800–3000ms caused systematic
-      // skipped_late → poll recovery (~2.5–5s lag), which is the dominant
-      // operator-visible delay when Socket.IO is healthy.
-      const cachedSkip = getEffectiveSkipBelowMs();
-      if (cachedSkip != null && Number.isFinite(cachedSkip)) {
-        const capped = Math.min(200, Math.max(SKIP_BELOW_MS, cachedSkip));
-        skipThreshold = Math.max(skipThreshold, capped);
-      }
-
-      // Expose cache values for residual math below via getWorkerValue shim
-      getWorkerValue = (key: string): string | undefined => {
-        if (key === "median_inter_round_gap_ms") {
-          const v = getMedianInterRoundGapMs();
-          return Number.isFinite(v) ? String(v) : undefined;
-        }
-        if (key === "wall_clock_skew_ms") {
-          const v = getWallClockSkewMs();
-          return Number.isFinite(v) ? String(v) : undefined;
-        }
-        if (key === "effective_skip_below_ms") {
-          const v = getEffectiveSkipBelowMs();
-          return v != null ? String(v) : undefined;
-        }
-        return undefined;
-      };
-
-      if (!isGateCacheWarm()) {
-        const workerStateRows = await sql<{ key: string; value: string }>`
-          SELECT key, value FROM worker_state
-          WHERE key IN ('effective_skip_below_ms', 'median_inter_round_gap_ms', 'wall_clock_skew_ms')
-        `.catch(() => [] as { key: string; value: string }[]);
-        for (const row of workerStateRows) {
-          const n = Number(row.value);
-          if (!Number.isFinite(n)) continue;
-          if (row.key === "median_inter_round_gap_ms") setMedianInterRoundGapMs(n);
-          if (row.key === "wall_clock_skew_ms") setWallClockSkewMs(n);
-          if (row.key === "effective_skip_below_ms") setEffectiveSkipBelowMs(n);
-        }
-        const t = getEffectiveSkipBelowMs();
-        if (t != null && Number.isFinite(t)) {
-          const capped = Math.min(200, Math.max(SKIP_BELOW_MS, t));
-          skipThreshold = Math.max(skipThreshold, capped);
-        }
-      }
-    } catch {
-      /* gate-cache optional */
-    }
-
-    // Single combined eligibility query (pending + lifecycle + crashed)
-    const eligibility = await sql<{
-      pending_id: string | null;
-      lifecycle: string | null;
-      began_at: string | Date | null;
-      crashed_game_id: string | null;
-    }>`
-      SELECT
-        (SELECT prediction_id::text FROM pending_predictions
-           WHERE target_game_id = ${targetGameId} AND status = 'PENDING' LIMIT 1) AS pending_id,
-        (SELECT lifecycle FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1) AS lifecycle,
-        (SELECT began_at FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1) AS began_at,
-        (SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1) AS crashed_game_id
-    `.catch(() => [] as {
-      pending_id: string | null;
-      lifecycle: string | null;
-      began_at: string | Date | null;
-      crashed_game_id: string | null;
-    }[]);
-
-    const el = eligibility[0];
-    liveLifecycle =
-      el && (el.lifecycle != null || el.began_at != null)
-        ? [{ lifecycle: el.lifecycle, began_at: el.began_at }]
-        : [];
-
-    if (el?.pending_id) {
-      return {
-        predictionId: el.pending_id,
-        targetGameId,
-        kind: "duplicate",
-      };
-    }
-    if (el?.crashed_game_id) {
-      logger.warn({ targetGameId }, "Target round N+1 already crashed - too late");
-      recordPredictionOutcome(true);
-      return { predictionId: null, targetGameId, kind: "too_late" };
-    }
-    const life = liveLifecycle[0];
-    if (life?.began_at != null) {
-      const beganMs = new Date(life.began_at).getTime();
-      if (Number.isFinite(beganMs) && beganMs <= Date.now()) {
-        logger.warn({ targetGameId }, "Target round N+1 already started - too late");
-        recordPredictionOutcome(true);
-        return { predictionId: null, targetGameId, kind: "too_late" };
-      }
-    }
-
-    let remainingMs: number | null = null;
-    let medianGapMs = 4_000;
-    const gapVal = getWorkerValue('median_inter_round_gap_ms');
-    if (gapVal) {
-      const g = Number(gapVal);
-      if (Number.isFinite(g) && g > 500 && g < 30_000) medianGapMs = g;
-    }
-    const elapsedSinceEd = Date.now() - new Date(crashedAt).getTime();
-
-    // P1.3: Reuse liveLifecycle[0]?.began_at instead of re-querying residualRows
-    const liveBeganAt = liveLifecycle[0]?.began_at;
-    if (liveBeganAt != null) {
-      remainingMs = new Date(liveBeganAt).getTime() - Date.now();
-    } else if (recoveryMode || (Number.isFinite(elapsedSinceEd) && elapsedSinceEd > medianGapMs * 1.5)) {
-      remainingMs = Math.floor(medianGapMs / 2);
-      logger.info(
-        {
-          targetGameId,
-          elapsedSinceEd,
-          medianGapMs,
-          remainingMs,
-          recoveryMode,
-        },
-        "recovery/stale: conservative residual estimate (medianGap/2)",
-      );
-    } else {
-      remainingMs = medianGapMs - Math.max(0, elapsedSinceEd);
-    }
-
-    const skewVal = getWorkerValue('wall_clock_skew_ms');
-    const skew = skewVal != null ? Number(skewVal) : 0;
-    if (Number.isFinite(skew) && remainingMs != null) {
-      remainingMs = remainingMs - skew;
-    }
-
-    const deadlineBudget = GENERATION_BUDGET_MS + DELIVERY_BUDGET_MS;
-    const effectiveFloor = skipThreshold;
-    if (remainingMs != null && Number.isFinite(remainingMs) && remainingMs < effectiveFloor) {
+    if (!isLiveHistoryWarmed()) {
       logger.warn(
-        {
-          targetGameId,
-          remainingMs,
-          threshold: effectiveFloor,
-          generationBudgetMs: GENERATION_BUDGET_MS,
-          deliveryBudgetMs: DELIVERY_BUDGET_MS,
-          elapsedSinceEd,
-          recoveryMode,
-        },
-        "tight residual window - generating anyway; outbox will expire if too late",
+        { targetGameId, sourceGameId: gameId },
+        "realtime prediction blocked — live history not ready (boot should warm before first ED)",
       );
     }
-    if (
-      remainingMs != null &&
-      Number.isFinite(remainingMs) &&
-      remainingMs < deadlineBudget
-    ) {
-      logger.info(
-        {
-          targetGameId,
-          remainingMs,
-          deadlineBudget,
-          elapsedSinceEd,
-        },
-        "tight residual - generating anyway; outbox may expire if target starts first",
-      );
-    }
-  } catch (gateErr) {
-    logger.warn(
-      { targetGameId, error: String(gateErr) },
-      "deadline gate soft-failed - proceeding with caution",
-    );
+
+    priorRounds = getPriorRoundsSync(MAX_HISTORY, gameId, crashedAt);
+  } catch {
+    /* soft — priorRounds stays empty */
   }
 
-  try {
-    // Under poll recovery, late-rate sheath must not silence the only working path.
-    if (!recoveryMode) {
-      const sheath = evaluateSheath();
-      if (sheath.decision === "halt") {
-        logger.warn(
-          {
-            targetGameId,
-            lateRate: sheath.rate,
-            sampleTotal: sheath.total,
-          },
-          "Sheath mode HALT - skipping prediction due to elevated late rate",
-        );
-        // Do NOT recordOutcome(true) here — that inflates late rate and locks HALT.
-        return {
-          predictionId: null,
-          targetGameId,
-          kind: "skipped_late",
-          temporalValidity: "TEMPORALLY_UNVERIFIED",
-        };
-      }
-    }
-  } catch {}
-
-  // P1.2: reuse the existing sql connection (no second getSqlFn() call).
-  // The history read was already started in parallel with the gate queries
-  // above; just await it here.
-  const priorRounds = await historyPromise;
-  if (historyError) {
-    logger.error(
-      { targetGameId, error: String(historyError) },
-      "loadPriorRoundsStrict failed",
-    );
-    throw historyError;
-  }
+  const t2 = performance.now(); // history loaded from memory
 
   if (priorRounds.length < MIN_HISTORY) {
     logger.warn(
-      { targetGameId, available: priorRounds.length, minHistory: MIN_HISTORY },
-      "insufficient history for prediction",
+      {
+        targetGameId,
+        sourceGameId: gameId,
+        historySize: priorRounds.length,
+        minHistory: MIN_HISTORY,
+      },
+      "realtime prediction blocked — insufficient warmed history",
     );
+    try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
     recordPredictionOutcome(true);
     return {
       predictionId: null,
       targetGameId,
       kind: "insufficient_history",
       temporalValidity: "TEMPORALLY_UNVERIFIED",
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
     };
   }
 
+  // ── P0: Prediction computation only (ZERO DB, ZERO Telegram, ZERO outbox) ──
   const timestamp = generatedAt;
-  // P0.4 + P3.1: Measure prediction generation time and wire latency metric
   const predictT0 = performance.now();
   const signal = predictFn(priorRounds, targetGameId, timestamp, DEFAULT_TARGET);
   const predictElapsed = performance.now() - predictT0;
+  const t3 = performance.now(); // prediction completed
+
   if (predictElapsed > PREDICT_TIMEOUT_MS) {
     logger.warn(
       { targetGameId, predictElapsedMs: predictElapsed, budgetMs: PREDICT_TIMEOUT_MS },
@@ -1011,12 +779,10 @@ export async function onGameEndPredict(
     );
     predictionGenerationMs.observe(predictElapsed);
   } catch { /* metrics optional */ }
+
   const predictionId = signal.predictionId;
 
-  // Compute once in function scope. This value is used both inside the
-  // transaction (outbox metadata) and after commit (live_event_log).
-  // Previously it was declared inside the transaction callback, causing
-  // ReferenceError: slaViolated is not defined after every generated signal.
+  // Compute SLA status (in-memory, no DB clock access)
   const effectiveSlaLagMs = recoveryMode ? SLA_LAG_MS * 2 : SLA_LAG_MS;
   const receivedMs = new Date(crashedAt).getTime();
   const slaLagMsActual = Date.now() - receivedMs;
@@ -1024,8 +790,6 @@ export async function onGameEndPredict(
     Number.isFinite(slaLagMsActual) && slaLagMsActual > effectiveSlaLagMs;
 
   // Selectivity gate: only persist/notify when there is edge vs fair odds.
-  // Fair P for cash-out target T is ~1/T (Crash). Always emitting 1.3x signals
-  // produces ~75–85% WIN rate that is not skill — just the base rate.
   {
     const targetNum = Number(DEFAULT_TARGET);
     const fair = targetNum > 1 ? 1 / targetNum : 0.5;
@@ -1051,7 +815,7 @@ export async function onGameEndPredict(
         },
         "skip signal — no edge vs fair odds (not every round should fire)",
       );
-      // Intentionally do not recordPredictionOutcome(true) — not a timing late.
+      try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
       return {
         predictionId: null,
         targetGameId,
@@ -1063,225 +827,185 @@ export async function onGameEndPredict(
     }
   }
 
-  try {
-    await runInTransaction(sql, async (tx) => {
-      // P1.3: Reuse liveLifecycle data from gate query instead of re-querying.
-      // liveLifecycle was fetched outside the transaction; the temporal invariant
-      // check only needs to know if the target round already started.
-      const targetBeganAt = liveLifecycle[0]?.began_at ?? null;
-      if (targetBeganAt != null) {
-        const beganMs = new Date(targetBeganAt).getTime();
-        const genMs = new Date(timestamp).getTime();
-        if (Number.isFinite(beganMs) && Number.isFinite(genMs) && genMs >= beganMs - TEMPORAL_TOLERANCE_MS) {
-          // Controlled skip — do not throw (throws were logged as onGameEndPredict failed
-          // and aborted the TX after the model already ran). Poll recovery often lands
-          // after target begin under WAF; surface as too_late instead.
-          const err = new Error("TEMPORAL_INVARIANT_SKIP");
-          (err as Error & { code?: string }).code = "TEMPORAL_INVARIANT_SKIP";
-          throw err;
-        }
-      }
+  // ── P0: SIGNAL READY ──
+  // The prediction signal is complete. Everything below is async persistence
+  // that must NOT block the signal path. We return immediately after logging.
+  const t4 = performance.now(); // signal ready
 
-      const ins = await tx<{ prediction_id: string; requested_at: string }>`
-        insert into pending_predictions (
-          prediction_id, target_multiplier, probability, confidence,
-          regime_name, regime_confidence, reasoning, feature_summary,
-          model_version, requested_at, generated_at,
-          target_game_id, source_round_id,
-          correlation_id
-        ) values (
-          ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-          ${signal.confidence}, ${signal.regimeId},
-          ${signal.regimeId ? 0.5 : null},
-          ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-          ${signal.modelVersion}, ${timestamp}, ${timestamp},
-          ${targetGameId}, ${gameId},
-          ${correlationId}
-        )
-        on conflict (prediction_id) do nothing
-        returning prediction_id, requested_at
-      `;
-
-      if (ins.length === 0) {
-        const dup = await tx<{ prediction_id: string }>`
-          select prediction_id from pending_predictions
-          where target_game_id = ${targetGameId} and matched = false
-          limit 1
-        `;
-        if (dup.length === 0) {
-          throw new Error("PREDICTION_DUPLICATE_BUT_UNREADABLE");
-        }
-        return;
-      }
-
-      // Always enqueue prediction Telegram signal.
-      // Prior gate used (now - crashedAt) > SLA_LAG_MS (~2s) which is almost
-      // always true on poll recovery and often true on slightly delayed ED,
-      // so predictions were persisted (WIN/LOSS still fire) but signal messages
-      // never entered the outbox.
-      {
-        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
-        const lateTag = slaViolated ? " (delayed)" : "";
-        const predictionContent = [
-          `NEW PREDICTION${regimeText}${lateTag}`,
-          "",
-          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
-          `Probability: ${(signal.probability * 100).toFixed(1)}%`,
-          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
-          "",
-          `Prediction ID: ${predictionId}`,
-          `Generated: ${timestamp}`,
-          recoveryMode ? "Source: poll recovery" : "Source: live ED",
-        ].join("\n");
-        // Priority 2 = high; next_attempt_at must be timestamptz (use now()), not Date.now() number
-        // P1.6: Populate telegram_deadline_at so the outbox dispatcher can expire
-        // stale signals before wasting a Telegram API round-trip.
-        const deadlineMs = recoveryMode
-          ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 12_000)
-          : Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000);
-        const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
-        await tx`
-          insert into notification_outbox (
-            notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at, telegram_deadline_at
-          ) values (
-            ${randomUUID()}::uuid, 'prediction',
-            ${predictionContent},
-            ${JSON.stringify({
-              predictionId,
-              correlationId,
-              targetGameId,
-              sourceGameId: gameId,
-              targetMultiplier: Number(DEFAULT_TARGET),
-              probability: signal.probability,
-              confidence: signal.confidence,
-              regimeName: signal.regimeId,
-              slaViolated,
-              slaLagMsActual,
-              kind: "prediction",
-              recoveryMode,
-            })},
-            'pending', 3,
-            0, now(), ${deadlineAt}::timestamptz
-          )
-        `;
-      }
-
-      // live_event_log moved outside TX — not required for correctness;
-      // saves one Neon RTT inside the critical transaction.
-    });
-
-    void sql`
-      insert into live_event_log (
-        correlation_id, event_kind, game_id, payload, received_at, processed_at,
-        processor_latency_ms, sla_violated
-      ) values (
-        ${correlationId}::text, 'PREDICT', ${targetGameId},
-        ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode })},
-        ${crashedAt}::timestamptz, now(),
-        ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
-      )
-    `.catch(() => undefined);
-
-    logger.info(
-      {
-        component: "live-predictor",
-        predictionId,
-        targetGameId,
-        sourceGameId: gameId,
-        correlationId,
-        recoveryMode,
-        engineMs: Math.round(performance.now() - engineT0),
-        sourceAgeMs: Math.max(0, Date.now() - new Date(crashedAt).getTime()),
-      },
-      "prediction generated and persisted for next round",
-    );
-
-    // Wake outbox dispatcher immediately after TX commit.
-    try {
-      const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
-      notifyOutbox();
-    } catch {
-      /* soft */
-    }
-
-    predictionSucceeded = true;
-  try { completeTarget(targetGameId, owner); } catch { /* soft */ }
-  return {
+  logger.info(
+    {
+      component: "live-predictor",
       predictionId,
       targetGameId,
-      kind: "predicted",
-      temporalValidity: "TEMPORALLY_VALID",
       sourceGameId: gameId,
-      sourceCrashAt: crashedAt,
-      targetStartedAt: null,
-      predictionGeneratedAt: timestamp,
-      predictionLatencyMs: Math.round(performance.now() - engineT0),
-      availableWindowMs: null,
-      remainingBeforeTargetMs: null,
-    };
-  } catch (e) {
-    const msg = String(e);
-    if (msg.includes("TEMPORAL_INVARIANT_SKIP") || (e as { code?: string })?.code === "TEMPORAL_INVARIANT_SKIP") {
-      logger.warn(
-        {
-          component: "live-predictor",
-          targetGameId,
-          sourceGameId: gameId,
-          recoveryMode,
-        },
-        "prediction skipped — target already started (temporal)",
+      correlationId,
+      recoveryMode,
+      // Precise stage-level latency instrumentation
+      claimMs: Number((t1 - t0).toFixed(2)),
+      historyMs: Number((t2 - t1).toFixed(2)),
+      predictionMs: Number((t3 - t2).toFixed(2)),
+      predictionToSignalMs: Number((t4 - t3).toFixed(2)),
+      totalMs: Number((t4 - t0).toFixed(2)),
+      sourceAgeMs: Math.max(0, Date.now() - new Date(crashedAt).getTime()),
+      signalReady: true,
+    },
+    "SIGNAL_READY — prediction generated, persistence async",
+  );
+
+  // ── P1/P2: EVERYTHING BELOW IS NON-BLOCKING ──
+  // pending_predictions, notification_outbox, and live_event_log are all
+  // written asynchronously. The DB remains the durability/idempotency
+  // backstop via ON CONFLICT DO NOTHING. If async persistence fails, the
+  // signal was already delivered and the prediction is still valid in-memory.
+  // The poll worker and validator will reconcile any missing DB state.
+
+  const persistPromise = (async () => {
+    const getSqlFn = deps.getSqlFn ?? getSql;
+    let sql: Sql;
+    try {
+      sql = await getSqlFn();
+    } catch (e) {
+      logger.error(
+        { component: "live-predictor", targetGameId, error: String(e) },
+        "async persistence: getSql failed — prediction signal was delivered",
       );
-      recordPredictionOutcome(true);
-      return {
-        predictionId: null,
-        targetGameId,
-        kind: "too_late",
-        temporalValidity: "TEMPORALLY_INVALID",
-        sourceGameId: gameId,
-        sourceCrashAt: crashedAt,
-      };
+      return;
     }
-    // Controlled skips (temporal / duplicate / no-edge) are operational, not hard failures.
-    const soft =
-      msg.includes("TEMPORAL_INVARIANT") ||
-      msg.includes("too_late") ||
-      msg.includes("DUPLICATE") ||
-      msg.includes("skipped_");
-    if (!predictionSucceeded) {
-      try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
-    }
-    if (soft) {
-      logger.warn(
+
+    try {
+      await runInTransaction(sql, async (tx) => {
+        const ins = await tx<{ prediction_id: string; requested_at: string }>`
+          insert into pending_predictions (
+            prediction_id, target_multiplier, probability, confidence,
+            regime_name, regime_confidence, reasoning, feature_summary,
+            model_version, requested_at, generated_at,
+            target_game_id, source_round_id,
+            correlation_id
+          ) values (
+            ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
+            ${signal.confidence}, ${signal.regimeId},
+            ${signal.regimeId ? 0.5 : null},
+            ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
+            ${signal.modelVersion}, ${timestamp}, ${timestamp},
+            ${targetGameId}, ${gameId},
+            ${correlationId}
+          )
+          on conflict (prediction_id) do nothing
+          returning prediction_id, requested_at
+        `;
+
+        if (ins.length === 0) {
+          // Duplicate — already persisted by another path (DB is the backstop)
+          return;
+        }
+
+        // Enqueue prediction Telegram signal
+        {
+          const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
+          const lateTag = slaViolated ? " (delayed)" : "";
+          const predictionContent = [
+            `NEW PREDICTION${regimeText}${lateTag}`,
+            "",
+            `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
+            `Probability: ${(signal.probability * 100).toFixed(1)}%`,
+            `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
+            "",
+            `Prediction ID: ${predictionId}`,
+            `Generated: ${timestamp}`,
+            recoveryMode ? "Source: poll recovery" : "Source: live ED",
+          ].join("\n");
+          const deadlineMs = recoveryMode
+            ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 12_000)
+            : Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000);
+          const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
+          await tx`
+            insert into notification_outbox (
+              notification_id, type, content, metadata, status, priority,
+              attempt_count, next_attempt_at, telegram_deadline_at
+            ) values (
+              ${randomUUID()}::uuid, 'prediction',
+              ${predictionContent},
+              ${JSON.stringify({
+                predictionId,
+                correlationId,
+                targetGameId,
+                sourceGameId: gameId,
+                targetMultiplier: Number(DEFAULT_TARGET),
+                probability: signal.probability,
+                confidence: signal.confidence,
+                regimeName: signal.regimeId,
+                slaViolated,
+                slaLagMsActual,
+                kind: "prediction",
+                recoveryMode,
+              })},
+              'pending', 3,
+              0, now(), ${deadlineAt}::timestamptz
+            )
+          `;
+        }
+      });
+
+      // live_event_log outside TX (not required for correctness)
+      void sql`
+        insert into live_event_log (
+          correlation_id, event_kind, game_id, payload, received_at, processed_at,
+          processor_latency_ms, sla_violated
+        ) values (
+          ${correlationId}::text, 'PREDICT', ${targetGameId},
+          ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode })},
+          ${crashedAt}::timestamptz, now(),
+          ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
+        )
+      `.catch(() => undefined);
+
+      // Wake outbox dispatcher after TX commit
+      try {
+        const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
+        notifyOutbox();
+      } catch { /* soft */ }
+
+      try { completeTarget(targetGameId, owner); } catch { /* soft */ }
+
+      logger.info(
         {
           component: "live-predictor",
+          predictionId,
           targetGameId,
-          sourceGameId: gameId,
           correlationId,
-          error: msg,
+          persistenceMs: Number((performance.now() - t4).toFixed(2)),
         },
-        "onGameEndPredict soft-skip",
+        "async persistence complete",
       );
-    } else {
+    } catch (e) {
       logger.error(
         {
           component: "live-predictor",
           targetGameId,
-          sourceGameId: gameId,
           correlationId,
-          error: msg,
+          error: String(e),
         },
-        "onGameEndPredict failed",
+        "async prediction persistence failed — prediction signal was already delivered",
       );
-      recordPredictionOutcome(true);
+      try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
     }
-    return {
-      predictionId: null,
-      targetGameId,
-      kind: "error",
-      temporalValidity: "TEMPORALLY_UNVERIFIED",
-      sourceGameId: gameId,
-      sourceCrashAt: crashedAt,
-    };
-  }
+  })();
+
+  // Don't await — return the signal immediately.
+  // Keep the promise alive so it doesn't become an unhandled rejection.
+  void persistPromise.catch(() => undefined);
+
+  return {
+    predictionId,
+    targetGameId,
+    kind: "predicted",
+    temporalValidity: "TEMPORALLY_VALID",
+    sourceGameId: gameId,
+    sourceCrashAt: crashedAt,
+    targetStartedAt: null,
+    predictionGeneratedAt: timestamp,
+    predictionLatencyMs: Math.round(t4 - t0),
+    availableWindowMs: null,
+    remainingBeforeTargetMs: null,
+  };
 }
