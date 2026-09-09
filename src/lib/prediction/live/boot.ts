@@ -148,6 +148,15 @@ async function heartbeatWorkerLock(sql: Sql): Promise<void> {
   `;
 }
 
+/** Rolling deploy: previous container still heartbeats until SIGTERM drains.
+ *  After a short wait, new instance takes the lock so live path is not blocked ~20s+. */
+async function forceStealWorkerLock(sql: Sql): Promise<boolean> {
+  await sql`
+    DELETE FROM worker_locks WHERE lock_key = ${LOCK_KEY}
+  `.catch(() => undefined);
+  return acquireWorkerLock(sql);
+}
+
 // P2.11: Persist Incremental State
 // Save incremental state alongside worker health
 async function persistIncrementalState(sql: Sql): Promise<void> {
@@ -616,18 +625,25 @@ class LiveBoot {
     // crash-looping during rolling deploys (previous holder may still be draining).
     let hasLock = await acquireWorkerLock(sql);
     if (!hasLock) {
-      // Rolling deploys: previous holder should expire in ≤ LOCK_TTL (8s).
-      // Default wait was 45s and blocked the live pipeline for a full round.
-      const waitMs = Number(process.env.WORKER_LOCK_WAIT_MS ?? 12_000);
-      const stepMs = 1_000;
-      const deadline = Date.now() + waitMs;
+      // Rolling deploys keep the old process heartbeating until drain (~10–30s).
+      // Do not wait that long — soft-wait then force-steal.
+      const softWaitMs = Number(process.env.WORKER_LOCK_SOFT_WAIT_MS ?? 4_000);
+      const stepMs = 500;
+      const deadline = Date.now() + softWaitMs;
       logger.warn(
-        { component: "live-boot", workerId: WORKER_ID, waitMs },
-        "Lock held by another worker — waiting for TTL/steal before aborting",
+        { component: "live-boot", workerId: WORKER_ID, softWaitMs },
+        "Lock held by another worker — short wait then force-steal",
       );
       while (!hasLock && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, stepMs));
         hasLock = await acquireWorkerLock(sql);
+      }
+      if (!hasLock) {
+        logger.warn(
+          { component: "live-boot", workerId: WORKER_ID },
+          "Force-stealing worker lock (rolling deploy)",
+        );
+        hasLock = await forceStealWorkerLock(sql);
       }
     }
     if (!hasLock) {
