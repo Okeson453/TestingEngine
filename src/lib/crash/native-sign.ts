@@ -143,7 +143,7 @@ export async function signSocketQuery(): Promise<{ p: string; t: string; ua: str
       return signed;
     })
     .catch((err) => {
-      disabledUntil = Date.now() + 60_000;
+      disabledUntil = Date.now() + 15_000;
       log.warn("bc-sign", "sign worker failed", {
         error: err instanceof Error ? err.message : String(err),
       });
@@ -160,5 +160,12 @@ export function prefetchSign(): void {
   if (cachedSign && Date.now() - cachedSign.at < SIGN_TTL_MS * 0.6) return;
   void signSocketQuery().catch(() => {
     /* next connect will retry after cooldown */
+  });
+}
+
+/** Boot-time sign warm so first WS connect does not pay cold wr_utils fetch. */
+export function prewarmSign(): void {
+  void signSocketQuery().catch(() => {
+    /* poll path remains primary if sign is blocked */
   });
 }

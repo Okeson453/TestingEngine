@@ -502,9 +502,14 @@ export class OutboxDispatcher {
     // not_configured / network / timeout are operational — never permanent.
     const isOpsMiss =
       errText === "not_configured" ||
+      errText.includes("not_configured") ||
       firstFailure?.status === 0 ||
+      firstFailure?.status == null ||
       errText.startsWith("timeout_") ||
-      errText.includes("network");
+      errText.includes("network") ||
+      errText.includes("ECONNRESET") ||
+      errText.includes("fetch failed") ||
+      errText.includes("socket hang up");
     const isPermanent =
       !isOpsMiss &&
       firstFailure != null &&

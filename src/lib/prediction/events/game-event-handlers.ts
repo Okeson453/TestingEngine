@@ -8,6 +8,7 @@
 import { randomUUID } from "node:crypto";
 import { bcGameSocket } from "@/lib/crash/socket-client";
 import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
+import { prewarmSign } from "@/lib/crash/native-sign";
 import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtime-pipeline";
 import { getSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
@@ -270,6 +271,12 @@ export async function startEventDrivenPipeline(): Promise<void> {
   const useNative = process.env.USE_NATIVE_BC_WS !== "0";
   if (useNative) {
     try {
+      prewarmSign();
+      // Give sign child a short head-start without blocking boot forever.
+      await Promise.race([
+        new Promise((r) => setTimeout(r, 1_500)),
+        new Promise((r) => setTimeout(r, 0)),
+      ]);
       await nativeBcGameSocket.start();
       logger.info({ component: "game-event-handlers" }, "native BC websocket started");
     } catch (e) {
@@ -277,10 +284,18 @@ export async function startEventDrivenPipeline(): Promise<void> {
         { error: String(e) },
         "native BC websocket failed — falling back to socket.io client",
       );
-      await bcGameSocket.connect();
+      try {
+        await bcGameSocket.connect();
+      } catch (e2) {
+        logger.warn({ error: String(e2) }, "socket.io fallback also failed — poll path active");
+      }
     }
   } else {
-    await bcGameSocket.connect();
+    try {
+      await bcGameSocket.connect();
+    } catch (e) {
+      logger.warn({ error: String(e) }, "socket.io connect failed — poll path active");
+    }
   }
 }
 

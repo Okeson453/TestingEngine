@@ -103,10 +103,20 @@ const WORKER_ID =
   process.env.WORKER_ID ||
   `worker-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
 const LOCK_KEY = "prediction_worker";
-const LOCK_TTL_SECONDS = 10;
+const LOCK_TTL_SECONDS = 8;
 let lockHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 async function acquireWorkerLock(sql: Sql): Promise<boolean> {
+  // Drop clearly dead rows first (expired or heartbeat stalled > 2× TTL).
+  await sql`
+    DELETE FROM worker_locks
+    WHERE lock_key = ${LOCK_KEY}
+      AND (
+        expires_at < now()
+        OR heartbeat_at < now() - (${LOCK_TTL_SECONDS * 2}::int * interval '1 second')
+      )
+  `.catch(() => undefined);
+
   const rows = await sql<{ owner_id: string }>`
     INSERT INTO worker_locks (lock_key, owner_id, acquired_at, expires_at, heartbeat_at)
     VALUES (
@@ -122,6 +132,7 @@ async function acquireWorkerLock(sql: Sql): Promise<boolean> {
         expires_at = EXCLUDED.expires_at,
         heartbeat_at = EXCLUDED.heartbeat_at
     WHERE worker_locks.expires_at < now()
+       OR worker_locks.heartbeat_at < now() - (${LOCK_TTL_SECONDS * 2}::int * interval '1 second')
        OR worker_locks.owner_id = ${WORKER_ID}
     RETURNING owner_id
   `;
@@ -605,8 +616,10 @@ class LiveBoot {
     // crash-looping during rolling deploys (previous holder may still be draining).
     let hasLock = await acquireWorkerLock(sql);
     if (!hasLock) {
-      const waitMs = Number(process.env.WORKER_LOCK_WAIT_MS ?? 45_000);
-      const stepMs = 3_000;
+      // Rolling deploys: previous holder should expire in ≤ LOCK_TTL (8s).
+      // Default wait was 45s and blocked the live pipeline for a full round.
+      const waitMs = Number(process.env.WORKER_LOCK_WAIT_MS ?? 12_000);
+      const stepMs = 1_000;
       const deadline = Date.now() + waitMs;
       logger.warn(
         { component: "live-boot", workerId: WORKER_ID, waitMs },

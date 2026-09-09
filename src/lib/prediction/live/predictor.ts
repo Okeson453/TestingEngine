@@ -1221,17 +1221,36 @@ export async function onGameEndPredict(
         sourceCrashAt: crashedAt,
       };
     }
-    logger.error(
-      {
-        component: "live-predictor",
-        targetGameId,
-        sourceGameId: gameId,
-        correlationId,
-        error: msg,
-      },
-      "onGameEndPredict failed",
-    );
-    recordPredictionOutcome(true);
+    // Controlled skips (temporal / duplicate / no-edge) are operational, not hard failures.
+    const soft =
+      msg.includes("TEMPORAL_INVARIANT") ||
+      msg.includes("too_late") ||
+      msg.includes("DUPLICATE") ||
+      msg.includes("skipped_");
+    if (soft) {
+      logger.warn(
+        {
+          component: "live-predictor",
+          targetGameId,
+          sourceGameId: gameId,
+          correlationId,
+          error: msg,
+        },
+        "onGameEndPredict soft-skip",
+      );
+    } else {
+      logger.error(
+        {
+          component: "live-predictor",
+          targetGameId,
+          sourceGameId: gameId,
+          correlationId,
+          error: msg,
+        },
+        "onGameEndPredict failed",
+      );
+      recordPredictionOutcome(true);
+    }
     return {
       predictionId: null,
       targetGameId,
