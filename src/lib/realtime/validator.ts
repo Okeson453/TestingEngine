@@ -10,8 +10,11 @@ export type ValidateResult =
 export class RoundValidator {
   private readonly seen = new Map<string, number>();
   private lastEndId: number | null = null;
+  private readonly metrics: RealtimeMetrics;
 
-  constructor(private readonly metrics: RealtimeMetrics) {}
+  constructor(metrics: RealtimeMetrics) {
+    this.metrics = metrics;
+  }
 
   hydrate(gameIds: string[]): void {
     for (const id of gameIds) {
