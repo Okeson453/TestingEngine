@@ -123,7 +123,7 @@ export async function signSocketQuery(): Promise<{ p: string; t: string; ua: str
       logger.info({}, "socket query signed");
       return { p, t, ua: UA };
     } catch (err) {
-      disabledUntil = Date.now() + 15_000;
+      disabledUntil = Date.now() + 5_000;
       logger.warn(
         { error: err instanceof Error ? err.message : String(err) },
         "sign failed",

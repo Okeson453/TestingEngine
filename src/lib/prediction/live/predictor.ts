@@ -545,7 +545,7 @@ export async function onGameStart(
         slaLagMsActual,
         slaViolated,
       },
-      "predictor.onGameStart failed; logging and recording in worker_state",
+      "predictor.onGameStart soft-fail (often temporal under live bg)",
     );
     try {
       await sql`

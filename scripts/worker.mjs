@@ -208,41 +208,49 @@ console.log(
  * potentially corrupted process alive is worse than a short outage.
  */
 process.on("uncaughtException", (err) => {
+  const stack = String(err?.stack ?? err);
   console.error(
     JSON.stringify({
       level: "error",
       time: new Date().toISOString(),
       component: "worker-entry",
-      msg: "uncaughtException — terminating worker",
-      error: String(err?.stack ?? err),
+      msg: "uncaughtException — continuing (live WS must stay up)",
+      error: stack.slice(0, 2000),
     }),
   );
-  // Best-effort resource cleanup; do not await indefinitely.
-  try {
-    void db.endPgPool?.();
-  } catch {
-    /* ignore */
+  // Only hard-exit on explicit fatal / OOM-style errors.
+  const fatal =
+    process.env.WORKER_FATAL_ON_UNCAUGHT === "1" ||
+    /out of memory|Cannot find module|FATAL/i.test(stack);
+  if (fatal) {
+    try {
+      void db.endPgPool?.();
+    } catch {
+      /* ignore */
+    }
+    process.exit(1);
   }
-  // Non-zero exit so the platform restarts the process.
-  process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {
+  const stack = String(reason?.stack ?? reason);
   console.error(
     JSON.stringify({
       level: "error",
       time: new Date().toISOString(),
       component: "worker-entry",
-      msg: "unhandledRejection — terminating worker",
-      error: String(reason?.stack ?? reason),
+      msg: "unhandledRejection — continuing",
+      error: stack.slice(0, 2000),
     }),
   );
-  try {
-    void db.endPgPool?.();
-  } catch {
-    /* ignore */
+  if (process.env.WORKER_FATAL_ON_UNCAUGHT === "1") {
+    try {
+      void db.endPgPool?.();
+    } catch {
+      /* ignore */
+    }
+    process.exit(1);
   }
-  process.exit(1);
 });
 
 const shutdown = async (signal) => {

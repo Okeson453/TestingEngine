@@ -340,9 +340,12 @@ export class NativeBcGameSocket {
       elapsedMs,
       receivedAt,
     };
-    // Latency budget gate (ported realtime layer): drop duplicates,
-    // stale end events, and count missed rounds before dispatch.
-    if (!getRealtimePipeline().observe(ev)) return;
+    // Metrics only — never drop live crash events from the prediction path.
+    try {
+      getRealtimePipeline().observe(ev);
+    } catch (e) {
+      logger.warn({ error: String(e) }, "realtime pipeline observe soft-failed");
+    }
 
     for (const h of this.handlers) {
       try {
