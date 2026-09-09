@@ -19,6 +19,7 @@ import {
   parsePacket,
 } from "@/lib/crash/native-protocol";
 import { prefetchSign, signSocketQuery } from "@/lib/crash/native-sign";
+import { getRealtimePipeline } from "@/lib/realtime/realtime-pipeline";
 
 const logger = getLogger("native-bc-socket");
 
@@ -27,7 +28,8 @@ const RECONNECT_DELAY_MS = 200;
 const RECONNECT_DELAY_MAX_MS = 4_000;
 const WAF_BACKOFF_MS = Number(process.env.WAF_BACKOFF_MS ?? 20_000);
 const DEGRADED_AFTER_MS = 20_000;
-const PING_MS = 10_000;
+/** 5s keepalive (ported from tested workspace) — faster dead-socket detection. */
+const PING_MS = 5_000;
 const TRACKED = new Set(["pr", "bg", "pg", "ed", "st"]);
 
 export type NativeCrashEvent = {
@@ -117,6 +119,7 @@ export class NativeBcGameSocket {
   private setStatus(status: string, detail?: string): void {
     this.status = status;
     if (detail) this.lastError = detail;
+    getRealtimePipeline().onStatus(status, detail);
     for (const h of this.statusHandlers) {
       try {
         h(status, detail);
@@ -282,6 +285,10 @@ export class NativeBcGameSocket {
       elapsedMs,
       receivedAt,
     };
+    // Latency budget gate (ported realtime layer): drop duplicates,
+    // stale end events, and count missed rounds before dispatch.
+    if (!getRealtimePipeline().observe(ev)) return;
+
     for (const h of this.handlers) {
       try {
         h(ev);

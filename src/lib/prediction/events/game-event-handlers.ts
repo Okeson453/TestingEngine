@@ -8,6 +8,7 @@
 import { randomUUID } from "node:crypto";
 import { bcGameSocket } from "@/lib/crash/socket-client";
 import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
+import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtime-pipeline";
 import { getSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
@@ -215,6 +216,8 @@ export function initializeEventHandlers(): void {
 
   // Native binary WS (tested workspace client) → same handlers
   nativeBcGameSocket.onEvent((ev) => {
+    // Latency budget: e2e sample at the point the prediction bridge sees it.
+    getRealtimePipeline().markE2e(ev.receivedAt);
     if (ev.event === "bg" || ev.event === "pr") {
       void bgHandler({
         gameId: ev.gameId,
@@ -249,6 +252,21 @@ export function initializeEventHandlers(): void {
 /** Called by worker boot — native WS primary; socket.io optional fallback. */
 export async function startEventDrivenPipeline(): Promise<void> {
   initializeEventHandlers();
+  // Hydrate the realtime validator with recent round ids so a restart
+  // doesn't count history as missed rounds or replay duplicates.
+  try {
+    const sql = await getSql();
+    const rows = await sql<{ game_id: string }>`
+      SELECT game_id FROM crash_rounds ORDER BY crashed_at DESC LIMIT 100
+    `;
+    if (rows.length > 0) getRealtimePipeline().hydrate(rows.map((r) => r.game_id));
+  } catch (e) {
+    logger.warn({ error: String(e) }, "realtime validator hydration failed");
+  }
+  // Periodic latency-budget snapshot so the budget is visible in logs.
+  const snapshotTimer = setInterval(logRealtimeSnapshot, 5 * 60_000);
+  snapshotTimer.unref?.();
+
   const useNative = process.env.USE_NATIVE_BC_WS !== "0";
   if (useNative) {
     try {
