@@ -156,6 +156,7 @@ export class EntryDecisionService {
     return this.acie;
   }
 
+  /** @deprecated Use getPredictionForTarget — lastEmitted is telemetry only. */
   getLastEmittedProbability(): number | null {
     return this.lastEmittedProbability;
   }
@@ -205,7 +206,7 @@ export class EntryDecisionService {
         const regimeKey = rec?.regime ?? 'global';
         globalCalibrationState.observe(pFeedback, actual, regimeKey);
         feedbackPredictionPipeline(pFeedback, actual);
-        recordOutcome(pFeedback, actual);
+        recordOutcome(pFeedback, actual, { regime: rec?.regime, modelVersion: rec?.modelVersion });
         const div = globalLiveDivergence.observe(pFeedback, actual);
         if (div.actions.fullSheathHaltEntries) {
           this.logger.warn(

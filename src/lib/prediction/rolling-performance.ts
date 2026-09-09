@@ -5,7 +5,7 @@
 
 export type LearningMode = "NORMAL" | "MONITOR" | "DEGRADED" | "LEARNING_RESTRICTED" | "FROZEN";
 
-type Sample = { hit: 0 | 1; p: number; at: number };
+type Sample = { hit: 0 | 1; p: number; at: number; regime?: string; modelVersion?: string };
 
 const samples: Sample[] = [];
 const MAX_SAMPLES = 300;
@@ -13,10 +13,18 @@ const MAX_SAMPLES = 300;
 let learningMode: LearningMode = "NORMAL";
 let frozenUntil = 0;
 
-export function recordOutcome(p: number, hit: 0 | 1): void {
-  samples.push({ hit, p, at: Date.now() });
+export function recordOutcome(p: number, hit: 0 | 1, meta?: { regime?: string; modelVersion?: string }): void {
+  samples.push({ hit, p, at: Date.now(), regime: meta?.regime, modelVersion: meta?.modelVersion });
   if (samples.length > MAX_SAMPLES) samples.shift();
   recomputeMode();
+}
+
+export function recordOutcomeSegmented(
+  p: number,
+  hit: 0 | 1,
+  meta: { regime?: string; modelVersion?: string; featurePath?: string },
+): void {
+  recordOutcome(p, hit, meta);
 }
 
 function windowStats(n: number): {
@@ -91,12 +99,36 @@ export function allowAcieLearning(): boolean {
 }
 
 export function rollingSnapshot(): Record<string, unknown> {
+  const byRegime: Record<string, ReturnType<typeof windowStats>> = {};
+  for (const s of samples.slice(-100)) {
+    const k = s.regime ?? 'unknown';
+    // aggregate lazily in snapshot
+    void k;
+  }
+  const regimes = new Map<string, Sample[]>();
+  for (const s of samples.slice(-100)) {
+    const k = s.regime ?? 'global';
+    const arr = regimes.get(k) ?? [];
+    arr.push(s);
+    regimes.set(k, arr);
+  }
+  const regimeStats: Record<string, { n: number; winRate: number; avgP: number }> = {};
+  for (const [k, arr] of regimes) {
+    const hits = arr.reduce((a, s) => a + s.hit, 0);
+    const sumP = arr.reduce((a, s) => a + s.p, 0);
+    regimeStats[k] = {
+      n: arr.length,
+      winRate: arr.length ? hits / arr.length : 0,
+      avgP: arr.length ? sumP / arr.length : 0,
+    };
+  }
   return {
     mode: getLearningMode(),
     w25: windowStats(25),
     w50: windowStats(50),
     w100: windowStats(100),
     w250: windowStats(250),
+    byRegime: regimeStats,
     frozenUntil: frozenUntil || null,
   };
 }

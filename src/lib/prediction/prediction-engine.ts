@@ -40,22 +40,37 @@ export class PredictionEngine {
     // the state is correctly maintained. Falls back to V1 (O(n) scan) on cold
     // start or if the incremental snapshot is insufficient.
     let features: FeatureVector;
+    let featurePath: 'V2_INCREMENTAL' | 'V1_FALLBACK' = 'V1_FALLBACK';
+    const blockV1Live = process.env.BLOCK_V1_LIVE_FEATURES === '1';
     if (globalIncrementalState.isWarm(20)) {
       try {
         features = this.featureEngineV2.snapshotFromState(
           req.targetRoundId,
           req.timestamp,
         );
+        featurePath = 'V2_INCREMENTAL';
       } catch (err) {
         this.logger.warn(
           { component: 'PredictionEngine', error: String(err) },
           'Incremental state feature computation failed — falling back to V1',
         );
+        if (blockV1Live) {
+          throw new Error('V2 features unavailable and BLOCK_V1_LIVE_FEATURES=1');
+        }
         features = this.featureEngine.buildVector(req.priorRounds, req.targetRoundId, req.timestamp);
+        featurePath = 'V1_FALLBACK';
       }
     } else {
-      // Cold start: use V1 full-history scan
+      // Cold start: use V1 full-history scan (explicitly labeled — never silent)
+      if (blockV1Live) {
+        throw new Error('Incremental state cold and BLOCK_V1_LIVE_FEATURES=1');
+      }
       features = this.featureEngine.buildVector(req.priorRounds, req.targetRoundId, req.timestamp);
+      featurePath = 'V1_FALLBACK';
+      this.logger.info(
+        { component: 'PredictionEngine', targetRoundId: req.targetRoundId },
+        'featurePath=V1_FALLBACK (cold incremental state)',
+      );
     }
 
     const regime = this.regimeDetector.detect(req.priorRounds, req.timestamp);
@@ -64,10 +79,17 @@ export class PredictionEngine {
       : this.registry.getDefault();
     const output = model.predict(features, target, regime);
     const signal = toSignal(output);
+    (signal as unknown as Record<string, unknown>).featurePath = featurePath;
+    (signal as unknown as Record<string, unknown>).featureVersion =
+      featurePath === 'V2_INCREMENTAL'
+        ? (signal.featureVersion ?? 'v2-incremental')
+        : (signal.featureVersion ?? 'v1-fallback');
+
     if (Math.random() < Number(process.env.PRED_LOG_SAMPLE_RATE ?? 0.05)) {
-      logger.info({
+      this.logger.info({
         component: 'PredictionEngine', predictionId: signal.predictionId, target: signal.target,
-        probability: signal.probability, confidence: signal.confidence, model: signal.modelVersion, regime: regime.name,
+        probability: signal.probability, confidence: signal.confidence, model: signal.modelVersion,
+        regime: regime.name, featurePath,
       }, 'Prediction generated');
     }
     return signal;

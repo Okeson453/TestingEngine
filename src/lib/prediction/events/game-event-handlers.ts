@@ -20,6 +20,7 @@ import {
   markLiveRoundEnded,
 } from "@/lib/prediction/live/live-round-state";
 import { appendCompletedRound } from "@/lib/prediction/live/live-history-buffer";
+import { bindTargetStarted } from "@/lib/prediction/prediction-record-store";
 import {
   claimTarget,
   completeTarget,
