@@ -155,11 +155,15 @@ export async function onGameEnd(
   // Fire N+1 prediction IMMEDIATELY — do not wait for validation TX.
   // Under live WS, validation of N and predict N+1 must race in parallel or
   // residual window collapses (logs: "too late" / "tight residual").
+  let didEarlyIncrementalUpdate = false;
   if (!evt.skipPredict) {
-    try {
-      globalIncrementalState.update(evt.multiplier);
-    } catch {
-      /* soft */
+    if (!evt.skipStateUpdate) {
+      try {
+        globalIncrementalState.update(evt.multiplier);
+        didEarlyIncrementalUpdate = true;
+      } catch {
+        /* soft */
+      }
     }
     scheduleNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
   }
@@ -399,11 +403,15 @@ export async function onGameEnd(
   // Bug: poll path uses skipPredict=true; the old branch only updated when
   // pending!=null OR !skipPredict — so under WAF (poll-only) the model froze
   // at boot seed → identical probability/confidence every round.
+  // After 902115a the live path updates at entry; do not apply the same
+  // multiplier a second time here (EWMA/Welford would double-count N).
   if (!evt.skipStateUpdate) {
-    try {
-      globalIncrementalState.update(evt.multiplier);
-    } catch {
-      /* soft */
+    if (!didEarlyIncrementalUpdate) {
+      try {
+        globalIncrementalState.update(evt.multiplier);
+      } catch {
+        /* soft */
+      }
     }
     try {
       const eng = (
