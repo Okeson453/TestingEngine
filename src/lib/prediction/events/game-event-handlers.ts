@@ -7,6 +7,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { bcGameSocket } from "@/lib/crash/socket-client";
+import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
 import { getSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
@@ -211,18 +212,68 @@ async function edHandler(payload: unknown): Promise<void> {
 export function initializeEventHandlers(): void {
   bcGameSocket.on("bg", bgHandler);
   bcGameSocket.on("ed", edHandler);
+
+  // Native binary WS (tested workspace client) → same handlers
+  nativeBcGameSocket.onEvent((ev) => {
+    if (ev.event === "bg" || ev.event === "pr") {
+      void bgHandler({
+        gameId: ev.gameId,
+        beginTime: ev.beginTime ?? Date.now(),
+        beganAt: ev.beginTime ?? Date.now(),
+      });
+      return;
+    }
+    if (ev.event === "ed" || ev.event === "st") {
+      // BC protobuf maxRate is hundredths (162 → 1.62x); tolerate already-scaled values.
+      let mult = ev.multiplier;
+      if (typeof mult === "number" && Number.isFinite(mult) && mult > 50) mult = mult / 100;
+      void edHandler({
+        gameId: ev.gameId,
+        multiplier: mult,
+        endTime: ev.endTime ?? ev.receivedAt,
+        crashedAt: ev.endTime ?? ev.receivedAt,
+        hash: ev.hash,
+      });
+    }
+  });
+  nativeBcGameSocket.onStatus((status, detail) => {
+    logger.info(
+      { component: "game-event-handlers", nativeStatus: status, detail },
+      "native BC socket status",
+    );
+  });
+
   logger.info({ component: "game-event-handlers" }, "event handlers wired");
 }
 
-/** Called by worker boot — wires handlers and opens the BC.Game crash socket. */
+/** Called by worker boot — native WS primary; socket.io optional fallback. */
 export async function startEventDrivenPipeline(): Promise<void> {
   initializeEventHandlers();
-  await bcGameSocket.connect();
+  const useNative = process.env.USE_NATIVE_BC_WS !== "0";
+  if (useNative) {
+    try {
+      await nativeBcGameSocket.start();
+      logger.info({ component: "game-event-handlers" }, "native BC websocket started");
+    } catch (e) {
+      logger.warn(
+        { error: String(e) },
+        "native BC websocket failed — falling back to socket.io client",
+      );
+      await bcGameSocket.connect();
+    }
+  } else {
+    await bcGameSocket.connect();
+  }
 }
 
 export async function stopEventDrivenPipeline(): Promise<void> {
   inFlightEd.clear();
   inFlightBg.clear();
+  try {
+    await nativeBcGameSocket.stop();
+  } catch {
+    /* soft */
+  }
   bcGameSocket.disconnect();
 }
 

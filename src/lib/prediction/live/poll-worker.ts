@@ -49,7 +49,7 @@ const logger = getLogger("poll-worker");
  *  Lowered 1500→500 so recovery can catch a missed ED within ~1 inter-round
  *  gap. README previously documented PREDICTION_POLL_MS — that name is unused. */
 export const POLL_INTERVAL_MS = Number(
-  process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 300,
+  process.env.POLL_WORKER_MS ?? process.env.PREDICTION_POLL_MS ?? 500,
 );
 export const STALE_PREDICTED_MS = Number(process.env.STUCK_STALE_MS ?? 5 * 60 * 1_000);
 
