@@ -68,6 +68,18 @@ jobs:
           done
           exit "$failed"
 
+      - name: Guard timing-safe ingest token + live test fail-closed
+        run: |
+          set -euo pipefail
+          if ! grep -q 'timingSafeEqual' src/lib/prediction/live/edge-ingest.ts; then
+            echo "::error::edge-ingest.ts must compare EDGE_INGEST_TOKEN with timingSafeEqual"
+            exit 1
+          fi
+          if grep -q 'LIVE TEST FAILURE' package.json; then
+            echo "::error::package.json must not swallow live suite failures"
+            exit 1
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
