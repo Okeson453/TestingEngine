@@ -107,6 +107,8 @@ export class FeatureEngineV2 {
     // Empirical ≥1.3x rates from incremental state (true crash base-rate ≈ 1/1.3 ≈ 0.77).
     const short13 = e.shortHitRate13();
     const ewma13 = s.ewmaHit13;
+    // Real hit rates for all targets, including 10x (no more approximations).
+    const hit10 = e.hitRate(10.0);
     // BaselineModel still reads fv-1 keys (hit_1_30_50 etc.). Without these
     // aliases every live signal collapsed to the hard-coded default 0.30 /
     // ~0.596 confidence — identical on every row in Live Validation.
@@ -130,13 +132,17 @@ export class FeatureEngineV2 {
       hit_2_00_100: e.hitRate(2.0),
       hit_5_00_50: e.hitRate(5.0),
       hit_5_00_100: e.hitRate(5.0),
-      hit_10_00_50: Math.max(0, e.hitRate(5.0) * 0.4),
-      hit_10_00_100: Math.max(0, e.hitRate(5.0) * 0.4),
-      // rounds-since not tracked in incremental engine yet
-      since_1_30: 0,
-      since_2_00: 0,
-      since_5_00: 0,
-      since_10_00: 0,
+      hit_10_00_50: hit10,
+      hit_10_00_100: hit10,
+      // Rounds-since-last-hit — now tracked incrementally (was hard-coded 0).
+      since_1_30: s.since.t13,
+      since_2_00: s.since.t20,
+      since_5_00: s.since.t50,
+      since_10_00: s.since.t100,
+      // Consecutive-below streaks — now mapped from runs (were missing entirely).
+      consec_below_1_30: s.runs.below13,
+      consec_below_2_00: s.runs.below20,
+      consec_above_2_00: s.runs.above20,
       roll_std_50: Math.sqrt(e.shortVariance() || variance || 0),
     };
   }

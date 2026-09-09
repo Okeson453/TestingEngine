@@ -2,7 +2,7 @@
  * Prediction stack snapshot v2 — crash points, ACIE online, ensemble flags.
  */
 
-import { globalIncrementalState } from './incremental-state-engine.ts';
+import { globalIncrementalState, LAG_CAP } from './incremental-state-engine.ts';
 import { globalCalibrationState } from '../calibration/calibration-state.ts';
 import { getLogger } from '../../observability/logger.ts';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
@@ -42,7 +42,7 @@ export type AcieLike = {
 };
 
 export function snapshotPredictionStack(
-  maxPoints = 2000,
+  maxPoints = LAG_CAP,
   acie?: AcieLike | null
 ): PredictionStackSnapshot {
   const points =
@@ -90,7 +90,7 @@ export async function saveSnapshotToRedis(
   redis: RedisLike,
   acie?: AcieLike | null
 ): Promise<void> {
-  const snap = snapshotPredictionStack(2000, acie);
+  const snap = snapshotPredictionStack(LAG_CAP, acie);
   await redis.set(SNAPSHOT_KEY, JSON.stringify(snap));
   logger.info(
     { component: 'StatePersistence', points: snap.crashPoints.length },
@@ -125,7 +125,7 @@ export async function saveSnapshotToFile(
     filePath ??
     path.join(process.env.PREDICTION_SNAPSHOT_DIR ?? '/tmp/crash-snapshots', 'prediction-stack-v2.json');
   await mkdir(path.dirname(dest), { recursive: true });
-  const snap = snapshotPredictionStack(2000, acie);
+  const snap = snapshotPredictionStack(LAG_CAP, acie);
   await writeFile(dest, JSON.stringify(snap), 'utf8');
   return dest;
 }

@@ -14,8 +14,10 @@ export function computeRunFeatures(engine: IncrementalStateEngine): Record<strin
     run_below_13: s.below13,
     run_above_13: s.above13,
     run_below_15: s.below15,
+    run_below_20: s.below20,
     run_above_20: s.above20,
     run_max_below_13: s.maxBelow13,
     run_max_above_13: s.maxAbove13,
+    run_max_below_20: s.maxBelow20,
   };
 }

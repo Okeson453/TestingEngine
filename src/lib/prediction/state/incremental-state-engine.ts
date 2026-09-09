@@ -11,16 +11,49 @@ export interface HitCounters {
   t13: number;
   t20: number;
   t50: number;
+  t100: number;
 }
 
 export interface RunState {
   below13: number;
   above13: number;
   below15: number;
+  below20: number;
   above20: number;
   maxBelow13: number;
   maxAbove13: number;
+  maxBelow20: number;
 }
+
+/**
+ * Rounds-since-last-hit counters for each target threshold.
+ * Incremented every round; reset to 0 when the target is hit.
+ */
+export interface SinceCounters {
+  t13: number;
+  t20: number;
+  t50: number;
+  t100: number;
+}
+
+/**
+ * Explicit engine lifecycle state — replaces implicit sample-count
+ * inference scattered across the pipeline.
+ *
+ * COLD       — no observations yet (count === 0)
+ * WARMING    — partial state, V1 fallback still in use (1..19)
+ * WARM       — V2 incremental path active, building confidence (20..99)
+ * PRODUCTION — fully warmed, all features real (≥100)
+ * DEGRADED   — stale state (no update in >5 min while count > 0)
+ */
+export type EngineLifecycleState =
+  | 'COLD'
+  | 'WARMING'
+  | 'WARM'
+  | 'PRODUCTION'
+  | 'DEGRADED';
+
+const DEGRADED_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 export interface MarkovState {
   /** 2x2 on (prev>=1.3, curr>=1.3): [fromBelow][toAbove] counts */
@@ -42,6 +75,7 @@ export interface IncrementalEngineSnapshot {
   ewmaHit13: number;
   hits: HitCounters;
   runs: RunState;
+  since: SinceCounters;
   markov: MarkovState;
   lagRing: number[];
   lagRingSize: number;
@@ -53,7 +87,7 @@ export interface IncrementalEngineSnapshot {
   featureVersion: string;
 }
 
-const LAG_CAP = 64;
+export const LAG_CAP = 512;
 const SHORT_CAP = 30;
 const EWMA_ALPHA = 0.05;
 
@@ -66,10 +100,16 @@ function emptyRuns(): RunState {
     below13: 0,
     above13: 0,
     below15: 0,
+    below20: 0,
     above20: 0,
     maxBelow13: 0,
     maxAbove13: 0,
+    maxBelow20: 0,
   };
+}
+
+function emptySince(): SinceCounters {
+  return { t13: 0, t20: 0, t50: 0, t100: 0 };
 }
 
 function emptyMarkov(): MarkovState {
@@ -89,8 +129,9 @@ export class IncrementalStateEngine {
   private welford: WelfordState = emptyWelford();
   private ewma = 1.3;
   private ewmaHit13 = 0.65;
-  private hits: HitCounters = { t13: 0, t20: 0, t50: 0 };
+  private hits: HitCounters = { t13: 0, t20: 0, t50: 0, t100: 0 };
   private runs: RunState = emptyRuns();
+  private since: SinceCounters = emptySince();
   private markov: MarkovState = emptyMarkov();
   private lagRing: number[] = new Array(LAG_CAP).fill(0);
   private lagLen = 0;
@@ -117,8 +158,9 @@ export class IncrementalStateEngine {
     this.welford = emptyWelford();
     this.ewma = 1.3;
     this.ewmaHit13 = 0.65;
-    this.hits = { t13: 0, t20: 0, t50: 0 };
+    this.hits = { t13: 0, t20: 0, t50: 0, t100: 0 };
     this.runs = emptyRuns();
+    this.since = emptySince();
     this.markov = emptyMarkov();
     this.lagRing.fill(0);
     this.lagLen = 0;
@@ -141,6 +183,7 @@ export class IncrementalStateEngine {
     const above13 = crashPoint >= 1.3;
     const above20 = crashPoint >= 2.0;
     const above50 = crashPoint >= 5.0;
+    const above100 = crashPoint >= 10.0;
 
     // Welford
     const w = this.welford;
@@ -158,6 +201,17 @@ export class IncrementalStateEngine {
     if (above13) this.hits.t13 += 1;
     if (above20) this.hits.t20 += 1;
     if (above50) this.hits.t50 += 1;
+    if (above100) this.hits.t100 += 1;
+
+    // Rounds-since-last-hit: increment all, then reset the ones that hit
+    this.since.t13 += 1;
+    this.since.t20 += 1;
+    this.since.t50 += 1;
+    this.since.t100 += 1;
+    if (above13) this.since.t13 = 0;
+    if (above20) this.since.t20 = 0;
+    if (above50) this.since.t50 = 0;
+    if (above100) this.since.t100 = 0;
 
     // Runs
     const r = this.runs;
@@ -172,8 +226,14 @@ export class IncrementalStateEngine {
     }
     if (crashPoint < 1.5) r.below15 += 1;
     else r.below15 = 0;
-    if (above20) r.above20 += 1;
-    else r.above20 = 0;
+    if (above20) {
+      r.above20 += 1;
+      r.below20 = 0;
+    } else {
+      r.below20 += 1;
+      r.above20 = 0;
+      if (r.below20 > r.maxBelow20) r.maxBelow20 = r.below20;
+    }
 
     // Markov 2-state
     if (this.markov.lastAbove13 !== null) {
@@ -218,6 +278,7 @@ export class IncrementalStateEngine {
       ewmaHit13: this.ewmaHit13,
       hits: { ...this.hits },
       runs: { ...this.runs },
+      since: { ...this.since },
       markov: {
         trans: [
           [this.markov.trans[0][0], this.markov.trans[0][1]],
@@ -255,11 +316,20 @@ export class IncrementalStateEngine {
     return Math.sqrt(this.variance());
   }
 
-  hitRate(target: PredictionTarget): number {
+  hitRate(target: number): number {
     if (this.count === 0) return 0;
-    if (target === 1.3) return this.hits.t13 / this.count;
-    if (target === 2.0) return this.hits.t20 / this.count;
-    return this.hits.t50 / this.count;
+    if (target <= 1.3) return this.hits.t13 / this.count;
+    if (target <= 2.0) return this.hits.t20 / this.count;
+    if (target <= 5.0) return this.hits.t50 / this.count;
+    return this.hits.t100 / this.count;
+  }
+
+  /** Rounds since the last crash point ≥ target. Returns count if never hit. */
+  roundsSince(target: number): number {
+    if (target <= 1.3) return this.since.t13;
+    if (target <= 2.0) return this.since.t20;
+    if (target <= 5.0) return this.since.t50;
+    return this.since.t100;
   }
 
   shortHitRate13(): number {
@@ -288,15 +358,28 @@ export class IncrementalStateEngine {
   isWarm(minCount = 50): boolean {
     return this.count >= minCount;
   }
-  /** Recent crash points for snapshot persistence (oldest→newest, capped) */
-  getRecentPoints(max = 2000): number[] {
-    const n = Math.min(max, this.lagLen, this.lagRing.length);
+
+  /**
+   * Explicit lifecycle state based on observation count and staleness.
+   * Replaces ad-hoc `Math.min(1, snap.count / 100)` inference scattered
+   * across the pipeline with a single authoritative state.
+   */
+  getLifecycleState(): EngineLifecycleState {
+    if (this.count === 0) return 'COLD';
+    const stale = Date.now() - this.updatedAt > DEGRADED_TIMEOUT_MS;
+    if (stale) return 'DEGRADED';
+    if (this.count < 20) return 'WARMING';
+    if (this.count < 100) return 'WARM';
+    return 'PRODUCTION';
+  }
+  /** Recent crash points for snapshot persistence (oldest→newest, capped at LAG_CAP). */
+  getRecentPoints(max = LAG_CAP): number[] {
+    const n = Math.min(max, this.lagLen);
     if (n <= 0) return [];
-    const out: number[] = [];
-    // lagRing is circular: lagPos points to next write
+    const out: number[] = new Array(n);
     const start = (this.lagPos - this.lagLen + this.lagRing.length) % this.lagRing.length;
-    for (let i = 0; i < this.lagLen && out.length < max; i++) {
-      out.push(this.lagRing[(start + i) % this.lagRing.length]);
+    for (let i = 0; i < n; i++) {
+      out[i] = this.lagRing[(start + i) % this.lagRing.length];
     }
     return out;
   }
