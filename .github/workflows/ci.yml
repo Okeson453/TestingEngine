@@ -43,6 +43,25 @@ jobs:
           fi
           echo "Worker implementations look real."
 
+      - name: Guard live-path files against PLACEHOLDER stubs
+        run: |
+          set -euo pipefail
+          for f in src/lib/db.ts src/lib/crash/socket-client.ts src/lib/prediction/events/game-event-handlers.ts src/lib/prediction/live/edge-ingest.ts; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f missing"
+              exit 1
+            fi
+            if grep -qE 'PLACEHOLDER_WILL_BE_REPLACED|SEE_ARTIFACTS|use full file from' "$f"; then
+              echo "::error::$f contains stub marker text"
+              exit 1
+            fi
+          done
+          grep -q 'createNeonSql' src/lib/db.ts
+          grep -q 'startEventDrivenPipeline\|bcGameSocket\|io(' src/lib/crash/socket-client.ts || grep -q 'socket.io' src/lib/crash/socket-client.ts
+          grep -q 'onGameStart\|onGameEnd' src/lib/prediction/events/game-event-handlers.ts
+          grep -q 'timingSafeEqual' src/lib/prediction/live/edge-ingest.ts
+          echo "Live-path files look real."
+
       - name: Guard against committed EDGE_INGEST_TOKEN in userscripts
         run: |
           set -euo pipefail

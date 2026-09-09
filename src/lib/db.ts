@@ -79,7 +79,8 @@ async function createNeonSql(): Promise<Sql> {
   const poolMax = readPoolMax();
   const poolMin = readPoolMin();
   const idleTimeoutMillis = Number(process.env.PG_IDLE_TIMEOUT_MS ?? 15_000) || 15_000;
-  const connectionTimeoutMillis = Number(process.env.PG_CONN_TIMEOUT_MS ?? 30_000) || 30_000;
+  const connectionTimeoutMillis =
+    Number(process.env.PG_POOL_CONN_TIMEOUT_MS ?? process.env.PG_CONN_TIMEOUT_MS ?? 30_000) || 30_000;
 
   console.log(
     `[db] Pool configured max=${poolMax} min=${poolMin} idleMs=${idleTimeoutMillis} connTimeoutMs=${connectionTimeoutMillis}`,
@@ -91,7 +92,15 @@ async function createNeonSql(): Promise<Sql> {
     min: poolMin,
     idleTimeoutMillis,
     connectionTimeoutMillis,
-    ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
+    ssl:
+      process.env.PG_SSL === "0"
+        ? false
+        : {
+            rejectUnauthorized:
+              process.env.PG_SSL_REJECT_UNAUTHORIZED === "1" ||
+              process.env.PG_SSL_REJECT_UNAUTHORIZED === "true",
+          },
+    family: process.env.PG_FAMILY === "0" ? undefined : Number(process.env.PG_FAMILY ?? 4) || 4,
   });
   globalRef.__pgPool__ = pool;
 
