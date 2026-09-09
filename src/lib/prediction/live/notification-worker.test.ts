@@ -147,6 +147,33 @@ test("outbox: 2xx transitions pending -> DELIVERED with delivered_at set", async
   }
 });
 
+test("outbox: partial Telegram fan-out delivers once without retrying healthy chats", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test";
+  process.env.TELEGRAM_CHAT_ID = "bad-chat";
+  process.env.TELEGRAM_GROUP_CHAT_ID = "good-chat";
+  await cleanSuiteRows();
+  try {
+    const { id } = await insertPendingRow();
+    const d = new OutboxDispatcher();
+    const result = await withStubbedFetch(
+      async (_url, body) => {
+        const payload = JSON.parse(body ?? "{}") as { chat_id?: string };
+        return payload.chat_id === "good-chat"
+          ? okTelegram()
+          : failTelegram(400, "Bad Request: chat not found");
+      },
+      () => d.tickOnce(),
+    );
+    assert.deepEqual(result, { recovered: 0, delivered: 1, dead: 0, requeued: 0 });
+    const s = await rowState(id);
+    assert.equal(s.status, "delivered");
+    assert.equal(s.attempt_count, 1);
+    assert.ok(s.delivered_at != null);
+  } finally {
+    clearTelegramEnv();
+  }
+});
+
 test("outbox: 4xx (non-429) transitions to DEAD immediately, no retry", async () => {
   setTelegramEnv();
   await cleanSuiteRows();

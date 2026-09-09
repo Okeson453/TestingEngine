@@ -44,9 +44,10 @@ Alert when socket_status != connected. Feed BCGAME_SOCKET_P / BCGAME_SOCKET_T vi
 If the dashboard shows no more connections allowed (max_client_conn):
 
 1. Use Neon pooled connection string (-pooler host), not the direct one.
-2. Set low pools:
-   PG_POOL_MAX=3
+2. Size the single worker pool for concurrent validation/prediction/outbox work:
+   PG_POOL_MAX=8
    PG_POOL_MIN=1
+   Use 3 only when the database plan has a hard connection cap; it will saturate under normal live traffic.
    PG_POOL_IDLE_MS=15000
    AUTH_PG_POOL_MAX=1
 3. Run one worker replica only (each replica opens its own pool).

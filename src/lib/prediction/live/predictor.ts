@@ -994,6 +994,16 @@ export async function onGameEndPredict(
   } catch { /* metrics optional */ }
   const predictionId = signal.predictionId;
 
+  // Compute once in function scope. This value is used both inside the
+  // transaction (outbox metadata) and after commit (live_event_log).
+  // Previously it was declared inside the transaction callback, causing
+  // ReferenceError: slaViolated is not defined after every generated signal.
+  const effectiveSlaLagMs = recoveryMode ? SLA_LAG_MS * 2 : SLA_LAG_MS;
+  const receivedMs = new Date(crashedAt).getTime();
+  const slaLagMsActual = Date.now() - receivedMs;
+  const slaViolated =
+    Number.isFinite(slaLagMsActual) && slaLagMsActual > effectiveSlaLagMs;
+
   // Selectivity gate: only persist/notify when there is edge vs fair odds.
   // Fair P for cash-out target T is ~1/T (Crash). Always emitting 1.3x signals
   // produces ~75–85% WIN rate that is not skill — just the base rate.
@@ -1090,11 +1100,6 @@ export async function onGameEndPredict(
       // always true on poll recovery and often true on slightly delayed ED,
       // so predictions were persisted (WIN/LOSS still fire) but signal messages
       // never entered the outbox.
-      const effectiveSlaLagMs = recoveryMode ? SLA_LAG_MS * 2 : SLA_LAG_MS;
-      const receivedMs = new Date(crashedAt).getTime();
-      const slaLagMsActual = Date.now() - receivedMs;
-      const slaViolated = Number.isFinite(slaLagMsActual) && slaLagMsActual > effectiveSlaLagMs;
-
       {
         const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
         const lateTag = slaViolated ? " (delayed)" : "";

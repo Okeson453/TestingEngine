@@ -269,7 +269,25 @@ export class OutboxDispatcher {
             });
             const allOk =
               sendResults.length > 0 && sendResults.every((r) => r.ok);
-            if (allOk) {
+            const anyOk = sendResults.some((r) => r.ok);
+            // Fan-out is independently addressed. If at least one destination
+            // accepted the message, mark the row delivered instead of retrying
+            // and duplicating it to healthy chats because another chat id is stale.
+            if (allOk || anyOk) {
+              if (!allOk) {
+                const failures = sendResults
+                  .filter((r) => !r.ok)
+                  .map((r) => ({ chatId: r.chatId, status: r.status, error: r.error ?? "send_failed" }));
+                logger.warn(
+                  {
+                    component: "outbox-dispatcher",
+                    notificationId: row.notification_id,
+                    failures,
+                    deliveredChats: sendResults.filter((r) => r.ok).map((r) => r.chatId),
+                  },
+                  "partial Telegram fan-out — delivered to healthy chats",
+                );
+              }
               const t0 = this.now();
               const acceptedAt = new Date(t0).toISOString();
               await sql`
@@ -507,7 +525,7 @@ export class OutboxDispatcher {
       `;
       this.stats.dead += 1;
       // Rich diagnostics for operators (Diagnosis P0-6)
-      let telegramChatId: string | null = null;
+      let telegramChatId: string | null = firstFailure?.chatId ?? null;
       let predictionId: string | null = null;
       let targetGameId: string | null = null;
       try {
@@ -526,6 +544,7 @@ export class OutboxDispatcher {
               ? (contentRaw as Record<string, unknown>)
               : {};
         telegramChatId =
+          telegramChatId ??
           (meta.chatId as string) ??
           (meta.chat_id as string) ??
           (content.chatId as string) ??

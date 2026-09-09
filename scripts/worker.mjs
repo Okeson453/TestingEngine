@@ -22,9 +22,11 @@ if (!process.env.DATABASE_URL) {
   process.exit(0);
 }
 
-// Prefer a small pool on the worker process unless operator overrides.
+// The live pipeline runs validation, prediction, feedback, outbox and polling
+// concurrently. A pool of 3 repeatedly saturates under normal round traffic.
+// Match src/lib/db.ts's measured default; an explicit operator value still wins.
 if (!process.env.PG_POOL_MAX) {
-  process.env.PG_POOL_MAX = "3";
+  process.env.PG_POOL_MAX = "8";
 }
 if (!process.env.PG_POOL_MIN) {
   process.env.PG_POOL_MIN = "1";
