@@ -332,6 +332,33 @@ export class IncrementalStateEngine {
     return this.since.t100;
   }
 
+  /**
+   * Empirical hit rate over the last `window` rounds from the lag ring.
+   * Semantics are exact: window=50 means the most recent min(50, lagLen) points.
+   * Does NOT use the SHORT_CAP=30 ring (that remains short_hit_13 only).
+   */
+  windowHitRate(window: number, target = 1.3): number {
+    const n = Math.min(Math.max(0, Math.floor(window)), this.lagLen);
+    if (n <= 0) return 0;
+    let hits = 0;
+    // Newest is at lagPos-1; walk backward n steps
+    for (let i = 1; i <= n; i++) {
+      const idx = (this.lagPos - i + this.lagRing.length) % this.lagRing.length;
+      if (this.lagRing[idx] >= target) hits += 1;
+    }
+    return hits / n;
+  }
+
+  /** Convenience: exact 20/50/100/200 windows for ≥1.3x */
+  hitRateWindows13(): { w20: number; w50: number; w100: number; w200: number } {
+    return {
+      w20: this.windowHitRate(20, 1.3),
+      w50: this.windowHitRate(50, 1.3),
+      w100: this.windowHitRate(100, 1.3),
+      w200: this.windowHitRate(200, 1.3),
+    };
+  }
+
   shortHitRate13(): number {
     return this.shortLen > 0 ? this.shortHits13 / this.shortLen : 0;
   }
