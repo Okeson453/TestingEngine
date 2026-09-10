@@ -1,6 +1,11 @@
 /**
  * Database client — Neon Postgres (production) / PGLite (local).
- * Restored Neon/PGLite database client.
+ *
+ * Dual pool isolation (P0):
+ *   - criticalPool: prediction persist + outbox dispatch (reserved capacity)
+ *   - generalPool:  dashboard, analytics, feedback, background
+ * Shared Neon connection budget is split; critical path never waits behind
+ * dashboard fan-out.
  */
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -31,10 +36,13 @@ export interface Sql {
 
 const globalRef = globalThis as typeof globalThis & {
   __pgSqlPromise__?: Promise<Sql>;
+  __pgCriticalSqlPromise__?: Promise<Sql>;
   __pgPool__?: import("pg").Pool;
+  __pgCriticalPool__?: import("pg").Pool;
   __pgliteInstance__?: Promise<import("@electric-sql/pglite").PGlite>;
   __pgPoolEnding__?: Promise<void>;
   __poolExhaustionAlerted__?: boolean;
+  __lastPoolAcquireMs__?: number;
 };
 
 const OID_INT8 = 20;
@@ -61,133 +69,20 @@ function toSql(run: Run): Sql {
   return sql;
 }
 
-function readPoolMax(): number {
+function readTotalMax(): number {
   const raw = Number(process.env.PG_POOL_MAX ?? 8);
-  return Math.max(1, Math.min(Number.isFinite(raw) ? raw : 8, 12));
+  return Math.max(2, Math.min(Number.isFinite(raw) ? raw : 8, 12));
 }
 
-function readPoolMin(): number {
-  const raw = Number(process.env.PG_POOL_MIN ?? 1);
-  return Math.max(0, Math.min(Number.isFinite(raw) ? raw : 1, readPoolMax()));
+function readCriticalMax(): number {
+  const total = readTotalMax();
+  const raw = Number(process.env.PG_CRITICAL_POOL_MAX ?? 3);
+  const crit = Math.max(1, Math.min(Number.isFinite(raw) ? raw : 3, total - 1));
+  return crit;
 }
 
-async function createNeonSql(): Promise<Sql> {
-  const { Pool, types } = await import("pg");
-  types.setTypeParser(OID_INT8, identity);
-  types.setTypeParser(OID_DATE, identity);
-
-  const poolMax = readPoolMax();
-  const poolMin = readPoolMin();
-  const idleTimeoutMillis = Number(process.env.PG_IDLE_TIMEOUT_MS ?? 15_000) || 15_000;
-  const connectionTimeoutMillis = Number(process.env.PG_CONN_TIMEOUT_MS ?? 30_000) || 30_000;
-
-  console.log(
-    `[db] Pool configured max=${poolMax} min=${poolMin} idleMs=${idleTimeoutMillis} connTimeoutMs=${connectionTimeoutMillis}`,
-  );
-
-  const pool = new Pool({
-    connectionString: databaseUrl,
-    max: poolMax,
-    min: poolMin,
-    idleTimeoutMillis,
-    connectionTimeoutMillis,
-    ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
-  });
-  globalRef.__pgPool__ = pool;
-
-  pool.on("error", (err) => {
-    console.error("[db] pool error:", err.message);
-  });
-
-  const monitor = setInterval(() => {
-    if (pool.totalCount >= poolMax && pool.idleCount === 0) {
-      if (!globalRef.__poolExhaustionAlerted__) {
-        globalRef.__poolExhaustionAlerted__ = true;
-        console.error(
-          `[db] POOL EXHAUSTION ALERT: utilization=1.00 total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${poolMax}`,
-        );
-      }
-    } else {
-      globalRef.__poolExhaustionAlerted__ = false;
-    }
-  }, 5_000);
-  monitor.unref?.();
-
-  const run: Run = async <T>(text: string, params: unknown[]) => {
-    const client = await pool.connect();
-    try {
-      const res = await client.query(text, params);
-      return res.rows as T[];
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("timeout exceeded when trying to connect") || msg.includes("remaining connection slots")) {
-        console.error(
-          `[db] POOL EXHAUSTION: ${msg} | pool total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
-        );
-      }
-      throw err;
-    } finally {
-      client.release();
-    }
-  };
-
-  return toSql(run);
-}
-
-async function createPgliteSql(): Promise<Sql> {
-  mkdirSync(pgliteDataPath, { recursive: true });
-  const { PGlite } = await import("@electric-sql/pglite");
-  const db = new PGlite(pgliteDataPath);
-  await db.waitReady;
-
-  const run: Run = async <T>(text: string, params: unknown[]) => {
-    const res = await db.query(text, params);
-    return (res.rows ?? []) as T[];
-  };
-  return toSql(run);
-}
-
-export async function getSql(): Promise<Sql> {
-  if (!globalRef.__pgSqlPromise__) {
-    globalRef.__pgSqlPromise__ = databaseUrl ? createNeonSql() : createPgliteSql();
-  }
-  return globalRef.__pgSqlPromise__;
-}
-
-export async function endPgPool(): Promise<void> {
-  if (globalRef.__pgPoolEnding__) return globalRef.__pgPoolEnding__;
-  globalRef.__pgPoolEnding__ = (async () => {
-    const pool = globalRef.__pgPool__;
-    globalRef.__pgPool__ = undefined;
-    globalRef.__pgSqlPromise__ = undefined;
-    if (pool) {
-      try {
-        await pool.end();
-      } catch {
-        /* soft */
-      }
-    }
-  })();
-  return globalRef.__pgPoolEnding__;
-}
-
-export function getPgPool(): import("pg").Pool | null {
-  return globalRef.__pgPool__ ?? null;
-}
-
-export async function withPinnedClient<T>(
-  fn: (client: import("pg").PoolClient) => Promise<T>,
-): Promise<T> {
-  const pool = getPgPool();
-  if (!pool) {
-    throw new Error("withPinnedClient requires Postgres pool (not PGLite)");
-  }
-  const client = await pool.connect();
-  try {
-    return await fn(client);
-  } finally {
-    client.release();
-  }
+function readGeneralMax(): number {
+  return Math.max(1, readTotalMax() - readCriticalMax());
 }
 
 export interface PoolStats {
@@ -195,6 +90,7 @@ export interface PoolStats {
   idleCount: number;
   waitingCount: number;
   max: number;
+  label: string;
 }
 
 export function getPoolStats(): PoolStats | null {
@@ -204,6 +100,246 @@ export function getPoolStats(): PoolStats | null {
     totalCount: pool.totalCount,
     idleCount: pool.idleCount,
     waitingCount: pool.waitingCount,
-    max: readPoolMax(),
+    max: readGeneralMax(),
+    label: "general",
   };
+}
+
+export function getCriticalPoolStats(): PoolStats | null {
+  const pool = globalRef.__pgCriticalPool__;
+  if (!pool) return null;
+  return {
+    totalCount: pool.totalCount,
+    idleCount: pool.idleCount,
+    waitingCount: pool.waitingCount,
+    max: readCriticalMax(),
+    label: "critical",
+  };
+}
+
+/** Last pool acquire latency (ms) observed by any run() — for PERSIST_PROFILE. */
+export function getLastPoolAcquireMs(): number | null {
+  return globalRef.__lastPoolAcquireMs__ ?? null;
+}
+
+function makeRun(
+  pool: import("pg").Pool,
+  label: string,
+): Run {
+  return async <T>(text: string, params: unknown[]) => {
+    const t0 = Date.now();
+    let client: import("pg").PoolClient;
+    try {
+      client = await pool.connect();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[db] ${label} POOL ACQUIRE FAILED: ${msg} | total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${pool.options.max}`,
+      );
+      throw err;
+    }
+    const acquireMs = Date.now() - t0;
+    globalRef.__lastPoolAcquireMs__ = acquireMs;
+    if (acquireMs > 100) {
+      console.warn(
+        `[db] ${label} pool_acquire_ms=${acquireMs} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
+      );
+    }
+    try {
+      const q0 = Date.now();
+      const res = await client.query(text, params);
+      const queryMs = Date.now() - q0;
+      if (queryMs > 500) {
+        console.warn(`[db] ${label} slow_query_ms=${queryMs} text=${text.slice(0, 80)}`);
+      }
+      return res.rows as T[];
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        msg.includes("timeout exceeded when trying to connect") ||
+        msg.includes("remaining connection slots")
+      ) {
+        console.error(
+          `[db] ${label} POOL EXHAUSTION: ${msg} | total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
+        );
+      }
+      throw err;
+    } finally {
+      client!.release();
+    }
+  };
+}
+
+async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
+  const { Pool, types } = await import("pg");
+  types.setTypeParser(OID_INT8, identity);
+  types.setTypeParser(OID_DATE, identity);
+
+  const criticalMax = readCriticalMax();
+  const generalMax = readGeneralMax();
+  const idleTimeoutMillis = Number(process.env.PG_IDLE_TIMEOUT_MS ?? 15_000) || 15_000;
+  // Critical path: short acquire timeout (do not sit 30s behind dashboard)
+  const criticalConnTimeout =
+    Number(process.env.PG_CRITICAL_CONN_TIMEOUT_MS ?? 5_000) || 5_000;
+  // General / dashboard: bounded, still shorter than legacy 30s default
+  const generalConnTimeout =
+    Number(process.env.PG_CONN_TIMEOUT_MS ?? 8_000) || 8_000;
+  const dashboardConnTimeout =
+    Number(process.env.PG_DASHBOARD_CONN_TIMEOUT_MS ?? 3_000) || 3_000;
+
+  console.log(
+    `[db] Dual pool: critical max=${criticalMax} connTimeoutMs=${criticalConnTimeout}; general max=${generalMax} connTimeoutMs=${generalConnTimeout}; dashboard acquire budget=${dashboardConnTimeout}`,
+  );
+
+  const criticalPool = new Pool({
+    connectionString: databaseUrl,
+    max: criticalMax,
+    min: 0,
+    idleTimeoutMillis,
+    connectionTimeoutMillis: criticalConnTimeout,
+    ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
+  });
+  const generalPool = new Pool({
+    connectionString: databaseUrl,
+    max: generalMax,
+    min: 0,
+    idleTimeoutMillis,
+    connectionTimeoutMillis: generalConnTimeout,
+    ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
+  });
+
+  globalRef.__pgCriticalPool__ = criticalPool;
+  globalRef.__pgPool__ = generalPool; // getPgPool / dashboard pin = general
+
+  const monitor = setInterval(() => {
+    for (const [label, pool, max] of [
+      ["critical", criticalPool, criticalMax],
+      ["general", generalPool, generalMax],
+    ] as const) {
+      if (pool.totalCount >= max && pool.idleCount === 0 && pool.waitingCount > 0) {
+        console.error(
+          `[db] ${label} POOL PRESSURE: total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${max}`,
+        );
+      }
+    }
+  }, 5_000);
+  monitor.unref?.();
+
+  criticalPool.on("error", (err) => console.error("[db] critical pool error:", err.message));
+  generalPool.on("error", (err) => console.error("[db] general pool error:", err.message));
+
+  return {
+    critical: toSql(makeRun(criticalPool, "critical")),
+    general: toSql(makeRun(generalPool, "general")),
+  };
+}
+
+async function createPgliteSql(): Promise<Sql> {
+  mkdirSync(pgliteDataPath, { recursive: true });
+  const { PGlite } = await import("@electric-sql/pglite");
+  const db = new PGlite(pgliteDataPath);
+  await db.waitReady;
+  const run: Run = async <T>(text: string, params: unknown[]) => {
+    const res = await db.query(text, params);
+    return (res.rows ?? []) as T[];
+  };
+  return toSql(run);
+}
+
+export async function getSql(): Promise<Sql> {
+  if (!globalRef.__pgSqlPromise__) {
+    if (databaseUrl) {
+      globalRef.__pgSqlPromise__ = createNeonPools().then((p) => {
+        globalRef.__pgCriticalSqlPromise__ = Promise.resolve(p.critical);
+        return p.general;
+      });
+    } else {
+      globalRef.__pgSqlPromise__ = createPgliteSql();
+      globalRef.__pgCriticalSqlPromise__ = globalRef.__pgSqlPromise__;
+    }
+  }
+  return globalRef.__pgSqlPromise__;
+}
+
+/** Latency-critical path: prediction persist + outbox (reserved pool). */
+export async function getCriticalSql(): Promise<Sql> {
+  await getSql(); // ensure pools initialized
+  if (globalRef.__pgCriticalSqlPromise__) {
+    return globalRef.__pgCriticalSqlPromise__;
+  }
+  return getSql();
+}
+
+export async function endPgPool(): Promise<void> {
+  if (globalRef.__pgPoolEnding__) return globalRef.__pgPoolEnding__;
+  globalRef.__pgPoolEnding__ = (async () => {
+    const g = globalRef.__pgPool__;
+    const c = globalRef.__pgCriticalPool__;
+    globalRef.__pgPool__ = undefined;
+    globalRef.__pgCriticalPool__ = undefined;
+    globalRef.__pgSqlPromise__ = undefined;
+    globalRef.__pgCriticalSqlPromise__ = undefined;
+    await Promise.all([
+      g ? g.end().catch(() => undefined) : Promise.resolve(),
+      c ? c.end().catch(() => undefined) : Promise.resolve(),
+    ]);
+  })();
+  return globalRef.__pgPoolEnding__;
+}
+
+export function getPgPool(): import("pg").Pool | null {
+  return globalRef.__pgPool__ ?? null;
+}
+
+export function getCriticalPool(): import("pg").Pool | null {
+  return globalRef.__pgCriticalPool__ ?? null;
+}
+
+export async function withPinnedClient<T>(
+  fn: (client: import("pg").PoolClient) => Promise<T>,
+): Promise<T> {
+  const pool = getPgPool();
+  if (!pool) {
+    throw new Error("withPinnedClient requires Postgres pool (not PGLite)");
+  }
+  const t0 = Date.now();
+  const client = await pool.connect();
+  globalRef.__lastPoolAcquireMs__ = Date.now() - t0;
+  try {
+    return await fn(client);
+  } finally {
+    client.release();
+  }
+}
+
+/** Dashboard-only: fail fast if general pool is busy (do not block 30s). */
+export async function withDashboardClient<T>(
+  fn: (client: import("pg").PoolClient) => Promise<T>,
+  timeoutMs = Number(process.env.PG_DASHBOARD_CONN_TIMEOUT_MS ?? 3_000) || 3_000,
+): Promise<T> {
+  const pool = getPgPool();
+  if (!pool) {
+    throw new Error("withDashboardClient requires Postgres pool");
+  }
+  const t0 = Date.now();
+  const client = await Promise.race([
+    pool.connect(),
+    new Promise<never>((_, rej) =>
+      setTimeout(
+        () =>
+          rej(
+            new Error(
+              `dashboard DB acquire timeout after ${timeoutMs}ms (pool busy)`,
+            ),
+          ),
+        timeoutMs,
+      ),
+    ),
+  ]);
+  globalRef.__lastPoolAcquireMs__ = Date.now() - t0;
+  try {
+    return await fn(client);
+  } finally {
+    client.release();
+  }
 }
