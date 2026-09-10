@@ -415,27 +415,27 @@ export async function processResolvedPredictionFeedback(
       { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "model-performance observe failed");
   }
 
-  // 5. ACIE observeRound (SOL/TPL/PSI/SAFE via engine)
+  // 5. ACIE observeRound on AUTHORITATIVE shared singleton (P0)
+  // Prefer shared engine; fall back to globalThis bridge during rollout.
   try {
-    const g = globalThis as {
-      __acieEngine__?: {
-        observeRound: (r: {
-          roundId: string;
-          crashPoint: number;
-          timestamp?: string;
-        }) => unknown;
-      };
-    };
-    let eng = g.__acieEngine__;
-    // If boot restore failed or tests, lazily construct and cache engine
+    let eng: { observeRound: (r: { roundId: string; crashPoint: number; timestamp?: string }) => unknown } | undefined;
+    try {
+      const { getSharedACIEEngine } = await import("@/lib/prediction/acie/shared-engine");
+      eng = getSharedACIEEngine();
+    } catch {
+      eng = undefined;
+    }
     if (!eng || typeof eng.observeRound !== "function") {
-      try {
-        const { ACIEEngine } = await import("@/lib/prediction/acie/engine");
-        eng = new ACIEEngine();
-        g.__acieEngine__ = eng;
-      } catch {
-        eng = undefined;
-      }
+      const g = globalThis as {
+        __acieEngine__?: {
+          observeRound: (r: {
+            roundId: string;
+            crashPoint: number;
+            timestamp?: string;
+          }) => unknown;
+        };
+      };
+      eng = g.__acieEngine__;
     }
     if (eng && typeof eng.observeRound === "function") {
       eng.observeRound({
