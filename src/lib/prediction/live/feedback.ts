@@ -331,6 +331,40 @@ export async function processResolvedPredictionFeedback(
       { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "baseline observeOutcome failed");
   }
 
+  // P1: degradation / SAFE_BASELINE controller + feature contribution
+  try {
+    const { globalSafeBaseline } = await import(
+      "@/lib/prediction/lifecycle/safe-baseline-controller"
+    );
+    const snap = globalSafeBaseline.observe(predicted, actual);
+    if (snap.mode === "SAFE_BASELINE") {
+      logger.warn(
+        {
+          predictionId: input.predictionId,
+          modelBrier: snap.modelBrier,
+          constantBrier: snap.constantBrier,
+          ece: snap.ece,
+          n: snap.n,
+        },
+        "SAFE_BASELINE mode active after feedback observe",
+      );
+    }
+  } catch (e) {
+    logger.debug(
+      { predictionId: input.predictionId, error: String(e) },
+      "safe-baseline observe failed (soft)",
+    );
+  }
+  try {
+    const { globalFeatureContribution } = await import(
+      "@/lib/prediction/models/feature-contribution"
+    );
+    const fs = (input.featureSummary ?? {}) as Record<string, number>;
+    globalFeatureContribution.observe(fs, predicted, actual);
+  } catch {
+    /* soft */
+  }
+
   // 3. Calibration + meta + production controller via feedbackPredictionPipeline
   try {
     const mod = await import("@/lib/prediction/prediction-pipeline");
