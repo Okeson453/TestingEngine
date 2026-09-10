@@ -188,8 +188,9 @@ function LeadTimeCard({ delivery }: { delivery: DashboardSnapshot["delivery"] })
             </p>
           ) : null}
           <p className="text-[11px] text-subtle">
-            ON_TIME = telegram accepted before target round started. UNKNOWN = required timestamps missing.
-            Outbox enqueue is not delivery.
+            ON_TIME/EARLY/LATE derive from telegram_accepted_at vs target start (raw timestamps win).
+            PENDING = outbox status pending/inflight (not derived from UNKNOWN). MASKED LATE flags
+            forensic cache drift. Outbox enqueue is not delivery.
           </p>
         </div>
       ) : (
