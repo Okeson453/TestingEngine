@@ -18,7 +18,11 @@
  */
 import { getCriticalSql, getSql, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
-import { sendTelegramMessage, type SendResult } from "@/lib/notifications/telegram";
+import {
+  sendTelegramMessage,
+  sendTelegramMessagePrimaryFirst,
+  type SendResult,
+} from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { isAuthoritative } from "@/lib/prediction/live/fencing";
 import { getWakeStats } from "@/lib/prediction/live/outbox-wake";
@@ -36,10 +40,16 @@ const logger = getLogger("outbox-dispatcher");
 // wake path's job — measured 1ms warm (18:36:33.169 -> .171).
 export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 2_000);
 export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
+/** Prediction lane is strictly single-item: freshness over throughput.
+ * There is normally only one actionable N+1 prediction at a time. A new
+ * prediction must never wait behind a batch of other predictions. */
+export const PREDICTION_BATCH_SIZE = Number(
+  process.env.OUTBOX_PREDICTION_BATCH_SIZE ?? 1,
+);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
 /**
- * Max concurrent Telegram sends within a claimed batch.
+ * Max concurrent Telegram sends within a claimed batch (normal lane).
  * POOL-BUDGET FIX: the dispatcher runs on the critical pool (max=3). Previous
  * default of 8 let one drain pass enqueue up to 8 concurrent critical-pool
  * operations per row (temporal check, send stamp, finalize) — the dispatcher
@@ -47,8 +57,15 @@ export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
  * path. 2 keeps one connection in reserve for claim/finalize/recovery while
  * still overlapping Telegram RTT (the long leg) with the next row's DB work.
  * Env-overridable as before.
+ *
+ * Prediction lane uses PREDICTION_PARALLELISM = 1 (see below).
  */
 export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 2);
+/** Prediction lane concurrency is hard-capped at 1 so a newly arriving N+1
+ * signal is never blocked behind an in-flight prediction send. */
+export const PREDICTION_PARALLELISM = Number(
+  process.env.OUTBOX_PREDICTION_PARALLELISM ?? 1,
+);
 /**
  * MINIMUM REMAINING LEAD SAFETY GATE (remediation plan §6): before a
  * prediction send begins, require at least this much residual deadline
@@ -304,34 +321,16 @@ export class OutboxDispatcher {
     // At ~800ms Neon RTT, N per-row UPDATEs were costing seconds per tick.
     // LANE FILTER: each pass claims only its own lane's rows — a prediction
     // dispatch opportunity never depends on unrelated notifications.
+    // Claim batch: SELECT FOR UPDATE SKIP LOCKED → set status=inflight → COMMIT.
+    // Hot path for prediction: claim ONLY (no temporal sweep). Expired-row
+    // cleanup lives in recoverStale() on the general/maintenance pool so it
+    // never adds DB work to the N+1 critical path. Pre-send atomic temporal
+    // authorization + finalization gate remain the safety invariants.
+    const claimLimit =
+      lane === "prediction" ? Math.max(1, PREDICTION_BATCH_SIZE) : BATCH_SIZE;
     const claimed = await runInTransaction(sql, async (tx) => {
       try {
         if (lane === "prediction") {
-          // CLAIM-TIME TEMPORAL GATE (forensic report Issue 1): a prediction
-          // whose target already started/crashed is dead on arrival. Kill it
-          // here, inside the claim TX, instead of paying an auth round trip
-          // and a Telegram RTT for a signal that can never be actionable.
-          // Zero extra round trips — same pinned transaction client.
-          // The pre-send atomic authorization remains the final gate; this
-          // sweep only removes rows that are ALREADY temporally invalid.
-          const swept = await tx<{ id: number }>`
-            update notification_outbox o
-            set status = 'dead_letter',
-                last_error = 'expired_late_signal: target started/crashed before claim (claim-time gate)'
-            where o.status = 'pending'
-              and o.type = 'prediction'
-              and coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id') is not null
-              and coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id') in (
-                select game_id from live_round_state
-                where began_at is not null and began_at <= clock_timestamp()
-                union
-                select game_id from crash_rounds
-                where crashed_at is not null and crashed_at <= clock_timestamp()
-              )
-            returning id
-          `;
-          this.stats.dead += swept.length;
-          claimGateDead = swept.length;
           return await tx<OutboxRow>`
             WITH picked AS (
               SELECT id
@@ -341,7 +340,7 @@ export class OutboxDispatcher {
                 AND next_attempt_at <= now()
                 AND (telegram_deadline_at IS NULL OR telegram_deadline_at > now())
               ORDER BY priority DESC, next_attempt_at ASC, id ASC
-              LIMIT ${BATCH_SIZE}
+              LIMIT ${claimLimit}
               FOR UPDATE SKIP LOCKED
             )
             UPDATE notification_outbox n
@@ -365,7 +364,7 @@ export class OutboxDispatcher {
               AND next_attempt_at <= now()
               AND (telegram_deadline_at IS NULL OR telegram_deadline_at > now())
             ORDER BY priority DESC, next_attempt_at ASC, id ASC
-            LIMIT ${BATCH_SIZE}
+            LIMIT ${claimLimit}
             FOR UPDATE SKIP LOCKED
           )
           UPDATE notification_outbox n
@@ -394,7 +393,7 @@ export class OutboxDispatcher {
                   and next_attempt_at <= now()
                   and (telegram_deadline_at is null or telegram_deadline_at > now())
                 order by priority desc, next_attempt_at asc, id asc
-                limit ${BATCH_SIZE}
+                limit ${claimLimit}
                 for update skip locked
               `
             : await tx<OutboxRow>`
@@ -406,7 +405,7 @@ export class OutboxDispatcher {
                   and next_attempt_at <= now()
                   and (telegram_deadline_at is null or telegram_deadline_at > now())
                 order by priority desc, next_attempt_at asc, id asc
-                limit ${BATCH_SIZE}
+                limit ${claimLimit}
                 for update skip locked
               `;
         for (const r of rows) {
@@ -430,6 +429,8 @@ export class OutboxDispatcher {
         return rows;
       }
     });
+    // claimGateDead no longer used (sweep moved to recoverStale); keep for
+    // type/stats compatibility if any residual path set it.
     dead += claimGateDead;
 
     if (claimed.length > 0) {
@@ -439,13 +440,11 @@ export class OutboxDispatcher {
     // (DB now() vs client clock skew must not pollute queue_wait/dispatch ms).
     const claimClientMs = this.now();
 
-    // Parallel dispatch bounded by BATCH_PARALLELISM (P0 / 6.5)
-    // The claim is already lane-filtered, so every claimed row belongs to
-    // this pass's lane. Prediction lane concurrency stays bounded at 2
-    // (never reduced to 1); the normal lane keeps the full parallelism.
+    // Parallel dispatch: prediction lane is strictly single-item (P0).
+    // Freshness > throughput for N+1. Normal lane retains BATCH_PARALLELISM.
     const parallelism =
       lane === "prediction"
-        ? Math.min(Math.max(1, BATCH_PARALLELISM), 2)
+        ? Math.max(1, Math.min(PREDICTION_PARALLELISM, 1))
         : Math.max(1, BATCH_PARALLELISM);
     const laneChunks: OutboxRow[][] = [];
     for (let i = 0; i < claimed.length; i += parallelism) {
@@ -677,17 +676,26 @@ export class OutboxDispatcher {
             );
             // send_started_at is now stamped by the atomic authorization
             // UPDATE above — no separate pre-send round trip.
-            const sendResults = await sendTelegramMessage(row.content, {
-              timeout: sendTimeout,
-            });
+            // P0: prediction lane uses primary-first so a slow secondary
+            // Telegram destination cannot occupy the dispatcher slot after
+            // the user already accepted the signal.
+            const sendResults =
+              row.type === "prediction"
+                ? await sendTelegramMessagePrimaryFirst(row.content, {
+                    timeout: sendTimeout,
+                  })
+                : await sendTelegramMessage(row.content, {
+                    timeout: sendTimeout,
+                  });
             const allOk =
               sendResults.length > 0 && sendResults.every((r) => r.ok);
             const anyOk = sendResults.some((r) => r.ok);
             // Fan-out is independently addressed. If at least one destination
             // accepted the message, mark the row delivered instead of retrying
             // and duplicating it to healthy chats because another chat id is stale.
+            // For prediction + primary-first, anyOk means primary accepted.
             if (allOk || anyOk) {
-              if (!allOk) {
+              if (!allOk && row.type !== "prediction") {
                 const failures = sendResults
                   .filter((r) => !r.ok)
                   .map((r) => ({ chatId: r.chatId, status: r.status, error: r.error ?? "send_failed" }));
@@ -1199,17 +1207,20 @@ export class OutboxDispatcher {
       `;
     } catch { /* soft */ }
 
-    // NO-RESURRECT (plan §21): stale recovery must never resurrect a
-    // prediction whose target already started/crashed. Dead-letter those
-    // FIRST; the generic reset below then only sees still-valid rows.
+    // NO-RESURRECT + claim-time sweep moved off hot path (P0):
+    // Dead-letter pending or inflight predictions whose target already
+    // started/crashed. This used to run inside every prediction claim TX;
+    // it now runs only on the maintenance/general pool so it cannot add
+    // latency to the N+1 critical path. Pre-send authorization remains the
+    // final gate for any row that reaches dispatch.
     try {
       await sql`
         update notification_outbox
         set status = 'dead_letter',
-            last_error = 'expired_late_signal: target started/crashed (recovery no-resurrect gate)'
-        where status = 'inflight'
+            last_error = 'expired_late_signal: target started/crashed (recovery temporal gate)'
+        where status in ('pending', 'inflight')
           and type = 'prediction'
-          and updated_at < now() - (${STALE_INFLIGHT_MS}::int * interval '1 millisecond')
+          and coalesce(target_game_id, metadata->>'targetGameId', metadata->>'target_game_id') is not null
           and coalesce(target_game_id, metadata->>'targetGameId', metadata->>'target_game_id') in (
             select game_id from live_round_state
             where began_at is not null and began_at <= clock_timestamp()
@@ -1218,7 +1229,7 @@ export class OutboxDispatcher {
             where crashed_at is not null and crashed_at <= clock_timestamp()
           )
       `;
-    } catch { /* soft — claim-time gate also covers these */ }
+    } catch { /* soft */ }
 
     // Reset stuck inflight rows (crash mid-send) and very-old pending rows.
     const result = await sql<{ id: number }>`
