@@ -288,7 +288,19 @@ export class BaselineStatisticalModel implements PredictiveModel {
     // Cap confidence-era overstatement: never claim > ~88% without strong sample+cal
     const hardCap =
       sampleSize >= 100 && calQuality >= 0.75 ? 0.88 : sampleSize >= 50 ? 0.82 : 0.78;
-    const probability = Math.max(0.05, Math.min(hardCap, baseProb));
+    let probability = Math.max(0.05, Math.min(hardCap, baseProb));
+
+    // Apply fitted calibrator when boot has published a warm calibrator fn
+    const cal = (globalThis as {
+      __calibrateProbability__?: (p: number, regimeKey: string, sampleSize: number) => number;
+    }).__calibrateProbability__;
+    if (typeof cal === 'function') {
+      try {
+        const regimeKey = regime?.id ?? regime?.name ?? 'global';
+        probability = cal(probability, regimeKey, sampleSize);
+        probability = Math.max(0.05, Math.min(hardCap, probability));
+      } catch { /* soft */ }
+    }
 
     // Calibration-aware confidence (NOT ≈ probability)
     const sampleFactor = Math.min(1, sampleSize / 100);
