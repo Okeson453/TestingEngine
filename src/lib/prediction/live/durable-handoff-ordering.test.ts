@@ -36,8 +36,9 @@ describe("durable prediction handoff ordering (P0)", () => {
     expect(attemptSrc).toContain("durable outbox enqueued");
   });
 
-  it("dispatcher claims by priority DESC so prediction (10) beats validation (2)", () => {
-    expect(notifSrc).toMatch(/ORDER BY priority DESC|order by priority desc/i);
+  it("dispatcher claims prediction type before other kinds, then priority DESC", () => {
+    expect(notifSrc).toMatch(/CASE WHEN type = 'prediction' THEN 0 ELSE 1 END|case when type = 'prediction' then 0 else 1 end/i);
+    expect(notifSrc).toMatch(/priority DESC|priority desc/i);
   });
 
   it("bgHandler still expires undelivered prediction outbox for target on start", () => {
