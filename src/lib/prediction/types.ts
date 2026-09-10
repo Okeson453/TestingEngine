@@ -76,8 +76,11 @@ export interface Dataset {
 }
 
 export interface Regime {
+  /** Deterministic regime classification key (e.g. "neutral", "deep-low"). */
   id: string;
   name: string;
+  /** Optional per-detection UUID for tracing only — not for grouping. */
+  instanceId?: string;
   dimensions: {
     lowMultiplierConcentration: number;
     highMultiplierConcentration: number;
