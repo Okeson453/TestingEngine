@@ -323,7 +323,19 @@ export async function onGameEnd(
         // P1.6: Populate telegram_deadline_at for validation messages too.
         // Validation messages have a longer deadline (5 min) since they're
         // for completed rounds and are never stale in the prediction sense.
+        //
+        // ORDERING FIX: ED of round N enqueues BOTH the N+1 prediction signal
+        // and the WIN/LOSS for the prediction about N. If both are claimable
+        // immediately, the dispatcher prediction lane and normal lane fire
+        // Telegram in parallel → user sees signal + result at the same time.
+        // Defer validation claimability so the N+1 signal always goes first.
         const valDeadlineAt = new Date(Date.now() + 300_000).toISOString();
+        const validationDelayMs = Number(
+          process.env.VALIDATION_DISPATCH_DELAY_MS ?? 2_500,
+        );
+        const valNextAttemptAt = new Date(
+          Date.now() + Math.max(0, validationDelayMs),
+        ).toISOString();
         await tx`
           insert into notification_outbox (
             notification_id, type, content, metadata, status, priority,
@@ -342,9 +354,10 @@ export async function onGameEnd(
               resolvedAt,
               slaViolated: false,
               kind: "validation",
+              dispatchDelayMs: validationDelayMs,
             })},
             'pending', 2,
-            0, now(), ${valDeadlineAt}::timestamptz
+            0, ${valNextAttemptAt}::timestamptz, ${valDeadlineAt}::timestamptz
           )
         `;
       }
@@ -453,13 +466,16 @@ export async function onGameEnd(
       /* soft */
     }
     try {
-      const { getSharedACIEEngine } = await import(
-        "@/lib/prediction/acie/shared-engine"
-      );
-      const eng = getSharedACIEEngine();
-      eng.observeRound({ roundId: evt.gameId, crashPoint: evt.multiplier });
+      const eng = (
+        globalThis as {
+          __acieEngine__?: {
+            observeRound: (r: { roundId: string; crashPoint: number }) => unknown;
+          };
+        }
+      ).__acieEngine__;
+      eng?.observeRound({ roundId: evt.gameId, crashPoint: evt.multiplier });
     } catch {
-      /* soft — predictor path is authoritative observer */
+      /* soft */
     }
   }
 
@@ -590,12 +606,18 @@ export async function onGameEnd(
   // N+1 already scheduled at function entry (parallel with validation).
   // Keep a safety schedule only if entry was skipped (should not happen here).
 
-  // Wake outbox dispatcher for the validation notification row.
-  setImmediate(() => {
+  // Wake the NORMAL lane only after the validation delay so the prediction
+  // lane owns the first Telegram slot. next_attempt_at already blocks claim
+  // until then; this wake avoids waiting a full TICK_MS recovery cycle.
+  const validationDelayMs = Number(
+    process.env.VALIDATION_DISPATCH_DELAY_MS ?? 2_500,
+  );
+  const wakeDelay = Math.max(0, validationDelayMs);
+  setTimeout(() => {
     void import("@/lib/prediction/live/outbox-wake")
-      .then(({ notifyOutbox }) => notifyOutbox())
+      .then(({ notifyOutbox }) => notifyOutbox("normal"))
       .catch(() => undefined);
-  });
+  }, wakeDelay).unref?.();
 
   return {
     kind: "resolved",
