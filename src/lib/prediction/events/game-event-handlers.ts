@@ -225,6 +225,13 @@ export async function bgHandler(payload: unknown): Promise<void> {
 
     await Promise.all([
       markLiveRoundStarted(gameId, beganAt, "socket", correlationId, sql).catch(() => undefined),
+      // P0 correlation: stamp target_round_started_at on the pending prediction for N
+      sql`
+        UPDATE pending_predictions
+        SET target_round_started_at = COALESCE(target_round_started_at, ${new Date(beganAt)})
+        WHERE target_game_id = ${gameId}
+          AND matched = false
+      `.catch(() => undefined),
       // P0 (temporal validity): authoritative round-start backfill on the
       // prediction registry — re-evaluates createdAt < targetStartedAt.
       import("@/lib/prediction/identity/prediction-registry")
