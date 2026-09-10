@@ -1,6 +1,8 @@
 /**
  * Feature Engine v2 — assembles incremental + feature families.
  * Critical path uses IncrementalStateEngine only (no full history scan).
+ *
+ * Each family is isolated so a throw surfaces featureStage=<name> for N+1 diagnosis.
  */
 
 import { createHash } from 'crypto';
@@ -18,6 +20,39 @@ import { computeEntropyFeatures } from './entropy-features.ts';
 import { computeTimeFeatures } from './time-features.ts';
 import { computeCrossTargetFeatures } from './cross-target-features.ts';
 import { computeFeatures as computeLegacy } from './calculators.ts';
+import { getLogger } from '../../observability/logger.ts';
+
+const logger = getLogger('FeatureEngineV2');
+
+function familyError(featureStage: string, err: unknown): Error {
+  const base = err instanceof Error ? err : new Error(String(err));
+  const e = new Error(`[featureStage=${featureStage}] ${base.message}`);
+  e.name = base.name || 'FeatureFamilyError';
+  (e as Error & { featureStage?: string; cause?: unknown }).featureStage = featureStage;
+  (e as Error & { featureStage?: string; cause?: unknown }).cause = base;
+  return e;
+}
+
+function runFamily<T extends Record<string, number>>(
+  featureStage: string,
+  fn: () => T,
+): T {
+  try {
+    return fn();
+  } catch (err) {
+    logger.error(
+      {
+        component: 'FeatureEngineV2',
+        featureStage,
+        errorName: err instanceof Error ? err.name : 'Error',
+        errorMessage: err instanceof Error ? err.message : String(err),
+        errorStack: err instanceof Error ? err.stack?.slice(0, 1200) : null,
+      },
+      `Feature family failed: ${featureStage}`,
+    );
+    throw familyError(featureStage, err);
+  }
+}
 
 export class FeatureEngineV2 {
   readonly featureVersion = FEATURE_VERSION_V2;
@@ -33,14 +68,14 @@ export class FeatureEngineV2 {
     timestamp: string = new Date().toISOString()
   ): FeatureVector {
     const values: Record<string, number> = {
-      ...this.baseFromEngine(),
-      ...computeLagFeatures(this.engine),
-      ...computeRunFeatures(this.engine),
-      ...computeMarkovFeatures(this.engine),
-      ...computeSpectralFeatures(this.engine),
-      ...computeEntropyFeatures(this.engine),
-      ...computeTimeFeatures(new Date(timestamp)),
-      ...computeCrossTargetFeatures(this.engine),
+      ...runFamily('base', () => this.baseFromEngine()),
+      ...runFamily('lag', () => computeLagFeatures(this.engine)),
+      ...runFamily('run', () => computeRunFeatures(this.engine)),
+      ...runFamily('markov', () => computeMarkovFeatures(this.engine)),
+      ...runFamily('spectral', () => computeSpectralFeatures(this.engine)),
+      ...runFamily('entropy', () => computeEntropyFeatures(this.engine)),
+      ...runFamily('time', () => computeTimeFeatures(new Date(timestamp))),
+      ...runFamily('cross_target', () => computeCrossTargetFeatures(this.engine)),
     };
     for (const k of Object.keys(values)) {
       if (!Number.isFinite(values[k])) values[k] = 0;
