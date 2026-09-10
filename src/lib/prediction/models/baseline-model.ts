@@ -184,6 +184,47 @@ export class BaselineStatisticalModel implements PredictiveModel {
     const targetKey =
       target === 1.3 ? '1_30' : target === 2.0 ? '2_00' : target === 5.0 ? '5_00' : '10_00';
 
+    // SAFE_BASELINE mode via process global (set by safe-baseline-controller)
+    const g = globalThis as {
+      __safeBaselineMode__?: boolean;
+      __safeBaselineProb__?: number;
+      __safeBaselineSnap__?: { modelBrier: number; ece: number; n: number };
+    };
+    if (g.__safeBaselineMode__ === true) {
+      const probability =
+        typeof g.__safeBaselineProb__ === 'number'
+          ? g.__safeBaselineProb__
+          : target === 1.3
+            ? EMPIRICAL_BASE_1_30
+            : Math.min(0.95, Math.max(0.05, 1 / Number(target)));
+      const snap = g.__safeBaselineSnap__ ?? { modelBrier: 0, ece: 0, n: 0 };
+      const now = new Date();
+      const quality = features.meta.dataQualityScore;
+      return {
+        predictionId: randomUUID(),
+        model: { ...this.identity, version: '1.2.0-safe' },
+        target,
+        score: probability,
+        probability,
+        confidence: Math.min(0.55, 0.35 + 0.2 * Math.min(1, (v.sample_size ?? 0) / 100)),
+        regime,
+        dataQuality: quality,
+        featureSummary: {
+          safe_baseline: 1,
+          model_brier: snap.modelBrier,
+          ece: snap.ece,
+          safe_n: snap.n,
+          sample_size: v.sample_size ?? 0,
+        },
+        reasoning: [
+          `SAFE_BASELINE active — empirical rate only (${(probability * 100).toFixed(1)}%)`,
+          `Trigger metrics: brier=${snap.modelBrier.toFixed(3)} ece=${snap.ece.toFixed(3)} n=${snap.n}`,
+        ],
+        timestamp: now.toISOString(),
+        expiresAt: new Date(now.getTime() + 60_000).toISOString(),
+      };
+    }
+
     // Prefer exact window rates (hit_rate_*) then fv-1 keys (now true windows).
     const rate50 =
       v.hit_rate_50 ??
