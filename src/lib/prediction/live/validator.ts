@@ -330,8 +330,10 @@ export async function onGameEnd(
         // Telegram in parallel → user sees signal + result at the same time.
         // Defer validation claimability so the N+1 signal always goes first.
         const valDeadlineAt = new Date(Date.now() + 300_000).toISOString();
+        // Keep short: only long enough for the N+1 prediction Telegram to
+        // complete first. 800ms ≪ prior 2500ms which inflated result lag.
         const validationDelayMs = Number(
-          process.env.VALIDATION_DISPATCH_DELAY_MS ?? 2_500,
+          process.env.VALIDATION_DISPATCH_DELAY_MS ?? 800,
         );
         const valNextAttemptAt = new Date(
           Date.now() + Math.max(0, validationDelayMs),
@@ -609,7 +611,7 @@ export async function onGameEnd(
   // lane owns the first Telegram slot. next_attempt_at already blocks claim
   // until then; this wake avoids waiting a full TICK_MS recovery cycle.
   const validationDelayMs = Number(
-    process.env.VALIDATION_DISPATCH_DELAY_MS ?? 2_500,
+    process.env.VALIDATION_DISPATCH_DELAY_MS ?? 800,
   );
   const wakeDelay = Math.max(0, validationDelayMs);
   setTimeout(() => {
