@@ -1394,6 +1394,11 @@ export class OutboxDispatcher {
   }
 
   private async drainLoop(): Promise<void> {
+    // First pass: drain any rows already pending at start (no wake kinds yet).
+    let wake: { prediction: boolean; normal: boolean } | null = {
+      prediction: true,
+      normal: true,
+    };
     while (this.running) {
       // Fencing gate (fix plan Phase 1): a worker that lost authority must not
       // dispatch. Covers the window between lock loss and cascade teardown.
@@ -1421,14 +1426,17 @@ export class OutboxDispatcher {
         if (this.stats.tickCount % 30 === 0) {
           void this.reconcileForensics();
         }
-        // PREDICTION LANE: inline, every cycle. A prediction wake resolves
-        // the wait below immediately and this claim runs right away — a new
-        // N+1 signal never waits for background work (plan §2).
+        // PREDICTION LANE: always checked first. A prediction wake resolves
+        // immediately and this claim runs before any validation/result work.
         await this.processLane("prediction");
-        // NORMAL LANE: detached. A slow result/validation Telegram send runs
-        // outside the scheduling path; the next cycle can claim and deliver a
-        // fresh prediction while it is still in flight (plan §11/§12).
-        this.runBackgroundDetached();
+        // NORMAL LANE: only when woken for normal work or on timer recovery
+        // (wake == null). Skip on pure prediction wakes so WIN/LOSS does not
+        // race the N+1 signal on the same ED tick (ordering fix).
+        const runNormal =
+          wake == null || wake.normal || (!wake.prediction && !wake.normal);
+        if (runNormal) {
+          this.runBackgroundDetached();
+        }
       } catch (e) {
         this.stats.lastError = String(e);
         logger.error(
@@ -1437,7 +1445,7 @@ export class OutboxDispatcher {
         );
       }
       if (!this.running) break;
-      await this.waitForNextTick();
+      wake = await this.waitForNextTick();
     }
   }
 
