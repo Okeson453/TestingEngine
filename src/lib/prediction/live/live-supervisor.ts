@@ -254,9 +254,9 @@ export class LiveSupervisor {
             __eventLoopLagP99__?: number;
           };
           g.__eventLoopLagMs__ = lagMs;
-          g.__eventLoopLagP50__ = stats.p50;
-          g.__eventLoopLagP95__ = stats.p95;
-          g.__eventLoopLagP99__ = stats.p99;
+          g.__eventLoopLagP50__ = stats.p50 ?? undefined;
+          g.__eventLoopLagP95__ = stats.p95 ?? undefined;
+          g.__eventLoopLagP99__ = stats.p99 ?? undefined;
         } catch {
           /* ignore */
         }

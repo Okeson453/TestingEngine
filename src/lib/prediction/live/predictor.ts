@@ -24,6 +24,17 @@ import { PredictionEngine } from "@/lib/prediction/prediction-engine";
 import type { FeaturePath, HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
+// P0 FIX: these were previously loaded via require() inside try/catch. The
+// production worker is pure ESM (node --experimental-strip-types +
+// scripts/paths-loader.mjs) where `require` does not exist, so every call
+// threw ReferenceError and was silently caught — the ACIE authoritative path
+// and the advanced pipeline NEVER ran (every prediction fell back to
+// FALLBACK_BASELINE). Static ESM imports work in both the Vite dev server
+// and the standalone ESM worker.
+import { getSharedACIEEngine, getSharedACIEInstanceId } from "@/lib/prediction/acie/shared-engine";
+import { buildAcieFeatureFingerprint, buildProvenance } from "@/lib/prediction/acie/provenance";
+import { recordAcieObservation, assertFreshAcieState } from "@/lib/prediction/acie/stale-guard";
+import { runPredictionPipeline } from "@/lib/prediction/prediction-pipeline";
 
 import {
   evaluateSheath,
@@ -188,22 +199,12 @@ type PipelineFn = (input: {
 let cachedPipelineFn: PipelineFn | null | undefined;
 function getPipelineFn(): PipelineFn | null {
   if (cachedPipelineFn !== undefined) return cachedPipelineFn;
+  // P0 FIX: was require()-based (ReferenceError under ESM → silent null).
+  // runPredictionPipeline is now a static import above.
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports -- sync lazy-load with deliberate dual-path fallback
-    const mod = require("../../prediction/prediction-pipeline.ts") as {
-      runPredictionPipeline: PipelineFn;
-    };
-    cachedPipelineFn = mod.runPredictionPipeline;
+    cachedPipelineFn = runPredictionPipeline as PipelineFn;
   } catch {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports -- sync lazy-load with deliberate dual-path fallback
-    const mod = require("@/lib/prediction/prediction-pipeline") as {
-        runPredictionPipeline: PipelineFn;
-      };
-      cachedPipelineFn = mod.runPredictionPipeline;
-    } catch {
-      cachedPipelineFn = null;
-    }
+    cachedPipelineFn = null;
   }
   return cachedPipelineFn;
 }
@@ -221,25 +222,16 @@ const defaultPredictFn = (
 ) => {
   // Prefer ACIE evaluation from the shared singleton (post-observe).
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const sharedMod = require("../acie/shared-engine.ts") as {
-      getSharedACIEEngine: () => {
-        historySize: () => number;
-        evaluateNext: (risk?: unknown) => {
-          psi: { estimatedProbability: number; modelUncertainty: number; dataUncertainty: number };
-          regime: string;
-          strategy: { action: string; reason: string; isOpportunity?: boolean };
-          evidence: { status: string };
-        };
-        getOnlineState: () => { observationCount?: number; ewmaHitRate?: number };
-        exportSnapshot: () => { crashPoints: number[] };
-      };
-      getSharedACIEInstanceId: () => string;
+    // P0 FIX: was require() — ReferenceError under the ESM worker made this
+    // fall back to PredictionEngine on every crash. Static import now.
+    const sharedMod = {
+      getSharedACIEEngine,
+      getSharedACIEInstanceId,
     };
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const provMod = require("../acie/provenance.ts") as {
-      buildAcieFeatureFingerprint: (a: Record<string, unknown>) => string;
-      buildProvenance: (a: Record<string, unknown>) => Record<string, unknown>;
+    // P0 FIX: was require() — ReferenceError under ESM. Static import now.
+    const provMod = {
+      buildAcieFeatureFingerprint,
+      buildProvenance,
     };
     const acie = sharedMod.getSharedACIEEngine();
     if (acie.historySize() >= 5) {
@@ -913,20 +905,9 @@ export async function onGameEndPredict(
   // Ordering invariant: Crash N → ACIE.observeRound → state advances → evaluate N+1
   // Never allow PredictionEngine to predict N+1 before ACIE has learned Crash N.
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { getSharedACIEEngine, getSharedACIEInstanceId } = require(
-      "../acie/shared-engine.ts",
-    ) as {
-      getSharedACIEEngine: () => {
-        observeRound: (r: {
-          roundId: string;
-          crashPoint: number;
-          timestamp?: string;
-        }) => { online: { observationCount?: number }; evaluation: unknown };
-        historySize: () => number;
-      };
-      getSharedACIEInstanceId: () => string;
-    };
+    // P0 FIX: was require() — ReferenceError under ESM made observeRound
+    // fail on every crash ("ACIE observeRound failed on hot path"). Static
+    // import now.
     const acie = getSharedACIEEngine();
     const learnResult = acie.observeRound({
       roundId: gameId,
@@ -936,10 +917,6 @@ export async function onGameEndPredict(
     const obsCount =
       learnResult?.online?.observationCount ?? acie.historySize();
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { recordAcieObservation } = require("../acie/stale-guard.ts") as {
-        recordAcieObservation: (gameId: string, n: number) => void;
-      };
       recordAcieObservation(gameId, obsCount);
     } catch {
       /* soft */
@@ -1033,10 +1010,7 @@ export async function onGameEndPredict(
 
   // P1: Reject emission from stale ACIE state (must have observed this source).
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { assertFreshAcieState } = require("../acie/stale-guard.ts") as {
-      assertFreshAcieState: (src: string) => { ok: boolean; reason?: string };
-    };
+    // P0 FIX: was require() — ReferenceError under ESM. Static import now.
     const check = assertFreshAcieState(gameId);
     if (!check.ok) {
       logger.error(

@@ -312,7 +312,7 @@ export class OutboxDispatcher {
     this.stats.tickCount += 1;
     let delivered = 0;
     let dead = 0;
-    let claimGateDead = 0;
+    const claimGateDead = 0;
     let requeued = 0;
     const tickStartMs = this.now();
 

@@ -292,12 +292,21 @@ test("temporal contract: dispatcher refuses to deliver a signal whose target alr
       targetGameId: freshTarget,
     });
 
+    // PREDICTION_BATCH_SIZE=1 (369b9e6): the prediction lane claims exactly
+    // one row per pass, so drain until both rows settle.
     await withStubbedFetch(
       async () => {
         telegramCalls += 1;
         return okTelegram();
       },
-      async () => d.tickOnce(),
+      async () => {
+        for (let i = 0; i < 5; i += 1) {
+          await d.tickOnce();
+          const lateNow = await lifecycleOf(lateId);
+          const okNow = await lifecycleOf(okId);
+          if (lateNow.status !== "pending" && okNow.status !== "pending") break;
+        }
+      },
     );
 
     const late = await lifecycleOf(lateId);

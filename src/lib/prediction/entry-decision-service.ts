@@ -20,6 +20,11 @@ import { globalCalibrationState } from './calibration/calibration-state.ts';
 
 import { RoundRepository } from '../persistence/repositories/round-repo.ts';
 import { ACIEEngine } from './acie/engine.ts';
+// P0 FIX: was require()-based ("lazy require to avoid circular init") but the
+// standalone worker is pure ESM — require threw ReferenceError and every
+// construction silently fell back to a private cold engine, diverging from
+// live observation state. shared-engine has no import back into this file.
+import { getSharedACIEEngine } from './acie/shared-engine.ts';
 import { globalLiveDivergence } from './validation/live-divergence-monitor.ts';
 import { isReadyForLiveSync as isReadyForLive } from '../observability/readiness.ts';
 import { saveSnapshotToFile } from './state/state-persistence.ts';
@@ -130,11 +135,9 @@ export class EntryDecisionService {
       this.acie = opts.acie;
     } else {
       try {
-        // Lazy require to avoid circular init; falls back to local construct.
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { getSharedACIEEngine } = require('./acie/shared-engine.ts') as {
-          getSharedACIEEngine: () => ACIEEngine;
-        };
+        // P0 FIX: was require() — ReferenceError under the ESM worker meant
+        // this ALWAYS took the fallback branch, constructing a private cold
+        // engine that diverged from live observation state.
         this.acie = getSharedACIEEngine();
       } catch {
         this.acie = new ACIEEngine();

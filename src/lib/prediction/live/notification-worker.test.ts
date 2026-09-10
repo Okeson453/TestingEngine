@@ -72,10 +72,13 @@ const okTelegram = () => tgResponse(200, { ok: true, result: { message_id: 1 } }
 const failTelegram = (status: number, description: string) =>
   tgResponse(status, { ok: false, description });
 
-/** Insert a pending outbox row tagged with a unique content prefix. */
+/** Insert a pending outbox row tagged with a unique content prefix.
+ *  type defaults to 'prediction' (primary-first lane); pass e.g. 'alert'
+ *  for normal-lane fan-out semantics. */
 async function insertPendingRow(opts: {
   attemptCount?: number;
   deadlineAheadMs?: number | null;
+  type?: "prediction" | "alert";
 } = {}): Promise<{ id: number; notificationId: string; content: string }> {
   const id = randomUUID();
   const content = `[nw-behavior] ${id}`;
@@ -89,12 +92,11 @@ async function insertPendingRow(opts: {
       notification_id, type, content, metadata, status, attempt_count, next_attempt_at,
       telegram_deadline_at
     ) values (
-      ${id}::uuid, 'prediction', ${content}, ${metadata}::jsonb, 'pending',
+      ${id}::uuid, ${opts.type ?? "prediction"}, ${content}, ${metadata}::jsonb, 'pending',
       ${opts.attemptCount ?? 0},
       now() - interval '1 millisecond',
       ${deadlineIso}
-    )
-    returning id
+    ) returning id
   `;
   return { id: rows[0]!.id, notificationId: id, content };
 }
@@ -151,7 +153,41 @@ test("outbox: 2xx transitions pending -> DELIVERED with delivered_at set", async
   }
 });
 
-test("outbox: partial Telegram fan-out delivers once without retrying healthy chats", async () => {
+test("outbox: normal-lane partial fan-out delivers once without retrying healthy chats", async () => {
+  // 369b9e6 moved prediction rows to primary-first send (secondary
+  // destinations are fire-and-forget), so full fan-out semantics now only
+  // apply to the normal lane (type <> 'prediction'). Cover it with 'alert'.
+  process.env.TELEGRAM_BOT_TOKEN = "123:test";
+  process.env.TELEGRAM_CHAT_ID = "bad-chat";
+  process.env.TELEGRAM_GROUP_CHAT_ID = "good-chat";
+  await cleanSuiteRows();
+  try {
+    const { id } = await insertPendingRow({ type: "alert" });
+    const d = new OutboxDispatcher();
+    const result = await withStubbedFetch(
+      async (_url, body) => {
+        const payload = JSON.parse(body ?? "{}") as { chat_id?: string };
+        return payload.chat_id === "good-chat"
+          ? okTelegram()
+          : failTelegram(400, "Bad Request: chat not found");
+      },
+      () => d.tickOnce(),
+    );
+    assert.deepEqual(result, { recovered: 0, delivered: 1, dead: 0, requeued: 0 });
+    const s = await rowState(id);
+    assert.equal(s.status, "delivered");
+    assert.equal(s.attempt_count, 1);
+    assert.ok(s.delivered_at != null);
+  } finally {
+    clearTelegramEnv();
+  }
+});
+
+test("outbox: prediction lane primary-first — stale primary chat dead-letters the row", async () => {
+  // Prediction rows treat the PRIMARY chat acceptance as delivery. A 4xx on
+  // the primary dead-letters immediately; the healthy group chat is still
+  // attempted in the background (fire-and-forget) but never held against
+  // the dispatcher slot.
   process.env.TELEGRAM_BOT_TOKEN = "123:test";
   process.env.TELEGRAM_CHAT_ID = "bad-chat";
   process.env.TELEGRAM_GROUP_CHAT_ID = "good-chat";
@@ -168,11 +204,11 @@ test("outbox: partial Telegram fan-out delivers once without retrying healthy ch
       },
       () => d.tickOnce(),
     );
-    assert.deepEqual(result, { recovered: 0, delivered: 1, dead: 0, requeued: 0 });
+    assert.deepEqual(result, { recovered: 0, delivered: 0, dead: 1, requeued: 0 });
     const s = await rowState(id);
-    assert.equal(s.status, "delivered");
-    assert.equal(s.attempt_count, 1);
-    assert.ok(s.delivered_at != null);
+    assert.equal(s.status, "dead_letter");
+    assert.equal(s.attempt_count, 1, "exactly one primary attempt, then dead");
+    assert.match(s.last_error ?? "", /Bad Request: chat not found/);
   } finally {
     clearTelegramEnv();
   }
