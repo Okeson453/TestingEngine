@@ -481,7 +481,7 @@ export interface DashboardSnapshot {
 }
 
 export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
-  const { withPinnedClient, getPoolStats, getPgPool } = await import("@/lib/db");
+  const { withDashboardClient, withPinnedClient, getPoolStats, getPgPool } = await import("@/lib/db");
   const generatedAt = new Date().toISOString();
 
   const poolSnap = () => {
@@ -707,7 +707,7 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
 
   try {
     if (getPgPool()) {
-      return await withPinnedClient(async (client) => {
+      return await withDashboardClient(async (client) => {
         const query: Q = async <T,>(text: string, params: unknown[] = []) => {
           const res = await client.query(text, params);
           return res.rows as T[];
