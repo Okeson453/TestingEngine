@@ -16,7 +16,7 @@
  *   INFLIGHT stuck > STALE_MS  --tick-->  PENDING (recovered)
  *   attempts >= MAX_ATTEMPTS  --tick-->  DEAD
  */
-import { getCriticalSql, type Sql } from "@/lib/db";
+import { getCriticalSql, getSql, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { sendTelegramMessage, type SendResult } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
@@ -31,13 +31,16 @@ export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
 /**
- * Max concurrent Telegram sends within a claimed batch (P0 / 6.5).
- * Batch 3 fix: with a ~800ms Neon RTT per DB round-trip, parallelism 2 meant
- * a full batch took multiple seconds per drain pass — the direct cause of the
- * repeated "outbox backlog >5s" warnings. 8 concurrent sends drain a full
- * batch in roughly one RTT. Env-overridable as before.
+ * Max concurrent Telegram sends within a claimed batch.
+ * POOL-BUDGET FIX: the dispatcher runs on the critical pool (max=3). Previous
+ * default of 8 let one drain pass enqueue up to 8 concurrent critical-pool
+ * operations per row (temporal check, send stamp, finalize) — the dispatcher
+ * created its own queue and competing rows starved the prediction persist
+ * path. 2 keeps one connection in reserve for claim/finalize/recovery while
+ * still overlapping Telegram RTT (the long leg) with the next row's DB work.
+ * Env-overridable as before.
  */
-export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 8);
+export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 2);
 // First-retry backoff lowered 1000→300ms (investigation report): a single
 // transient Telegram timeout shouldn't cost a full second before the retry.
 // Curve: 300/600/1200/2400... capped at MAX_BACKOFF_MS.
@@ -298,11 +301,67 @@ export class OutboxDispatcher {
             // For predictions: HARD temporal contract — a signal for a target
             // that has ALREADY STARTED is semantically wrong (false-timing).
             // Late delivery is REMOVED (was "delivering late signal anyway").
-            // The check is unconditional now: the old remainingMs<800 /
-            // FORCE-flag gate made the safety net inactive for exactly the
-            // rows that need it (creation-relative 8s deadline outlives the
-            // target's start). Cost: one indexed lookup per prediction send.
-            if (row.type === "prediction") {
+            //
+            // POOL-BUDGET FIX: the temporal gate and the send_started_at stamp
+            // used to be two separate round trips (SELECT live/crash state,
+            // then UPDATE send_started_at). They are now ONE atomic
+            // authorization UPDATE: the send_started stamp is only written
+            // when the row is still inflight, within deadline, and — for
+            // predictions — the target has not started or crashed. Fail
+            // closed: a DB error requeues without sending.
+            lc.sendStartedMs = this.now();
+            let authorized: { id: number; send_started_at: string | Date }[];
+            try {
+              authorized = await sql<{ id: number; send_started_at: string | Date }>`
+                update notification_outbox o
+                set send_started_at = clock_timestamp()
+                where o.id = ${row.id}
+                  and o.status = 'inflight'
+                  and (o.telegram_deadline_at is null or o.telegram_deadline_at > clock_timestamp())
+                  and (
+                    o.type <> 'prediction'
+                    or coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id') is null
+                    or (
+                      not exists (
+                        select 1 from live_round_state lrs
+                        where lrs.game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id')
+                          and lrs.began_at is not null
+                          and lrs.began_at <= clock_timestamp()
+                      )
+                      and not exists (
+                        select 1 from crash_rounds cr
+                        where cr.game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id')
+                          and cr.crashed_at is not null
+                          and cr.crashed_at <= clock_timestamp()
+                      )
+                    )
+                  )
+                returning o.id, o.send_started_at
+              `;
+            } catch (authErr) {
+              // Fail closed: do not send while authorization is unverifiable.
+              await sql`
+                update notification_outbox
+                set status = 'pending',
+                    next_attempt_at = now() + interval '250 milliseconds',
+                    last_error = ${'send_auth_db_error: ' + String(authErr).slice(0, 180)}
+                where id = ${row.id} and status = 'inflight'
+              `.catch(() => undefined);
+              this.stats.requeued += 1;
+              logger.warn(
+                {
+                  component: "outbox-dispatcher",
+                  notificationId: row.notification_id,
+                  error: String(authErr),
+                },
+                "SEND_AUTH_DB_ERROR — fail-closed; requeued without send",
+              );
+              return "requeued" as const;
+            }
+            if (authorized.length === 0) {
+              // Authorization did not match: classify WHY with one follow-up
+              // read (rare path) so the row lands in the right terminal state.
+              let reason = "row_no_longer_inflight_bg_or_expiry";
               try {
                 const meta = (row.metadata ?? {}) as Record<string, unknown>;
                 const targetGameId =
@@ -310,88 +369,60 @@ export class OutboxDispatcher {
                   ((meta.targetGameId as string) ||
                     (meta.target_game_id as string) ||
                     null);
-                if (targetGameId) {
-                  // P1.7: Consolidated pre-send check — 1 query instead of 2.
-                  // LEFT JOIN live_round_state and crash_rounds in a single pass.
-                  // P0: FAIL CLOSED on DB error — never send when target state is unknown.
-                  let live: { began_at: string | Date | null; crashed_at: string | Date | null }[];
-                  try {
-                    live = await sql<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
-                      SELECT lrs.began_at, cr.crashed_at
-                      FROM (SELECT 1) AS dummy
-                      LEFT JOIN live_round_state lrs ON lrs.game_id = ${targetGameId}
-                      LEFT JOIN crash_rounds cr ON cr.game_id = ${targetGameId}
-                      LIMIT 1
-                    `;
-                  } catch (dbErr) {
-                    // Requeue briefly; do NOT send while temporal state is unverifiable.
-                    await sql`
-                      update notification_outbox
-                      set status = 'pending',
-                          next_attempt_at = now() + interval '250 milliseconds',
-                          last_error = ${'temporal_check_db_error: ' + String(dbErr).slice(0, 180)}
-                      where id = ${row.id} and status = 'inflight'
-                    `;
-                    this.stats.requeued += 1;
-                    logger.warn(
-                      {
-                        component: "outbox-dispatcher",
-                        notificationId: row.notification_id,
-                        targetGameId,
-                        error: String(dbErr),
-                      },
-                      "TEMPORAL_CHECK_DB_ERROR — fail-closed; requeued without send",
-                    );
-                    return "requeued" as const;
-                  }
-
-                  // HARD GATE: target started => signal expired, never sent.
-                  const beganAt = live[0]?.began_at;
-                  if (beganAt) {
-                    const began = new Date(beganAt).getTime();
-                    if (Number.isFinite(began) && began <= this.now()) {
-                      await sql`
-                        update notification_outbox
-                        set status = 'dead_letter',
-                            last_error = 'expired_late_signal: target started before delivery'
-                        where id = ${row.id}
-                      `;
-                      this.stats.dead += 1;
-                      logger.warn(
-                        {
-                          component: "outbox-dispatcher",
-                          notificationId: row.notification_id,
-                          targetGameId,
-                          target_started_at: new Date(began).toISOString(),
-                          expiration_reason: "target_already_started",
-                        },
-                        "SIGNAL_EXPIRED — target already started; NOT delivering late signal",
-                      );
-                      return "dead" as const;
-                    }
-                  }
-
-                  // Check both live_round_state.crashed_at and crash_rounds.crashed_at
-                  const crashedAt = live[0]?.crashed_at;
-                  if (crashedAt) {
-                    const crashed = new Date(crashedAt).getTime();
-                    if (Number.isFinite(crashed) && crashed <= this.now()) {
-                      await sql`
-                        update notification_outbox
-                        set status = 'dead_letter',
-                            last_error = 'target_already_crashed_before_delivery'
-                        where id = ${row.id}
-                      `;
-                      this.stats.dead += 1;
-                      logger.warn(
-                        { component: "outbox-dispatcher", notificationId: row.notification_id, targetGameId },
-                        "target already crashed before delivery — expiring signal",
-                      );
-                      return "dead" as const;
-                    }
-                  }
+                const state = await sql<{
+                  status: string;
+                  deadline_passed: boolean;
+                  target_started: boolean;
+                  target_crashed: boolean;
+                }>`
+                  select o.status,
+                    (o.telegram_deadline_at is not null and o.telegram_deadline_at <= now()) as deadline_passed,
+                    exists (
+                      select 1 from live_round_state lrs
+                      where lrs.game_id = ${targetGameId} and lrs.began_at is not null and lrs.began_at <= now()
+                    ) as target_started,
+                    exists (
+                      select 1 from crash_rounds cr
+                      where cr.game_id = ${targetGameId} and cr.crashed_at is not null and cr.crashed_at <= now()
+                    ) as target_crashed
+                  from notification_outbox o
+                  where o.id = ${row.id}
+                `;
+                const s = state[0];
+                if (s?.target_started) reason = "expired_late_signal: target started before delivery";
+                else if (s?.target_crashed) reason = "target_already_crashed_before_delivery";
+                else if (s?.deadline_passed) reason = "expired_before_send: telegram_deadline_at passed";
+                else if (s && s.status !== "inflight") reason = `row_no_longer_inflight: ${s.status}`;
+                if (s?.target_started || s?.target_crashed || s?.deadline_passed || (s && s.status !== "inflight")) {
+                  await sql`
+                    update notification_outbox
+                    set status = 'dead_letter',
+                        last_error = ${reason}
+                    where id = ${row.id} and status = 'inflight'
+                  `.catch(() => undefined);
+                  this.stats.dead += 1;
+                  logger.warn(
+                    {
+                      component: "outbox-dispatcher",
+                      notificationId: row.notification_id,
+                      targetGameId,
+                      expiration_reason: reason,
+                    },
+                    "SIGNAL_EXPIRED — pre-send authorization refused delivery",
+                  );
+                  return "dead" as const;
                 }
-              } catch { /* soft */ }
+              } catch { /* classification best-effort */ }
+              this.stats.dead += 1;
+              logger.warn(
+                {
+                  component: "outbox-dispatcher",
+                  notificationId: row.notification_id,
+                  type: row.type,
+                },
+                "OUTBOX_DISPATCH aborted before send — authorization refused (BG/expiry)",
+              );
+              return "dead" as const;
             }
 
             // Cap Telegram timeout by remaining deadline.
@@ -421,49 +452,8 @@ export class OutboxDispatcher {
                 ? Math.max(50, remainingMs - 50)
                 : 5_000,
             );
-            // P0 correlation: durable send_started_at BEFORE the HTTP call so
-            // in-flight races (BG kill / TOCTOU suppress) still leave a timeline.
-            lc.sendStartedMs = this.now();
-            const sendStartedIso = new Date(lc.sendStartedMs).toISOString();
-            try {
-              const stillInflight = await sql<{ id: number }>`
-                update notification_outbox
-                set send_started_at = ${sendStartedIso}::timestamptz
-                where id = ${row.id} and status = 'inflight'
-                returning id
-              `;
-              if (stillInflight.length === 0) {
-                this.stats.dead += 1;
-                logger.warn(
-                  {
-                    component: "outbox-dispatcher",
-                    notificationId: row.notification_id,
-                    type: row.type,
-                  },
-                  "OUTBOX_DISPATCH aborted before send — row no longer inflight (BG/expiry)",
-                );
-                return "dead" as const;
-              }
-            } catch (stampErr) {
-              // Fail closed: do not send if we cannot stamp the timeline.
-              await sql`
-                update notification_outbox
-                set status = 'pending',
-                    next_attempt_at = now() + interval '200 milliseconds',
-                    last_error = ${'send_started_stamp_failed: ' + String(stampErr).slice(0, 160)}
-                where id = ${row.id} and status = 'inflight'
-              `.catch(() => undefined);
-              this.stats.requeued += 1;
-              logger.warn(
-                {
-                  component: "outbox-dispatcher",
-                  notificationId: row.notification_id,
-                  error: String(stampErr),
-                },
-                "send_started_at stamp failed — requeued without Telegram send",
-              );
-              return "requeued" as const;
-            }
+            // send_started_at is now stamped by the atomic authorization
+            // UPDATE above — no separate pre-send round trip.
             const sendResults = await sendTelegramMessage(row.content, {
               timeout: sendTimeout,
             });
@@ -550,30 +540,38 @@ export class OutboxDispatcher {
                 },
                 "OUTBOX_DISPATCH correlated",
               );
-              // Forensics: classify ON_TIME/LATE/UNKNOWN vs target start if known
-              try {
-                const { recordDeliveredForensics } = await import(
-                  "@/lib/prediction/live/delivery-forensics"
-                );
-                const metaF = (row.metadata ?? {}) as Record<string, unknown>;
-                await recordDeliveredForensics(sql, {
-                  notificationId: row.notification_id,
-                  predictionId:
-                    typeof metaF.predictionId === "string" ? metaF.predictionId : null,
-                  correlationId:
-                    typeof metaF.correlationId === "string" ? metaF.correlationId : null,
-                  sourceGameId:
-                    typeof metaF.sourceGameId === "string" ? metaF.sourceGameId : null,
-                  targetGameId:
-                    (row.target_game_id as string | null) ??
-                    (typeof metaF.targetGameId === "string" ? metaF.targetGameId : null),
-                  createdAt: row.created_at,
-                  sendStartedAtMs: lc.sendStartedMs,
-                  telegramAcceptedAtMs: acceptedMs,
+              // Forensics: classify ON_TIME/LATE/UNKNOWN vs target start if known.
+              // POOL-BUDGET FIX: forensics is analytics, never a delivery gate.
+              // It used to be awaited on the dispatcher's CRITICAL sql — an
+              // analytics read+write series sitting between Telegram accepted
+              // and the dispatcher task returning. It now runs detached on the
+              // GENERAL pool; delivery success/failure is decided before this.
+              setImmediate(() => {
+                void (async () => {
+                  const { recordDeliveredForensics } = await import(
+                    "@/lib/prediction/live/delivery-forensics"
+                  );
+                  const generalSql = await getSql();
+                  const metaF = (row.metadata ?? {}) as Record<string, unknown>;
+                  await recordDeliveredForensics(generalSql, {
+                    notificationId: row.notification_id,
+                    predictionId:
+                      typeof metaF.predictionId === "string" ? metaF.predictionId : null,
+                    correlationId:
+                      typeof metaF.correlationId === "string" ? metaF.correlationId : null,
+                    sourceGameId:
+                      typeof metaF.sourceGameId === "string" ? metaF.sourceGameId : null,
+                    targetGameId:
+                      (row.target_game_id as string | null) ??
+                      (typeof metaF.targetGameId === "string" ? metaF.targetGameId : null),
+                    createdAt: row.created_at,
+                    sendStartedAtMs: lc.sendStartedMs,
+                    telegramAcceptedAtMs: acceptedMs,
+                  });
+                })().catch(() => {
+                  /* soft — forensics must never break delivery */
                 });
-              } catch {
-                /* soft */
-              }
+              });
               logger.info(
                 {
                   component: "timing",
@@ -608,16 +606,20 @@ export class OutboxDispatcher {
               } catch { /* metrics optional */ }
 
               // Phase 19 — record lead times when target_round_started_at is known
-              // P1.7: Defer to background so it doesn't block the outbox dispatch loop.
+              // POOL-BUDGET FIX: runs detached on the GENERAL pool. The block
+              // used to close over the dispatcher's critical-pool `sql`, so
+              // lead-time analytics competed with claim/finalize on the
+              // reserved pool. Delivery never depends on this completing.
               setImmediate(() => {
                 void (async () => {
+                const generalSql = await getSql();
                 const meta = (row.metadata ?? {}) as Record<string, unknown>;
                 const targetGameId =
                   (meta.targetGameId as string) ||
                   (meta.target_game_id as string) ||
                   null;
                 if (targetGameId) {
-                  const predRows = await sql<{
+                  const predRows = await generalSql<{
                     requested_at: string | Date | null;
                     target_round_started_at: string | Date | null;
                   }>`
@@ -632,7 +634,7 @@ export class OutboxDispatcher {
                   const generatedAt: string | Date | null =
                     predRows[0]?.requested_at ?? null;
                   if (!startedAt) {
-                    const live = await sql<{ began_at: string | Date | null }>`
+                    const live = await generalSql<{ began_at: string | Date | null }>`
                       SELECT began_at FROM live_round_state
                       WHERE game_id = ${targetGameId} LIMIT 1
                     `.catch(() => [] as { began_at: string | Date | null }[]);

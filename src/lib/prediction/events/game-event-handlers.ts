@@ -11,6 +11,7 @@ import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
 import { prewarmSign } from "@/lib/crash/native-sign";
 import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtime-pipeline";
 import { getSql } from "@/lib/db";
+import { runInTransaction } from "@/lib/prediction/live/tx";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
 import { attemptNPlusOnePrediction } from "@/lib/prediction/live/prediction-attempt";
@@ -223,74 +224,78 @@ export async function bgHandler(payload: unknown): Promise<void> {
       WHERE game_id = ${gameId}
     `.catch(() => undefined);
 
-    await Promise.all([
-      markLiveRoundStarted(gameId, beganAt, "socket", correlationId, sql).catch(() => undefined),
-      // P0 correlation: stamp target_round_started_at on the pending prediction for N
-      sql`
-        UPDATE pending_predictions
-        SET target_round_started_at = COALESCE(target_round_started_at, ${new Date(beganAt)})
-        WHERE target_game_id = ${gameId}
-          AND matched = false
-      `.catch(() => undefined),
-      // Forensics: reclassify delivered signals vs authoritative began_at
-      (async () => {
-        try {
-          const { reclassifyOnTargetStart } = await import(
-            "@/lib/prediction/live/delivery-forensics"
-          );
-          await reclassifyOnTargetStart(sql, gameId, beganAt);
-        } catch {
-          /* soft */
-        }
-      })(),
-      // P0 (temporal validity): authoritative round-start backfill on the
-      // prediction registry — re-evaluates createdAt < targetStartedAt.
-      import("@/lib/prediction/identity/prediction-registry")
-        .then(({ globalPredictionRegistry }) => {
-          globalPredictionRegistry.noteTargetStarted(gameId, beganAt);
-        })
-        .catch(() => undefined),
-      // Hard temporal contract (report #13): BG(N) arriving means round N has
-      // STARTED — every undelivered prediction signal targeting N is now
-      // EXPIRED. Atomic kill beats waiting for the dispatcher tick.
-      // P0: do NOT fail-open — retry once and log hard if kill cannot run.
-      (async () => {
-        const killSql = async () =>
-          sql`
-            UPDATE notification_outbox
-            SET status = 'dead_letter',
-                last_error = 'expired_late_signal: target round started (BG received)'
-            WHERE type = 'prediction'
-              AND status IN ('pending', 'inflight')
-              AND target_game_id = ${gameId}
-          `;
-        try {
-          await killSql();
-        } catch (e1) {
-          logger.warn(
-            { event: "bg", gameId, error: String(e1), attempt: 1 },
-            "BG temporal kill failed — retrying once",
-          );
-          try {
-            await killSql();
-          } catch (e2) {
-            logger.error(
-              { event: "bg", gameId, error: String(e2), attempt: 2 },
-              "BG temporal kill FAILED after retry — prediction may still be inflight",
-            );
-          }
-        }
-      })(),
-      sql`
-        INSERT INTO live_event_log (
-          correlation_id, event_kind, game_id, payload, received_at, processed_at,
-          processor_latency_ms, sla_violated
-        ) VALUES (
-          ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: true })},
-          ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
-        ) ON CONFLICT DO NOTHING
-      `.catch(() => undefined),
-    ]);
+    // POOL-BUDGET FIX: BG used to launch SIX concurrent general-pool
+    // operations via Promise.all — with general max=5 that self-induced
+    // waiting=2/3 pool pressure on every round start. The essential BG
+    // lifecycle is now ONE transaction (round start + prediction target
+    // stamp + temporal kill + event log); analytics run detached after.
+    // Retried once — if both attempts fail, the dispatcher's atomic
+    // pre-send authorization still refuses late signals at send time.
+    const runBgTx = () =>
+      runInTransaction(sql, async (tx) => {
+        // P0 correlation: stamp target_round_started_at on the pending prediction for N
+        await tx`
+          UPDATE pending_predictions
+          SET target_round_started_at = COALESCE(target_round_started_at, ${new Date(beganAt)})
+          WHERE target_game_id = ${gameId}
+            AND matched = false
+        `;
+        await markLiveRoundStarted(gameId, beganAt, "socket", correlationId, tx);
+        // Hard temporal contract (report #13): BG(N) arriving means round N
+        // has STARTED — every undelivered prediction signal targeting N is
+        // now EXPIRED. Atomic kill beats waiting for the dispatcher tick.
+        await tx`
+          UPDATE notification_outbox
+          SET status = 'dead_letter',
+              last_error = 'expired_late_signal: target round started (BG received)'
+          WHERE type = 'prediction'
+            AND status IN ('pending', 'inflight')
+            AND target_game_id = ${gameId}
+        `;
+        await tx`
+          INSERT INTO live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) VALUES (
+            ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: true })},
+            ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
+          ) ON CONFLICT DO NOTHING
+        `;
+      });
+    try {
+      await runBgTx();
+    } catch (txErr1) {
+      logger.warn(
+        { event: "bg", gameId, error: String(txErr1), attempt: 1 },
+        "BG transaction failed — retrying once",
+      );
+      try {
+        await runBgTx();
+      } catch (txErr2) {
+        logger.error(
+          { event: "bg", gameId, error: String(txErr2), attempt: 2 },
+          "BG transaction FAILED after retry — temporal kill may not have run",
+        );
+      }
+    }
+
+    // Nonessential after commit — analytics and in-memory registry work must
+    // never gate (or roll back with) the temporal kill above.
+    import("@/lib/prediction/identity/prediction-registry")
+      .then(({ globalPredictionRegistry }) => {
+        globalPredictionRegistry.noteTargetStarted(gameId, beganAt);
+      })
+      .catch(() => undefined);
+    setImmediate(() => {
+      void (async () => {
+        const { reclassifyOnTargetStart } = await import(
+          "@/lib/prediction/live/delivery-forensics"
+        );
+        await reclassifyOnTargetStart(sql, gameId, beganAt);
+      })().catch(() => {
+        /* soft */
+      });
+    });
 
     logger.info(
       { event: "bg", gameId, correlationId },

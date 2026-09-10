@@ -14,11 +14,13 @@ describe("prediction delivery correlation timeline", () => {
   );
 
   it("stamps send_started_at while inflight before sendTelegramMessage", () => {
-    const stampIdx = nw.indexOf("set send_started_at");
+    // POOL-BUDGET FIX: the stamp lives inside the atomic authorization UPDATE
+    // (set send_started_at = clock_timestamp()) which still precedes the send.
+    const stampIdx = nw.indexOf("set send_started_at = clock_timestamp()");
     const sendIdx = nw.indexOf("sendTelegramMessage(row.content");
     expect(stampIdx).toBeGreaterThan(-1);
     expect(sendIdx).toBeGreaterThan(stampIdx);
-    expect(nw).toContain("aborted before send — row no longer inflight");
+    expect(nw).toContain("authorization refused (BG/expiry)");
   });
 
   it("lifecycle logs include predictionId, targetGameId, sourceGameId, queuedAt", () => {

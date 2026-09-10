@@ -309,3 +309,161 @@ test("outbox: start/stop is idempotent", async () => {
   await d.stop();
   await d.stop();
 });
+
+// ---------------------------------------------------------------------------
+// POOL-BUDGET FIX — atomic pre-send authorization + prediction lane priority
+// ---------------------------------------------------------------------------
+
+/** Insert a prediction row bound to a real target_game_id. */
+async function insertPredictionRow(opts: {
+  targetGameId: string;
+}): Promise<{ id: number; notificationId: string }> {
+  const sql = await getSql();
+  const id = randomUUID();
+  const content = `[nw-behavior] ${id}`;
+  const metadata = JSON.stringify({ predictionId: id, targetGameId: opts.targetGameId });
+  const rows = await sql<{ id: number }>`
+    insert into notification_outbox (
+      notification_id, type, content, metadata, status, attempt_count, next_attempt_at,
+      target_game_id
+    ) values (
+      ${id}::uuid, 'prediction', ${content}, ${metadata}::jsonb, 'pending', 0,
+      now() - interval '1 millisecond',
+      ${opts.targetGameId}
+    )
+    returning id
+  `;
+  return { id: rows[0].id, notificationId: id };
+}
+
+/** Seed live_round_state with a started round. */
+async function seedStartedRound(gameId: string, beganAt: Date): Promise<void> {
+  await (await getSql())`
+    insert into live_round_state (game_id, lifecycle, began_at, source, updated_at)
+    values (${gameId}, 'STARTED', ${beganAt.toISOString()}, 'socket', now())
+    on conflict (game_id) do update set began_at = ${beganAt.toISOString()}, updated_at = now()
+  `;
+}
+
+async function cleanPoolBudgetRows(): Promise<void> {
+  const sql = await getSql();
+  await sql`delete from notification_outbox where content like '[nw-behavior] %'`;
+  await sql`delete from live_round_state where game_id like '[nw-pool-budget]%'`;
+}
+
+test("pool-budget: prediction with target NOT started is delivered (atomic auth passes)", async () => {
+  setTelegramEnv();
+  await cleanPoolBudgetRows();
+  const sentUrls: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown) => {
+    sentUrls.push(String(url));
+    return okTelegram();
+  }) as typeof fetch;
+  try {
+    const gameId = "[nw-pool-budget] future-round";
+    // began_at in the FUTURE: round has not started; signal is valid.
+    await seedStartedRound(gameId, new Date(Date.now() + 60_000));
+    const { id } = await insertPredictionRow({ targetGameId: gameId });
+    const d = new OutboxDispatcher();
+    const result = await d.tickOnce();
+    assert.equal(result.delivered, 1);
+    const s = await rowState(id);
+    assert.equal(s.status, "delivered");
+    assert.equal(s.last_error, null);
+    assert.equal(
+      sentUrls.filter((u) => /sendMessage/i.test(u)).length,
+      1,
+      "Telegram must be contacted exactly once for a valid signal",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    clearTelegramEnv();
+    await cleanPoolBudgetRows();
+  }
+});
+
+test("pool-budget: prediction with target ALREADY started is dead-lettered and never sent", async () => {
+  setTelegramEnv();
+  await cleanPoolBudgetRows();
+  const sentUrls: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown) => {
+    sentUrls.push(String(url));
+    return okTelegram();
+  }) as typeof fetch;
+  try {
+    const gameId = "[nw-pool-budget] started-round";
+    // began_at 5s in the past: BG already arrived; signal is expired.
+    await seedStartedRound(gameId, new Date(Date.now() - 5_000));
+    const { id } = await insertPredictionRow({ targetGameId: gameId });
+    const d = new OutboxDispatcher();
+    const result = await d.tickOnce();
+    assert.equal(result.dead, 1);
+    const s = await rowState(id);
+    assert.equal(s.status, "dead_letter");
+    assert.match(s.last_error ?? "", /expired_late_signal/);
+    assert.equal(
+      sentUrls.filter((u) => /sendMessage/i.test(u)).length,
+      0,
+      "Telegram must NOT be contacted for an expired signal",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    clearTelegramEnv();
+    await cleanPoolBudgetRows();
+  }
+});
+
+test("pool-budget: prediction rows are claimed ahead of a full batch of result rows", async () => {
+  setTelegramEnv();
+  await cleanPoolBudgetRows();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => okTelegram()) as typeof fetch;
+  try {
+    const sql = await getSql();
+    // Fill the claim batch (BATCH_SIZE=16) with validation rows queued first…
+    const validationIds: string[] = [];
+    for (let i = 0; i < 16; i += 1) {
+      const vid = randomUUID();
+      validationIds.push(vid);
+      await sql`
+        insert into notification_outbox (
+          notification_id, type, content, metadata, status, attempt_count, next_attempt_at
+        ) values (
+          ${vid}::uuid, 'validation', ${`[nw-behavior] ${vid}`}, '{}'::jsonb, 'pending', 0,
+          now() - interval '1 millisecond'
+        )
+      `;
+    }
+    // …then enqueue a prediction. Claim ordering (prediction-first) must put
+    // it in the FIRST batch even though 16 older rows are queued ahead of it.
+    const { id: predId } = await insertPredictionRow({
+      targetGameId: "[nw-pool-budget] priority-round",
+    });
+    const d = new OutboxDispatcher();
+    await d.tickOnce();
+    const rows = await sql<{ id: number; notification_id: string; status: string }>`
+      select id, notification_id, status from notification_outbox
+      where id = ${predId} or notification_id in (${validationIds[0]}::uuid, ${validationIds[15]}::uuid)
+    `;
+    const byPred = rows.find((r) => r.id === predId);
+    const oldestValidation = rows.find(
+      (r) => r.notification_id === validationIds[15],
+    );
+    assert.equal(
+      byPred?.status,
+      "delivered",
+      "prediction must be claimed and delivered in the first batch despite 16 older rows",
+    );
+    assert.equal(
+      oldestValidation?.status,
+      "pending",
+      "the oldest result row beyond the batch size must still be waiting — prediction lane priority",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    clearTelegramEnv();
+    await cleanPoolBudgetRows();
+  }
+});

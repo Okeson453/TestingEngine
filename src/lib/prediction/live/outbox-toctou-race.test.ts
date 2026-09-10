@@ -21,10 +21,18 @@ describe("outbox TOCTOU temporal contract (source)", () => {
   });
 
   it("temporal DB check fails closed (no .catch(() => []) on target lookup)", () => {
-    // The fail-open pattern must not appear on the prediction temporal query path
-    expect(src).toContain("TEMPORAL_CHECK_DB_ERROR");
+    // The fail-open pattern must not appear on the prediction temporal query path.
+    // POOL-BUDGET FIX: the temporal gate + send stamp are ONE atomic
+    // authorization UPDATE; a DB error on it must requeue without sending.
+    expect(src).toContain("SEND_AUTH_DB_ERROR");
     expect(src).toContain("fail-closed");
-    expect(src).toContain("temporal_check_db_error");
+    expect(src).toContain("send_auth_db_error");
+    // The atomic authorization must fail closed INSIDE the send path: the
+    // authorization UPDATE must appear before sendTelegramMessage.
+    const authIdx = src.indexOf("SEND_AUTH_DB_ERROR");
+    const sendIdx = src.indexOf("sendTelegramMessage(row.content");
+    expect(authIdx).toBeGreaterThan(-1);
+    expect(sendIdx).toBeGreaterThan(authIdx);
   });
 
   it("does not force min 200ms send timeout when residual budget is smaller", () => {
@@ -33,7 +41,9 @@ describe("outbox TOCTOU temporal contract (source)", () => {
   });
 
   it("BG temporal kill retries and logs error instead of silent swallow only", () => {
-    expect(handlers).toContain("BG temporal kill failed — retrying once");
-    expect(handlers).toContain("BG temporal kill FAILED after retry");
+    // POOL-BUDGET FIX: the kill now lives inside the BG transaction; the
+    // retry-with-log contract is at transaction granularity.
+    expect(handlers).toContain("BG transaction failed — retrying once");
+    expect(handlers).toContain("BG transaction FAILED after retry");
   });
 });
