@@ -24,14 +24,9 @@ import { Link } from "@tanstack/react-router";
 import {
   predictionGetDailyTarget,
   predictionSetDailyTarget,
-  predictionGetTodayStats,
-  predictionGetLifetimeStats,
-  predictionGetStreaks,
-  predictionGetRecent,
+  predictionGetDashboardSnapshot,
   predictionGetHistory,
   predictionExportHistory,
-  predictionGetPending,
-  predictionGetWorkerStatus,
 } from "@/lib/p";
 import type { WorkerStatus } from "@/lib/p";
 import type {
@@ -119,45 +114,28 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
   const [historyFilter, setHistoryFilter] = useState<"WIN" | "LOSS" | "all">("all");
   const [searchId, setSearchId] = useState("");
 
+  // P0: one snapshot / 5s — single pinned DB connection (was 6× concurrent polls).
+  const snapshotQ = useQuery({
+    queryKey: ["prediction-dashboard-snapshot"],
+    queryFn: () => predictionGetDashboardSnapshot(),
+    initialData: {
+      dailyTarget: initial.dailyTarget,
+      today: initial.today,
+      lifetime: initial.lifetime,
+      streaks: initial.streaks,
+      recent: initial.recent,
+      pending: initial.pending,
+      worker: { ...initial.worker, healthKind: "UNKNOWN" as const, pool: null },
+      generatedAt: new Date().toISOString(),
+      dbOk: true,
+      dbError: null,
+    },
+    refetchInterval: 5_000,
+  });
   const dailyTargetQ = useQuery({
     queryKey: ["prediction-daily-target"],
     queryFn: () => predictionGetDailyTarget(),
     initialData: initial.dailyTarget,
-  });
-
-  const todayQ = useQuery({
-    queryKey: ["prediction-today"],
-    queryFn: () => predictionGetTodayStats(),
-    initialData: initial.today,
-    refetchInterval: 4_000,
-  });
-
-  const lifetimeQ = useQuery({
-    queryKey: ["prediction-lifetime"],
-    queryFn: () => predictionGetLifetimeStats(),
-    initialData: initial.lifetime,
-    refetchInterval: 4_000,
-  });
-
-  const streaksQ = useQuery({
-    queryKey: ["prediction-streaks"],
-    queryFn: () => predictionGetStreaks(),
-    initialData: initial.streaks,
-    refetchInterval: 4_000,
-  });
-
-  const recentQ = useQuery({
-    queryKey: ["prediction-recent"],
-    queryFn: () => predictionGetRecent(),
-    initialData: initial.recent,
-    refetchInterval: 4_000,
-  });
-
-  const pendingQ = useQuery({
-    queryKey: ["prediction-pending"],
-    queryFn: () => predictionGetPending(),
-    initialData: initial.pending,
-    refetchInterval: 4_000,
   });
 
   const historyQ = useQuery({
@@ -209,23 +187,20 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
     mutationFn: (target: number) => predictionSetDailyTarget({ data: { target } }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["prediction-daily-target"] });
-      queryClient.invalidateQueries({ queryKey: ["prediction-today"] });
+      queryClient.invalidateQueries({ queryKey: ["prediction-dashboard-snapshot"] });
     },
   });
 
-  const dailyTarget = dailyTargetQ.data ?? initial.dailyTarget;
-  const today = todayQ.data ?? initial.today;
-  const lifetime = lifetimeQ.data ?? initial.lifetime;
-  const streaks = streaksQ.data ?? initial.streaks;
-   const recent = recentQ.data ?? initial.recent;
-  const pending = pendingQ.data ?? initial.pending;
-  const workerQ = useQuery({
-    queryKey: ["prediction-worker"],
-    queryFn: () => predictionGetWorkerStatus(),
-    initialData: initial.worker,
-    refetchInterval: 4_000,
-  });
-  const worker = workerQ.data ?? initial.worker;
+  const snap = snapshotQ.data;
+  const dailyTarget = snap?.dailyTarget ?? dailyTargetQ.data ?? initial.dailyTarget;
+  const today = snap?.today ?? initial.today;
+  const lifetime = snap?.lifetime ?? initial.lifetime;
+  const streaks = snap?.streaks ?? initial.streaks;
+  const recent = snap?.recent ?? initial.recent;
+  const pending = snap?.pending ?? initial.pending;
+  const worker = snap?.worker ?? { ...initial.worker, healthKind: "UNKNOWN" as const, pool: null };
+  const dbOk = snap?.dbOk !== false;
+  const dbError = snap?.dbError ?? null;
   const history = historyQ.data;
 
   const progressPct =
@@ -346,7 +321,11 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
                   )}
                 />
                 <span className="font-medium">
-                  {worker.running ? "Running" : "Offline"}
+                  {worker.healthKind === "DATABASE_ERROR"
+                    ? "DB error"
+                    : worker.running
+                      ? "Running"
+                      : "Offline"}
                 </span>
               </div>
               <Badge variant={worker.running ? "live" : "warn"}>
@@ -374,7 +353,11 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
                 hint={worker.remainingToday === 0 ? "target reached today" : `${worker.remainingToday} remaining`}
               />
             </div>
-            {worker.lastError ? (
+            {!dbOk && dbError ? (
+              <p className="text-xs text-low">
+                Dashboard database unavailable — not a live feed failure. {dbError}
+              </p>
+            ) : worker.lastError ? (
               <p className="text-xs text-low">Error: {worker.lastError}</p>
             ) : null}
           </div>
