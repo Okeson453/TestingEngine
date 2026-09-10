@@ -80,6 +80,17 @@ export interface EntryDecisionResult {
   acie?: CrashLearningResult['evaluation'] | null;
 }
 
+
+/** Soft adapters for sheath API drift — never throw if methods missing. */
+function sheathReport(sheath: unknown, triggers: unknown[]): void {
+  const s = sheath as { reportTriggers?: (t: unknown[]) => void } | null | undefined;
+  s?.reportTriggers?.(triggers);
+}
+function sheathState(sheath: unknown): unknown {
+  const s = sheath as { getState?: () => unknown } | null | undefined;
+  return typeof s?.getState === "function" ? s.getState() : undefined;
+}
+
 export class EntryDecisionService {
   private readonly logger = getLogger();
   private readonly predictionEngine: PredictionEngine;
@@ -218,7 +229,7 @@ export class EntryDecisionService {
             'Live divergence full sheath — halt entries'
           );
           try {
-            this.sheathMode?.reportTriggers([
+            sheathReport(this.sheathMode, [
               {
                 id: 'prediction_divergence',
                 severity: 'critical',
@@ -234,7 +245,7 @@ export class EntryDecisionService {
           } as never);
         } else if (div.actions.lockConservativeBaseline) {
           try {
-            this.sheathMode?.reportTriggers([
+            sheathReport(this.sheathMode, [
               {
                 id: 'prediction_calibration_degraded',
                 severity: 'high',
@@ -307,7 +318,7 @@ export class EntryDecisionService {
           { component: 'EntryDecisionService', streak: cl },
           'Consecutive loss streak sheath — forcing conservative mode'
         );
-        this.sheathMode?.reportTriggers([
+        sheathReport(this.sheathMode, [
           {
             id: 'consecutive_loss_streak',
             severity: 'high',
@@ -332,8 +343,7 @@ export class EntryDecisionService {
           },
           'Rolling performance deterioration — sheath trigger'
         );
-        (this.sheathMode as unknown as { reportTriggers?: (t: unknown[]) => void })
-          .reportTriggers?.([
+        sheathReport(this.sheathMode, [
           {
             id: 'rolling_performance_degradation',
             severity: drift === 'FROZEN' ? 'critical' : 'high',
@@ -654,7 +664,7 @@ export class EntryDecisionService {
           {
             component: 'EntryDecisionService',
             divergenceLevel: prodStatus.divergence.level,
-            sheath: this.sheathMode?.getState(),
+            sheath: sheathState(this.sheathMode),
           },
           'Entries blocked by prediction sheath / divergence'
         );
