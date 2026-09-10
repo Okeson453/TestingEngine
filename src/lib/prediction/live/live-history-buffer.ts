@@ -17,9 +17,16 @@ import { RollingHistoryBuffer } from "@/lib/prediction/rolling-history-buffer";
 const logger = getLogger("live-history-buffer");
 
 const DEFAULT_MAX = 200;
+/** Minimum rounds required before the N+1 hot path may compute a prediction.
+ * Matches predictor MIN_HISTORY — freshness requires a ready buffer, not SQL. */
+export const MIN_HISTORY_FOR_PREDICTION = Number(
+  process.env.LIVE_HISTORY_MIN ?? 20,
+);
 
 const buffer = new RollingHistoryBuffer(DEFAULT_MAX);
 let warmPromise: Promise<void> | null = null;
+/** True only after a successful warm with size >= MIN_HISTORY_FOR_PREDICTION. */
+let historyReady = false;
 
 interface CrashRow {
   game_id: string;
@@ -76,14 +83,31 @@ export async function warmLiveHistoryBuffer(
       // rows are newest-first; buffer expects chronological ascending
       const chronological = rows.reverse().map(mapRow);
       buffer.warm(chronological);
-      logger.info(
-        { component: "live-history-buffer", size: chronological.length },
-        "Live history buffer warmed from crash_rounds",
-      );
+      historyReady = chronological.length >= MIN_HISTORY_FOR_PREDICTION;
+      if (historyReady) {
+        logger.info(
+          {
+            component: "live-history-buffer",
+            size: chronological.length,
+            minRequired: MIN_HISTORY_FOR_PREDICTION,
+          },
+          "Live history buffer warmed and READY for N+1 prediction",
+        );
+      } else {
+        logger.error(
+          {
+            component: "live-history-buffer",
+            size: chronological.length,
+            minRequired: MIN_HISTORY_FOR_PREDICTION,
+          },
+          "P0 health fault: history buffer warmed but below MIN_HISTORY — N+1 predictions blocked (no SQL fallback on hot path)",
+        );
+      }
     } catch (e) {
-      logger.warn(
+      historyReady = false;
+      logger.error(
         { component: "live-history-buffer", error: String(e) },
-        "Failed to warm live history buffer — will fall back to SQL",
+        "P0 health fault: failed to warm live history buffer — N+1 predictions blocked (no SQL fallback on hot path)",
       );
     }
   })();
@@ -118,6 +142,22 @@ export function appendCompletedRound(round: {
     sequenceIndex: undefined,
   };
   buffer.append(h);
+  // Async recovery path: after a cold/failed warm, live appends can restore readiness.
+  if (
+    buffer.isWarmed() &&
+    !historyReady &&
+    buffer.size() >= MIN_HISTORY_FOR_PREDICTION
+  ) {
+    historyReady = true;
+    logger.info(
+      {
+        component: "live-history-buffer",
+        size: buffer.size(),
+        minRequired: MIN_HISTORY_FOR_PREDICTION,
+      },
+      "Live history buffer recovered READY via live appends",
+    );
+  }
 }
 
 /**
@@ -154,6 +194,15 @@ export function isLiveHistoryWarmed(): boolean {
   return buffer.isWarmed();
 }
 
+/**
+ * Hard readiness gate for the N+1 hot path: buffer must be warmed AND
+ * hold at least MIN_HISTORY_FOR_PREDICTION rounds. Prefer explicit
+ * N+1_UNAVAILABLE_HISTORY over a silent 700–1000ms Neon query.
+ */
+export function isHistoryReadyForPrediction(): boolean {
+  return historyReady && buffer.isWarmed() && buffer.size() >= MIN_HISTORY_FOR_PREDICTION;
+}
+
 export function liveHistorySize(): number {
   return buffer.size();
 }
@@ -162,4 +211,5 @@ export function liveHistorySize(): number {
 export function _resetLiveHistoryBufferForTests(): void {
   buffer.clear();
   warmPromise = null;
+  historyReady = false;
 }
