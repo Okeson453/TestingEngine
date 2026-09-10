@@ -181,8 +181,29 @@ export function isPrivilegedFallbackAllowed(): boolean {
 
 let sandboxFallbackWarned = false;
 
+let loadInflight: Promise<SignUtils> | null = null;
+
+/**
+ * Load (fetch + sandbox-evaluate) the wr_utils bundle, single-flight.
+ *
+ * Concurrent callers share ONE fetch+evaluate attempt chain: without this,
+ * every sign request that raced a cold cache ran its own 3-attempt loop
+ * (prod 2026-09-10: five overlapping bundle fetches during boot). Failures
+ * are NOT cached — the next caller starts a fresh chain, so transient
+ * cold-network fetch failures self-heal.
+ */
 async function loadSignUtils(): Promise<SignUtils> {
   if (cachedUtils) return cachedUtils;
+  if (loadInflight) return loadInflight;
+  loadInflight = loadSignUtilsOnce();
+  try {
+    return await loadInflight;
+  } finally {
+    loadInflight = null;
+  }
+}
+
+async function loadSignUtilsOnce(): Promise<SignUtils> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {

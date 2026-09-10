@@ -103,7 +103,11 @@ export async function reconcileStuckPredictions(
         const lc = live[0]!.lifecycle;
         if (lc === "STARTED" || lc === "RUNNING") {
           result.stillLive += 1;
-          logger.info(
+          // Debug, not info: this fires EVERY poll pass (~2s) for every
+          // still-live pending row — info here drowned the log in
+          // "retained" spam during normal operation (seen in prod
+          // 2026-09-10). Actual state transitions below stay info.
+          logger.debug(
             {
               component: "stuck-recovery",
               predictionId: row.prediction_id,
