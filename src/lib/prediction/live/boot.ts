@@ -23,7 +23,7 @@ import { getSql, type Sql } from "@/lib/db";
 import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
 import { getSharedPredictionEngine } from "@/lib/prediction/live/predictor";
 // Fix 6/1/14: WORKER_ID + persistIncrementalState live in the supervisor now.
-import { WORKER_ID, LiveSupervisor, persistIncrementalState } from "@/lib/prediction/live/live-supervisor";
+import { WORKER_ID, LiveSupervisor, persistIncrementalState, restoreBaselineAdaptiveState } from "@/lib/prediction/live/live-supervisor";
 import { setWorkerAuthority, onAuthorityLost } from "@/lib/prediction/live/fencing";
 
 const logger = getLogger("live-boot");
@@ -360,6 +360,7 @@ class LiveBoot {
 
       // P2.11: Restore incremental state after schema validation
       await restoreIncrementalState(sql);
+      await restoreBaselineAdaptiveState(sql);
 
       // Pre-warm the PredictionEngine so the first live prediction avoids
       // constructor + module-resolution cost on the hot path.
@@ -617,7 +618,7 @@ class LiveBoot {
  *   - connection warmer (3s), event-loop lag probe (2s)
  * and derives the authoritative WorkerHealth record (fix 14).
  */
-export { WORKER_ID, persistIncrementalState } from "@/lib/prediction/live/live-supervisor";
+export { WORKER_ID, persistIncrementalState, restoreBaselineAdaptiveState } from "@/lib/prediction/live/live-supervisor";
 export { LiveSupervisor } from "@/lib/prediction/live/live-supervisor";
 
 const globalSupervisorRef = globalThis as typeof globalThis & {
