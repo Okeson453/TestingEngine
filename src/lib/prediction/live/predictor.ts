@@ -296,17 +296,20 @@ async function loadPriorRoundsStrict(
     /* fall through only if forced */
   }
 
-  // Escape hatch / empty buffer — costs 700–1000ms on Neon; must be rare.
+  // Escape hatch / empty buffer — costs 700–1000ms on Neon.
+  // P0: do NOT silently insert a 1s SQL query into the N+1 hot path.
+  // Prefer explicit unavailability over destroying the inter-round budget.
+  // SQL fallback is only allowed when FORCE_HISTORY_SQL=1 (tests / recovery).
   logger.warn(
     { component: "live-predictor", beganAt, limit },
-    "HISTORY BUFFER MISS — SQL fallback (high latency on Neon)",
+    "HISTORY BUFFER MISS — refusing SQL fallback on hot path (N+1_UNAVAILABLE_HISTORY)",
   );
   try {
     const { dbFallbackCount } = await import("@/lib/observability/performance/latency");
     dbFallbackCount.observe(1);
   } catch { /* soft */ }
 
-  if (process.env.FORCE_HISTORY_SQL !== "0") {
+  if (process.env.FORCE_HISTORY_SQL === "1") {
     const t0 = performance.now();
     const rows = await sql<PriorRow>`
       select game_id, multiplier, began_at, crashed_at
