@@ -146,6 +146,15 @@ interface WasmSignModule {
  *  - Read back two i32s (ptr, len) from the WASM stack
  *  - Decode UTF-8 string from WASM memory
  */
+
+function wasmMemoryBuffer(exports: WebAssembly.Exports): ArrayBuffer {
+  const mem = exports["memory"];
+  if (!(mem instanceof WebAssembly.Memory)) {
+    throw new Error("WASM module missing WebAssembly.Memory export");
+  }
+  return mem.buffer;
+}
+
 async function loadSignModule(wasmPath: string): Promise<WasmSignModule> {
   const wasmBinary = await readFile(wasmPath);
 
@@ -154,7 +163,7 @@ async function loadSignModule(wasmPath: string): Promise<WasmSignModule> {
     "./wr_utils_bg.js": {
       __wbg_now_9c5990bda04c7e53: () => Date.now(),
       __wbindgen_throw: (ptr: number, len: number) => {
-        const mem = new Uint8Array(instance.exports.memory.buffer);
+        const mem = new Uint8Array(wasmMemoryBuffer(instance.exports));
         throw new Error(`WASM throw: ${new TextDecoder().decode(mem.subarray(ptr, ptr + len))}`);
       },
     },
@@ -169,14 +178,14 @@ async function loadSignModule(wasmPath: string): Promise<WasmSignModule> {
 
   function getU8(): Uint8Array {
     if (!cachedU8 || cachedU8.byteLength === 0) {
-      cachedU8 = new Uint8Array(exports.memory.buffer);
+      cachedU8 = new Uint8Array(wasmMemoryBuffer(exports as WebAssembly.Exports));
     }
     return cachedU8;
   }
 
   function getI32(): Int32Array {
     if (!cachedI32 || cachedI32.byteLength === 0) {
-      cachedI32 = new Int32Array(exports.memory.buffer);
+      cachedI32 = new Int32Array(wasmMemoryBuffer(exports as WebAssembly.Exports));
     }
     return cachedI32;
   }
