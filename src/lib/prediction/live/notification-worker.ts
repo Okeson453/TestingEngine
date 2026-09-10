@@ -307,13 +307,37 @@ export class OutboxDispatcher {
                 if (targetGameId) {
                   // P1.7: Consolidated pre-send check — 1 query instead of 2.
                   // LEFT JOIN live_round_state and crash_rounds in a single pass.
-                  const live = await sql<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
-                    SELECT lrs.began_at, cr.crashed_at
-                    FROM (SELECT 1) AS dummy
-                    LEFT JOIN live_round_state lrs ON lrs.game_id = ${targetGameId}
-                    LEFT JOIN crash_rounds cr ON cr.game_id = ${targetGameId}
-                    LIMIT 1
-                  `.catch(() => [] as { began_at: string | Date | null; crashed_at: string | Date | null }[]);
+                  // P0: FAIL CLOSED on DB error — never send when target state is unknown.
+                  let live: { began_at: string | Date | null; crashed_at: string | Date | null }[];
+                  try {
+                    live = await sql<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
+                      SELECT lrs.began_at, cr.crashed_at
+                      FROM (SELECT 1) AS dummy
+                      LEFT JOIN live_round_state lrs ON lrs.game_id = ${targetGameId}
+                      LEFT JOIN crash_rounds cr ON cr.game_id = ${targetGameId}
+                      LIMIT 1
+                    `;
+                  } catch (dbErr) {
+                    // Requeue briefly; do NOT send while temporal state is unverifiable.
+                    await sql`
+                      update notification_outbox
+                      set status = 'pending',
+                          next_attempt_at = now() + interval '250 milliseconds',
+                          last_error = ${'temporal_check_db_error: ' + String(dbErr).slice(0, 180)}
+                      where id = ${row.id} and status = 'inflight'
+                    `;
+                    this.stats.requeued += 1;
+                    logger.warn(
+                      {
+                        component: "outbox-dispatcher",
+                        notificationId: row.notification_id,
+                        targetGameId,
+                        error: String(dbErr),
+                      },
+                      "TEMPORAL_CHECK_DB_ERROR — fail-closed; requeued without send",
+                    );
+                    return "requeued" as const;
+                  }
 
                   // HARD GATE: target started => signal expired, never sent.
                   const beganAt = live[0]?.began_at;
@@ -364,10 +388,32 @@ export class OutboxDispatcher {
               } catch { /* soft */ }
             }
 
-            // Cap Telegram timeout by remaining deadline (rec 93)
-            const sendTimeout = Math.max(
-              200,
-              Math.min(5_000, Number.isFinite(remainingMs) ? remainingMs - 50 : 5_000),
+            // Cap Telegram timeout by remaining deadline.
+            // P0/P1: never start a send whose minimum timeout exceeds the residual budget.
+            // If residual < 250ms, expire rather than racing past the semantic deadline.
+            if (Number.isFinite(remainingMs) && remainingMs < 250) {
+              await sql`
+                update notification_outbox
+                set status = 'dead_letter',
+                    last_error = 'expired_insufficient_send_budget'
+                where id = ${row.id} and status = 'inflight'
+              `;
+              this.stats.dead += 1;
+              logger.warn(
+                {
+                  component: "outbox-dispatcher",
+                  notificationId: row.notification_id,
+                  remainingMs: Math.round(remainingMs),
+                },
+                "OUTBOX_DISPATCH expired — residual budget too small to send safely",
+              );
+              return "dead" as const;
+            }
+            const sendTimeout = Math.min(
+              5_000,
+              Number.isFinite(remainingMs)
+                ? Math.max(50, remainingMs - 50)
+                : 5_000,
             );
             lc.sendStartedMs = this.now();
             const sendResults = await sendTelegramMessage(row.content, {
@@ -397,15 +443,36 @@ export class OutboxDispatcher {
               const acceptedMs = this.now();
               lc.telegramAcceptedMs = acceptedMs;
               const acceptedAt = new Date(acceptedMs).toISOString();
-              await sql`
+              // P0 TOCTOU fix: finalize ONLY if still inflight and within deadline.
+              // BG may have set dead_letter while Telegram was in flight — do not
+              // overwrite that expiration with delivered.
+              const finalized = await sql<{ id: number }>`
                 update notification_outbox
                 set status = 'delivered',
                     delivered_at = ${acceptedAt}::timestamptz,
-                    send_started_at = ${new Date(lc.sendStartedMs).toISOString()}::timestamptz,
+                    send_started_at = ${new Date(lc.sendStartedMs!).toISOString()}::timestamptz,
                     telegram_accepted_at = ${acceptedAt}::timestamptz,
                     last_error = null
                 where id = ${row.id}
+                  and status = 'inflight'
+                  and (telegram_deadline_at is null or telegram_deadline_at > now())
+                returning id
               `;
+              if (finalized.length === 0) {
+                // Race lost to BG/expiry — Telegram may have been accepted, but
+                // we must not record a valid delivery after semantic invalidation.
+                this.stats.dead += 1;
+                logger.warn(
+                  {
+                    component: "outbox-dispatcher",
+                    ...lifecycleLogFields(row, lc, acceptedMs, "suppressed_after_telegram"),
+                    notificationId: row.notification_id,
+                    type: row.type,
+                  },
+                  "OUTBOX_DISPATCH telegram accepted but row no longer inflight/valid — delivery suppressed (BG or deadline won)",
+                );
+                return "dead" as const;
+              }
               this.stats.delivered += 1;
               logger.info(
                 {
