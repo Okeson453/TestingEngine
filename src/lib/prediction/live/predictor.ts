@@ -933,13 +933,24 @@ export async function onGameEndPredict(
       crashPoint: multiplier,
       timestamp: crashedAt,
     });
+    const obsCount =
+      learnResult?.online?.observationCount ?? acie.historySize();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { recordAcieObservation } = require("../acie/stale-guard.ts") as {
+        recordAcieObservation: (gameId: string, n: number) => void;
+      };
+      recordAcieObservation(gameId, obsCount);
+    } catch {
+      /* soft */
+    }
     logger.info(
       {
         component: "live-predictor",
         event: "ACIE_OBSERVATION",
         gameId,
         multiplier,
-        observationCount: learnResult?.online?.observationCount ?? acie.historySize(),
+        observationCount: obsCount,
         acieInstanceId: getSharedACIEInstanceId(),
       },
       "ACIE observed crash before N+1 evaluation",
@@ -1019,6 +1030,39 @@ export async function onGameEndPredict(
   } catch { /* metrics optional */ }
 
   const predictionId = signal.predictionId;
+
+  // P1: Reject emission from stale ACIE state (must have observed this source).
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { assertFreshAcieState } = require("../acie/stale-guard.ts") as {
+      assertFreshAcieState: (src: string) => { ok: boolean; reason?: string };
+    };
+    const check = assertFreshAcieState(gameId);
+    if (!check.ok) {
+      logger.error(
+        {
+          component: "live-predictor",
+          event: "STALE_REJECTED",
+          sourceGameId: gameId,
+          targetGameId,
+          reason: check.reason,
+          predictionId,
+        },
+        "Refusing to emit prediction from stale ACIE state",
+      );
+      try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+      return {
+        predictionId: null,
+        targetGameId,
+        kind: "error",
+        temporalValidity: "TEMPORALLY_UNVERIFIED",
+        sourceGameId: gameId,
+        sourceCrashAt: crashedAt,
+      };
+    }
+  } catch {
+    /* if guard module unavailable, continue (boot/test edge) */
+  }
 
   // Compute SLA status (in-memory, no DB clock access)
   const effectiveSlaLagMs = recoveryMode ? SLA_LAG_MS * 2 : SLA_LAG_MS;
@@ -1195,7 +1239,9 @@ export async function onGameEndPredict(
               regime_name, regime_confidence, reasoning, feature_summary,
               model_version, requested_at, generated_at,
               target_game_id, source_round_id,
-              correlation_id
+              correlation_id,
+              acie_instance_id, acie_observation_count, acie_state_version,
+              feature_hash, prediction_mode, execution_path, strategy_action
             ) values (
               ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
               ${signal.confidence}, ${signal.regimeId},
@@ -1203,7 +1249,14 @@ export async function onGameEndPredict(
               ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
               ${signal.modelVersion}, ${timestamp}, ${timestamp},
               ${targetGameId}, ${gameId},
-              ${correlationId}
+              ${correlationId},
+              ${String((signal.featureSummary as Record<string, unknown> | undefined)?.acie_instance_id ?? "") || null},
+              ${Number((signal.featureSummary as Record<string, unknown> | undefined)?.acie_observation_count) || null},
+              ${Number((signal.featureSummary as Record<string, unknown> | undefined)?.acie_state_version) || null},
+              ${String((signal.featureSummary as Record<string, unknown> | undefined)?.feature_hash ?? "") || null},
+              ${String((signal.featureSummary as Record<string, unknown> | undefined)?.prediction_mode ?? "UNKNOWN")},
+              ${String((signal.featureSummary as Record<string, unknown> | undefined)?.execution_path ?? "") || null},
+              ${String((signal.featureSummary as Record<string, unknown> | undefined)?.strategy_action ?? "") || null}
             )
             on conflict (target_game_id) where matched = false and target_game_id is not null do nothing
             returning prediction_id
