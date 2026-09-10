@@ -1,11 +1,22 @@
 /**
- * Baseline statistical / heuristic model with online adaptive multipliers.
- * Uses empirical rates from features + outcome-driven multiplier updates.
+ * Baseline statistical model — honest empirical rates + constrained adjustments.
+ *
+ * P0 calibration fix (diagnosis 2026-09):
+ * - Uses genuine 50/100/200 window hit rates (not SHORT_CAP=30 aliases).
+ * - Gap/streak multipliers do NOT boost probability until proven OOS
+ *   (held at 1.0; still recorded for diagnostics).
+ * - Confidence is calibration-aware and cannot claim ~100% when ECE is poor.
+ * - Adaptive state is serializable for restore across worker restarts.
+ * - Soft shrink toward empirical 1.3× base rate when sample is thin or
+ *   recent calibration is poor.
  */
 
 import { CURRENT_FEATURE_VERSION } from '../features/feature-meta.ts';
 import type { FeatureVector, ThresholdTarget, ModelIdentity, PredictionOutput, Regime, Dataset } from '../types.ts';
 import { randomUUID } from 'crypto';
+
+/** Approximate long-run P(crash ≥ 1.3) under fair crash process ≈ 1/1.3. */
+export const EMPIRICAL_BASE_1_30 = 1 / 1.3;
 
 /**
  * Model capability contract.
@@ -37,31 +48,56 @@ interface OutcomeSample {
   anomalyActive: boolean;
 }
 
+/** Serializable adaptive state for worker restart continuity. */
+export interface BaselineAdaptiveState {
+  version: 1;
+  gapMultiplier: number;
+  streakMultiplier: number;
+  anomalyMultiplier: number;
+  shortWeight: number;
+  midWeight: number;
+  longWeight: number;
+  outcomes: OutcomeSample[];
+  /** Rolling absolute calibration error |p - y| mean over recent outcomes. */
+  rollingAbsError: number;
+  /** When true, gap/streak multipliers are allowed to move probability (default false). */
+  allowHeuristicBoosts: boolean;
+  updatedAt: string;
+}
+
 /**
- * Deterministic statistical baseline with online adaptive multipliers.
+ * Deterministic statistical baseline with constrained online adaptation.
  */
 export class BaselineStatisticalModel implements PredictiveModel {
   readonly identity: ModelIdentity = {
     name: 'baseline-statistical',
-    version: '1.1.0',
+    version: '1.2.0',
     featureVersion: CURRENT_FEATURE_VERSION,
     targetVersion: 'tv-1.0.0',
   };
 
-  private gapMultiplier = 1.15;
-  private streakMultiplier = 1.1;
-  private anomalyMultiplier = 0.7;
-  private shortWeight = 0.7;
+  /** Diagnostic only — do not apply as probability boosts unless allowHeuristicBoosts. */
+  private gapMultiplier = 1.0;
+  private streakMultiplier = 1.0;
+  private anomalyMultiplier = 1.0;
+  /** Blend: 50-window / 100-window / 200-window (was 0.7 short / 0.3 long on mislabeled short-30). */
+  private shortWeight = 0.3;
+  private midWeight = 0.4;
   private longWeight = 0.3;
   private outcomes: OutcomeSample[] = [];
   private readonly maxOutcomes = 200;
   private lastGapActive = false;
   private lastStreakActive = false;
   private lastAnomalyActive = false;
-
+  private rollingAbsError = 0.25; // start moderately uncertain
   /**
-   * Optional batch fit: seed empirical priors from training rows if available.
+   * Env ALLOW_HEURISTIC_BOOSTS=1 re-enables gap/streak probability multipliers.
+   * Default OFF per diagnosis: gambler's-fallacy risk until OOS proven.
    */
+  private allowHeuristicBoosts =
+    process.env.ALLOW_HEURISTIC_BOOSTS === '1' ||
+    process.env.ALLOW_HEURISTIC_BOOSTS === 'true';
+
   fit(trainingData: Dataset): void {
     try {
       const rows = (trainingData as { rows?: Array<{ crashPoint?: number; y?: number }> })?.rows
@@ -72,23 +108,12 @@ export class BaselineStatisticalModel implements PredictiveModel {
         .map((r) => Number((r as { crashPoint?: number }).crashPoint ?? (r as { y?: number }).y))
         .filter((x) => Number.isFinite(x) && x > 0);
       if (cps.length < 20) return;
-      const hit = cps.filter((c) => c >= 1.3).length / cps.length;
-      // Mild prior nudge toward observed hit rate via short/long blend weights
-      if (hit < 0.4) {
-        this.shortWeight = 0.6;
-        this.longWeight = 0.4;
-      } else if (hit > 0.7) {
-        this.shortWeight = 0.8;
-        this.longWeight = 0.2;
-      }
+      // No aggressive short-weight inflation from training hit rate.
     } catch {
       /* soft */
     }
   }
 
-  /**
-   * Online learning: record outcome and periodically adapt multipliers.
-   */
   observeOutcome(
     predicted: number,
     actual: 0 | 1,
@@ -96,8 +121,9 @@ export class BaselineStatisticalModel implements PredictiveModel {
     _target?: ThresholdTarget,
   ): void {
     if (!Number.isFinite(predicted)) return;
+    const p = Math.min(0.999, Math.max(0.001, predicted));
     this.outcomes.push({
-      predicted: Math.min(0.999, Math.max(0.001, predicted)),
+      predicted: p,
       actual,
       gapActive: this.lastGapActive,
       streakActive: this.lastStreakActive,
@@ -106,30 +132,47 @@ export class BaselineStatisticalModel implements PredictiveModel {
     if (this.outcomes.length > this.maxOutcomes) {
       this.outcomes.shift();
     }
-    if (this.outcomes.length >= 10 && this.outcomes.length % 10 === 0) {
+    // Rolling abs calibration error (EMA)
+    const absErr = Math.abs(p - actual);
+    this.rollingAbsError = 0.95 * this.rollingAbsError + 0.05 * absErr;
+
+    // Only adapt anomaly multiplier mildly; gap/streak stay at 1.0 unless allowed.
+    if (this.outcomes.length >= 20 && this.outcomes.length % 20 === 0) {
       this.recomputeMultipliers();
     }
   }
 
   private recomputeMultipliers(): void {
-    const adapt = (
-      filter: (o: OutcomeSample) => boolean,
-      current: number,
-      lo: number,
-      hi: number,
-    ): number => {
-      const subset = this.outcomes.filter(filter);
-      if (subset.length < 5) return current;
-      // Mean residual: predicted - actual; positive => overconfident
+    if (!this.allowHeuristicBoosts) {
+      // Keep diagnostic multipliers near 1; only anomaly may damp slightly.
+      this.gapMultiplier = 1.0;
+      this.streakMultiplier = 1.0;
+    }
+    const subset = this.outcomes.filter((o) => o.anomalyActive);
+    if (subset.length >= 8) {
       const residual =
         subset.reduce((s, o) => s + (o.predicted - o.actual), 0) / subset.length;
-      // If overconfident on this condition, reduce multiplier toward 1 (or lower for anomaly)
-      const step = Math.max(-0.08, Math.min(0.08, -residual * 0.5));
-      return Math.max(lo, Math.min(hi, current + step));
-    };
-    this.gapMultiplier = adapt((o) => o.gapActive, this.gapMultiplier, 0.5, 2.0);
-    this.streakMultiplier = adapt((o) => o.streakActive, this.streakMultiplier, 0.5, 2.0);
-    this.anomalyMultiplier = adapt((o) => o.anomalyActive, this.anomalyMultiplier, 0.3, 1.0);
+      // If overconfident under anomaly, damp slightly toward conservative
+      const step = Math.max(-0.05, Math.min(0.05, -residual * 0.3));
+      this.anomalyMultiplier = Math.max(0.7, Math.min(1.0, this.anomalyMultiplier + step));
+    }
+    if (this.allowHeuristicBoosts) {
+      const adapt = (
+        filter: (o: OutcomeSample) => boolean,
+        current: number,
+        lo: number,
+        hi: number,
+      ): number => {
+        const sub = this.outcomes.filter(filter);
+        if (sub.length < 10) return current;
+        const residual =
+          sub.reduce((s, o) => s + (o.predicted - o.actual), 0) / sub.length;
+        const step = Math.max(-0.05, Math.min(0.05, -residual * 0.4));
+        return Math.max(lo, Math.min(hi, current + step));
+      };
+      this.gapMultiplier = adapt((o) => o.gapActive, this.gapMultiplier, 0.85, 1.15);
+      this.streakMultiplier = adapt((o) => o.streakActive, this.streakMultiplier, 0.85, 1.15);
+    }
   }
 
   predict(
@@ -141,93 +184,97 @@ export class BaselineStatisticalModel implements PredictiveModel {
     const targetKey =
       target === 1.3 ? '1_30' : target === 2.0 ? '2_00' : target === 5.0 ? '5_00' : '10_00';
 
-    // Prefer target-specific hit rate; fall back to short_hit_13 / ewma for 1.3x
-    // (FeatureEngineV2 primary keys) so we never silently stick at 0.30.
-    let baseProb =
+    // Prefer exact window rates (hit_rate_*) then fv-1 keys (now true windows).
+    const rate50 =
+      v.hit_rate_50 ??
       v[`hit_${targetKey}_50`] ??
-      (target === 1.3 ? (v.short_hit_13 ?? v.ewma_hit_13) : undefined) ??
-      0.3;
-    const longProb =
+      (target === 1.3 ? (v.short_hit_13 ?? EMPIRICAL_BASE_1_30) : EMPIRICAL_BASE_1_30);
+    const rate100 =
+      v.hit_rate_100 ??
       v[`hit_${targetKey}_100`] ??
-      (target === 1.3 ? (v.ewma_hit_13 ?? v.short_hit_13) : undefined) ??
-      baseProb;
-    baseProb = this.shortWeight * baseProb + this.longWeight * longProb;
+      rate50;
+    const rate200 =
+      v.hit_rate_200 ??
+      rate100;
 
-    // P1.6: Consume More Features in Baseline Model
-    // Volatility adjustment from roll_std_50
+    let baseProb =
+      this.shortWeight * rate50 +
+      this.midWeight * rate100 +
+      this.longWeight * rate200;
+
+    // Soft shrink toward empirical base when sample is thin
+    const sampleSize = v.sample_size ?? v.n ?? features.meta.sampleSize ?? 0;
+    const shrink = Math.min(1, sampleSize / 100);
+    if (target === 1.3) {
+      baseProb = shrink * baseProb + (1 - shrink) * EMPIRICAL_BASE_1_30;
+    }
+
+    // Calibration shrink: if recent |p-y| is high, pull toward empirical base
+    const calQuality = Math.max(0, Math.min(1, 1 - this.rollingAbsError / 0.35));
+    if (target === 1.3 && calQuality < 0.7) {
+      const pull = 0.4 * (1 - calQuality);
+      baseProb = (1 - pull) * baseProb + pull * EMPIRICAL_BASE_1_30;
+    }
+
+    // Volatility: mild conservative only (no aggressive boost)
     const rollStd = v.roll_std_50 ?? 0;
-    if (rollStd > 5) {
-      baseProb *= 0.95; // high vol → slightly more conservative
-    } else if (rollStd > 0 && rollStd < 1.5) {
-      baseProb = Math.min(0.95, baseProb * 1.03);
+    if (rollStd > 8) {
+      baseProb *= 0.97;
     }
 
-    // Time-of-day mild adjustment
-    const hour = v.hour_utc;
-    if (typeof hour === 'number' && Number.isFinite(hour)) {
-      // Night hours (0-6 UTC) often different dynamics
-      if (hour >= 0 && hour < 6) baseProb *= 0.97;
+    // Gap / streak: diagnostic flags only unless allowHeuristicBoosts
+    const since = v[`since_${targetKey}`] ?? v.since_1_30 ?? 0;
+    const consecBelow = v.consec_below_1_30 ?? 0;
+    this.lastGapActive = since >= 3;
+    this.lastStreakActive = consecBelow >= 3;
+    this.lastAnomalyActive = Boolean(regime?.dimensions?.anomalyState);
+
+    if (this.allowHeuristicBoosts) {
+      if (this.lastGapActive) baseProb *= this.gapMultiplier;
+      if (this.lastStreakActive) baseProb *= this.streakMultiplier;
+      if (this.lastAnomalyActive) baseProb *= this.anomalyMultiplier;
+    } else if (this.lastAnomalyActive) {
+      // Mild anomaly damp only
+      baseProb *= Math.min(1, this.anomalyMultiplier);
     }
 
-    // Pacing adjustment
-    const since = v[`since_${targetKey}`] ?? 0;
-    const expectedGap = 1 / Math.max(baseProb, 0.05);
-    this.lastGapActive = since > expectedGap * 1.5;
-    if (this.lastGapActive) {
-      // Ensure gap setups clear a small edge gate (~+2–5pp)
-      baseProb = Math.min(0.95, Math.max(baseProb * this.gapMultiplier, baseProb + 0.025));
+    // Regime name adjustments: very mild, no large boosts
+    const dims = regime?.dimensions;
+    if (dims?.anomalyState) {
+      baseProb *= 0.98;
     }
 
-    const consecKey = target <= 1.3 ? 'consec_below_1_30' : 'consec_below_2_00';
-    const consec = v[consecKey] ?? 0;
-    this.lastStreakActive = consec >= 8;
-    if (this.lastStreakActive) {
-      baseProb = Math.min(0.95, Math.max(baseProb * this.streakMultiplier, baseProb + 0.025));
-    }
+    // Cap confidence-era overstatement: never claim > ~88% without strong sample+cal
+    const hardCap =
+      sampleSize >= 100 && calQuality >= 0.75 ? 0.88 : sampleSize >= 50 ? 0.82 : 0.78;
+    const probability = Math.max(0.05, Math.min(hardCap, baseProb));
 
-    // P1.7: Use Regime Dimensions in Baseline Model
-    const dims = regime?.dimensions as Record<string, unknown> | undefined;
-    this.lastAnomalyActive = Boolean(dims?.anomalyState);
-    if (this.lastAnomalyActive) {
-      baseProb *= this.anomalyMultiplier;
-    }
-    const lowConc = Number(dims?.lowMultiplierConcentration ?? dims?.lowConc ?? NaN);
-    if (Number.isFinite(lowConc) && lowConc > 0.7) {
-      baseProb *= 0.92; // deep-low concentration → slightly lower
-    }
-    const vol = Number(dims?.volatility ?? dims?.vol ?? NaN);
-    if (Number.isFinite(vol) && vol > 15) {
-      baseProb *= 0.93;
-    }
-
-    // Additional regime dimension features
-    const streakState = dims?.streakState as string | undefined;
-    if (streakState === 'low') {
-      baseProb *= 1.1;
-    }
-    const thresholdFreq = dims?.thresholdFrequency as Record<string, number> | undefined;
-    if (thresholdFreq && thresholdFreq['1.30'] < 0.5) {
-      baseProb *= 0.9;
-    }
-
-    // Do not shrink toward fair here — that cancelled gap/streak edge and
-    // combined with MIN_SIGNAL_EDGE caused hour-long signal silence.
-    const probability = Math.max(0, Math.min(1, baseProb));
-    const sampleFactor = Math.min(1, (v.sample_size ?? 0) / 50);
+    // Calibration-aware confidence (NOT ≈ probability)
+    const sampleFactor = Math.min(1, sampleSize / 100);
     const quality = features.meta.dataQualityScore;
-    const confidence = Math.max(
-      0,
-      Math.min(1, 0.4 * sampleFactor + 0.4 * quality + 0.2 * (regime?.confidence ?? 0.5))
-    );
+    const regimeStab = regime?.confidence ?? 0.5;
+    let confidence =
+      0.35 * sampleFactor +
+      0.25 * quality +
+      0.25 * calQuality +
+      0.15 * regimeStab;
+    // If calibration is poor, hard-cap confidence
+    if (calQuality < 0.5) {
+      confidence = Math.min(confidence, 0.5);
+    }
+    if (this.rollingAbsError > 0.28) {
+      confidence = Math.min(confidence, 0.45);
+    }
+    confidence = Math.max(0.15, Math.min(0.85, confidence));
 
     const reasoning: string[] = [
-      `Baseline statistical heuristic (adaptive multipliers)`,
-      `Base hit-rate (50): ${((v[`hit_${targetKey}_50`] ?? 0) * 100).toFixed(1)}%`,
-      `Rounds since last ≥${target}x: ${since}`,
-      `Sample size: ${v.sample_size ?? 0}`,
-      `gapMult=${this.gapMultiplier.toFixed(3)} streakMult=${this.streakMultiplier.toFixed(3)} anomalyMult=${this.anomalyMultiplier.toFixed(3)}`,
+      `Baseline statistical v1.2 (honest windows, heuristic boosts ${this.allowHeuristicBoosts ? 'ON' : 'OFF'})`,
+      `hit50=${(rate50 * 100).toFixed(1)}% hit100=${(rate100 * 100).toFixed(1)}% hit200=${(rate200 * 100).toFixed(1)}%`,
+      `blend→${(baseProb * 100).toFixed(1)}% capped→${(probability * 100).toFixed(1)}%`,
+      `calAbsErr=${this.rollingAbsError.toFixed(3)} calQ=${calQuality.toFixed(2)} conf=${(confidence * 100).toFixed(0)}%`,
+      `Rounds since ≥${target}x: ${since}; sample=${sampleSize}`,
     ];
-    if (regime) reasoning.push(`Regime: ${regime.name}`);
+    if (regime) reasoning.push(`Regime: ${regime.name} (id=${regime.id})`);
 
     const now = new Date();
     return {
@@ -240,13 +287,18 @@ export class BaselineStatisticalModel implements PredictiveModel {
       regime,
       dataQuality: quality,
       featureSummary: {
-        hit_rate_50: v[`hit_${targetKey}_50`] ?? 0,
-        since,
-        sample_size: v.sample_size ?? 0,
+        hit_rate_50: rate50,
+        hit_rate_100: rate100,
+        hit_rate_200: rate200,
+        since: Number(since),
+        sample_size: sampleSize,
         roll_mean_50: v.roll_mean_50 ?? 0,
         roll_std_50: v.roll_std_50 ?? 0,
+        rolling_abs_error: this.rollingAbsError,
+        calibration_quality: calQuality,
         gap_multiplier: this.gapMultiplier,
         streak_multiplier: this.streakMultiplier,
+        heuristic_boosts: this.allowHeuristicBoosts ? 1 : 0,
       },
       reasoning,
       timestamp: now.toISOString(),
@@ -254,19 +306,59 @@ export class BaselineStatisticalModel implements PredictiveModel {
     };
   }
 
-  /** Test/ops introspection */
   getAdaptiveState(): {
     gapMultiplier: number;
     streakMultiplier: number;
     anomalyMultiplier: number;
     outcomeCount: number;
+    rollingAbsError: number;
+    allowHeuristicBoosts: boolean;
   } {
     return {
       gapMultiplier: this.gapMultiplier,
       streakMultiplier: this.streakMultiplier,
       anomalyMultiplier: this.anomalyMultiplier,
       outcomeCount: this.outcomes.length,
+      rollingAbsError: this.rollingAbsError,
+      allowHeuristicBoosts: this.allowHeuristicBoosts,
     };
+  }
+
+  /** Serialize for worker_state persistence. */
+  exportState(): BaselineAdaptiveState {
+    return {
+      version: 1,
+      gapMultiplier: this.gapMultiplier,
+      streakMultiplier: this.streakMultiplier,
+      anomalyMultiplier: this.anomalyMultiplier,
+      shortWeight: this.shortWeight,
+      midWeight: this.midWeight,
+      longWeight: this.longWeight,
+      outcomes: this.outcomes.slice(-this.maxOutcomes),
+      rollingAbsError: this.rollingAbsError,
+      allowHeuristicBoosts: this.allowHeuristicBoosts,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Restore after worker restart. */
+  importState(state: BaselineAdaptiveState | null | undefined): void {
+    if (!state || state.version !== 1) return;
+    if (Number.isFinite(state.gapMultiplier)) this.gapMultiplier = state.gapMultiplier;
+    if (Number.isFinite(state.streakMultiplier)) this.streakMultiplier = state.streakMultiplier;
+    if (Number.isFinite(state.anomalyMultiplier)) this.anomalyMultiplier = state.anomalyMultiplier;
+    if (Number.isFinite(state.shortWeight)) this.shortWeight = state.shortWeight;
+    if (Number.isFinite(state.midWeight)) this.midWeight = state.midWeight;
+    if (Number.isFinite(state.longWeight)) this.longWeight = state.longWeight;
+    if (Number.isFinite(state.rollingAbsError)) this.rollingAbsError = state.rollingAbsError;
+    if (Array.isArray(state.outcomes)) {
+      this.outcomes = state.outcomes.slice(-this.maxOutcomes);
+    }
+    // Env still wins for heuristic boosts at runtime
+    this.allowHeuristicBoosts =
+      process.env.ALLOW_HEURISTIC_BOOSTS === '1' ||
+      process.env.ALLOW_HEURISTIC_BOOSTS === 'true' ||
+      Boolean(state.allowHeuristicBoosts && process.env.ALLOW_HEURISTIC_BOOSTS !== '0');
   }
 }
 
