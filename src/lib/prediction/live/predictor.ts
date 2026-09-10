@@ -998,9 +998,12 @@ export async function onGameEndPredict(
           recoveryMode ? "Source: poll recovery" : "Source: live ED",
         ].join("\n");
         // Shorter live deadline keeps temporal contract tight; recovery keeps more budget.
+        // P1: tighter creation-relative deadline (was 8s). Semantic validity is
+        // still enforced by target-start checks + BG kill; this shrinks the
+        // window where a send can cross round-start while still "in deadline".
         const deadlineMs = recoveryMode
-          ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 12_000)
-          : Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000);
+          ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 10_000)
+          : Number(process.env.TELEGRAM_DEADLINE_MS ?? 5_000);
         const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
         try {
           await tx`
