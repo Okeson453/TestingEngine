@@ -32,45 +32,32 @@ export class PredictionEngine {
     this.registry = registry ?? new ModelRegistry();
   }
 
+  
   predict(req: PredictRequest): PredictionSignal {
     const target = req.target ?? 1.3;
 
-    // P2.1: Use incremental state engine for O(1) feature computation when warm.
-    // The validator calls globalIncrementalState.update() on every crash, so
-    // the state is correctly maintained. Falls back to V1 (O(n) scan) on cold
-    // start or if the incremental snapshot is insufficient.
+    // PHASE 3: Remove silent V1 fallback from live prediction path
+    // V2 is now the only supported feature engine for live predictions.
+    // Any V2 failure will bubble up as an explicit error rather than silently degrading.
     let features: FeatureVector;
-    let featurePath: 'V2_INCREMENTAL' | 'V1_FALLBACK' = 'V1_FALLBACK';
-    const blockV1Live = process.env.BLOCK_V1_LIVE_FEATURES === '1';
-    if (globalIncrementalState.isWarm(20)) {
-      try {
-        features = this.featureEngineV2.snapshotFromState(
-          req.targetRoundId,
-          req.timestamp,
-        );
-        featurePath = 'V2_INCREMENTAL';
-      } catch (err) {
-        this.logger.warn(
-          { component: 'PredictionEngine', error: String(err) },
-          'Incremental state feature computation failed — falling back to V1',
-        );
-        if (blockV1Live) {
-          throw new Error('V2 features unavailable and BLOCK_V1_LIVE_FEATURES=1');
-        }
-        features = this.featureEngine.buildVector(req.priorRounds, req.targetRoundId, req.timestamp);
-        featurePath = 'V1_FALLBACK';
-      }
-    } else {
-      // Cold start: use V1 full-history scan (explicitly labeled — never silent)
-      if (blockV1Live) {
-        throw new Error('Incremental state cold and BLOCK_V1_LIVE_FEATURES=1');
-      }
-      features = this.featureEngine.buildVector(req.priorRounds, req.targetRoundId, req.timestamp);
-      featurePath = 'V1_FALLBACK';
-      this.logger.info(
-        { component: 'PredictionEngine', targetRoundId: req.targetRoundId },
-        'featurePath=V1_FALLBACK (cold incremental state)',
+    let featurePath: 'V2_INCREMENTAL' = 'V2_INCREMENTAL';
+    
+    // Always require warm incremental state for live predictions
+    if (!globalIncrementalState.isWarm(20)) {
+      throw new Error('Incremental state not warm - V2 features require at least 20 observations');
+    }
+    
+    try {
+      features = this.featureEngineV2.snapshotFromState(
+        req.targetRoundId,
+        req.timestamp,
       );
+    } catch (err) {
+      this.logger.error(
+        { component: 'PredictionEngine', error: String(err), targetRoundId: req.targetRoundId },
+        'V2 feature computation failed — no V1 fallback available in live mode',
+      );
+      throw new Error('V2 feature computation failed: ' + String(err));
     }
 
     const regime = this.regimeDetector.detect(req.priorRounds, req.timestamp);
@@ -80,10 +67,7 @@ export class PredictionEngine {
     const output = model.predict(features, target, regime);
     const signal = toSignal(output);
     (signal as unknown as Record<string, unknown>).featurePath = featurePath;
-    (signal as unknown as Record<string, unknown>).featureVersion =
-      featurePath === 'V2_INCREMENTAL'
-        ? (signal.featureVersion ?? 'v2-incremental')
-        : (signal.featureVersion ?? 'v1-fallback');
+    (signal as unknown as Record<string, unknown>).featureVersion = signal.featureVersion ?? 'v2-incremental';
 
     if (Math.random() < Number(process.env.PRED_LOG_SAMPLE_RATE ?? 0.05)) {
       this.logger.info({
