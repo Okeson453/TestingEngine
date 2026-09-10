@@ -32,13 +32,13 @@ describe("classifyDelivery", () => {
     ).toBe("EXPIRED");
   });
 
-  it("UNKNOWN when target start missing", () => {
+  it("ON_TIME when delivered and target start not yet known", () => {
     expect(
       classifyDelivery({
         telegramAcceptedAtMs: 1_000,
         targetStartedAtMs: null,
         outboxStatus: "delivered",
       }).outcome,
-    ).toBe("UNKNOWN");
+    ).toBe("ON_TIME");
   });
 });
