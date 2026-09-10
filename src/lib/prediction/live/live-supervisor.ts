@@ -226,23 +226,62 @@ export class LiveSupervisor {
     this.warmerTimer.unref?.();
   }
 
+  /** Ring buffer of recent event-loop lag samples for p50/p95/p99 (P1). */
+  private lagSamples: number[] = [];
+  private static readonly LAG_SAMPLE_CAP = 120;
+
   private startEventLoopLagMonitor(): void {
     if (this.probeTimer) return;
     this.probeTimer = setInterval(() => {
       const start = process.hrtime.bigint();
       setImmediate(() => {
         const lagMs = Number(process.hrtime.bigint() - start) / 1_000_000;
-        if (lagMs > 50) {
-          logger.warn({ eventLoopLagMs: Math.round(lagMs) }, "Event loop lag detected");
+        this.lagSamples.push(lagMs);
+        if (this.lagSamples.length > LiveSupervisor.LAG_SAMPLE_CAP) {
+          this.lagSamples.shift();
         }
+        const stats = this.computeLagPercentiles();
         try {
-          (globalThis as { __eventLoopLagMs__?: number }).__eventLoopLagMs__ = lagMs;
+          const g = globalThis as {
+            __eventLoopLagMs__?: number;
+            __eventLoopLagP50__?: number;
+            __eventLoopLagP95__?: number;
+            __eventLoopLagP99__?: number;
+          };
+          g.__eventLoopLagMs__ = lagMs;
+          g.__eventLoopLagP50__ = stats.p50;
+          g.__eventLoopLagP95__ = stats.p95;
+          g.__eventLoopLagP99__ = stats.p99;
         } catch {
           /* ignore */
+        }
+        if (lagMs > 50 || (stats.p99 != null && stats.p99 > 100)) {
+          logger.warn(
+            {
+              eventLoopLagMs: Math.round(lagMs),
+              event_loop_lag_p50: stats.p50,
+              event_loop_lag_p95: stats.p95,
+              event_loop_lag_p99: stats.p99,
+            },
+            "Event loop lag detected",
+          );
         }
       });
     }, EVENT_LOOP_PROBE_MS);
     this.probeTimer.unref?.();
+  }
+
+  private computeLagPercentiles(): {
+    p50: number | null;
+    p95: number | null;
+    p99: number | null;
+  } {
+    const n = this.lagSamples.length;
+    if (n === 0) return { p50: null, p95: null, p99: null };
+    const sorted = [...this.lagSamples].sort((a, b) => a - b);
+    const at = (p: number) =>
+      Math.round(sorted[Math.min(n - 1, Math.max(0, Math.ceil((p / 100) * n) - 1))]!);
+    return { p50: at(50), p95: at(95), p99: at(99) };
   }
 
   async writeWorkerHealth(sql: Sql, cycle: number): Promise<void> {
@@ -255,12 +294,16 @@ export class LiveSupervisor {
     } catch {
       /* optional */
     }
+    const lag = this.computeLagPercentiles();
     const payload = JSON.stringify({
       workerId: WORKER_ID,
       cycle,
       at: new Date().toISOString(),
       pool: poolInfo,
       pid: process.pid,
+      event_loop_lag_p50: lag.p50,
+      event_loop_lag_p95: lag.p95,
+      event_loop_lag_p99: lag.p99,
     });
     await sql`
       INSERT INTO worker_state (key, value, updated_at)
