@@ -43,6 +43,7 @@ import {
   socketHealthCheckMs,
 } from "@/lib/observability/performance/latency";
 import { isEdgeFresh } from "@/lib/prediction/live/edge-ingest";
+import { isAuthoritative } from "@/lib/prediction/live/fencing";
 
 /** Prefer native WS health (workspace breakthrough) over socket.io-client state. */
 function liveSocketSnapshot(): { status: string; lastEdAt: number | null } {
@@ -195,6 +196,20 @@ export class PollWorker {
   }
 
   async tickOnce(): Promise<PollTickResult> {
+    // Fencing gate (fix plan Phase 1): a worker that lost authority must not
+    // mutate via poll recovery. No-op before the registry is initialized.
+    if (!isAuthoritative()) {
+      return {
+        fetched: 0,
+        inserted: 0,
+        validated: 0,
+        predictionAttempts: 0,
+        missedRounds: 0,
+        stuckRecovered: 0,
+        stuckPredicted: 0,
+        error: null,
+      };
+    }
     const tickT0 = performance.now();
     const sql = await this.getSqlFn();
     const result: PollTickResult = {

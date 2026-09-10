@@ -171,6 +171,14 @@ async function discoverWrUtilsUrl(): Promise<string> {
   return wrUrl;
 }
 
+/**
+ * True when the privileged (unsandboxed) dynamic-import fallback may run.
+ * Production FAILS CLOSED — fix plan Phase 3. Exported for tests.
+ */
+export function isPrivilegedFallbackAllowed(): boolean {
+  return process.env.NODE_ENV !== "production";
+}
+
 let sandboxFallbackWarned = false;
 
 async function loadSignUtils(): Promise<SignUtils> {
@@ -197,11 +205,20 @@ async function loadSignUtils(): Promise<SignUtils> {
         return cachedUtils;
       }
 
+      // Fix plan Phase 3: production FAILS CLOSED. A privileged dynamic
+      // import of downloaded third-party code is not an acceptable fallback
+      // in production — refuse and let the structured sign-failure path
+      // degrade the WS instead of exposing process/fs/net to the bundle.
+      if (!isPrivilegedFallbackAllowed()) {
+        throw new Error(
+          "wr_utils sandbox unavailable in production (needs NODE_OPTIONS=--experimental-vm-modules) — refusing UNSANDBOXED dynamic import of downloaded code (fail closed)",
+        );
+      }
       if (!sandboxFallbackWarned) {
         sandboxFallbackWarned = true;
         logger.warn(
           { component: "bc-sign" },
-          "wr_utils sandbox unavailable (needs NODE_OPTIONS=--experimental-vm-modules) — falling back to UNSANDBOXED dynamic import of the fetched bundle",
+          "wr_utils sandbox unavailable (dev mode) — falling back to privileged dynamic import of the fetched bundle; production fails closed",
         );
       }
       // Legacy path: full-privilege dynamic import via a temp .mjs file.

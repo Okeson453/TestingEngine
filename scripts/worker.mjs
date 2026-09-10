@@ -11,7 +11,26 @@
  *     potentially corrupted worker alive.
  */
 import { pathToFileURL } from "node:url";
+import vm from "node:vm";
 import { registerProcessFailureHandlers } from "./worker-fatal.mjs";
+
+// Fix plan Phase 3: the wr_utils sandbox is a STARTUP REQUIREMENT in
+// production. Without --experimental-vm-modules the sign loader would fall
+// back to a privileged dynamic import of downloaded third-party code —
+// refused elsewhere, so fail the boot clearly here instead of starting a
+// worker that cannot sign.
+if (
+  process.env.NODE_ENV === "production" &&
+  typeof vm.SourceTextModule !== "function"
+) {
+  console.error(
+    "[worker] FATAL: NODE_ENV=production requires node:vm.SourceTextModule (the wr_utils sandbox).",
+  );
+  console.error(
+    "[worker] Start the worker with NODE_OPTIONS=--experimental-vm-modules — production fails closed rather than executing downloaded code with full Node privileges.",
+  );
+  process.exit(1);
+}
 
 if (!process.env.DATABASE_URL) {
   console.error("[worker] DATABASE_URL is not set (local PGLite mode).");

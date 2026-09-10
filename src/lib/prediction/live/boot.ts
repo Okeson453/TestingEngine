@@ -24,6 +24,7 @@ import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
 import { getSharedPredictionEngine } from "@/lib/prediction/live/predictor";
 // Fix 6/1/14: WORKER_ID + persistIncrementalState live in the supervisor now.
 import { WORKER_ID, LiveSupervisor, persistIncrementalState } from "@/lib/prediction/live/live-supervisor";
+import { setWorkerAuthority, onAuthorityLost } from "@/lib/prediction/live/fencing";
 
 const logger = getLogger("live-boot");
 
@@ -76,8 +77,12 @@ async function prewarmHotModules(): Promise<void> {
 const LOCK_KEY = "prediction_worker";
 const LOCK_TTL_SECONDS = 8;
 
-async function acquireWorkerLock(sql: Sql): Promise<boolean> {
+async function acquireWorkerLock(
+  sql: Sql,
+): Promise<{ ok: boolean; epoch: number | null }> {
   // Drop clearly dead rows first (expired or heartbeat stalled > 2× TTL).
+  // This DELETE is conditional — it PROVES expiry; the plan's ban is on
+  // unconditional lock deletion as a takeover mechanism.
   await sql`
     DELETE FROM worker_locks
     WHERE lock_key = ${LOCK_KEY}
@@ -87,36 +92,37 @@ async function acquireWorkerLock(sql: Sql): Promise<boolean> {
       )
   `.catch(() => undefined);
 
-  const rows = await sql<{ owner_id: string }>`
-    INSERT INTO worker_locks (lock_key, owner_id, acquired_at, expires_at, heartbeat_at)
+  const rows = await sql<{ owner_id: string; epoch: number }>`
+    INSERT INTO worker_locks (lock_key, owner_id, acquired_at, expires_at, heartbeat_at, epoch)
     VALUES (
       ${LOCK_KEY},
       ${WORKER_ID},
       now(),
       now() + (${LOCK_TTL_SECONDS}::int * interval '1 second'),
-      now()
+      now(),
+      1
     )
     ON CONFLICT (lock_key) DO UPDATE
     SET owner_id = EXCLUDED.owner_id,
         acquired_at = EXCLUDED.acquired_at,
         expires_at = EXCLUDED.expires_at,
-        heartbeat_at = EXCLUDED.heartbeat_at
+        heartbeat_at = EXCLUDED.heartbeat_at,
+        epoch = worker_locks.epoch + 1
     WHERE worker_locks.expires_at < now()
        OR worker_locks.heartbeat_at < now() - (${LOCK_TTL_SECONDS * 2}::int * interval '1 second')
-       OR worker_locks.owner_id = ${WORKER_ID}
-    RETURNING owner_id
+       OR worker_locks.owner_id = EXCLUDED.owner_id
+    RETURNING epoch, owner_id
   `;
-  return rows[0]?.owner_id === WORKER_ID;
+  const row = rows[0];
+  return row && row.owner_id === WORKER_ID
+    ? { ok: true, epoch: Number(row.epoch) }
+    : { ok: false, epoch: null };
 }
 
-/** Rolling deploy: previous container still heartbeats until SIGTERM drains.
- *  After a short wait, new instance takes the lock so live path is not blocked ~20s+. */
-async function forceStealWorkerLock(sql: Sql): Promise<boolean> {
-  await sql`
-    DELETE FROM worker_locks WHERE lock_key = ${LOCK_KEY}
-  `.catch(() => undefined);
-  return acquireWorkerLock(sql);
-}
+/** Rolling deploy: the previous container keeps its lease until its heartbeat
+ *  goes stale (≤ 2×TTL after its last heartbeat) or it releases on SIGTERM.
+ *  Takeover must PROVE lease expiry — unconditional DELETE is banned
+ *  (fix plan Phase 1). Callers retry on a bounded loop instead. */
 
 /**
  * Phase 4 / 12 — Restore adaptive incremental state from real Crash observations.
@@ -456,49 +462,64 @@ class LiveBoot {
       throw e;
     }
 
-    // P0: distributed single-writer lock — wait for expire/steal instead of
-    // crash-looping during rolling deploys (previous holder may still be draining).
-    let hasLock = await acquireWorkerLock(sql);
-    if (!hasLock) {
-      // Rolling deploys keep the old process heartbeating until drain (~10–30s).
-      // Do not wait that long — soft-wait then force-steal.
-      const softWaitMs = Number(process.env.WORKER_LOCK_SOFT_WAIT_MS ?? 4_000);
-      const stepMs = 500;
-      const deadline = Date.now() + softWaitMs;
-      logger.warn(
-        { component: "live-boot", workerId: WORKER_ID, softWaitMs },
-        "Lock held by another worker — short wait then force-steal",
-      );
-      while (!hasLock && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, stepMs));
-        hasLock = await acquireWorkerLock(sql);
-      }
-      if (!hasLock) {
+    // P0 (fix plan Phase 1): lease + fencing epoch = authority. Takeover must
+    // PROVE the previous lease expired — no unconditional DELETE. During a
+    // rolling deploy the old worker heartbeats until drained; we retry until
+    // its lease proves expired (≤ 2×TTL after its last heartbeat) or it
+    // releases on SIGTERM. Bounded by WORKER_LEASE_WAIT_MS.
+    const leaseWaitDeadline = Date.now() + Number(process.env.WORKER_LEASE_WAIT_MS ?? 45_000);
+    let lock: { ok: boolean; epoch: number | null } = { ok: false, epoch: null };
+    let leaseAttempts = 0;
+    while (Date.now() < leaseWaitDeadline) {
+      leaseAttempts += 1;
+      lock = await acquireWorkerLock(sql);
+      if (lock.ok) break;
+      if (leaseAttempts === 1) {
         logger.warn(
-          { component: "live-boot", workerId: WORKER_ID },
-          "Force-stealing worker lock (rolling deploy)",
+          {
+            component: "live-boot",
+            workerId: WORKER_ID,
+            leaseWaitMs: Number(process.env.WORKER_LEASE_WAIT_MS ?? 45_000),
+          },
+          "WORKER_LEASE_WAITING: another worker holds an unexpired lease — retrying until it proves expired",
         );
-        hasLock = await forceStealWorkerLock(sql);
       }
+      await new Promise((r) => setTimeout(r, 2_000));
     }
-    if (!hasLock) {
+    if (!lock.ok) {
       logger.error(
-        { component: "live-boot", workerId: WORKER_ID },
-        "Another worker holds the distributed lock. Refusing to start mutation roles.",
+        { component: "live-boot", workerId: WORKER_ID, attempts: leaseAttempts },
+        "Another worker holds an unexpired lease. Refusing to start mutation roles.",
       );
       throw new Error(
-        `Worker lock not acquired (another instance holds '${LOCK_KEY}')`,
+        `Worker lease not acquired (another instance holds '${LOCK_KEY}' and its lease never proved expired)`,
       );
     }
+    setWorkerAuthority(lock.epoch);
     logger.info(
-      { component: "live-boot", workerId: WORKER_ID },
-      "distributed worker lock acquired",
+      { component: "live-boot", workerId: WORKER_ID, workerEpoch: lock.epoch },
+      "distributed worker lease acquired (fencing epoch active)",
     );
     // Fix 6: supervisor owns ALL control-loop timers — lock heartbeat +
     // worker health (10s), invariant monitor (30s, exactly ONE timer — fix 1),
     // connection warmer (3s), event-loop probe (2s).
     const supervisor = getLiveSupervisor();
     supervisor.start();
+
+    // Fix plan Phase 2: lock loss must cancel EVERY mutation-capable
+    // component, not just supervisor timers. The supervisor calls
+    // markAuthorityLost(); this cascade stops the dispatcher, poll worker and
+    // clock monitor immediately. The ed/dispatch/poll gates consult
+    // isAuthoritative() for the window before teardown completes.
+    onAuthorityLost(() => {
+      logger.error(
+        { component: "live-boot", workerId: WORKER_ID },
+        "authority lost — stopping dispatcher/poll/clock components",
+      );
+      try { void this.dispatcher?.stop(); } catch { /* */ }
+      try { void this.pollWorker?.stop(); } catch { /* */ }
+      try { void this.clockMonitor?.stop(); } catch { /* */ }
+    });
 
     await dispatcher.start();
     if (deps.startSubscriber) {
@@ -538,6 +559,8 @@ class LiveBoot {
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
+    // Clean shutdown revokes authority explicitly (fencing registry).
+    setWorkerAuthority(null);
     // Fix 6: supervisor stops ALL timers (heartbeat, invariants, warmer, probe)
     await getLiveSupervisor().stop();
     if (this.dispatcher) {

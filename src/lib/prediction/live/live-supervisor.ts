@@ -17,6 +17,7 @@ import { getSql, getPoolStats, type Sql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
 import { getLastSignalAt } from "@/lib/prediction/live/latency-trace";
+import { markAuthorityLost } from "@/lib/prediction/live/fencing";
 
 const logger = getLogger("live-supervisor");
 
@@ -193,6 +194,10 @@ export class LiveSupervisor {
                 { component: "live-supervisor", workerId: WORKER_ID },
                 "WORKER_LOCK_DEMOTED: stopping predict/dispatch/invariant loops (split-brain guard)",
               );
+              // Fix plan Phase 2: fire the cancellation cascade — stops the
+              // dispatcher, poll worker, clock monitor; ed/poll/dispatch
+              // gates refuse further authoritative mutation.
+              markAuthorityLost(`lock lost for ${this.lockLostStrikes} consecutive heartbeats`);
               this.stop();
             }
           }

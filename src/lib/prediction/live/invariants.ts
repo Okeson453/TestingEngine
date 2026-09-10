@@ -12,6 +12,9 @@ export type InvariantId =
   | "one_active_prediction_per_target"
   | "one_validation_per_prediction"
   | "one_feedback_per_validation"
+  // Fix plan Phase 14: renamed semantics + new duplicate-state check.
+  | "feedback_not_applied_within_sla"
+  | "feedback_state_contradiction"
   | "one_crash_result_per_game"
   | "no_prediction_without_history"
   | "no_duplicate_outbox_for_prediction";
@@ -100,8 +103,11 @@ export async function sampleProductionInvariants(
       LIMIT 5
     `;
     for (const row of stuck) {
+      // Fix plan Phase 14: renamed — this detects FEEDBACK THAT MISSED ITS SLA
+      // (never applied), not duplicate feedback. Duplicate/contradictory
+      // feedback state is checked by feedback_state_contradiction below.
       violations.push({
-        id: "one_feedback_per_validation",
+        id: "feedback_not_applied_within_sla",
         detail: `feedback not applied within 2m for prediction=${row.prediction_id}`,
         predictionId: row.prediction_id,
         gameId: row.game_id,
@@ -112,6 +118,31 @@ export async function sampleProductionInvariants(
     }
   } catch (e) {
     logger.debug({ error: String(e) }, "invariant sample skip (feedback)");
+  }
+
+  try {
+    // Fix plan Phase 14: duplicate/contradictory feedback state. A row that is
+    // BOTH skipped (intentionally never applied) and marked applied is
+    // corrupted state — one of the two markers is wrong.
+    const contradicted = await db<{ prediction_id: string }>`
+      SELECT prediction_id
+      FROM prediction_validations
+      WHERE feedback_applied_at IS NOT NULL
+        AND feedback_skip_reason IS NOT NULL
+      LIMIT 5
+    `;
+    for (const row of contradicted) {
+      violations.push({
+        id: "feedback_state_contradiction",
+        detail: `prediction=${row.prediction_id} has feedback_applied_at AND feedback_skip_reason set`,
+        predictionId: row.prediction_id,
+        expected: "feedback_applied_at and feedback_skip_reason are mutually exclusive",
+        actual: "both set",
+        stage: "feedback",
+      });
+    }
+  } catch (e) {
+    logger.debug({ error: String(e) }, "invariant sample skip (feedback contradiction)");
   }
 
   try {

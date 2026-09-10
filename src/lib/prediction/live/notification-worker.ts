@@ -20,6 +20,7 @@ import { getSql, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { sendTelegramMessage, type SendResult } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
+import { isAuthoritative } from "@/lib/prediction/live/fencing";
 
 const logger = getLogger("outbox-dispatcher");
 
@@ -120,7 +121,6 @@ export interface DispatcherStats {
 }
 
 export class OutboxDispatcher {
-  private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
   private stats: DispatcherStats = {
     tickCount: 0,
@@ -143,14 +143,22 @@ export class OutboxDispatcher {
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    this.scheduleNext(0);
+    // Fix plan Phase 4: exactly ONE drain loop per worker. The previous
+    // scheduleNext() registered a fresh `once` wake listener per cycle; when
+    // the timer won the race the listener leaked and later fired overlapping
+    // runOneTick()s. The loop below is the only executor — wake events merely
+    // shorten its wait.
+    void this.drainLoop();
   }
 
   async stop(): Promise<void> {
     this.running = false;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
+    // Nudge the loop so a pending wait resolves immediately and the loop exits.
+    try {
+      const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
+      notifyOutbox();
+    } catch {
+      /* wake module optional in tests */
     }
   }
 
@@ -795,54 +803,53 @@ export class OutboxDispatcher {
     return "requeued";
   }
 
-  private scheduleNext(delayMs: number): void {
-    if (!this.running) return;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-
-    let settled = false;
-    const run = (): void => {
-      if (settled || !this.running) return;
-      settled = true;
-      if (this.timer) {
-        clearTimeout(this.timer);
-        this.timer = null;
+  private async drainLoop(): Promise<void> {
+    while (this.running) {
+      // Fencing gate (fix plan Phase 1): a worker that lost authority must not
+      // dispatch. Covers the window between lock loss and cascade teardown.
+      if (!isAuthoritative()) {
+        logger.warn(
+          { component: "outbox-dispatcher" },
+          "dispatcher stopping — worker authority lost",
+        );
+        this.running = false;
+        break;
       }
-      void this.runOneTick();
-    };
-
-    // Race periodic tick against immediate wake from producers (predictor /
-    // validator). Removes average TICK_MS/2 wait after outbox enqueue.
-    this.timer = setTimeout(run, delayMs);
-    this.timer.unref?.();
-
-    void import("@/lib/prediction/live/outbox-wake")
-      .then(({ waitForOutboxWake }) => waitForOutboxWake())
-      .then(() => run())
-      .catch(() => {
-        /* wake module optional in tests */
-      });
+      try {
+        // P2.4: Throttle recoverStale to every 10 ticks (250ms at 25ms tick)
+        // instead of every tick. Stale recovery is non-critical and the DB
+        // UPDATE it runs was consuming ~5-10ms on every tick.
+        if (this.stats.tickCount % 10 === 0) {
+          await this.recoverStale();
+        }
+        await this.tickOnce();
+      } catch (e) {
+        this.stats.lastError = String(e);
+        logger.error(
+          { component: "outbox-dispatcher", error: String(e) },
+          "tick error",
+        );
+      }
+      if (!this.running) break;
+      await this.waitForNextTick();
+    }
   }
 
-  private async runOneTick(): Promise<void> {
-    if (!this.running) return;
+  /**
+   * Wait between ticks: resolves on a producer wake (immediate drain) or
+   * after TICK_MS, whichever first. The coalescing wake channel guarantees
+   * bursts collapse into a single immediate tick — never overlapping ones.
+   */
+  private async waitForNextTick(): Promise<void> {
     try {
-      // P2.4: Throttle recoverStale to every 10 ticks (250ms at 25ms tick)
-      // instead of every tick. Stale recovery is non-critical and the DB
-      // UPDATE it runs was consuming ~5-10ms on every tick.
-      if (this.stats.tickCount % 10 === 0) {
-        await this.recoverStale();
-      }
-      await this.tickOnce();
-    } catch (e) {
-      this.stats.lastError = String(e);
-      logger.error(
-        { component: "outbox-dispatcher", error: String(e) },
-        "tick error",
-      );
+      const { waitForOutboxWake } = await import("@/lib/prediction/live/outbox-wake");
+      await waitForOutboxWake(TICK_MS);
+    } catch {
+      // wake module unavailable in some test contexts — plain timer fallback
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, TICK_MS);
+        t.unref?.();
+      });
     }
-    this.scheduleNext(TICK_MS);
   }
 }

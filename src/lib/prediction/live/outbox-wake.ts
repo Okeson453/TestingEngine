@@ -1,37 +1,74 @@
 /**
- * Outbox wake channel — process-level EventEmitter.
+ * Outbox wake channel — process-level, stateful, coalescing.
  *
  * After a prediction or validation row is committed to `notification_outbox`,
  * producers call `notifyOutbox()` so the dispatcher can drain immediately
- * instead of waiting up to TICK_MS (default 25 ms) for the next timer.
+ * instead of waiting the full tick for the next timer.
  *
- * Extracted to its own module to avoid a circular import between
- * predictor / validator and notification-worker.
+ * Fix plan Phase 4: the previous implementation registered a fresh `once`
+ * EventEmitter listener per scheduling cycle. If the timer won the race, the
+ * listener leaked — and all leaked listeners later fired, producing
+ * overlapping drain ticks. This version keeps AT MOST ONE waiter and
+ * coalesces wake events:
+ *
+ *   - notifyOutbox() with no waiter  -> wakePending = true (next wait returns
+ *     immediately)
+ *   - notifyOutbox() with a waiter   -> that waiter resolves (exactly one)
+ *   - multiple notifyOutbox() bursts -> single drain, never N overlapping
+ *
+ * The dispatcher is the only waiter; the single-waiter contract is enforced
+ * by construction (a second wait would replace the first — there is only one
+ * drain loop per worker by invariant).
  */
-import { EventEmitter } from "node:events";
 
-const bus = new EventEmitter();
-// Unlimited listeners: many concurrent ED handlers may wake the same drain.
-bus.setMaxListeners(0);
-
-const WAKE_EVENT = "outbox-wake";
+let wakePending = false;
+const waiters = new Set<() => void>();
 
 /** Signal that at least one new outbox row is ready to claim. */
 export function notifyOutbox(): void {
-  bus.emit(WAKE_EVENT);
+  if (waiters.size > 0) {
+    wakePending = false;
+    for (const w of [...waiters]) w();
+  } else {
+    // No waiter right now — LATCH the wake so the next wait returns
+    // immediately instead of sleeping a full tick. Losing this wake is
+    // exactly the dropped-notification bug the channel exists to prevent.
+    wakePending = true;
+  }
 }
 
 /**
- * Resolve on the next wake (or never, until aborted via stop).
- * Used by the dispatcher to race against the periodic setTimeout.
+ * Wait for a wake, a timeout, or both — whichever first. With no timeout,
+ * waits until the next wake. Never throws. Multiple concurrent waiters are
+ * supported; a wake resolves all of them (coalesced — one event, one resolve
+ * per waiter).
  */
-export function waitForOutboxWake(): Promise<void> {
+export function waitForOutboxWake(timeoutMs?: number): Promise<void> {
+  if (wakePending) {
+    wakePending = false;
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
-    bus.once(WAKE_EVENT, () => resolve());
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      waiters.delete(settle);
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    waiters.add(settle);
+    if (timeoutMs != null) {
+      timer = setTimeout(settle, timeoutMs);
+      timer.unref?.();
+    }
   });
 }
 
 /** Test helper. */
 export function _resetOutboxWakeForTests(): void {
-  bus.removeAllListeners(WAKE_EVENT);
+  wakePending = false;
+  for (const w of [...waiters]) w();
+  waiters.clear();
 }

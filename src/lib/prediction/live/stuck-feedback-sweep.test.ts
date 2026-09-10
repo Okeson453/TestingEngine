@@ -9,7 +9,7 @@
  *      idempotent — a second sweep must be a no-op.
  *   2. Rows with feedback_skip_reason='TEMPORALLY_INVALID' (intentional
  *      skips) are excluded from the sweep AND from the
- *      one_feedback_per_validation invariant — previously every
+ *      feedback_not_applied_within_sla invariant — previously every
  *      temporally-invalid prediction tripped the invariant forever.
  *
  * Requires migration 0024 (feedback_skip_reason) applied to the local pglite.
@@ -18,6 +18,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getSql } from "@/lib/db";
 import { sweepStuckFeedback } from "@/lib/prediction/live/feedback";
+
+// Unique-per-run suffix: the pglite DB persists rows across runs and
+// game_id carries a UNIQUE index.
+const rid = Math.random().toString(36).slice(2, 10);
 
 async function insertStaleValidation(opts: {
   predictionId: string;
@@ -45,7 +49,7 @@ async function insertStaleValidation(opts: {
 test("sweep applies feedback to genuinely stuck rows (idempotently)", async () => {
   const sql = await getSql();
   const predictionId = `sweep-test-${randomUUIDShort()}`;
-  await insertStaleValidation({ predictionId, gameId: "sweep-game-1" });
+  await insertStaleValidation({ predictionId, gameId: `sweep-game-1-${rid}` });
 
   const before = await sql<{ feedback_applied_at: string | Date | null }>`
     SELECT feedback_applied_at FROM prediction_validations
@@ -62,17 +66,24 @@ test("sweep applies feedback to genuinely stuck rows (idempotently)", async () =
   `;
   assert.notEqual(after[0]!.feedback_applied_at, null, "sweep must set feedback_applied_at");
 
-  // Second pass: the row is claimed — nothing left to do for it.
-  const second = await sweepStuckFeedback(sql, { olderThanMinutes: 5, limit: 50 });
+  // Second pass: the row is claimed — nothing left to do for it. The count
+  // assertion targets THIS row only: the shared pglite DB persists stale
+  // rows from earlier runs, which the sweep may legitimately re-drive.
+  const appliedAtAfterFirst = after[0]!.feedback_applied_at;
+  await sweepStuckFeedback(sql, { olderThanMinutes: 5, limit: 50 });
   const after2 = await sql<{ feedback_applied_at: string | Date | null }>`
     SELECT feedback_applied_at FROM prediction_validations
     WHERE prediction_id = ${predictionId}
   `;
   assert.notEqual(after2[0]!.feedback_applied_at, null);
   assert.equal(
-    second.applied,
-    0,
-    "second sweep must not re-apply (durable claim idempotency)",
+    after2[0]!.feedback_applied_at instanceof Date
+      ? (after2[0]!.feedback_applied_at as Date).toISOString()
+      : after2[0]!.feedback_applied_at,
+    appliedAtAfterFirst instanceof Date
+      ? (appliedAtAfterFirst as Date).toISOString()
+      : appliedAtAfterFirst,
+    "second sweep must not re-apply this row (durable claim idempotency)",
   );
 });
 
@@ -81,7 +92,7 @@ test("skip-reasoned rows (TEMPORALLY_INVALID) are excluded from the sweep", asyn
   const predictionId = `sweep-skip-${randomUUIDShort()}`;
   await insertStaleValidation({
     predictionId,
-    gameId: "sweep-game-2",
+    gameId: `sweep-game-2-${rid}`,
     skipReason: "TEMPORALLY_INVALID",
   });
 
@@ -98,12 +109,12 @@ test("skip-reasoned rows (TEMPORALLY_INVALID) are excluded from the sweep", asyn
   );
 });
 
-test("skip-reasoned rows are excluded from the one_feedback_per_validation invariant", async () => {
+test("skip-reasoned rows are excluded from the feedback_not_applied_within_sla invariant", async () => {
   const sql = await getSql();
   const skipId = `invariant-skip-${randomUUIDShort()}`;
   await insertStaleValidation({
     predictionId: skipId,
-    gameId: "sweep-game-3",
+    gameId: `sweep-game-3-${rid}`,
     skipReason: "TEMPORALLY_INVALID",
   });
 
@@ -113,7 +124,7 @@ test("skip-reasoned rows are excluded from the one_feedback_per_validation invar
   const snapshot = await sampleProductionInvariants(sql);
   const feedbackViolations = (snapshot.violations ?? []).filter(
     (v: { id?: string; predictionId?: string }) =>
-      v.id === "one_feedback_per_validation" && v.predictionId === skipId,
+      v.id === "feedback_not_applied_within_sla" && v.predictionId === skipId,
   );
   assert.equal(
     feedbackViolations.length,

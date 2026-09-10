@@ -20,6 +20,7 @@ import {
   markLiveRoundEnded,
 } from "@/lib/prediction/live/live-round-state";
 import { appendCompletedRound } from "@/lib/prediction/live/live-history-buffer";
+import { isAuthoritative } from "@/lib/prediction/live/fencing";
 import {
   completeTarget,
   releaseTarget,
@@ -291,6 +292,16 @@ export function normalizeCrashEnd(
  * Phase 2: attemptNPlusOnePrediction is the sole ownership boundary.
  */
 async function edHandler(payload: unknown): Promise<void> {
+  // Fencing gate (fix plan Phase 1): a worker that lost authority must not
+  // ingest authoritative events or compute predictions. No-op before boot
+  // initializes the fencing registry (tests, non-boot processes).
+  if (!isAuthoritative()) {
+    logger.warn(
+      { component: "game-event-handlers", ownership_result: "not_authoritative" },
+      "ED event dropped — worker authority lost",
+    );
+    return;
+  }
   const gameId = extractLastGameId(payload);
   if (!gameId) return;
   // P0: dedupe by canonical round ID BEFORE any computation. Duplicate native

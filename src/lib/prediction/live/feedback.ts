@@ -139,24 +139,104 @@ export function analyzeFailure(
  * Returns true if this process/call owns the claim (first successful claim).
  * Returns false if already claimed or no validation row exists.
  */
-async function claimFeedbackDurable(predictionId: string): Promise<boolean> {
+/**
+ * Durable feedback JOB claim (fix plan Phase 5).
+ *
+ * feedback_jobs is the authoritative state machine: the claim flips
+ * PENDING (or a stale PROCESSING row from a dead worker) to PROCESSING and
+ * bumps attempt_count. Completion is recorded SEPARATELY — after the learning
+ * pipeline succeeds — so a crash between claim and completion yields a
+ * retryable PROCESSING row (stale-claim re-drive / sweep), never a lost
+ * feedback. The in-memory processedIds Set is a fast-path optimization only.
+ *
+ * Fallback chain for pre-0026 databases: claim via feedback_applied_at on
+ * prediction_validations, then in-memory.
+ */
+async function claimFeedbackJobDurable(predictionId: string): Promise<boolean> {
   try {
     const sql = await getSql();
-    const claimed = await sql<{ prediction_id: string }>`
-      UPDATE prediction_validations
-      SET feedback_applied_at = now()
+    const claimed = await sql<{ id: number }>`
+      UPDATE feedback_jobs
+      SET status = 'PROCESSING',
+          claimed_at = now(),
+          attempt_count = attempt_count + 1,
+          updated_at = now()
       WHERE prediction_id = ${predictionId}
-        AND feedback_applied_at IS NULL
-      RETURNING prediction_id
+        AND (
+          status = 'PENDING'
+          OR (status = 'PROCESSING' AND claimed_at < now() - interval '2 minutes')
+        )
+      RETURNING id
     `;
-    return claimed.length > 0;
+    if (claimed.length > 0) return true;
+    // No claimable row: either the job is COMPLETED (done — skip) or it does
+    // not exist yet (legacy row / direct call). Enqueue+claim atomically;
+    // a UNIQUE(prediction_id) job that already exists in a terminal state
+    // makes this a no-op.
+    const inserted = await sql<{ id: number }>`
+      INSERT INTO feedback_jobs (prediction_id, status, claimed_at, attempt_count)
+      VALUES (${predictionId}, 'PROCESSING', now(), 1)
+      ON CONFLICT (prediction_id) DO NOTHING
+      RETURNING id
+    `;
+    return inserted.length > 0;
   } catch (e) {
-    // Column may not exist yet (pre-migration). Fall back to in-memory only.
+    // feedback_jobs may not exist yet (pre-migration). Fall back to the
+    // feedback_applied_at claim, then in-memory.
     logger.warn(
       { predictionId, error: String(e) },
-      "durable feedback claim failed — falling back to in-memory idempotency",
+      "feedback_jobs claim failed — falling back to feedback_applied_at claim",
     );
-    return !processedIds.has(predictionId);
+    try {
+      const sql = await getSql();
+      const claimed = await sql<{ prediction_id: string }>`
+        UPDATE prediction_validations
+        SET feedback_applied_at = now()
+        WHERE prediction_id = ${predictionId}
+          AND feedback_applied_at IS NULL
+        RETURNING prediction_id
+      `;
+      return claimed.length > 0;
+    } catch {
+      return !processedIds.has(predictionId);
+    }
+  }
+}
+
+/**
+ * Record feedback COMPLETION — only after the learning pipeline has run.
+ * Sets the job terminal state AND feedback_applied_at (the SLA marker the
+ * invariant checks). Failure path: job returns to PENDING with last_error so
+ * the sweep re-drives it.
+ */
+async function completeFeedbackJob(
+  predictionId: string,
+  ok: boolean,
+  err: string | null,
+): Promise<void> {
+  try {
+    const sql = await getSql();
+    await sql`
+      UPDATE feedback_jobs
+      SET status = ${ok ? "COMPLETED" : "PENDING"},
+          completed_at = ${ok ? new Date().toISOString() : null}::timestamptz,
+          last_error = ${err},
+          updated_at = now()
+      WHERE prediction_id = ${predictionId}
+    `;
+    if (ok) {
+      await sql`
+        UPDATE prediction_validations
+        SET feedback_applied_at = now()
+        WHERE prediction_id = ${predictionId} AND feedback_applied_at IS NULL
+      `;
+    }
+  } catch (e) {
+    // Soft: pre-migration fallback keeps feedback_applied_at as claim==complete.
+    logger.warn(
+      { predictionId, error: String(e) },
+      "feedback job completion persist failed",
+    );
   }
 }
 
@@ -199,8 +279,8 @@ export async function processResolvedPredictionFeedback(
     };
   }
 
-  // Durable claim (survives restart / duplicate ed / poll recovery)
-  const owned = await claimFeedbackDurable(input.predictionId);
+  // Durable job claim (fix plan Phase 5): PENDING/stale-PROCESSING → PROCESSING.
+  const owned = await claimFeedbackJobDurable(input.predictionId);
   if (!owned) {
     processedIds.add(input.predictionId);
     logger.debug(
@@ -340,6 +420,17 @@ export async function processResolvedPredictionFeedback(
   const okCount = Object.values(components).filter(Boolean).length;
   const learningStatus: LearningStatus =
     okCount >= 4 ? "COMPLETE" : okCount >= 1 ? "PARTIAL" : "FAILED";
+
+  // Fix plan Phase 5: completion is recorded only AFTER the learning pipeline
+  // has run — the job was claimed at entry; success/failure lands here.
+  // PARTIAL still counts as applied (components that failed were soft-caught
+  // and logged); FAILED (zero components) returns the job to PENDING so the
+  // sweep re-drives it.
+  await completeFeedbackJob(
+    input.predictionId,
+    learningStatus !== "FAILED",
+    learningStatus === "FAILED" ? "all learning components failed" : null,
+  );
 
   processedIds.add(input.predictionId);
   if (processedIds.size > MAX_PROCESSED) {
