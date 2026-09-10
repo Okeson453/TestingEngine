@@ -415,37 +415,19 @@ export async function processResolvedPredictionFeedback(
       { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "model-performance observe failed");
   }
 
-  // 5. ACIE observeRound on AUTHORITATIVE shared singleton (P0)
-  // Prefer shared engine; fall back to globalThis bridge during rollout.
+  // 5. ACIE observeRound on AUTHORITATIVE shared singleton (P0/P2)
+  // Primary learning for emission already happens in onGameEndPredict;
+  // this path keeps closed-loop feedback consistent on the same instance.
   try {
-    let eng: { observeRound: (r: { roundId: string; crashPoint: number; timestamp?: string }) => unknown } | undefined;
-    try {
-      const { getSharedACIEEngine } = await import("@/lib/prediction/acie/shared-engine");
-      eng = getSharedACIEEngine();
-    } catch {
-      eng = undefined;
-    }
-    if (!eng || typeof eng.observeRound !== "function") {
-      const g = globalThis as {
-        __acieEngine__?: {
-          observeRound: (r: {
-            roundId: string;
-            crashPoint: number;
-            timestamp?: string;
-          }) => unknown;
-        };
-      };
-      eng = g.__acieEngine__;
-    }
-    if (eng && typeof eng.observeRound === "function") {
-      eng.observeRound({
-        roundId: input.targetGameId,
-        crashPoint: input.actualMultiplier,
-        timestamp: input.resolvedAt,
-      });
-      components.acie = true;
-      components.sol = true; // SOL is updated inside ACIE observeRound
-    }
+    const { getSharedACIEEngine } = await import("@/lib/prediction/acie/shared-engine");
+    const eng = getSharedACIEEngine();
+    eng.observeRound({
+      roundId: input.targetGameId,
+      crashPoint: input.actualMultiplier,
+      timestamp: input.resolvedAt,
+    });
+    components.acie = true;
+    components.sol = true;
   } catch (e) {
     logger.warn(
       { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "ACIE observeRound failed");
