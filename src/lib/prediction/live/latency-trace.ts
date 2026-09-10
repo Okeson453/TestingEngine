@@ -2,6 +2,7 @@
  * Monotonic ED→signal stage latency tracing (P50/P95/P99).
  */
 import { getLogger } from "@/lib/observability/logger";
+import { pollDeferMs, crashEdLagMs } from "@/lib/observability/performance/latency";
 
 const logger = getLogger("latency-trace");
 
@@ -118,10 +119,26 @@ function percentile(arr: number[], p: number): number {
   return sorted[idx] ?? 0;
 }
 
+function recorderPercentiles(r: {
+  percentile(p: number): number | null;
+  count(): number;
+}): { p50: number | null; p95: number | null; n: number } {
+  return { p50: r.percentile(50), p95: r.percentile(95), n: r.count() };
+}
+
 export function snapshotLatencyBudget(): Record<string, unknown> {
   const n = samples.length;
   return {
     n,
+    // Second-opinion audit rec 5: surface poll-stream health distributions in
+    // the 5-min snapshot so ops can alert directly (greppable, no log-diffing).
+    // Sustained crash_ed_lag_ms p95 above one inter-round gap (~30s cadence,
+    // alert well below that) = native WS stream stalled and poll recovery is
+    // carrying traffic; poll_defer_ms > 0 means recovery was deferred.
+    stream_health: {
+      poll_defer_ms: recorderPercentiles(pollDeferMs),
+      crash_ed_lag_ms: recorderPercentiles(crashEdLagMs),
+    },
     predictionLifecycle: { ...predictionLifecycleCounters },
     ed_to_signal_ms: {
       p50: percentile(samples, 50),

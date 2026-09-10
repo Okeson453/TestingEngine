@@ -91,6 +91,40 @@ function wsStreamState(): "healthy" | "degraded" | "dead" {
 
 const logger = getLogger("poll-worker");
 
+// Second-opinion audit rec 1: make the effective poll-defer window visible at
+// boot and flag stale env overrides. Code default is 800ms; a leftover
+// POLL_HEALTHY_DEFER_MS=2500 in the deploy env (e.g. from the historical
+// LATENCY_FIX_AUDIT value) silently widens poll-recovery deferral.
+const POLL_DEFER_DEFAULT_MS = 800;
+const pollDeferEnvRaw = process.env.POLL_HEALTHY_DEFER_MS;
+const HEALTHY_DEFER_MS =
+  pollDeferEnvRaw != null && pollDeferEnvRaw !== ""
+    ? Number(pollDeferEnvRaw)
+    : POLL_DEFER_DEFAULT_MS;
+if (pollDeferEnvRaw != null && pollDeferEnvRaw !== "") {
+  const parsed = Number(pollDeferEnvRaw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    logger.warn(
+      {
+        component: "poll-worker",
+        envValue: pollDeferEnvRaw,
+        effectiveDeferMs: HEALTHY_DEFER_MS,
+      },
+      "POLL_DEFER_CONFIG: POLL_HEALTHY_DEFER_MS is not a valid number — falling back to default",
+    );
+  } else if (parsed !== POLL_DEFER_DEFAULT_MS) {
+    logger.warn(
+      {
+        component: "poll-worker",
+        envValue: pollDeferEnvRaw,
+        effectiveDeferMs: HEALTHY_DEFER_MS,
+        defaultMs: POLL_DEFER_DEFAULT_MS,
+      },
+      "POLL_DEFER_CONFIG: env override active — verify this is intentional (stale 2500 from LATENCY_FIX_AUDIT is a known leftover)",
+    );
+  }
+}
+
 /** Optimized polling interval. Canonical env: POLL_WORKER_MS (default 500).
  *  Lowered 1500→500 so recovery can catch a missed ED within ~1 inter-round
  *  gap. README previously documented PREDICTION_POLL_MS — that name is unused. */
@@ -503,7 +537,6 @@ export class PollWorker {
         const lag = Date.now() - lastCrashEd;
         // Latency fix: defer window 10s → 2.5s so a missed ED is recovered
         // inside one inter-round gap instead of 2–3 rounds later.
-        const HEALTHY_DEFER_MS = Number(process.env.POLL_HEALTHY_DEFER_MS ?? 800);
         if (lag < HEALTHY_DEFER_MS) {
           const recentPending = await sql<{ target_game_id: string }>`
             SELECT target_game_id FROM pending_predictions

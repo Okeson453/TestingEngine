@@ -12,8 +12,10 @@
  *      swallow it, and Fix 1's top-of-boot handlers catch anything that
  *      escapes. Sign failure must degrade the WS, never kill the worker.
  *
- * The full sandboxing of the wr_utils bundle (node:vm worker) is deliberately
- * deferred (FIX_PLAN.md Fix 2) until the bundle format is verified live.
+ * The wr_utils bundle itself now runs inside a node:vm sandbox with a minimal
+ * global allowlist (evaluateWrUtilsBundleInSandbox — audit rec 4); the live
+ * bundle format was verified 2026-09-10 (self-contained ESM, inlined wasm,
+ * Promise<{t1,t2}> default export). See wr-utils-sandbox.test.ts.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";

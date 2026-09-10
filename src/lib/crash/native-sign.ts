@@ -11,6 +11,7 @@ import { writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import vm from "node:vm";
 import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("bc-sign");
@@ -45,6 +46,88 @@ function installDomPolyfill(): void {
   g.document = { location: loc };
   g.window ??= g;
   g.self ??= g;
+}
+
+// ——— node:vm sandbox (audit rec 4) ———
+// The wr_utils bundle is fetched from bc.game at runtime and executed here.
+// Dynamic import() runs it with FULL Node globals (fs, net, process) — a
+// compromised or rotated bundle could exfiltrate DATABASE_URL / bot tokens.
+// The sandbox runs it in a context that sees only an explicit allowlist.
+//
+// Bundle format verified live (2026-09-10, wr_utils-DPR8KNaj.js): a
+// self-contained ES module — wasm is inlined as a base64 data: URL, so there
+// are NO imports and NO network at init. Runtime needs: WebAssembly,
+// TextEncoder/TextDecoder, atob, tolerant window/global/self (SENTRY_RELEASE
+// block, try/catch-wrapped). fetch exists only in a dead branch; we provide a
+// rejecting stub so an unexpected fetch fails loud instead of leaking out.
+type VmModuleCtor = new (
+  code: string,
+  opts?: { identifier?: string; context?: vm.Context },
+) => {
+  link(linker: () => void): Promise<void>;
+  evaluate(): Promise<unknown>;
+  namespace: Record<string, unknown>;
+};
+
+function getSourceTextModule(): VmModuleCtor | null {
+  // Requires --experimental-vm-modules (not enabled → null, caller falls back)
+  const ctor = (vm as unknown as { SourceTextModule?: VmModuleCtor })
+    .SourceTextModule;
+  return typeof ctor === "function" ? ctor : null;
+}
+
+/** True when the node:vm sandbox path is available in this runtime. */
+export function isWrUtilsSandboxAvailable(): boolean {
+  return getSourceTextModule() !== null;
+}
+
+/**
+ * Evaluate a wr_utils bundle body inside a node:vm context with a minimal
+ * global allowlist. Exported for tests; production callers go via
+ * loadSignUtils. Throws structured errors on any bundle that fails
+ * validation — same contract as the legacy path.
+ */
+export async function evaluateWrUtilsBundleInSandbox(
+  body: string,
+): Promise<SignUtils> {
+  const SourceTextModule = getSourceTextModule();
+  if (!SourceTextModule) {
+    throw new Error(
+      "wr_utils sandbox unavailable: node:vm.SourceTextModule requires --experimental-vm-modules",
+    );
+  }
+  const sandbox: Record<string, unknown> = {
+    // SENTRY_RELEASE block touches window/global/self inside try/catch —
+    // plain objects satisfy the typeof checks without host access.
+    window: {},
+    global: {},
+    self: {},
+    WebAssembly,
+    TextEncoder,
+    TextDecoder,
+    atob,
+    btoa,
+    console,
+    // Dead branch in the verified bundle (wasm is a data: URL) — provided so
+    // any surprise fetch is a loud structured failure, never a host request.
+    fetch: () => Promise.reject(new Error("wr_utils sandbox: fetch is not allowed")),
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+  const mod = new SourceTextModule(body, { context, identifier: "wr_utils.vm.mjs" });
+  // Bundle is self-contained (no static imports — verified live); the linker
+  // must never be called. If a rotated bundle starts importing, this throws
+  // and the structured sign-failure path handles it.
+  await mod.link(() => {
+    throw new Error("wr_utils sandbox: bundle attempted an import");
+  });
+  await mod.evaluate();
+  const exported = mod.namespace.default as Promise<SignUtils> | SignUtils;
+  const utils = await exported;
+  if (typeof utils?.t1 !== "function" || typeof utils?.t2 !== "function") {
+    throw new Error("wr_utils missing t1/t2");
+  }
+  return utils;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -88,9 +171,10 @@ async function discoverWrUtilsUrl(): Promise<string> {
   return wrUrl;
 }
 
+let sandboxFallbackWarned = false;
+
 async function loadSignUtils(): Promise<SignUtils> {
   if (cachedUtils) return cachedUtils;
-  installDomPolyfill();
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -101,6 +185,27 @@ async function loadSignUtils(): Promise<SignUtils> {
       });
       if (!res.ok) throw new Error(`wr_utils fetch ${res.status}`);
       const body = await res.text();
+
+      // Audit rec 4: prefer the node:vm sandbox. Dynamic import() would run
+      // the fetched bundle with full Node globals (fs/net/process) — a
+      // rotated or malicious bundle could exfiltrate env/secrets. The
+      // sandbox sees only the allowlisted globals it verifiably needs.
+      if (getSourceTextModule() !== null) {
+        const utils = await evaluateWrUtilsBundleInSandbox(body);
+        cachedUtils = utils;
+        logger.info({ url, attempt, sandboxed: true }, "wr_utils loaded");
+        return cachedUtils;
+      }
+
+      if (!sandboxFallbackWarned) {
+        sandboxFallbackWarned = true;
+        logger.warn(
+          { component: "bc-sign" },
+          "wr_utils sandbox unavailable (needs NODE_OPTIONS=--experimental-vm-modules) — falling back to UNSANDBOXED dynamic import of the fetched bundle",
+        );
+      }
+      // Legacy path: full-privilege dynamic import via a temp .mjs file.
+      installDomPolyfill();
       const file = join(tmpdir(), `te-wr-utils-${process.pid}-${attempt}.mjs`);
       await writeFile(file, body, "utf8");
       try {
@@ -112,7 +217,7 @@ async function loadSignUtils(): Promise<SignUtils> {
           throw new Error("wr_utils missing t1/t2");
         }
         cachedUtils = utils;
-        logger.info({ url, attempt }, "wr_utils loaded");
+        logger.info({ url, attempt, sandboxed: false }, "wr_utils loaded");
         return cachedUtils;
       } finally {
         void unlink(file).catch(() => undefined);

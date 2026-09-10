@@ -41,7 +41,12 @@ export const predictionPersistMs = makeRecorder("predictionPersist");
 export const edToPredictMs = makeRecorder("edToPredict");
 export const outboxDeliveryMs = makeRecorder("outboxDelivery");
 /** End-to-end: outbox row created (INSERT) → Telegram accepted. Complements
- * outboxDeliveryMs (claim→accepted); together they split queue wait from send. */
+ * outboxDeliveryMs (claim→accepted); together they split queue wait from send.
+ * Audit rec 2 note: the outbox INSERT is issued inside the same persist
+ * transaction, <1ms after SIGNAL_READY (measured ED→SIGNAL_READY hot path is
+ * 0.4–0.75ms), so this recorder IS the ed→telegram_accepted distribution
+ * within ~1ms — a separate ED→accepted histogram would be redundant. The
+ * ed→outbox_insert leg is covered by the `outbox_enqueued` trace stage. */
 export const outboxTotalDeliveryMs = makeRecorder("outboxTotalDelivery");
 export const poolWaitMs = makeRecorder("poolWait");
 export const interRoundGapMs = makeRecorder("interRoundGap");
