@@ -10,7 +10,9 @@ import {
   getAllValidationHistory,
   validationRecordsToCsv,
   getPendingStatus,
+  getDashboardSnapshot,
   type ValidationHistoryOpts,
+  type DashboardSnapshot,
 } from "./prediction/service.ts";
 import { getSql } from "./db";
 
@@ -34,85 +36,38 @@ export type WorkerStatus = {
   telegramEnabled: boolean;
   telegramLastSentAt: string | null;
   telegramLastError: string | null;
+  healthKind?: "RUNNING" | "DEGRADED" | "DATABASE_ERROR" | "OFFLINE" | "UNKNOWN";
+  pool?: { total: number; idle: number; waiting: number; max: number } | null;
 };
 
 async function getWorkerStatus(): Promise<WorkerStatus> {
-  const sql = await getSql();
-  const empty: WorkerStatus = {
-    running: false,
-    ownerId: null,
-    expiresAt: null,
-    heartbeatAt: null,
-    lastSyncAt: null,
-    lastSyncOk: false,
-    lastError: null,
-    lastFetchCount: 0,
-    lastInsertedCount: 0,
-    lastOnlinePlayers: null,
-    lastSeenGameId: null,
-    cyclesTotal: 0,
-    pendingCount: 0,
-    resolvedToday: 0,
-    dailyTarget: 100,
-    remainingToday: 100,
-    telegramEnabled: false,
-    telegramLastSentAt: null,
-    telegramLastError: null,
+  // P0: avoid nested Promise.all fan-out (was 5 concurrent pool acquires).
+  // Use dashboard snapshot which pins one connection.
+  const snap = await getDashboardSnapshot();
+  const w = snap.worker;
+  return {
+    running: w.running,
+    ownerId: w.ownerId,
+    expiresAt: w.expiresAt,
+    heartbeatAt: w.heartbeatAt,
+    lastSyncAt: w.lastSyncAt,
+    lastSyncOk: w.lastSyncOk,
+    lastError: snap.dbOk ? w.lastError : `DATABASE: ${snap.dbError ?? w.lastError}`,
+    lastFetchCount: w.lastFetchCount,
+    lastInsertedCount: w.lastInsertedCount,
+    lastOnlinePlayers: w.lastOnlinePlayers,
+    lastSeenGameId: w.lastSeenGameId,
+    cyclesTotal: w.cyclesTotal,
+    pendingCount: w.pendingCount,
+    resolvedToday: w.resolvedToday,
+    dailyTarget: w.dailyTarget,
+    remainingToday: w.remainingToday,
+    telegramEnabled: w.telegramEnabled,
+    telegramLastSentAt: w.telegramLastSentAt,
+    telegramLastError: w.telegramLastError,
+    healthKind: w.healthKind,
+    pool: w.pool,
   };
-  try {
-    const [lockRows, stateRows, today, pending, target] = await Promise.all([
-      sql<{ owner_id: string; expires_at: string | Date; heartbeat_at: string | Date }>`
-        select owner_id, expires_at, heartbeat_at from worker_locks
-        where lock_key = 'prediction_worker' limit 1
-      `,
-      sql<{ key: string; value: string }>`select key, value from worker_state`,
-      getTodayStats(),
-      getPendingStatus(),
-      getDailyTarget(),
-    ]);
-    const state = new Map(stateRows.map((r) => [r.key, r.value]));
-    const lock = lockRows[0];
-    const now = Date.now();
-    const expiresAt = lock?.expires_at
-      ? lock.expires_at instanceof Date
-        ? lock.expires_at.toISOString()
-        : String(lock.expires_at)
-      : null;
-    const heartbeatAt = lock?.heartbeat_at
-      ? lock.heartbeat_at instanceof Date
-        ? lock.heartbeat_at.toISOString()
-        : String(lock.heartbeat_at)
-      : null;
-    const running =
-      !!lock &&
-      expiresAt != null &&
-      new Date(expiresAt).getTime() > now;
-    const rawPlayers = state.get("last_online_players");
-    return {
-      running,
-      ownerId: lock?.owner_id ?? null,
-      expiresAt,
-      heartbeatAt,
-      lastSyncAt: state.get("last_sync_at") ?? null,
-      lastSyncOk: state.get("last_sync_ok") === "1",
-      lastError: state.get("last_error") ?? null,
-      lastFetchCount: Number(state.get("last_fetch_count") ?? 0) || 0,
-      lastInsertedCount: Number(state.get("last_inserted_count") ?? 0) || 0,
-      lastOnlinePlayers:
-        rawPlayers != null && rawPlayers !== "" ? Number(rawPlayers) : null,
-      lastSeenGameId: state.get("last_seen_game_id") ?? null,
-      cyclesTotal: Number(state.get("cycles_total") ?? 0) || 0,
-      pendingCount: pending.pendingCount,
-      resolvedToday: today.total,
-      dailyTarget: target.dailyTarget,
-      remainingToday: today.remaining,
-      telegramEnabled: state.get("telegram_enabled") === "1",
-      telegramLastSentAt: state.get("telegram_last_sent_at") ?? null,
-      telegramLastError: state.get("telegram_last_error") ?? null,
-    };
-  } catch (e) {
-    return { ...empty, lastError: String(e) };
-  }
 }
 
 export const predictionGetDailyTarget = createServerFn({ method: "GET" }).handler(getDailyTarget);
@@ -209,6 +164,11 @@ export const predictionExportHistory = createServerFn({ method: "POST" })
 export const predictionGetPending = createServerFn({ method: "GET" }).handler(getPendingStatus);
 
 export const predictionGetWorkerStatus = createServerFn({ method: "GET" }).handler(getWorkerStatus);
+
+export const predictionGetDashboardSnapshot = createServerFn({ method: "GET" }).handler(
+  getDashboardSnapshot,
+);
+
 
 
 
