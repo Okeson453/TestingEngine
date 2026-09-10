@@ -22,10 +22,25 @@ export function registerProcessFailureHandlers(opts = {}) {
 
   const serialize = (err) => {
     const errorObj = err instanceof Error ? err : { message: String(err), name: "Unknown" };
+    const chain = [];
+    // Full cause chain (report #2): wrap(asyncFn) patterns bury the root
+    // cause in error.cause — losing it makes prod rejections undebuggable.
+    let cause = errorObj.cause;
+    let depth = 0;
+    while (cause && depth < 5) {
+      chain.push(
+        cause instanceof Error
+          ? { name: cause.name, message: cause.message }
+          : { name: "Unknown", message: String(cause) },
+      );
+      cause = cause.cause;
+      depth += 1;
+    }
     return {
       name: errorObj.name,
       message: errorObj.message,
       stack: String(errorObj.stack ?? "").slice(0, 4000),
+      ...(chain.length > 0 ? { cause: chain } : {}),
     };
   };
 

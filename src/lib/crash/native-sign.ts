@@ -272,6 +272,44 @@ async function loadSignUtilsOnce(): Promise<SignUtils> {
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
+/**
+ * Startup readiness gate (second-opinion report #1): signing is a HARD
+ * dependency of the live pipeline — without it the native socket cannot
+ * connect, ED never fires, and the worker produces nothing while still
+ * advertising itself as up. Boot awaits this BEFORE starting the WS /
+ * pipeline; production treats exhaustion as fatal so the runtime restarts a
+ * clean worker instead of running a dead one.
+ *
+ * Fresh chain per call: bypasses the soft-fail/stale-cache path on purpose —
+ * a boot gate must not "succeed" by serving stale credentials.
+ */
+export async function ensureSignReady(timeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    attempt += 1;
+    try {
+      const signed = await refreshSign();
+      cachedSign = signed;
+      softFailUntil = 0;
+      logger.info(
+        { component: "bc-sign", attempt, timeoutMs },
+        "sign readiness confirmed (bundle + self-test)",
+      );
+      return;
+    } catch (e) {
+      lastErr = e;
+      await sleep(500);
+    }
+  }
+  throw new Error(
+    `sign not ready after ${attempt} attempts in ${timeoutMs}ms: ${
+      lastErr instanceof Error ? lastErr.message : String(lastErr)
+    }`,
+  );
+}
+
 async function refreshSign(): Promise<Signed> {
   const utils = await loadSignUtils();
   const probe = utils.t1(UA);

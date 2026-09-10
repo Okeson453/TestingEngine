@@ -184,6 +184,61 @@ test("feedback job: claim is exclusive, completion sets the SLA marker", async (
   assert.notEqual(marker[0]!.feedback_applied_at, null);
 });
 
+// ——— 3b. Fencing takeover/demote contract (second-opinion report #3) ———
+
+test("fencing: fresh lease blocks takeover; expired lease escalates epoch; stale worker demotes", async () => {
+  const sql = await getSql();
+  _resetFencingForTests();
+  setWorkerAuthority(5); // worker A holds epoch 5
+
+  // Seed the lock row: owner A, FRESH lease (not expired).
+  await sql`
+    INSERT INTO worker_locks (lock_key, owner_id, acquired_at, expires_at, heartbeat_at, epoch)
+    VALUES ('prediction_worker', 'worker-A', now(), now() + interval '8 seconds', now(), 5)
+    ON CONFLICT (lock_key) DO UPDATE
+    SET owner_id = 'worker-A', expires_at = now() + interval '8 seconds',
+        heartbeat_at = now(), epoch = 5
+  `;
+
+  // B must NOT take over a fresh lease (proof-of-expiry contract).
+  const blocked = await sql<{ owner_id: string }>`
+    UPDATE worker_locks SET owner_id = 'worker-B', epoch = epoch + 1
+    WHERE lock_key = 'prediction_worker' AND expires_at < now()
+    RETURNING owner_id
+  `;
+  assert.equal(blocked.length, 0, "fresh lease must block takeover");
+
+  // A's lease expires (dead worker). B takes over -> epoch escalates.
+  await sql`
+    UPDATE worker_locks SET expires_at = now() - interval '1 second' WHERE lock_key = 'prediction_worker'
+  `;
+  const took = await sql<{ epoch: number; owner_id: string }>`
+    UPDATE worker_locks SET owner_id = 'worker-B', epoch = epoch + 1
+    WHERE lock_key = 'prediction_worker' AND expires_at < now()
+    RETURNING epoch, owner_id
+  `;
+  assert.equal(took.length, 1);
+  assert.equal(took[0]!.owner_id, "worker-B");
+  assert.equal(Number(took[0]!.epoch), 6, "epoch must escalate on ownership change");
+
+  // Stale worker A heartbeats -> zero rows (owner no longer A) -> demote.
+  const heartbeat = await sql<{ owner_id: string }>`
+    UPDATE worker_locks SET heartbeat_at = now(), expires_at = now() + interval '8 seconds'
+    WHERE lock_key = 'prediction_worker' AND owner_id = 'worker-A'
+    RETURNING owner_id
+  `;
+  assert.equal(heartbeat.length, 0, "stale worker's heartbeat must match zero rows");
+
+  let cascadeRuns = 0;
+  onAuthorityLost(() => {
+    cascadeRuns += 1;
+  });
+  markAuthorityLost("test: heartbeat returned zero rows");
+  assert.equal(isAuthoritative(), false);
+  assert.equal(cascadeRuns, 1);
+  _resetFencingForTests();
+});
+
 // ——— 4. Sandbox fail-closed ———
 
 test("sandbox: privileged fallback is env-gated (production fails closed)", () => {

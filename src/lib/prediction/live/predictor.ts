@@ -944,6 +944,7 @@ export async function onGameEndPredict(
 
   const persistPromise = (async () => {
     const getSqlFn = deps.getSqlFn ?? getSql;
+    const persistT0 = Date.now();
     let sql: Sql;
     try {
       sql = await getSqlFn();
@@ -954,8 +955,10 @@ export async function onGameEndPredict(
       );
       return;
     }
+    const poolWaitMs = Date.now() - persistT0;
 
     try {
+      const txT0 = Date.now();
       await runInTransaction(sql, async (tx) => {
         const ins = await tx<{ prediction_id: string; requested_at: string }>`
           insert into pending_predictions (
@@ -1054,6 +1057,29 @@ export async function onGameEndPredict(
         const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
         notifyOutbox();
       } catch { /* soft */ }
+
+      // PERSIST_PROFILE (report #5/#7): decompose the ~1s persist stage into
+      // pool wait vs transaction duration. The TX is BEGIN + 2 inserts +
+      // COMMIT — sequential Neon round trips are the suspected consumer.
+      // Confirms or kills the round-trip theory with one deploy of data;
+      // CTE-merging the inserts is deferred until this confirms.
+      {
+        const txMs = Date.now() - txT0;
+        const profile = {
+          component: "live-predictor",
+          predictionId,
+          targetGameId,
+          correlationId,
+          pool_wait_ms: poolWaitMs,
+          tx_ms: txMs,
+          tx_statements: 2,
+        };
+        if (txMs + poolWaitMs > 300) {
+          logger.info(profile, "PERSIST_PROFILE");
+        } else {
+          logger.debug(profile, "PERSIST_PROFILE");
+        }
+      }
       // P1 latency chain: outbox row is durably enqueued at this point.
       try {
         const { mark } = await import("@/lib/prediction/live/latency-trace");

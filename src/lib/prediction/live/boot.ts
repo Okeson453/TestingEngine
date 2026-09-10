@@ -500,6 +500,30 @@ class LiveBoot {
       { component: "live-boot", workerId: WORKER_ID, workerEpoch: lock.epoch },
       "distributed worker lease acquired (fencing epoch active)",
     );
+
+    // Second-opinion report #1: signing is a HARD readiness dependency. The
+    // wr_utils bundle + self-test must land BEFORE the WS / pipeline starts —
+    // an unsignable worker connects nothing and produces nothing while still
+    // advertising ready. Production treats exhaustion as fatal (runtime
+    // restarts); dev warns and continues so local work isn't blocked by
+    // bc.game reachability.
+    const signReadyTimeoutMs = Number(process.env.SIGN_READY_TIMEOUT_MS ?? 30_000);
+    try {
+      const { ensureSignReady } = await import("@/lib/crash/native-sign");
+      await ensureSignReady(signReadyTimeoutMs);
+    } catch (e) {
+      if (process.env.NODE_ENV === "production") {
+        logger.error(
+          { component: "live-boot", workerId: WORKER_ID, error: String(e) },
+          "FATAL: signing not ready — refusing to start live pipeline",
+        );
+        throw e;
+      }
+      logger.warn(
+        { component: "live-boot", error: String(e) },
+        "sign readiness failed (dev) — starting pipeline degraded",
+      );
+    }
     // Fix 6: supervisor owns ALL control-loop timers — lock heartbeat +
     // worker health (10s), invariant monitor (30s, exactly ONE timer — fix 1),
     // connection warmer (3s), event-loop probe (2s).

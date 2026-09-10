@@ -17,6 +17,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { OutboxDispatcher } from "@/lib/prediction/live/notification-worker";
+import { notifyOutbox } from "@/lib/prediction/live/outbox-wake";
 import {
   classifyEdReentry,
   recordEdRoundProcessedForTests,
@@ -218,4 +219,36 @@ test("ED dedup: classify by game ID — new, then duplicate_event", () => {
   // Unrelated round is unaffected.
   assert.equal(classifyEdReentry(`other-${randomUUID()}`), "new");
   _resetEdDedupForTests();
+});
+
+test("outbox: wake burst during active drain never duplicates delivery (single drain loop)", async () => {
+  setTelegramEnv();
+  await cleanSuiteRows();
+  try {
+    const id = await insertPendingRow({ deadlineAheadMs: 30_000 });
+    const d = new OutboxDispatcher();
+    await withStubbedFetch(
+      // Slowed provider so the wake burst lands MID-drain — the exact race
+      // the old per-cycle `once()` listener registration lost.
+      async () => {
+        await new Promise((r) => setTimeout(r, 30));
+        for (let i = 0; i < 50; i += 1) notifyOutbox();
+        return okTelegram();
+      },
+      async () => {
+        await d.start();
+        await new Promise((r) => setTimeout(r, 400));
+        await d.stop();
+      },
+    );
+    const row = await lifecycleOf(id);
+    assert.equal(row.status, "delivered");
+    assert.equal(row.attempt_count, 1, "burst of 50 wakes must yield exactly ONE delivery attempt");
+    const stats = d.getStats();
+    assert.equal(stats.delivered, 1);
+    assert.equal(stats.claimed, 1, "a single row must be claimed exactly once");
+  } finally {
+    await cleanSuiteRows();
+    clearTelegramEnv();
+  }
 });
