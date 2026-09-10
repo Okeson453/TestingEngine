@@ -37,7 +37,10 @@ export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
  * batch in roughly one RTT. Env-overridable as before.
  */
 export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 8);
-const BASE_BACKOFF_MS = 1_000;
+// First-retry backoff lowered 1000→300ms (investigation report): a single
+// transient Telegram timeout shouldn't cost a full second before the retry.
+// Curve: 300/600/1200/2400... capped at MAX_BACKOFF_MS.
+const BASE_BACKOFF_MS = 300;
 const MAX_BACKOFF_MS = 60_000;
 
 interface OutboxRow {
@@ -81,9 +84,15 @@ function lifecycleLogFields(
     lc.sendStartedMs != null && lc.telegramAcceptedMs != null
       ? Math.max(0, lc.telegramAcceptedMs - lc.sendStartedMs)
       : null;
+  // Correlation (investigation report): join an outbox delivery log back to
+  // its originating ED event without a DB hop. Prediction rows carry both in
+  // metadata (written by predictor.ts at enqueue).
+  const meta = (row.metadata ?? {}) as Record<string, unknown>;
   return {
     id: row.id,
     notificationId: row.notification_id,
+    predictionId: typeof meta.predictionId === "string" ? meta.predictionId : null,
+    correlationId: typeof meta.correlationId === "string" ? meta.correlationId : null,
     type: row.type,
     status,
     attempt: row.attempt_count,

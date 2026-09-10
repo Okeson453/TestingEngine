@@ -94,6 +94,7 @@ export async function sampleProductionInvariants(
       SELECT prediction_id, game_id
       FROM prediction_validations
       WHERE feedback_applied_at IS NULL
+        AND feedback_skip_reason IS NULL
         AND resolved_at < now() - interval '2 minutes'
       ORDER BY resolved_at ASC
       LIMIT 5

@@ -228,7 +228,8 @@ export async function processResolvedPredictionFeedback(
     incrementalCount = globalIncrementalState.snapshot().count;
     components.incremental = true;
   } catch (e) {
-    logger.warn({ error: String(e) }, "incremental state update failed");
+    logger.warn(
+      { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "incremental state update failed");
   }
 
   // 2. Baseline adaptive multipliers
@@ -246,7 +247,8 @@ export async function processResolvedPredictionFeedback(
       components.baseline = true;
     }
   } catch (e) {
-    logger.warn({ error: String(e) }, "baseline observeOutcome failed");
+    logger.warn(
+      { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "baseline observeOutcome failed");
   }
 
   // 3. Calibration + meta + production controller via feedbackPredictionPipeline
@@ -281,7 +283,8 @@ export async function processResolvedPredictionFeedback(
     components.calibration = true;
     components.meta = metaFeatures != null;
   } catch (e) {
-    logger.warn({ error: String(e) }, "feedbackPredictionPipeline failed");
+    logger.warn(
+      { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "feedbackPredictionPipeline failed");
   }
 
   // 4. Model performance tracker
@@ -294,7 +297,8 @@ export async function processResolvedPredictionFeedback(
     mod.globalModelPerformance.observe("live", predicted, actual, { silent: true });
     components.modelPerformance = true;
   } catch (e) {
-    logger.warn({ error: String(e) }, "model-performance observe failed");
+    logger.warn(
+      { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "model-performance observe failed");
   }
 
   // 5. ACIE observeRound (SOL/TPL/PSI/SAFE via engine)
@@ -329,7 +333,8 @@ export async function processResolvedPredictionFeedback(
       components.sol = true; // SOL is updated inside ACIE observeRound
     }
   } catch (e) {
-    logger.warn({ error: String(e) }, "ACIE observeRound failed");
+    logger.warn(
+      { predictionId: input.predictionId, targetGameId: input.targetGameId, correlationId: input.correlationId ?? null, error: String(e) }, "ACIE observeRound failed");
   }
 
   const okCount = Object.values(components).filter(Boolean).length;
@@ -391,4 +396,83 @@ export async function processResolvedPredictionFeedback(
 /** Test helper: clear idempotency set */
 export function resetFeedbackIdempotencyForTests(): void {
   processedIds.clear();
+}
+
+/**
+ * Recovery sweep for genuinely-stuck feedback rows (investigation report fix).
+ *
+ * A process crash between the validation commit and the deferred
+ * processResolvedPredictionFeedback call leaves feedback_applied_at NULL
+ * forever — nothing re-drove it. This sweep re-calls the (idempotent) feedback
+ * pipeline for such rows: the durable claim
+ * (UPDATE ... WHERE feedback_applied_at IS NULL RETURNING) makes a double
+ * apply impossible, and rows with feedback_skip_reason (intentional skips,
+ * e.g. TEMPORALLY_INVALID) are excluded.
+ *
+ * Called on the supervisor's invariant cadence. Bounded per pass so a large
+ * backlog can't starve the hot path.
+ */
+export async function sweepStuckFeedback(
+  sql: import("@/lib/db").Sql,
+  opts: { olderThanMinutes?: number; limit?: number } = {},
+): Promise<{ swept: number; applied: number; failed: number }> {
+  const olderThanMinutes = opts.olderThanMinutes ?? 5;
+  const limit = opts.limit ?? 20;
+  const stuck = await sql<{
+    prediction_id: string;
+    game_id: string;
+    target_multiplier: number;
+    predicted_probability: string | number | null;
+    actual_multiplier: number;
+    result: string;
+    resolved_at: string | Date;
+    model_version: string | null;
+  }>`
+    SELECT prediction_id, game_id, target_multiplier, predicted_probability,
+           actual_multiplier, result, resolved_at, model_version
+    FROM prediction_validations
+    WHERE feedback_applied_at IS NULL
+      AND feedback_skip_reason IS NULL
+      AND resolved_at < now() - (${olderThanMinutes}::int * interval '1 minute')
+    ORDER BY resolved_at ASC
+    LIMIT ${limit}
+  `;
+  let applied = 0;
+  let failed = 0;
+  for (const row of stuck) {
+    try {
+      await processResolvedPredictionFeedback({
+        predictionId: row.prediction_id,
+        targetGameId: row.game_id,
+        predictedProbability: Number(row.predicted_probability ?? 0.5),
+        targetMultiplier: Number(row.target_multiplier),
+        actualMultiplier: Number(row.actual_multiplier),
+        result: row.result as "WIN" | "LOSS",
+        modelVersion: row.model_version,
+        correlationId: null,
+        resolvedAt:
+          row.resolved_at instanceof Date
+            ? row.resolved_at.toISOString()
+            : String(row.resolved_at),
+      });
+      applied += 1;
+    } catch (e) {
+      failed += 1;
+      logger.warn(
+        {
+          predictionId: row.prediction_id,
+          targetGameId: row.game_id,
+          error: String(e),
+        },
+        "stuck-feedback sweep attempt failed",
+      );
+    }
+  }
+  if (stuck.length > 0) {
+    logger.info(
+      { component: "feedback", swept: stuck.length, applied, failed },
+      "stuck-feedback sweep complete",
+    );
+  }
+  return { swept: stuck.length, applied, failed };
 }

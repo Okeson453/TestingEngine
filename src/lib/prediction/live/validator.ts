@@ -552,6 +552,19 @@ export async function onGameEnd(
             },
             "skipping closed-loop feedback — prediction TEMPORALLY_INVALID",
           );
+          // Record the skip durably so the one_feedback_per_validation
+          // invariant and the stuck-feedback sweep can distinguish
+          // "intentionally never applied" from "genuinely stuck".
+          try {
+            const skipSql = await getSql();
+            await skipSql`
+              UPDATE prediction_validations
+              SET feedback_skip_reason = 'TEMPORALLY_INVALID'
+              WHERE prediction_id = ${pendingSnapshot.prediction_id}
+                AND feedback_applied_at IS NULL
+                AND feedback_skip_reason IS NULL
+            `;
+          } catch { /* soft — invariant may flag once, harmless */ }
           return;
         }
       } catch { /* soft */ }

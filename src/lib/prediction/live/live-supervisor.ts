@@ -57,6 +57,8 @@ export class LiveSupervisor {
   private getSqlFn: () => Promise<Sql> = getSql;
   private cycle = 0;
   private lastDbOkAt: number | null = null;
+  /** Consecutive zero-row lock heartbeats — >=2 triggers self-demotion. */
+  private lockLostStrikes = 0;
   private lastHeartbeatAt: number | null = null;
   private lifecycle: WorkerHealth["lifecycle"] = "COLD";
   private lastHealth: WorkerHealth | null = null;
@@ -135,7 +137,16 @@ export class LiveSupervisor {
         const { sampleProductionInvariants } = await import(
           "@/lib/prediction/live/invariants"
         );
-        return sampleProductionInvariants(sql);
+        await sampleProductionInvariants(sql);
+        // Recovery sweep for genuinely-stuck feedback rows (idempotent via the
+        // durable claim; skip-reasoned rows excluded). Same cadence as the
+        // invariant sample — self-heals crash windows between validation
+        // commit and the deferred feedback call.
+        const { sweepStuckFeedback } = await import(
+          "@/lib/prediction/live/feedback"
+        );
+        await sweepStuckFeedback(sql);
+        return undefined;
       })()
         .catch((error) => {
           logger.error(
@@ -151,12 +162,40 @@ export class LiveSupervisor {
 
   private startHeartbeat(): void {
     if (this.heartbeatTimer) return;
+    // Split-brain guard (P0): if the lock was force-stolen by a newer
+    // instance, our heartbeat UPDATE matches zero rows. A single zero-row
+    // heartbeat is definitive (the claim UPDATE itself would throw on a
+    // transient DB error — false is a real answer, not a network flake), but
+    // we require 2 consecutive losses (~20s) so an exotic race can't demote a
+    // healthy worker. After demotion this process stops predicting and
+    // dispatching; the instance that stole the lock owns the live path.
     this.heartbeatTimer = setInterval(() => {
       this.cycle += 1;
       void this.getSqlFn()
         .then(async (sql) => {
           this.lastDbOkAt = Date.now();
-          await heartbeatWorkerLock(sql);
+          const ownsLock = await heartbeatWorkerLock(sql);
+          if (ownsLock) {
+            this.lockLostStrikes = 0;
+          } else {
+            this.lockLostStrikes += 1;
+            logger.error(
+              {
+                component: "live-supervisor",
+                workerId: WORKER_ID,
+                lockLostStrikes: this.lockLostStrikes,
+                cycle: this.cycle,
+              },
+              "WORKER_LOCK_LOST: heartbeat matched zero rows — lock held by another instance",
+            );
+            if (this.lockLostStrikes >= 2) {
+              logger.error(
+                { component: "live-supervisor", workerId: WORKER_ID },
+                "WORKER_LOCK_DEMOTED: stopping predict/dispatch/invariant loops (split-brain guard)",
+              );
+              this.stop();
+            }
+          }
           await this.writeWorkerHealth(sql, this.cycle);
         })
         .catch((e) => {
@@ -293,13 +332,17 @@ export const WORKER_ID =
 const LOCK_KEY = "prediction_worker";
 const LOCK_TTL_SECONDS = 8;
 
-export async function heartbeatWorkerLock(sql: Sql): Promise<void> {
-  await sql`
+export async function heartbeatWorkerLock(sql: Sql): Promise<boolean> {
+  const rows = await sql<{ owner_id: string }>`
     UPDATE worker_locks
     SET heartbeat_at = now(),
         expires_at = now() + (${LOCK_TTL_SECONDS}::int * interval '1 second')
     WHERE lock_key = ${LOCK_KEY} AND owner_id = ${WORKER_ID}
+    RETURNING owner_id
   `;
+  // Zero rows = we no longer own the lock (force-stolen by a newer instance).
+  // Caller (live-supervisor) counts consecutive losses and self-demotes.
+  return rows.length > 0;
 }
 
 // P2.11: Persist Incremental State
