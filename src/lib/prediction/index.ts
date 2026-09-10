@@ -9,6 +9,16 @@ export { BaselineStatisticalModel, type PredictiveModel } from './models/baselin
 export { ModelRegistry } from './models/model-registry.ts';
 export { PredictionEngine } from './prediction-engine.ts';
 export { toSignal, isSignalExpired, isSignalFresh } from './signals/signal.ts';
+export type { SignalConstructionContext } from './signals/signal.ts';
+export {
+  PipelineValidationError,
+  PredictionOutputValidationError,
+  PredictionSignalValidationError,
+  summarizePredictionOutput,
+  validatePredictionOutput,
+  validatePredictionSignal,
+  typeName,
+} from './signals/validate.ts';
 export { StatisticalValidator } from './validation/statistical-validator.ts';
 export { BacktestEngine } from './backtesting/backtest-engine.ts';
 export { WalkForwardValidator } from './backtesting/walk-forward.ts';

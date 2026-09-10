@@ -192,9 +192,16 @@ export async function attemptNPlusOnePrediction(
         component: "prediction-attempt",
         event: "n1_attempt_failed",
         source,
-        sourceGameId: sourceRoundId,
+        sourceRoundId,
+        targetRoundId:
+          (err as { targetRoundId?: string }).targetRoundId ??
+          (err as { context?: { targetRoundId?: string } }).context?.targetRoundId ??
+          null,
+        predictionType: `N+1:${source === "ED" ? "live" : "recovery"}`,
+        predictionResult: (err as { predictionResult?: unknown }).predictionResult ?? null,
         stage,
         featureStage,
+        failureReason: (err as { failureReason?: string }).failureReason ?? err.message,
         errorName: err.name,
         errorMessage: err.message,
         errorStack: err.stack?.slice(0, 2000) ?? null,

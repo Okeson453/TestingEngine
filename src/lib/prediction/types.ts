@@ -7,6 +7,8 @@ export type ThresholdTarget = 1.3 | 2.0 | 5.0 | 10.0;
 export const SUPPORTED_TARGETS: readonly ThresholdTarget[] = [1.3, 2.0, 5.0, 10.0] as const;
 export type FeatureVersion = string;
 export type TargetVersion = string;
+/** Which feature-generation path produced the model's input. */
+export type FeaturePath = 'V2_INCREMENTAL' | 'V1_FALLBACK' | 'ACIE_STATE';
 
 export interface ModelIdentity {
   name: string;
@@ -104,11 +106,22 @@ export interface PredictionOutput {
   expiresAt: string;
 }
 
+/**
+ * Canonical, immutable prediction signal.
+ *
+ * One canonical signal schema — callers are NOT permitted to augment or
+ * mutate a signal after construction. `toSignal()` builds the complete
+ * object (including featurePath and targetRoundId) and freezes it; nothing
+ * downstream may add fields. If a field is needed, it belongs in this
+ * interface and in toSignal(), not in caller-side mutation.
+ */
 export interface PredictionSignal {
   readonly predictionId: string;
   readonly timestamp: string;
   readonly modelVersion: string;
   readonly featureVersion: string;
+  readonly featurePath: FeaturePath;
+  readonly targetRoundId: string;
   readonly target: ThresholdTarget;
   readonly score: number;
   readonly probability: number;

@@ -5,6 +5,11 @@ import { globalIncrementalState } from './state/incremental-state-engine.ts';
 import { RegimeDetector } from './regimes/regime-detector.ts';
 import { ModelRegistry } from './models/model-registry.ts';
 import { toSignal } from './signals/signal.ts';
+import {
+  summarizePredictionOutput,
+  validatePredictionOutput,
+  validatePredictionSignal,
+} from './signals/validate.ts';
 import { getLogger } from '../observability/logger.ts';
 
 export interface PredictRequest {
@@ -23,6 +28,7 @@ export type PredictionStage =
   | 'regime_detection'
   | 'model_resolution'
   | 'model_prediction'
+  | 'prediction_output_validation'
   | 'signal_conversion'
   | 'signal_validation';
 
@@ -200,27 +206,86 @@ export class PredictionEngine {
       });
     }
 
+    // ── stage: prediction_output_validation ────────────────────────────────
+    // Strict validation of the model's output BEFORE toSignal() sees it.
+    // No coercion, no defaults — a malformed output fails HERE, not later
+    // as a misleading signal_conversion error.
+    try {
+      validatePredictionOutput(output);
+    } catch (err) {
+      // PredictionOutputValidationError is already stage-tagged and typed;
+      // log the structured diagnostic and rethrow as-is.
+      this.logger.error(
+        {
+          component: 'PredictionEngine',
+          stage: 'prediction_output_validation',
+          targetRoundId,
+          featurePath,
+          predictionResult: summarizePredictionOutput(output),
+          failureReason: (err as { failureReason?: string }).failureReason ?? String(err),
+          invalidField: (err as { invalidField?: string }).invalidField ?? null,
+          expectedType: (err as { expectedType?: string }).expectedType ?? null,
+          actualType: (err as { actualType?: string }).actualType ?? null,
+          errorName: err instanceof Error ? err.name : 'Error',
+          errorMessage: err instanceof Error ? err.message : String(err),
+        },
+        'prediction output failed strict validation',
+      );
+      throw err;
+    }
+
     // ── stage: signal_conversion ───────────────────────────────────────────
+    // toSignal() constructs the COMPLETE signal (featurePath and
+    // targetRoundId included) and freezes it. No post-conversion mutation
+    // is permitted anywhere downstream — the old code mutated the frozen
+    // signal here (featurePath/featureVersion) and threw at runtime.
     let signal: PredictionSignal;
     try {
-      signal = toSignal(output);
-      (signal as unknown as Record<string, unknown>).featurePath = featurePath;
-      (signal as unknown as Record<string, unknown>).featureVersion =
-        featurePath === 'V2_INCREMENTAL'
-          ? (signal.featureVersion ?? 'v2-incremental')
-          : (signal.featureVersion ?? 'v1-fallback');
+      signal = toSignal(output, { featurePath, targetRoundId });
     } catch (err) {
       this.logger.error(
         {
           component: 'PredictionEngine',
           stage: 'signal_conversion',
           targetRoundId,
+          featurePath,
+          predictionResult: summarizePredictionOutput(output),
+          failureReason: String(err),
           errorName: err instanceof Error ? err.name : 'Error',
           errorMessage: err instanceof Error ? err.message : String(err),
         },
         'toSignal conversion failed',
       );
-      throw stageError('signal_conversion', err, { targetRoundId });
+      throw stageError('signal_conversion', err, {
+        targetRoundId,
+        featurePath,
+        predictionResult: summarizePredictionOutput(output),
+      });
+    }
+
+    // ── stage: signal_validation ───────────────────────────────────────────
+    // The constructed signal must satisfy the canonical schema (and be
+    // frozen) before it is allowed to reach persistence.
+    try {
+      validatePredictionSignal(signal);
+    } catch (err) {
+      this.logger.error(
+        {
+          component: 'PredictionEngine',
+          stage: 'signal_validation',
+          targetRoundId,
+          featurePath,
+          predictionResult: summarizePredictionOutput(output),
+          failureReason: (err as { failureReason?: string }).failureReason ?? String(err),
+          invalidField: (err as { invalidField?: string }).invalidField ?? null,
+          expectedType: (err as { expectedType?: string }).expectedType ?? null,
+          actualType: (err as { actualType?: string }).actualType ?? null,
+          errorName: err instanceof Error ? err.name : 'Error',
+          errorMessage: err instanceof Error ? err.message : String(err),
+        },
+        'constructed signal failed canonical schema validation',
+      );
+      throw err;
     }
 
     if (Math.random() < Number(process.env.PRED_LOG_SAMPLE_RATE ?? 0.05)) {

@@ -27,7 +27,10 @@ export type TemporalValidity =
   | "TEMPORALLY_UNVERIFIED"
   | "TEMPORALLY_INVALID";
 
-export type FeaturePath = "V2_INCREMENTAL" | "V1_FALLBACK";
+import type { FeaturePath } from "../types.ts";
+// Canonical FeaturePath lives in ../types.ts — one signal schema, no
+// caller-side duplicates of the contract.
+export type { FeaturePath };
 
 export type DriftState =
   | "NORMAL"

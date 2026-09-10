@@ -19,7 +19,7 @@ import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/liv
 import { getSql, getPgPool, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
-import type { HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
+import type { FeaturePath, HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 
@@ -100,6 +100,7 @@ export type OnGameStartResult =
   | { kind: "duplicate"; predictionId: string; targetGameId: string }
   | { kind: "no_history"; available: number; targetGameId: string }
   | { kind: "temporal_violation"; targetGameId: string; beginTime: string; reason: string }
+  | { kind: "error"; targetGameId: string; reason: string }
   | { kind: "sla_violated_no_outbox"; predictionId: string; targetGameId: string };
 
 interface PredictorDeps {
@@ -117,6 +118,7 @@ interface PredictorDeps {
     reasoning: string[];
     featureSummary: Record<string, unknown>;
     modelVersion: string;
+    featurePath?: string;
   };
   getChatIds?: () => string[];
   now?: () => number;
@@ -259,6 +261,7 @@ const defaultPredictFn = (
     reasoning,
     featureSummary: signal.featureSummary,
     modelVersion,
+    featurePath: signal.featurePath,
   };
 };
 
@@ -445,7 +448,35 @@ export async function onGameStart(
   }
 
   const timestamp = new Date(now()).toISOString();
-  const signal = predictFn(priorRounds, evt.gameId, timestamp, DEFAULT_TARGET);
+  let signal: ReturnType<NonNullable<PredictorDeps["predictFn"]>>;
+  try {
+    signal = predictFn(priorRounds, evt.gameId, timestamp, DEFAULT_TARGET);
+  } catch (e) {
+    const stage = (e as { stage?: string }).stage ?? "prediction";
+    const errObj = e as Record<string, unknown>;
+    const failure: Record<string, unknown> = {
+      component: "live-predictor",
+      stage,
+      sourceRoundId: evt.sourceRoundGameId,
+      targetRoundId: evt.gameId,
+      predictionType: `bg:${DEFAULT_TARGET}x`,
+      failureReason: (errObj.failureReason as string | undefined) ?? String(e),
+      errorName: e instanceof Error ? e.name : "Error",
+      errorMessage: e instanceof Error ? e.message : String(e),
+      correlationId,
+    };
+    if (errObj.predictionResult !== undefined) failure.predictionResult = errObj.predictionResult;
+    else if (errObj.prediction !== undefined) failure.predictionResult = errObj.prediction;
+    for (const k of ["invalidField", "expectedType", "actualType"] as const) {
+      if (errObj[k] !== undefined && errObj[k] !== null) failure[k] = errObj[k];
+    }
+    logger.error(failure, `bg prediction attempt failed at stage=${stage}`);
+    return {
+      kind: "error",
+      targetGameId: evt.gameId,
+      reason: String(e),
+    };
+  }
 
   let predictionId: string = signal.predictionId;
   let predictionGeneratedAt = timestamp;
@@ -766,7 +797,50 @@ export async function onGameEndPredict(
   // ── P0: Prediction computation only (ZERO DB, ZERO Telegram, ZERO outbox) ──
   const timestamp = generatedAt;
   const predictT0 = performance.now();
-  const signal = predictFn(priorRounds, targetGameId, timestamp, DEFAULT_TARGET);
+  let signal: ReturnType<NonNullable<PredictorDeps["predictFn"]>>;
+  try {
+    signal = predictFn(priorRounds, targetGameId, timestamp, DEFAULT_TARGET);
+  } catch (e) {
+    // Structured N+1 failure diagnostics. The error carries its own stage
+    // from the engine (prediction_output_validation / signal_conversion /
+    // model_prediction / ...); we add the source/target round context here.
+    const stage = (e as { stage?: string }).stage ?? "prediction";
+    const errObj = e as Record<string, unknown>;
+    const failure: Record<string, unknown> = {
+      component: "live-predictor",
+      stage,
+      sourceRoundId: gameId,
+      targetRoundId: targetGameId,
+      predictionType: `N+1:${DEFAULT_TARGET}x`,
+      failureReason: (errObj.failureReason as string | undefined) ?? String(e),
+      errorName: e instanceof Error ? e.name : "Error",
+      errorMessage: e instanceof Error ? e.message : String(e),
+      correlationId,
+      recoveryMode,
+    };
+    // Bounded prediction summary — never dump the raw model object.
+    if (errObj.predictionResult !== undefined) {
+      failure.predictionResult = errObj.predictionResult;
+    } else if (errObj.prediction !== undefined) {
+      failure.predictionResult = errObj.prediction;
+    }
+    for (const k of ["invalidField", "expectedType", "actualType"] as const) {
+      if (errObj[k] !== undefined && errObj[k] !== null) failure[k] = errObj[k];
+    }
+    logger.error(failure, `N+1 prediction attempt failed at stage=${stage}`);
+    // The in-memory claim MUST be released so a later ED/recovery attempt
+    // for this target is not permanently blocked as a phantom "duplicate".
+    try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+    recordPredictionOutcome(true);
+    return {
+      predictionId: null,
+      targetGameId,
+      kind: "error",
+      temporalValidity: "TEMPORALLY_UNVERIFIED",
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
+    };
+  }
   const predictElapsed = performance.now() - predictT0;
   const t3 = performance.now(); // prediction completed
 
@@ -921,31 +995,38 @@ export async function onGameEndPredict(
             ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 12_000)
             : Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000);
           const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
-          await tx`
-            insert into notification_outbox (
-              notification_id, type, content, metadata, status, priority,
-              attempt_count, next_attempt_at, telegram_deadline_at
-            ) values (
-              ${randomUUID()}::uuid, 'prediction',
-              ${predictionContent},
-              ${JSON.stringify({
-                predictionId,
-                correlationId,
-                targetGameId,
-                sourceGameId: gameId,
-                targetMultiplier: Number(DEFAULT_TARGET),
-                probability: signal.probability,
-                confidence: signal.confidence,
-                regimeName: signal.regimeId,
-                slaViolated,
-                slaLagMsActual,
-                kind: "prediction",
-                recoveryMode,
-              })},
-              'pending', 3,
-              0, now(), ${deadlineAt}::timestamptz
-            )
-          `;
+          try {
+            await tx`
+              insert into notification_outbox (
+                notification_id, type, content, metadata, status, priority,
+                attempt_count, next_attempt_at, telegram_deadline_at
+              ) values (
+                ${randomUUID()}::uuid, 'prediction',
+                ${predictionContent},
+                ${JSON.stringify({
+                  predictionId,
+                  correlationId,
+                  targetGameId,
+                  sourceGameId: gameId,
+                  targetMultiplier: Number(DEFAULT_TARGET),
+                  probability: signal.probability,
+                  confidence: signal.confidence,
+                  regimeName: signal.regimeId,
+                  slaViolated,
+                  slaLagMsActual,
+                  kind: "prediction",
+                  recoveryMode,
+                })},
+                'pending', 3,
+                0, now(), ${deadlineAt}::timestamptz
+              )
+            `;
+          } catch (err) {
+            // Tag so the outer catch distinguishes outbox_enqueue from
+            // pending_predictions persistence failures.
+            (err as { stage?: string }).stage = "outbox_enqueue";
+            throw err;
+          }
         }
       });
 
@@ -981,14 +1062,22 @@ export async function onGameEndPredict(
         "async persistence complete",
       );
     } catch (e) {
+      const stage = (e as { stage?: string }).stage ?? "persistence";
       logger.error(
         {
           component: "live-predictor",
+          stage,
           targetGameId,
+          sourceRoundId: gameId,
           correlationId,
-          error: String(e),
+          predictionId,
+          failureReason: String(e),
+          errorName: e instanceof Error ? e.name : "Error",
+          errorMessage: e instanceof Error ? e.message : String(e),
         },
-        "async prediction persistence failed — PREDICTION_READY returned but durable handoff failed",
+        stage === "outbox_enqueue"
+          ? "outbox enqueue failed — PREDICTION_READY returned but Telegram handoff failed"
+          : "async prediction persistence failed — PREDICTION_READY returned but durable handoff failed",
       );
       try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
     }
@@ -1022,7 +1111,7 @@ export async function onGameEndPredict(
       regime: signal.regimeId ?? null,
       modelVersion: signal.modelVersion,
       featureVersion: featureVersionOf,
-      featurePath: null,
+      featurePath: (signal.featurePath as FeaturePath | undefined) ?? null,
       temporalValidity: "TEMPORALLY_UNVERIFIED",
       provenance: {
         stateVersion: (fs?.stateVersion as string | number | undefined) ?? null,
