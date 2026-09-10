@@ -13,7 +13,7 @@
  * derived state — process alive AND DB healthy AND ws live AND namespace
  * joined AND recent ED — never a bare online/offline string.
  */
-import { getSql, getPoolStats, type Sql } from "@/lib/db";
+import { getSql, getCriticalSql, getPoolStats, type Sql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
 import { getLastSignalAt } from "@/lib/prediction/live/latency-trace";
@@ -215,9 +215,14 @@ export class LiveSupervisor {
 
   private startConnectionWarmer(): void {
     if (this.warmerTimer) return;
+    // LATENCY FIX: the previous warmer only touched getSql() (general pool).
+    // Prediction persist + outbox dispatch use getCriticalSql(). Cold critical
+    // connections paid ~700–1500ms Neon TLS on every ED; warm both pools.
     this.warmerTimer = setInterval(() => {
-      void this.getSqlFn()
-        .then((sql) => sql`SELECT 1`)
+      void Promise.all([
+        this.getSqlFn().then((sql) => sql`SELECT 1`),
+        getCriticalSql().then((sql) => sql`SELECT 1`),
+      ])
         .then(() => {
           this.lastDbOkAt = Date.now();
         })
