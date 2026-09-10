@@ -378,4 +378,52 @@ export async function persistIncrementalState(sql: Sql): Promise<void> {
       "incremental state persistence failed (soft)",
     );
   }
+  // P0: persist baseline adaptive multipliers/outcomes so restarts match prior model
+  try {
+    const { globalBaselineModel } = await import(
+      "@/lib/prediction/models/baseline-model"
+    );
+    const baselineJson = JSON.stringify(globalBaselineModel.exportState());
+    await sql`
+      INSERT INTO worker_state (key, value, updated_at)
+      VALUES ('baseline_adaptive_state', ${baselineJson}, now())
+      ON CONFLICT (key) DO UPDATE
+      SET value = EXCLUDED.value, updated_at = now()
+    `;
+  } catch (e) {
+    logger.debug(
+      { component: "live-supervisor", error: String(e) },
+      "baseline adaptive state persistence failed (soft)",
+    );
+  }
+}
+
+/** Restore baseline adaptive state from worker_state (soft on miss/corrupt). */
+export async function restoreBaselineAdaptiveState(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql<{ value: string }>`
+      SELECT value FROM worker_state WHERE key = 'baseline_adaptive_state' LIMIT 1
+    `;
+    if (!rows.length || !rows[0]?.value) return false;
+    const parsed = JSON.parse(rows[0].value);
+    const { globalBaselineModel } = await import(
+      "@/lib/prediction/models/baseline-model"
+    );
+    globalBaselineModel.importState(parsed);
+    logger.info(
+      {
+        component: "live-supervisor",
+        outcomeCount: globalBaselineModel.getAdaptiveState().outcomeCount,
+        rollingAbsError: globalBaselineModel.getAdaptiveState().rollingAbsError,
+      },
+      "baseline adaptive state restored",
+    );
+    return true;
+  } catch (e) {
+    logger.debug(
+      { component: "live-supervisor", error: String(e) },
+      "baseline adaptive state restore failed (soft)",
+    );
+    return false;
+  }
 }
