@@ -927,6 +927,7 @@ export async function onGameEndPredict(
   const getSqlFn = deps.getSqlFn ?? getSql;
   const persistT0 = Date.now();
   let outboxEnqueued = 0;
+  let pendingWasDuplicate = false;
   let sql: Sql;
   try {
     sql = await getSqlFn();
@@ -975,7 +976,9 @@ export async function onGameEndPredict(
       `;
 
       if (ins.length === 0) {
-        // Duplicate — already persisted by another path (DB is the backstop)
+        // Duplicate — already persisted by another path (DB is the backstop).
+        // Do not insert a second outbox row (would double-notify).
+        pendingWasDuplicate = true;
         return;
       }
 
@@ -1092,6 +1095,21 @@ export async function onGameEndPredict(
         : "durable prediction handoff complete — duplicate pending (outbox may already exist)",
     );
     predictionLifecycleCounters.predictionsPersisted += 1;
+
+    if (pendingWasDuplicate) {
+      try { completeTarget(targetGameId, owner); } catch { /* soft */ }
+      return {
+        predictionId,
+        targetGameId,
+        kind: "duplicate",
+        temporalValidity: "TEMPORALLY_VALID",
+        sourceGameId: gameId,
+        sourceCrashAt: crashedAt,
+        predictionGeneratedAt: timestamp,
+        predictionLatencyMs: Math.round(performance.now() - t0),
+        outboxEnqueued: 0,
+      };
+    }
   } catch (e) {
     const stage = (e as { stage?: string }).stage ?? "persistence";
     logger.error(
