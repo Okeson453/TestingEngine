@@ -1,4 +1,7 @@
 -- Migration 0029: Prediction delivery forensics columns + enriched timeline view
+-- NOTE: CREATE OR REPLACE VIEW cannot change column names/order in Postgres.
+-- We DROP + CREATE so inserting delivery_outcome/lead_time_ms does not try to
+-- "rename" last_error → delivery_outcome (worker crash loop).
 
 ALTER TABLE notification_outbox
   ADD COLUMN IF NOT EXISTS delivery_outcome TEXT
@@ -16,7 +19,9 @@ CREATE INDEX IF NOT EXISTS notification_outbox_delivery_outcome_idx
   ON notification_outbox (delivery_outcome)
   WHERE delivery_outcome IS NOT NULL;
 
-CREATE OR REPLACE VIEW prediction_delivery_timeline AS
+DROP VIEW IF EXISTS prediction_delivery_timeline;
+
+CREATE VIEW prediction_delivery_timeline AS
 SELECT
   p.prediction_id,
   p.source_round_id                    AS source_game_id,
