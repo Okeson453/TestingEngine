@@ -523,44 +523,25 @@ export async function onGameStart(
       predictionGeneratedAt = String(ins[0]!.requested_at);
 
       if (!slaViolated) {
-        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
-        const predictionContent = [
-          `NEW PREDICTION${regimeText}`,
-          "",
-          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
-          `Probability: ${(signal.probability * 100).toFixed(1)}%`,
-          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
-          "",
-          `Prediction ID: ${predictionId}`,
-          `Generated: ${predictionGeneratedAt}`,
-        ].join("\n");
-        // P1.6: Populate telegram_deadline_at for onGameStart path too.
-        const deadlineAt = new Date(Date.now() + Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000)).toISOString();
-        await tx`
-          insert into notification_outbox (
-            notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at, telegram_deadline_at
-          ) values (
-            ${randomUUID()}::uuid, 'prediction',
-            ${predictionContent},
-            ${JSON.stringify({
-              predictionId,
-              correlationId,
-              targetGameId: evt.gameId,
-              targetBeganAt: evt.beginTime,
-              targetMultiplier: Number(DEFAULT_TARGET),
-              probability: signal.probability,
-              confidence: signal.confidence,
-              regimeName: signal.regimeId,
-              slaViolated: false,
-              kind: "prediction",
-            })},
-            'pending', 3,
-            0, now(), ${deadlineAt}::timestamptz
-          )
-        `;
-        outboxEnqueued = 1;
-      }
+        // Hard temporal contract (report #12-15): a prediction for a round
+        // that has ALREADY STARTED (this path fires ON BG — the round is
+        // live) must never become a Telegram signal. The prediction row
+        // above still persists — learning/calibration/feedback use it and
+        // the registry marks it TEMPORALLY_INVALID — but no signal intent
+        // is created. The old behavior enqueued it with an 8s
+        // creation-relative deadline: a false-timing signal by definition.
+        logger.info(
+          {
+            component: "live-predictor",
+            predictionId,
+            targetGameId: evt.gameId,
+            correlationId,
+            expiration_reason: "target_already_started_at_prediction_time",
+          },
+          "SIGNAL_NOT_ENQUEUED: target started before prediction — learning only",
+      );
+      outboxEnqueued = 0;
+    }
 
       await tx`
         insert into live_event_log (
@@ -1008,7 +989,7 @@ export async function onGameEndPredict(
             await tx`
               insert into notification_outbox (
                 notification_id, type, content, metadata, status, priority,
-                attempt_count, next_attempt_at, telegram_deadline_at
+                attempt_count, next_attempt_at, telegram_deadline_at, target_game_id
               ) values (
                 ${randomUUID()}::uuid, 'prediction',
                 ${predictionContent},
@@ -1027,7 +1008,7 @@ export async function onGameEndPredict(
                   recoveryMode,
                 })},
                 'pending', 3,
-                0, now(), ${deadlineAt}::timestamptz
+                0, now(), ${deadlineAt}::timestamptz, ${targetGameId}
               )
             `;
           } catch (err) {

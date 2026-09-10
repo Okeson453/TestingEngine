@@ -22,6 +22,7 @@ import {
   classifyEdReentry,
   recordEdRoundProcessedForTests,
   _resetEdDedupForTests,
+  bgHandler,
 } from "@/lib/prediction/events/game-event-handlers";
 import { getSql } from "@/lib/db";
 import { randomUUID } from "node:crypto";
@@ -77,6 +78,7 @@ async function insertPendingRow(opts: {
   type?: string;
   deadlineAheadMs?: number | null;
   ageMinutes?: number;
+  targetGameId?: string;
 } = {}): Promise<number> {
   const id = randomUUID();
   const content = `[ol-test] ${id}`;
@@ -89,11 +91,12 @@ async function insertPendingRow(opts: {
   const rows = await (await getSql())<{ id: number }>`
     insert into notification_outbox (
       notification_id, type, content, metadata, status, attempt_count, next_attempt_at,
-      created_at, telegram_deadline_at
+      created_at, telegram_deadline_at, target_game_id
     ) values (
       ${id}::uuid, ${opts.type ?? "prediction"}, ${content}, ${metadata}::jsonb, 'pending',
       0, now() - interval '1 millisecond',
-      now() - (${age}::int * interval '1 minute'), ${deadlineIso}::timestamptz
+      now() - (${age}::int * interval '1 minute'), ${deadlineIso}::timestamptz,
+      ${opts.targetGameId ?? null}
     )
     returning id
   `;
@@ -247,6 +250,101 @@ test("outbox: wake burst during active drain never duplicates delivery (single d
     const stats = d.getStats();
     assert.equal(stats.delivered, 1);
     assert.equal(stats.claimed, 1, "a single row must be claimed exactly once");
+  } finally {
+    await cleanSuiteRows();
+    clearTelegramEnv();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Hard temporal delivery contract (migration 0027):
+// a prediction signal for target round N+1 is valid ONLY before N+1 starts.
+// Late delivery is REMOVED — an expired signal is dead-lettered, never sent.
+// ---------------------------------------------------------------------------
+
+test("temporal contract: dispatcher refuses to deliver a signal whose target already started", async () => {
+  setTelegramEnv();
+  await cleanSuiteRows();
+  try {
+    // Target round started 2s ago (authoritative BG path).
+    const startedTarget = `ol-tc-started-${randomUUID()}`;
+    await bgHandler({ gameId: startedTarget, beganAt: Date.now() - 2_000 });
+
+    let telegramCalls = 0;
+    const d = new OutboxDispatcher();
+    await withStubbedFetch(
+      async () => {
+        telegramCalls += 1;
+        return okTelegram();
+      },
+      async () => d.tickOnce(),
+    );
+
+    // Row 1: signal for the ALREADY-STARTED target must be dead-lettered.
+    const lateId = await insertPendingRow({
+      deadlineAheadMs: 30_000,
+      targetGameId: startedTarget,
+    });
+    // Row 2: signal for a target that has NOT started must still deliver.
+    const freshTarget = `ol-tc-fresh-${randomUUID()}`;
+    const okId = await insertPendingRow({
+      deadlineAheadMs: 30_000,
+      targetGameId: freshTarget,
+    });
+
+    await withStubbedFetch(
+      async () => {
+        telegramCalls += 1;
+        return okTelegram();
+      },
+      async () => d.tickOnce(),
+    );
+
+    const late = await lifecycleOf(lateId);
+    assert.equal(late.status, "dead_letter", "late signal must NEVER be delivered");
+    assert.ok(
+      (late.last_error ?? "").startsWith("expired_late_signal"),
+      `last_error must record the expiration reason, got: ${late.last_error}`,
+    );
+    assert.equal(late.delivered_at, null, "late signal must have no delivered_at");
+
+    const ok = await lifecycleOf(okId);
+    assert.equal(ok.status, "delivered", "pre-start signal must still deliver");
+    assert.ok(telegramCalls >= 1, "the fresh signal must reach Telegram");
+  } finally {
+    await cleanSuiteRows();
+    clearTelegramEnv();
+  }
+});
+
+test("temporal contract: BG arrival atomically kills undelivered signals for that target", async () => {
+  setTelegramEnv();
+  await cleanSuiteRows();
+  try {
+    const target = `ol-tc-kill-${randomUUID()}`;
+    // Pending prediction signal targeting `target` — created BEFORE BG(N).
+    const signalId = await insertPendingRow({
+      deadlineAheadMs: 30_000,
+      targetGameId: target,
+    });
+    // Control: a non-prediction row sharing the target must be untouched.
+    const validationId = await insertPendingRow({
+      type: "validation",
+      deadlineAheadMs: 30_000,
+      targetGameId: target,
+    });
+
+    // BG(N) arrives: the round STARTED — every undelivered signal for it dies.
+    await bgHandler({ gameId: target, beganAt: Date.now() });
+
+    const signal = await lifecycleOf(signalId);
+    assert.equal(signal.status, "dead_letter", "BG must kill the pending signal immediately");
+    assert.ok(
+      (signal.last_error ?? "").includes("target round started"),
+      `kill must be attributed to target start, got: ${signal.last_error}`,
+    );
+    const validation = await lifecycleOf(validationId);
+    assert.equal(validation.status, "pending", "non-prediction rows must NOT be killed");
   } finally {
     await cleanSuiteRows();
     clearTelegramEnv();

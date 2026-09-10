@@ -56,6 +56,8 @@ interface OutboxRow {
   created_at: string;
   telegram_deadline_at?: string | Date | null;
   priority?: number;
+  /** Prediction rows: the round this signal trades (temporal contract). */
+  target_game_id?: string | null;
 }
 
 /** Per-attempt lifecycle timestamps captured in memory and persisted at the
@@ -206,7 +208,7 @@ export class OutboxDispatcher {
           WHERE n.id = picked.id AND n.status = 'pending'
           RETURNING n.id, n.notification_id, n.type, n.content, n.metadata, n.status,
                     n.attempt_count, n.next_attempt_at, n.created_at,
-                    n.telegram_deadline_at, n.priority
+                    n.telegram_deadline_at, n.priority, n.target_game_id
         `;
       } catch {
         const rows = await tx<OutboxRow>`
@@ -279,22 +281,22 @@ export class OutboxDispatcher {
               return "dead" as const;
             }
 
-            // For predictions: only expire if target already CRASHED (past is fully over).
-            // Do NOT drop on "started" — poll recovery often delivers after N+1 has begun;
-            // operators still need the signal, and WIN/LOSS otherwise arrives with no prior alert.
+            // For predictions: HARD temporal contract — a signal for a target
+            // that has ALREADY STARTED is semantically wrong (false-timing).
+            // Late delivery is REMOVED (was "delivering late signal anyway").
+            // The check is unconditional now: the old remainingMs<800 /
+            // FORCE-flag gate made the safety net inactive for exactly the
+            // rows that need it (creation-relative 8s deadline outlives the
+            // target's start). Cost: one indexed lookup per prediction send.
             if (row.type === "prediction") {
               try {
                 const meta = (row.metadata ?? {}) as Record<string, unknown>;
                 const targetGameId =
-                  (meta.targetGameId as string) ||
-                  (meta.target_game_id as string) ||
-                  null;
-                // Latency: only hit DB when close to deadline; otherwise trust
-                // telegram_deadline_at already checked above.
-                const needTargetDb =
-                  process.env.OUTBOX_FORCE_TARGET_DB_CHECK === "1" ||
-                  (Number.isFinite(remainingMs) && remainingMs < 800);
-                if (targetGameId && needTargetDb) {
+                  (row.target_game_id as string | null) ??
+                  ((meta.targetGameId as string) ||
+                    (meta.target_game_id as string) ||
+                    null);
+                if (targetGameId) {
                   // P1.7: Consolidated pre-send check — 1 query instead of 2.
                   // LEFT JOIN live_round_state and crash_rounds in a single pass.
                   const live = await sql<{ began_at: string | Date | null; crashed_at: string | Date | null }>`
@@ -305,17 +307,29 @@ export class OutboxDispatcher {
                     LIMIT 1
                   `.catch(() => [] as { began_at: string | Date | null; crashed_at: string | Date | null }[]);
 
-                  // Soft note only if already started (still deliver)
-                  if (live[0]?.began_at) {
-                    const began = new Date(live[0].began_at).getTime();
+                  // HARD GATE: target started => signal expired, never sent.
+                  const beganAt = live[0]?.began_at;
+                  if (beganAt) {
+                    const began = new Date(beganAt).getTime();
                     if (Number.isFinite(began) && began <= this.now()) {
-                      logger.info(
-                        { component: "outbox-dispatcher", notificationId: row.notification_id, targetGameId },
-                        "target already started — delivering late signal anyway",
+                      await sql`
+                        update notification_outbox
+                        set status = 'dead_letter',
+                            last_error = 'expired_late_signal: target started before delivery'
+                        where id = ${row.id}
+                      `;
+                      this.stats.dead += 1;
+                      logger.warn(
+                        {
+                          component: "outbox-dispatcher",
+                          notificationId: row.notification_id,
+                          targetGameId,
+                          target_started_at: new Date(began).toISOString(),
+                          expiration_reason: "target_already_started",
+                        },
+                        "SIGNAL_EXPIRED — target already started; NOT delivering late signal",
                       );
-                      if (!String(row.content).includes("(late)")) {
-                        row.content = `${row.content}\n\n(late: target already started)`;
-                      }
+                      return "dead" as const;
                     }
                   }
 

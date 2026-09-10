@@ -17,7 +17,10 @@ export type InvariantId =
   | "feedback_state_contradiction"
   | "one_crash_result_per_game"
   | "no_prediction_without_history"
-  | "no_duplicate_outbox_for_prediction";
+  | "no_duplicate_outbox_for_prediction"
+  // Hard temporal delivery contract (0027): a prediction signal must NEVER
+  // be delivered after its target round started.
+  | "prediction_delivered_after_target_start";
 
 export interface InvariantViolation {
   id: InvariantId;
@@ -175,6 +178,48 @@ export async function sampleProductionInvariants(
     }
   } catch (e) {
     logger.debug({ error: String(e) }, "invariant sample skip (temporal)");
+  }
+
+  try {
+    // Hard temporal delivery contract (migration 0027): NO prediction signal
+    // may be delivered after its target round started. The join uses the
+    // validation row's authoritative target_round_started_at (BG-supplied).
+    const lateDelivered = await db<{
+      notification_id: string;
+      target_game_id: string | null;
+      prediction_id: string | null;
+      delivered_at: string | Date;
+      target_round_started_at: string | Date;
+    }>`
+      SELECT o.notification_id, o.target_game_id,
+             o.metadata->>'predictionId' AS prediction_id,
+             o.delivered_at, pv.target_round_started_at
+      FROM notification_outbox o
+      JOIN prediction_validations pv
+        ON pv.prediction_id = o.metadata->>'predictionId'
+      WHERE o.type = 'prediction'
+        AND o.status = 'delivered'
+        AND o.delivered_at IS NOT NULL
+        AND pv.target_round_started_at IS NOT NULL
+        AND o.delivered_at >= pv.target_round_started_at
+      ORDER BY o.delivered_at DESC
+      LIMIT 5
+    `;
+    for (const row of lateDelivered) {
+      const delivered = new Date(row.delivered_at).toISOString();
+      const started = new Date(row.target_round_started_at).toISOString();
+      violations.push({
+        id: "prediction_delivered_after_target_start",
+        detail: `signal ${row.notification_id} delivered AFTER target round started`,
+        predictionId: row.prediction_id ?? undefined,
+        gameId: row.target_game_id ?? undefined,
+        expected: `delivered_at < target_round_started_at (${started})`,
+        actual: `delivered_at=${delivered} (at/after target start)`,
+        stage: "notification",
+      });
+    }
+  } catch (e) {
+    logger.debug({ error: String(e) }, "invariant sample skip (late delivery)");
   }
 
   if (violations.length > 0) {

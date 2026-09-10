@@ -192,7 +192,9 @@ function nextTargetGameId(sourceGameId: string): string {
 /**
  * BG: reconcile target start only — never create a new prediction.
  */
-async function bgHandler(payload: unknown): Promise<void> {
+// Exported for tests: the BG-arrival signal-kill contract is asserted
+// directly against this handler (see outbox-lifecycle.test.ts).
+export async function bgHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
   if (!gameId) return;
   if (inFlightBg.has(gameId)) return;
@@ -230,6 +232,17 @@ async function bgHandler(payload: unknown): Promise<void> {
           globalPredictionRegistry.noteTargetStarted(gameId, beganAt);
         })
         .catch(() => undefined),
+      // Hard temporal contract (report #13): BG(N) arriving means round N has
+      // STARTED — every undelivered prediction signal targeting N is now
+      // EXPIRED. Atomic kill beats waiting for the dispatcher tick.
+      sql`
+        UPDATE notification_outbox
+        SET status = 'dead_letter',
+            last_error = 'expired_late_signal: target round started (BG received)'
+        WHERE type = 'prediction'
+          AND status IN ('pending', 'inflight')
+          AND target_game_id = ${gameId}
+      `.catch(() => undefined),
       sql`
         INSERT INTO live_event_log (
           correlation_id, event_kind, game_id, payload, received_at, processed_at,
