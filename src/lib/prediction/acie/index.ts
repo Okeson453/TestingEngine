@@ -62,3 +62,12 @@ export {
   type AcieProvenance,
   type PredictionExecutionMode,
 } from './provenance.ts';
+
+export {
+  recordAcieObservation,
+  getLastAcieObservation,
+  assertFreshAcieState,
+  resetStaleGuardForTests,
+  type StaleCheckResult,
+} from './stale-guard.ts';
+
