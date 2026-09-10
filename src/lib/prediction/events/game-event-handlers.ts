@@ -407,7 +407,9 @@ async function edHandler(payload: unknown): Promise<void> {
             ed_to_signal_ms: Math.round(totalMs * 100) / 100,
             correlationId,
           },
-          "ED→N+1 SIGNAL_READY (durability pending)",
+          result.kind === "predicted"
+            ? "ED→N+1 SIGNAL_READY (durable outbox enqueued)"
+            : `ED→N+1 result kind=${result.kind}`,
         );
       } else {
         // soft miss / duplicate / insufficient_history / exception handled in attempt
