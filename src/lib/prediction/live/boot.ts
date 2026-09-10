@@ -404,28 +404,40 @@ class LiveBoot {
       }
 
       // Warm the live rolling history buffer so the first ED predict hits
-      // memory instead of a crash_rounds SQL round-trip.
+      // memory. P0: history is a hard prerequisite — without READY buffer
+      // the predictor returns N+1_UNAVAILABLE_HISTORY (no silent SQL fallback).
       try {
         const {
           warmLiveHistoryBuffer,
+          isHistoryReadyForPrediction,
           isLiveHistoryWarmed,
+          liveHistorySize,
+          MIN_HISTORY_FOR_PREDICTION,
         } = await import("@/lib/prediction/live/live-history-buffer");
         await warmLiveHistoryBuffer(sql, 200);
-        if (!isLiveHistoryWarmed()) {
+        if (!isHistoryReadyForPrediction()) {
           logger.error(
-            { component: "live-boot" },
-            "Live history buffer NOT warmed — hot path will hit Neon (~700–1000ms/query)",
+            {
+              component: "live-boot",
+              warmed: isLiveHistoryWarmed(),
+              size: liveHistorySize(),
+              minRequired: MIN_HISTORY_FOR_PREDICTION,
+            },
+            "P0 health fault: live history NOT READY — N+1 predictions blocked until buffer recovers",
           );
         } else {
           logger.info(
-            { component: "live-boot" },
-            "live history buffer warmed (hot path avoids history SQL)",
+            {
+              component: "live-boot",
+              size: liveHistorySize(),
+            },
+            "live history buffer READY (hot path memory-only, no history SQL)",
           );
         }
       } catch (e) {
         logger.error(
           { component: "live-boot", error: String(e) },
-          "live history buffer warm failed — predictions will pay Neon RTT",
+          "P0 health fault: live history warm failed — N+1 predictions blocked (no SQL fallback)",
         );
       }
 
