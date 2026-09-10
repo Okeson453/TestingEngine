@@ -51,7 +51,17 @@ describe("durable prediction handoff ordering (P0)", () => {
   });
 
   it("dispatcher claims prediction type before other kinds, then priority DESC", () => {
-    expect(notifSrc).toMatch(/CASE WHEN type = 'prediction' THEN 0 ELSE 1 END|case when type = 'prediction' then 0 else 1 end/i);
+    // LANE SEPARATION (remediation plan §2/§11/§12): the prediction lane is
+    // its own claim (`type = 'prediction'`), the normal lane claims only
+    // non-predictions (`type <> 'prediction'`), and the drain loop runs the
+    // prediction lane INLINE while the normal lane runs detached. A new
+    // prediction therefore never depends on the age, size or Telegram
+    // latency of a running background batch — a strictly stronger guarantee
+    // than the old prediction-first ORDER BY inside one shared claim.
+    expect(notifSrc).toContain("type = 'prediction'");
+    expect(notifSrc).toContain("type <> 'prediction'");
+    expect(notifSrc).toMatch(/await this\.processLane\("prediction"\)/);
+    expect(notifSrc).toMatch(/runBackgroundDetached\(\)/);
     expect(notifSrc).toMatch(/priority DESC|priority desc/i);
   });
 

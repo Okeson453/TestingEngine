@@ -36,7 +36,7 @@
       debugFrameTypes: false,
       forwardBinary: true,
     },
-    typeof window !== 'undefined' ? window.__TE_EDGE__ || {} : {},
+    typeof window !== 'undefined' ? window.__TE_EDGE__ || { /* intentionally empty */ } : { /* intentionally empty */ },
   );
 
   if (
@@ -56,7 +56,7 @@
       tip.textContent =
         'TE Edge: edit WORKER_URL + AUTH_TOKEN in Tampermonkey script, then Save & reload';
       document.documentElement.appendChild(tip);
-    } catch (_) {}
+    } catch (_) { /* intentionally empty */ }
     return;
   }
 
@@ -206,7 +206,7 @@
       const ws = new OrigWS(...args);
       try {
         ws.binaryType = 'arraybuffer';
-      } catch (_) {}
+      } catch (_) { /* intentionally empty */ }
       ws.addEventListener('message', (ev) => {
         const d = ev.data;
         if (CONFIG.debugFrameTypes) {
@@ -229,7 +229,7 @@
           return;
         }
         if (typeof Blob !== 'undefined' && d instanceof Blob) {
-          d.arrayBuffer().then(postBinaryFrame).catch(() => {});
+          d.arrayBuffer().then(postBinaryFrame).catch(() => { /* intentionally empty */ });
         }
       });
       return ws;

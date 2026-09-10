@@ -8,6 +8,7 @@
  * - Precise latency instrumentation is present
  * - Invariant logger includes violation details
  */
+import path from "node:path";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { IncrementalStateEngine } from "../state/incremental-state-engine.ts";
 import { RollingHistoryBuffer } from "../rolling-history-buffer.ts";
@@ -129,7 +130,7 @@ describe("Zero-DB ED prediction path — regression tests", () => {
       // `const sql = await getSqlFn()` at the top level.
       const fs = await import("node:fs/promises");
       const source = await fs.readFile(
-        require("node:path").join(__dirname, "predictor.ts"),
+        path.join(__dirname, "predictor.ts"),
         "utf8",
       );
 
@@ -169,7 +170,7 @@ describe("Zero-DB ED prediction path — regression tests", () => {
     it("durable outbox handoff is awaited before returning predicted", async () => {
       const fs = await import("node:fs/promises");
       const source = await fs.readFile(
-        require("node:path").join(__dirname, "predictor.ts"),
+        path.join(__dirname, "predictor.ts"),
         "utf8",
       );
 
@@ -190,7 +191,7 @@ describe("Zero-DB ED prediction path — regression tests", () => {
     it("onGameEndPredict logs stage-level timing", async () => {
       const fs = await import("node:fs/promises");
       const source = await fs.readFile(
-        require("node:path").join(__dirname, "predictor.ts"),
+        path.join(__dirname, "predictor.ts"),
         "utf8",
       );
 
@@ -217,7 +218,7 @@ describe("Zero-DB ED prediction path — regression tests", () => {
     it("invariants.ts maps violation details in the warning", async () => {
       const fs = await import("node:fs/promises");
       const source = await fs.readFile(
-        require("node:path").join(__dirname, "invariants.ts"),
+        path.join(__dirname, "invariants.ts"),
         "utf8",
       );
 
@@ -232,7 +233,7 @@ describe("Zero-DB ED prediction path — regression tests", () => {
     it("boot.ts prewarms all PredictionEngine.predict() dependencies", async () => {
       const fs = await import("node:fs/promises");
       const source = await fs.readFile(
-        require("node:path").join(__dirname, "boot.ts"),
+        path.join(__dirname, "boot.ts"),
         "utf8",
       );
 

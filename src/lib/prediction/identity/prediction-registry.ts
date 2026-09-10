@@ -214,7 +214,7 @@ function eceOf(samples: Sample[]): number | null {
     den[b] += 1;
   }
   let e = 0;
-  let total = samples.length;
+  const total = samples.length;
   for (let i = 0; i < bins; i += 1) {
     if (den[i] === 0) continue;
     e += (den[i]! / total) * Math.abs(num[i]! / den[i]! - i / bins + 0.5 / bins);

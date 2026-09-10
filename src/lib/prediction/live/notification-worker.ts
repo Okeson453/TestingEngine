@@ -21,12 +21,20 @@ import { runInTransaction } from "@/lib/prediction/live/tx";
 import { sendTelegramMessage, type SendResult } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { isAuthoritative } from "@/lib/prediction/live/fencing";
+import { getWakeStats } from "@/lib/prediction/live/outbox-wake";
 
 const logger = getLogger("outbox-dispatcher");
 
 /** Tunables (env-overridable for tests). */
 // P2.5: Reduced default from 50ms to 25ms to halve max queue wait time.
-export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 10);
+// FAST-LANE FIX (production trace 18:35-18:39): the wake channel gives
+// immediate drain after every durable enqueue (notifyOutbox is latched, so
+// wakes are never lost); a 10ms timer on top of that was issuing a
+// claim query against the CRITICAL pool ~100x/sec even when the outbox was
+// empty. The timer is now RECOVERY/FALLBACK ONLY (covers missed wakes,
+// clock drift, operator re-enqueue without wake). Delivery latency is the
+// wake path's job — measured 1ms warm (18:36:33.169 -> .171).
+export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 2_000);
 export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 export const STALE_INFLIGHT_MS = Number(process.env.OUTBOX_STALE_MS ?? 30_000);
 export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
@@ -41,6 +49,16 @@ export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
  * Env-overridable as before.
  */
 export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 2);
+/**
+ * MINIMUM REMAINING LEAD SAFETY GATE (remediation plan §6): before a
+ * prediction send begins, require at least this much residual deadline
+ * budget. The budget covers the Telegram P99 send leg + delivery-finalize
+ * leg + safety margin, so a send that would straddle the semantic validity
+ * boundary is refused (MISSED) instead of accepted and suppressed. Env-
+ * configurable — never a hard-coded guess. Measured production legs are
+ * well under 250ms warm; 500ms default is conservative.
+ */
+export const MIN_REMAINING_LEAD_MS = Number(process.env.DELIVERY_MIN_LEAD_MS ?? 500);
 // First-retry backoff lowered 1000→300ms (investigation report): a single
 // transient Telegram timeout shouldn't cost a full second before the retry.
 // Curve: 300/600/1200/2400... capped at MAX_BACKOFF_MS.
@@ -61,6 +79,8 @@ interface OutboxRow {
   priority?: number;
   /** Prediction rows: the round this signal trades (temporal contract). */
   target_game_id?: string | null;
+  /** Server-stamped claim time (canonical per-row dispatch start). */
+  dispatch_claimed_at?: string | Date | null;
 }
 
 /** Per-attempt lifecycle timestamps captured in memory and persisted at the
@@ -177,9 +197,59 @@ export class OutboxDispatcher {
     return { ...this.stats };
   }
 
-  /** Run a single drain pass. Returns the result for testability. */
+  /** Run a single drain pass (both lanes, awaited). Returns the result for
+   * testability. The production drain loop uses processLane directly: the
+   * prediction lane runs inline, the normal lane runs DETACHED so a slow
+   * result batch can never delay a new prediction (remediation plan §2/§12). */
   async tickOnce(): Promise<{
     recovered: number;
+    delivered: number;
+    dead: number;
+    requeued: number;
+  }> {
+    const pred = await this.processLane("prediction");
+    const bg = await this.processLane("normal");
+    return {
+      recovered: 0,
+      delivered: pred.delivered + bg.delivered,
+      dead: pred.dead + bg.dead,
+      requeued: pred.requeued + bg.requeued,
+    };
+  }
+
+  /** Guard so at most ONE background (normal-lane) pass runs at a time. */
+  private bgRunning = false;
+
+  /** Kick a detached normal-lane pass. Never awaited by the drain loop —
+   * a slow result/validation Telegram send must not occupy the scheduling
+   * path a new N+1 prediction needs (plan §2, §12). SKIP LOCKED claiming
+   * makes concurrent lane passes row-safe. */
+  private runBackgroundDetached(): void {
+    if (this.bgRunning) return;
+    this.bgRunning = true;
+    void (async () => {
+      // Bounded backlog drain: keep claiming while the batch comes back full
+      // (max 10 passes) so a large queued backlog drains promptly without
+      // ever blocking the prediction lane.
+      for (let i = 0; i < 10; i += 1) {
+        const r = await this.processLane("normal");
+        if (r.delivered + r.dead + r.requeued < BATCH_SIZE) break;
+      }
+    })()
+      .catch((e) => {
+        logger.warn(
+          { component: "outbox-dispatcher", error: String(e) },
+          "background lane pass failed (detached)",
+        );
+      })
+      .finally(() => {
+        this.bgRunning = false;
+      });
+  }
+
+  /** Process one lane: claim + dispatch. Lanes are disjoint row sets
+   * (prediction vs non-prediction), so concurrent passes never contend. */
+  async processLane(lane: "prediction" | "normal"): Promise<{
     delivered: number;
     dead: number;
     requeued: number;
@@ -187,6 +257,7 @@ export class OutboxDispatcher {
     this.stats.tickCount += 1;
     let delivered = 0;
     let dead = 0;
+    let claimGateDead = 0;
     let requeued = 0;
     const tickStartMs = this.now();
 
@@ -196,20 +267,69 @@ export class OutboxDispatcher {
     // Exclude rows past telegram_deadline_at so we never deliver "predicts the past".
     // Single round-trip claim inside one TX (UPDATE…FROM…RETURNING).
     // At ~800ms Neon RTT, N per-row UPDATEs were costing seconds per tick.
+    // LANE FILTER: each pass claims only its own lane's rows — a prediction
+    // dispatch opportunity never depends on unrelated notifications.
     const claimed = await runInTransaction(sql, async (tx) => {
       try {
+        if (lane === "prediction") {
+          // CLAIM-TIME TEMPORAL GATE (forensic report Issue 1): a prediction
+          // whose target already started/crashed is dead on arrival. Kill it
+          // here, inside the claim TX, instead of paying an auth round trip
+          // and a Telegram RTT for a signal that can never be actionable.
+          // Zero extra round trips — same pinned transaction client.
+          // The pre-send atomic authorization remains the final gate; this
+          // sweep only removes rows that are ALREADY temporally invalid.
+          const swept = await tx<{ id: number }>`
+            update notification_outbox o
+            set status = 'dead_letter',
+                last_error = 'expired_late_signal: target started/crashed before claim (claim-time gate)'
+            where o.status = 'pending'
+              and o.type = 'prediction'
+              and coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id') is not null
+              and coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id') in (
+                select game_id from live_round_state
+                where began_at is not null and began_at <= clock_timestamp()
+                union
+                select game_id from crash_rounds
+                where crashed_at is not null and crashed_at <= clock_timestamp()
+              )
+            returning id
+          `;
+          this.stats.dead += swept.length;
+          claimGateDead = swept.length;
+          return await tx<OutboxRow>`
+            WITH picked AS (
+              SELECT id
+              FROM notification_outbox
+              WHERE status = 'pending'::text
+                AND type = 'prediction'
+                AND next_attempt_at <= now()
+                AND (telegram_deadline_at IS NULL OR telegram_deadline_at > now())
+              ORDER BY priority DESC, next_attempt_at ASC, id ASC
+              LIMIT ${BATCH_SIZE}
+              FOR UPDATE SKIP LOCKED
+            )
+            UPDATE notification_outbox n
+            SET status = 'inflight',
+                attempt_count = attempt_count + 1,
+                dispatch_claimed_at = now()
+            FROM picked
+            WHERE n.id = picked.id AND n.status = 'pending'
+            RETURNING n.id, n.notification_id, n.type, n.content, n.metadata, n.status,
+                      n.attempt_count, n.next_attempt_at, n.created_at,
+                      n.telegram_deadline_at, n.priority, n.target_game_id,
+                      n.dispatch_claimed_at
+          `;
+        }
         return await tx<OutboxRow>`
           WITH picked AS (
             SELECT id
             FROM notification_outbox
             WHERE status = 'pending'::text
+              AND type <> 'prediction'
               AND next_attempt_at <= now()
               AND (telegram_deadline_at IS NULL OR telegram_deadline_at > now())
-            ORDER BY
-              CASE WHEN type = 'prediction' THEN 0 ELSE 1 END,
-              priority DESC,
-              next_attempt_at ASC,
-              id ASC
+            ORDER BY priority DESC, next_attempt_at ASC, id ASC
             LIMIT ${BATCH_SIZE}
             FOR UPDATE SKIP LOCKED
           )
@@ -221,36 +341,61 @@ export class OutboxDispatcher {
           WHERE n.id = picked.id AND n.status = 'pending'
           RETURNING n.id, n.notification_id, n.type, n.content, n.metadata, n.status,
                     n.attempt_count, n.next_attempt_at, n.created_at,
-                    n.telegram_deadline_at, n.priority, n.target_game_id
+                    n.telegram_deadline_at, n.priority, n.target_game_id,
+                    n.dispatch_claimed_at
         `;
       } catch {
-        const rows = await tx<OutboxRow>`
-          select id, notification_id, type, content, metadata, status, attempt_count,
-                 next_attempt_at, created_at, telegram_deadline_at, priority
-          from notification_outbox
-          where status = 'pending'::text
-            and next_attempt_at <= now()
-            and (telegram_deadline_at is null or telegram_deadline_at > now())
-          order by
-            case when type = 'prediction' then 0 else 1 end,
-            priority desc,
-            next_attempt_at asc,
-            id asc
-          limit ${BATCH_SIZE}
-          for update skip locked
-        `;
+        // Legacy fallback (older drivers without UPDATE…FROM): plain SELECT
+        // FOR UPDATE + per-row UPDATE. Lane filter is duplicated explicitly —
+        // the pinned tx sql builds raw text and cannot compose fragments.
+        const rows =
+          lane === "prediction"
+            ? await tx<OutboxRow>`
+                select id, notification_id, type, content, metadata, status, attempt_count,
+                       next_attempt_at, created_at, telegram_deadline_at, priority
+                from notification_outbox
+                where status = 'pending'::text
+                  and type = 'prediction'
+                  and next_attempt_at <= now()
+                  and (telegram_deadline_at is null or telegram_deadline_at > now())
+                order by priority desc, next_attempt_at asc, id asc
+                limit ${BATCH_SIZE}
+                for update skip locked
+              `
+            : await tx<OutboxRow>`
+                select id, notification_id, type, content, metadata, status, attempt_count,
+                       next_attempt_at, created_at, telegram_deadline_at, priority
+                from notification_outbox
+                where status = 'pending'::text
+                  and type <> 'prediction'
+                  and next_attempt_at <= now()
+                  and (telegram_deadline_at is null or telegram_deadline_at > now())
+                order by priority desc, next_attempt_at asc, id asc
+                limit ${BATCH_SIZE}
+                for update skip locked
+              `;
         for (const r of rows) {
-          await tx`
-            update notification_outbox
-            set status = 'inflight', attempt_count = attempt_count + 1,
-                dispatch_claimed_at = now()
-            where id = ${r.id} and status = 'pending'
-          `;
+          if (lane === "prediction") {
+            await tx`
+              update notification_outbox
+              set status = 'inflight', attempt_count = attempt_count + 1,
+                  dispatch_claimed_at = now()
+              where id = ${r.id} and status = 'pending' and type = 'prediction'
+            `;
+          } else {
+            await tx`
+              update notification_outbox
+              set status = 'inflight', attempt_count = attempt_count + 1,
+                  dispatch_claimed_at = now()
+              where id = ${r.id} and status = 'pending' and type <> 'prediction'
+            `;
+          }
           r.attempt_count = (r.attempt_count ?? 0) + 1;
         }
         return rows;
       }
     });
+    dead += claimGateDead;
 
     if (claimed.length > 0) {
       this.stats.claimed += claimed.length;
@@ -260,9 +405,18 @@ export class OutboxDispatcher {
     const claimClientMs = this.now();
 
     // Parallel dispatch bounded by BATCH_PARALLELISM (P0 / 6.5)
-    const parallelism = Math.max(1, BATCH_PARALLELISM);
+    // The claim is already lane-filtered, so every claimed row belongs to
+    // this pass's lane. Prediction lane concurrency stays bounded at 2
+    // (never reduced to 1); the normal lane keeps the full parallelism.
+    const parallelism =
+      lane === "prediction"
+        ? Math.min(Math.max(1, BATCH_PARALLELISM), 2)
+        : Math.max(1, BATCH_PARALLELISM);
+    const laneChunks: OutboxRow[][] = [];
     for (let i = 0; i < claimed.length; i += parallelism) {
-      const chunk = claimed.slice(i, i + parallelism);
+      laneChunks.push(claimed.slice(i, i + parallelism));
+    }
+    for (const chunk of laneChunks) {
       const results = await Promise.all(
         chunk.map(async (row) => {
           const lc: RowLifecycle = {
@@ -298,6 +452,31 @@ export class OutboxDispatcher {
               return "dead" as const;
             }
 
+            // MINIMUM REMAINING LEAD SAFETY GATE (plan §6): for predictions,
+            // refuse to start a send whose residual budget cannot plausibly
+            // cover the Telegram leg + finalize + margin. Better to mark
+            // MISSED now than to race the round start and suppress after the
+            // fact. DELIVERY_MIN_LEAD_MS is configuration, not a guess.
+            if (row.type === "prediction" && Number.isFinite(remainingMs) && remainingMs < MIN_REMAINING_LEAD_MS) {
+              await sql`
+                update notification_outbox
+                set status = 'dead_letter',
+                    last_error = 'missed: insufficient remaining lead before target start (min_lead_ms gate)'
+                where id = ${row.id} and status = 'inflight'
+              `;
+              this.stats.dead += 1;
+              logger.warn(
+                {
+                  component: "outbox-dispatcher",
+                  notificationId: row.notification_id,
+                  remainingMs: Math.round(remainingMs),
+                  minRemainingLeadMs: MIN_REMAINING_LEAD_MS,
+                },
+                "OUTBOX_DISPATCH missed — remaining lead below minimum safety budget",
+              );
+              return "dead" as const;
+            }
+
             // For predictions: HARD temporal contract — a signal for a target
             // that has ALREADY STARTED is semantically wrong (false-timing).
             // Late delivery is REMOVED (was "delivering late signal anyway").
@@ -309,7 +488,12 @@ export class OutboxDispatcher {
             // when the row is still inflight, within deadline, and — for
             // predictions — the target has not started or crashed. Fail
             // closed: a DB error requeues without sending.
-            lc.sendStartedMs = this.now();
+            // CLOCK HYGIENE (forensic report Issue 3): the client send-start
+            // clock is captured AFTER the authorization resolves, so
+            // telegramSendMs (client accepted − client send-start) measures
+            // only the Telegram leg. The server-side send_started_at from the
+            // auth RETURNING is the dispatch-leg source of truth.
+            let sendStartedServerIso: string | null = null;
             let authorized: { id: number; send_started_at: string | Date }[];
             try {
               authorized = await sql<{ id: number; send_started_at: string | Date }>`
@@ -338,6 +522,10 @@ export class OutboxDispatcher {
                   )
                 returning o.id, o.send_started_at
               `;
+              lc.sendStartedMs = this.now();
+              if (authorized.length > 0) {
+                sendStartedServerIso = new Date(authorized[0]!.send_started_at).toISOString();
+              }
             } catch (authErr) {
               // Fail closed: do not send while authorization is unverifiable.
               await sql`
@@ -480,26 +668,120 @@ export class OutboxDispatcher {
               }
               const acceptedMs = this.now();
               lc.telegramAcceptedMs = acceptedMs;
-              const acceptedAt = new Date(acceptedMs).toISOString();
               // P0 TOCTOU fix: finalize ONLY if still inflight and within deadline.
               // BG may have set dead_letter while Telegram was in flight — do not
               // overwrite that expiration with delivered.
-              const finalized = await sql<{ id: number }>`
-                update notification_outbox
-                set status = 'delivered',
-                    delivered_at = ${acceptedAt}::timestamptz,
-                    send_started_at = ${new Date(lc.sendStartedMs!).toISOString()}::timestamptz,
-                    telegram_accepted_at = ${acceptedAt}::timestamptz,
-                    last_error = null
-                where id = ${row.id}
-                  and status = 'inflight'
-                  and (telegram_deadline_at is null or telegram_deadline_at > now())
-                returning id
-              `;
+              // LATE ACCEPTANCE GATE (plan §7): for predictions the finalize
+              // ALSO refuses when the target started/crashed between
+              // authorization and Telegram acceptance — the invariant
+              // telegram_accepted_at < target_round_started_at is enforced at
+              // the last write, not just at authorization time.
+              // CLOCK HYGIENE: delivered_at / telegram_accepted_at are stamped
+              // SERVER-side (clock_timestamp) — the authoritative lead-time
+              // chain (target_started − telegram_accepted) must live on one
+              // clock. Client clock survives only in the Telegram-send
+              // duration (acceptedMs − lc.sendStartedMs).
+              const finalized =
+                row.type === "prediction"
+                  ? await sql<{ id: number; telegram_accepted_at: string | Date }>`
+                      update notification_outbox
+                      set status = 'delivered',
+                          delivered_at = clock_timestamp(),
+                          telegram_accepted_at = clock_timestamp(),
+                          last_error = null
+                      where id = ${row.id}
+                        and status = 'inflight'
+                        and (telegram_deadline_at is null or telegram_deadline_at > now())
+                        and not exists (
+                          select 1 from live_round_state lrs
+                          where lrs.game_id = coalesce(${row.target_game_id ?? null}, metadata->>'targetGameId', metadata->>'target_game_id')
+                            and lrs.began_at is not null
+                            and lrs.began_at <= clock_timestamp()
+                        )
+                        and not exists (
+                          select 1 from crash_rounds cr
+                          where cr.game_id = coalesce(${row.target_game_id ?? null}, metadata->>'targetGameId', metadata->>'target_game_id')
+                            and cr.crashed_at is not null
+                            and cr.crashed_at <= clock_timestamp()
+                        )
+                      returning id, telegram_accepted_at
+                    `
+                  : await sql<{ id: number; telegram_accepted_at: string | Date }>`
+                      update notification_outbox
+                      set status = 'delivered',
+                          delivered_at = clock_timestamp(),
+                          telegram_accepted_at = clock_timestamp(),
+                          last_error = null
+                      where id = ${row.id}
+                        and status = 'inflight'
+                        and (telegram_deadline_at is null or telegram_deadline_at > now())
+                      returning id, telegram_accepted_at
+                    `;
               if (finalized.length === 0) {
                 // Race lost to BG/expiry — Telegram may have been accepted, but
                 // we must not record a valid delivery after semantic invalidation.
                 this.stats.dead += 1;
+                // LATE classification (plan §7): if the target started between
+                // auth and acceptance, this is not merely "suppressed" — it is
+                // a LATE acceptance. Persist the outcome and exact reason.
+                if (row.type === "prediction") {
+                  const targetGameIdLate =
+                    (row.target_game_id as string | null) ??
+                    ((row.metadata as Record<string, unknown> | null)?.targetGameId as string) ??
+                    null;
+                  let lateAccepted = false;
+                  if (targetGameIdLate) {
+                    try {
+                      const st = await sql<{ started: boolean }>`
+                        select (
+                          exists (
+                            select 1 from live_round_state lrs
+                            where lrs.game_id = ${targetGameIdLate}
+                              and lrs.began_at is not null and lrs.began_at <= clock_timestamp()
+                          ) or exists (
+                            select 1 from crash_rounds cr
+                            where cr.game_id = ${targetGameIdLate}
+                              and cr.crashed_at is not null and cr.crashed_at <= clock_timestamp()
+                          )
+                        ) as started
+                      `;
+                      lateAccepted = st[0]?.started === true;
+                    } catch { /* classification best-effort */ }
+                  }
+                  await sql`
+                    update notification_outbox
+                    set status = 'dead_letter',
+                        last_error = 'late_acceptance: telegram_accepted_at >= target_round_started_at — never a successful delivery'
+                    where id = ${row.id} and status = 'inflight'
+                  `.catch(() => undefined);
+                  if (lateAccepted) {
+                    setImmediate(() => {
+                      void import("@/lib/prediction/live/delivery-forensics")
+                        .then(({ persistDeliveryOutcome }) =>
+                          persistDeliveryOutcome(
+                            sql,
+                            row.notification_id,
+                            "LATE",
+                            null,
+                          ),
+                        )
+                        .catch(() => undefined);
+                    });
+                  }
+                  logger.warn(
+                    {
+                      component: "outbox-dispatcher",
+                      ...lifecycleLogFields(row, lc, acceptedMs, "late_acceptance"),
+                      notificationId: row.notification_id,
+                      type: row.type,
+                      lateAccepted,
+                    },
+                    lateAccepted
+                      ? "OUTBOX_DISPATCH telegram accepted AFTER target start — recorded LATE, never delivered"
+                      : "OUTBOX_DISPATCH telegram accepted but row no longer inflight/valid — delivery suppressed (BG or deadline won)",
+                  );
+                  return "dead" as const;
+                }
                 logger.warn(
                   {
                     component: "outbox-dispatcher",
@@ -512,6 +794,11 @@ export class OutboxDispatcher {
                 return "dead" as const;
               }
               this.stats.delivered += 1;
+              // Server-accepted ISO from the finalize RETURNING — the
+              // authoritative clock for every downstream lead-time number.
+              const acceptedAt = finalized[0]
+                ? new Date(finalized[0].telegram_accepted_at).toISOString()
+                : new Date(acceptedMs).toISOString();
               logger.info(
                 {
                   component: "outbox-dispatcher",
@@ -519,6 +806,35 @@ export class OutboxDispatcher {
                   remainingBudgetMs: Number.isFinite(remainingMs)
                     ? Math.round(remainingMs)
                     : null,
+                  // Per-destination Telegram timing (plan §13): first accept,
+                  // slowest destination, full fan-out completion — measured,
+                  // so timeout policy is never adjusted on speculation.
+                  telegramDestinations: sendResults.map((r) => ({
+                    chatId: r.chatId,
+                    ok: r.ok,
+                    status: r.status ?? null,
+                    durationMs: r.durationMs ?? null,
+                  })),
+                  firstAcceptMs:
+                    sendResults.filter((r) => r.ok && r.durationMs != null).length > 0
+                      ? Math.round(
+                          Math.min(
+                            ...sendResults
+                              .filter((r) => r.ok && r.durationMs != null)
+                              .map((r) => r.durationMs!),
+                          ),
+                        )
+                      : null,
+                  slowestDestinationMs:
+                    sendResults.some((r) => r.durationMs != null)
+                      ? Math.round(
+                          Math.max(
+                            ...sendResults
+                              .filter((r) => r.durationMs != null)
+                              .map((r) => r.durationMs!),
+                          ),
+                        )
+                      : null,
                 },
                 "OUTBOX_DISPATCH delivered",
               );
@@ -565,8 +881,15 @@ export class OutboxDispatcher {
                       (row.target_game_id as string | null) ??
                       (typeof metaF.targetGameId === "string" ? metaF.targetGameId : null),
                     createdAt: row.created_at,
+                    // Canonical per-row dispatch start, stamped server-side by
+                    // the claim query — never derived from batch timing.
+                    dispatchClaimedAt: row.dispatch_claimed_at
+                      ? new Date(row.dispatch_claimed_at).toISOString()
+                      : null,
                     sendStartedAtMs: lc.sendStartedMs,
+                    sendStartedAtServerIso: sendStartedServerIso,
                     telegramAcceptedAtMs: acceptedMs,
+                    serverAcceptedAtIso: acceptedAt,
                   });
                 })().catch(() => {
                   /* soft — forensics must never break delivery */
@@ -718,26 +1041,45 @@ export class OutboxDispatcher {
       // claims per pass, and how long a full drain takes (identifies whether
       // one slow Telegram request dominates a pass — chunk parallelism makes
       // drain time ≈ ceil(claimed/parallelism) × slowest send).
+      // Wake-to-dispatch instrumentation (plan §10): notify→claim latency
+      // proves whether notifyOutbox() is immediate but the dispatcher busy.
+      const wake = getWakeStats();
+      const lastNotifyAt =
+        lane === "prediction" ? wake.lastPredictionNotifyAt : wake.lastNormalNotifyAt;
+      const notifyToClaimMs =
+        lastNotifyAt != null
+          ? Math.max(0, claimClientMs - lastNotifyAt)
+          : null;
       logger.info(
         {
           component: "outbox-dispatcher",
+          lane,
           claimed: claimed.length,
           batchSize: BATCH_SIZE,
-          parallelism: BATCH_PARALLELISM,
+          parallelism,
           delivered,
           dead,
           requeued,
           drainMs: Math.round(this.now() - tickStartMs),
+          notifyToClaimMs: notifyToClaimMs != null ? Math.round(notifyToClaimMs) : null,
+          wakeKindCounts: {
+            prediction: wake.predictionWakeCount,
+            normal: wake.normalWakeCount,
+          },
         },
         "OUTBOX_TICK drained claimed rows",
       );
     }
-    return { recovered: 0, delivered, dead, requeued };
+    return { delivered, dead, requeued };
   }
 
-  /** Recover stale INFLIGHT (legacy status) or stuck pending rows. */
+  /** Recover stale INFLIGHT (legacy status) or stuck pending rows.
+   * PLAN §8: recovery is MAINTENANCE — it runs on the GENERAL pool and must
+   * never compete with prediction persistence/dispatch for critical-pool
+   * capacity. Stale lease semantics, idempotency and row ownership are
+   * unchanged. */
   async recoverStale(): Promise<number> {
-    const sql = await this.getSqlFn();
+    const sql = await getSql();
 
     // Health signal: pending rows older than 5s mean the dispatcher is lagging.
     // Split into CLAIMABLE (dispatcher can and should have taken them) vs
@@ -821,6 +1163,27 @@ export class OutboxDispatcher {
           )
       `;
     } catch { /* soft */ }
+
+    // NO-RESURRECT (plan §21): stale recovery must never resurrect a
+    // prediction whose target already started/crashed. Dead-letter those
+    // FIRST; the generic reset below then only sees still-valid rows.
+    try {
+      await sql`
+        update notification_outbox
+        set status = 'dead_letter',
+            last_error = 'expired_late_signal: target started/crashed (recovery no-resurrect gate)'
+        where status = 'inflight'
+          and type = 'prediction'
+          and updated_at < now() - (${STALE_INFLIGHT_MS}::int * interval '1 millisecond')
+          and coalesce(target_game_id, metadata->>'targetGameId', metadata->>'target_game_id') in (
+            select game_id from live_round_state
+            where began_at is not null and began_at <= clock_timestamp()
+            union
+            select game_id from crash_rounds
+            where crashed_at is not null and crashed_at <= clock_timestamp()
+          )
+      `;
+    } catch { /* soft — claim-time gate also covers these */ }
 
     // Reset stuck inflight rows (crash mid-send) and very-old pending rows.
     const result = await sql<{ id: number }>`
@@ -1000,10 +1363,19 @@ export class OutboxDispatcher {
         // P2.4: Throttle recoverStale to every 10 ticks (250ms at 25ms tick)
         // instead of every tick. Stale recovery is non-critical and the DB
         // UPDATE it runs was consuming ~5-10ms on every tick.
+        // PLAN §8: recoverStale now runs on the GENERAL pool (maintenance),
+        // never on the prediction-critical pool.
         if (this.stats.tickCount % 10 === 0) {
           await this.recoverStale();
         }
-        await this.tickOnce();
+        // PREDICTION LANE: inline, every cycle. A prediction wake resolves
+        // the wait below immediately and this claim runs right away — a new
+        // N+1 signal never waits for background work (plan §2).
+        await this.processLane("prediction");
+        // NORMAL LANE: detached. A slow result/validation Telegram send runs
+        // outside the scheduling path; the next cycle can claim and deliver a
+        // fresh prediction while it is still in flight (plan §11/§12).
+        this.runBackgroundDetached();
       } catch (e) {
         this.stats.lastError = String(e);
         logger.error(
@@ -1020,17 +1392,23 @@ export class OutboxDispatcher {
    * Wait between ticks: resolves on a producer wake (immediate drain) or
    * after TICK_MS, whichever first. The coalescing wake channel guarantees
    * bursts collapse into a single immediate tick — never overlapping ones.
+   * Returns the latched wake kinds so the caller knows which lanes need
+   * work (lane-aware wake, plan §11).
    */
-  private async waitForNextTick(): Promise<void> {
+  private async waitForNextTick(): Promise<{
+    prediction: boolean;
+    normal: boolean;
+  } | null> {
     try {
       const { waitForOutboxWake } = await import("@/lib/prediction/live/outbox-wake");
-      await waitForOutboxWake(TICK_MS);
+      return await waitForOutboxWake(TICK_MS);
     } catch {
       // wake module unavailable in some test contexts — plain timer fallback
       await new Promise<void>((resolve) => {
         const t = setTimeout(resolve, TICK_MS);
         t.unref?.();
       });
+      return null;
     }
   }
 }

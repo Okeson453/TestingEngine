@@ -56,7 +56,7 @@ export type ErrorHandler = (error: Error, context: string) => Promise<void>;
 function normalizeEpochMs(value: number | undefined | null, fallbackMs: number): number {
   if (value == null || !Number.isFinite(value) || value <= 0) return fallbackMs;
   // Seconds-scale (10 digits) → convert to ms
-  let ms = value < 1e11 ? value * 1000 : value;
+  const ms = value < 1e11 ? value * 1000 : value;
   // Must be within ±1 day of "now"; otherwise treat as corrupt and use fallback
   const skew = Math.abs(ms - fallbackMs);
   if (skew > 86_400_000) return fallbackMs;

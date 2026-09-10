@@ -16,7 +16,11 @@ export class FeatureStore {
   private readonly logger = getLogger();
   private readonly l1 = new Map<string, FeatureVector>();
   private readonly maxL1 = 2_000;
-  private redis: { hset: Function; hget: Function; expire: Function } | null = null;
+  private redis: {
+    hset: (key: string, data: Record<string, unknown>) => Promise<unknown>;
+    hget: (key: string, field: string) => Promise<unknown>;
+    expire: (key: string, seconds: number) => Promise<unknown>;
+  } | null = null;
   private readonly keyPrefix: string;
 
   constructor(opts?: { redis?: FeatureStore['redis']; keyPrefix?: string }) {

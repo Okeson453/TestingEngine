@@ -42,6 +42,8 @@ export type SendResult = {
   status: number;
   error?: string;
   chatId: string;
+  /** Per-destination Telegram round-trip duration (plan §13 forensics). */
+  durationMs?: number;
 };
 
 /** Narrow shape passed to `formatPredictionMessage`. */
@@ -168,6 +170,8 @@ async function sendToChat(
   const url = `${TELEGRAM_API}/bot${token}/sendMessage`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Per-destination timing (plan §13): one clock around the whole leg.
+  const sendT0 = Date.now();
   try {
     const response = await fetch(url, {
       method: "POST",
@@ -183,22 +187,22 @@ async function sendToChat(
     try {
       parsed = await response.json();
     } catch {
-      return { ok: false, status: response.status, error: "malformed_response", chatId };
+      return { ok: false, status: response.status, error: "malformed_response", chatId, durationMs: Date.now() - sendT0 };
     }
     if (response.ok && isTelegramOk(parsed)) {
-      return { ok: true, status: response.status, chatId };
+      return { ok: true, status: response.status, chatId, durationMs: Date.now() - sendT0 };
     }
     const description =
       isRecord(parsed) && typeof parsed.description === "string"
         ? parsed.description
         : `http_${response.status}`;
-    return { ok: false, status: response.status, error: description, chatId };
+    return { ok: false, status: response.status, error: description, chatId, durationMs: Date.now() - sendT0 };
   } catch (e: unknown) {
     const name = (e as { name?: string })?.name;
     if (name === "AbortError") {
-      return { ok: false, status: 0, error: `timeout_${timeoutMs}ms`, chatId };
+      return { ok: false, status: 0, error: `timeout_${timeoutMs}ms`, chatId, durationMs: Date.now() - sendT0 };
     }
-    return { ok: false, status: 0, error: (e as Error)?.message ?? "network_error", chatId };
+    return { ok: false, status: 0, error: (e as Error)?.message ?? "network_error", chatId, durationMs: Date.now() - sendT0 };
   } finally {
     clearTimeout(timer);
   }

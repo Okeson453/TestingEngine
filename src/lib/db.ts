@@ -208,7 +208,14 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   const criticalPool = new Pool({
     connectionString: databaseUrl,
     max: criticalMax,
-    min: 0,
+    // WARM-POOL FIX (production trace 18:35-18:39): with min=0 and a 15s
+    // idle timeout, both pools went cold between rounds (crash rounds are
+    // spaced 10-70s). Every cold acquire paid ~1s of TLS+auth to Neon —
+    // the direct cause of the intermittent ~700-1000ms prediction
+    // persistence leg and ~1.3-2.0s dispatch leg (warm rounds: ~1ms).
+    // min keeps one connection alive; MAX is unchanged — this is connection
+    // warming, not pool-size growth.
+    min: Math.min(Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 1) || 1), criticalMax),
     idleTimeoutMillis,
     connectionTimeoutMillis: criticalConnTimeout,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
@@ -216,7 +223,7 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   const generalPool = new Pool({
     connectionString: databaseUrl,
     max: generalMax,
-    min: 0,
+    min: Math.min(Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 1) || 1), generalMax),
     idleTimeoutMillis,
     connectionTimeoutMillis: generalConnTimeout,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },

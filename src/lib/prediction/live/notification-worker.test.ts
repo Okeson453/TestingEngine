@@ -80,6 +80,10 @@ async function insertPendingRow(opts: {
   const id = randomUUID();
   const content = `[nw-behavior] ${id}`;
   const metadata = JSON.stringify({ predictionId: id, kind: "prediction" });
+  const deadlineIso =
+    opts.deadlineAheadMs != null
+      ? new Date(Date.now() + opts.deadlineAheadMs).toISOString()
+      : null;
   const rows = await (await getSql())<{ id: number }>`
     insert into notification_outbox (
       notification_id, type, content, metadata, status, attempt_count, next_attempt_at,
@@ -88,7 +92,7 @@ async function insertPendingRow(opts: {
       ${id}::uuid, 'prediction', ${content}, ${metadata}::jsonb, 'pending',
       ${opts.attemptCount ?? 0},
       now() - interval '1 millisecond',
-      ${opts.deadlineAheadMs != null ? `now() + interval '${opts.deadlineAheadMs} milliseconds'` : null}
+      ${deadlineIso}
     )
     returning id
   `;
@@ -454,16 +458,317 @@ test("pool-budget: prediction rows are claimed ahead of a full batch of result r
     assert.equal(
       byPred?.status,
       "delivered",
-      "prediction must be claimed and delivered in the first batch despite 16 older rows",
+      "prediction must be claimed and delivered in the first prediction batch despite 16 older rows",
     );
+    // Lane batches are INDEPENDENT (plan §2/§12): the prediction no longer
+    // displaces background rows from the batch, so the oldest validation is
+    // delivered by its own lane's claim in the same pass — no starvation.
     assert.equal(
       oldestValidation?.status,
-      "pending",
-      "the oldest result row beyond the batch size must still be waiting — prediction lane priority",
+      "delivered",
+      "background lane drains its own batch — prediction priority no longer starves result rows",
     );
   } finally {
     globalThis.fetch = realFetch;
     clearTelegramEnv();
     await cleanPoolBudgetRows();
   }
+});
+
+test("pool-budget: prediction lane executes before background lane within a batch", async () => {
+  setTelegramEnv();
+  await cleanPoolBudgetRows();
+  const callOrder: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init: { body?: string } = {}) => {
+    const body = init.body ?? "";
+    if (body.includes("[nw-lane-pred]")) callOrder.push("prediction");
+    else if (body.includes("[nw-lane-val]")) callOrder.push("validation");
+    await new Promise((r) => setTimeout(r, 10));
+    return okTelegram();
+  }) as typeof fetch;
+  try {
+    const sql = await getSql();
+    // One prediction + several validation rows. The claim puts the prediction
+    // first; the lane partition must EXECUTE it before any validation send
+    // starts (execution order, not just claim order).
+    const { id: predId } = await insertPredictionRow({
+      targetGameId: "[nw-pool-budget] lane-round",
+    });
+    await sql`
+      update notification_outbox set content = '[nw-lane-pred] signal' where id = ${predId}
+    `;
+    for (let i = 0; i < 4; i += 1) {
+      const vid = randomUUID();
+      await sql`
+        insert into notification_outbox (
+          notification_id, type, content, metadata, status, attempt_count, next_attempt_at
+        ) values (
+          ${vid}::uuid, 'validation', ${`[nw-lane-val] result ${i}`}, '{}'::jsonb, 'pending', 0,
+          now() - interval '1 millisecond'
+        )
+      `;
+    }
+    const d = new OutboxDispatcher();
+    await d.tickOnce();
+    assert.ok(callOrder.length >= 5, `expected >=5 sends, got ${callOrder.length}`);
+    assert.equal(
+      callOrder[0],
+      "prediction",
+      `prediction send must start first; got order ${callOrder.join(",")}`,
+    );
+    assert.equal(
+      callOrder.lastIndexOf("prediction"),
+      callOrder.indexOf("prediction"),
+      "single prediction row must send exactly once",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    clearTelegramEnv();
+    await cleanPoolBudgetRows();
+  }
+});
+
+test("pool-budget: a latched notifyOutbox wakes the drain loop immediately (no tick wait)", async () => {
+  // Delivery latency belongs to the wake path; the 2s timer is fallback only.
+  // A producer that commits and wakes BEFORE the dispatcher waits must be
+  // drained on the spot — the latch must not lose the wake.
+  const { notifyOutbox, waitForOutboxWake } = await import(
+    "@/lib/prediction/live/outbox-wake"
+  );
+  notifyOutbox(); // producer wakes with no waiter -> latch
+  const t0 = Date.now();
+  await waitForOutboxWake(2_000);
+  const waited = Date.now() - t0;
+  assert.ok(
+    waited < 100,
+    `latched wake must return immediately, waited ${waited}ms`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// REMEDIATION PLAN (N+1 signal delivery) — §25 race/regression tests
+// ---------------------------------------------------------------------------
+
+/** Poll until fn() passes or timeout (ms). Returns fn()'s last value. */
+async function pollUntil<T>(fn: () => Promise<T>, timeoutMs = 3_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let last: T = await fn();
+  while (Date.now() < deadline) {
+    const done = await fn();
+    last = done;
+    if (done) return last;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return last;
+}
+
+test("fast lane: a prediction committed while a slow validation send is running is delivered without waiting for it", async () => {
+  setTelegramEnv();
+  await cleanPoolBudgetRows();
+  const realFetch = globalThis.fetch;
+  let releaseValidation: (r: Response) => void = () => undefined;
+  let validationClaimed = false;
+  const validationHeld = new Promise<Response>((res) => {
+    releaseValidation = res;
+  });
+  globalThis.fetch = (async (_url: unknown, init: { body?: string } = {}) => {
+    const body = init.body ?? "";
+    if (body.includes("[nw-preempt-val]")) {
+      validationClaimed = true;
+      return await validationHeld;
+    }
+    return okTelegram();
+  }) as typeof fetch;
+  const d = new OutboxDispatcher();
+  try {
+    const sql = await getSql();
+    // Queue one validation that will hang mid-send inside the background lane.
+    const vid = randomUUID();
+    await sql`
+      insert into notification_outbox (
+        notification_id, type, content, metadata, status, attempt_count, next_attempt_at
+      ) values (
+        ${vid}::uuid, 'validation', ${"[nw-preempt-val] slow result"}, '{}'::jsonb, 'pending', 0,
+        now() - interval '1 millisecond'
+      )
+    `;
+    await d.start();
+    // Wait until the background lane has claimed and hung on the slow send.
+    await pollUntil(async () => {
+      const rows = await sql<{ status: string }>`
+        select status from notification_outbox where notification_id = ${vid}::uuid
+      `;
+      return rows[0]?.status === "inflight";
+    });
+    assert.ok(validationClaimed, "slow validation send must be in flight");
+
+    // NOW commit the prediction + prediction wake. It must NOT wait for the
+    // hung validation — the prediction lane runs immediately.
+    const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
+    const { id: predId } = await insertPredictionRow({
+      targetGameId: "[nw-pool-budget] preempt-round",
+    });
+    notifyOutbox("prediction");
+    const deliveredWhileValidationHung = await pollUntil(async () => {
+      const rows = await sql<{ status: string }>`
+        select status from notification_outbox where id = ${predId}
+      `;
+      return rows[0]?.status === "delivered";
+    });
+    assert.ok(
+      deliveredWhileValidationHung,
+      "prediction must be delivered while the validation send is still hung",
+    );
+    const valStillHung = await sql<{ status: string }>`
+      select status from notification_outbox where notification_id = ${vid}::uuid
+    `;
+    assert.equal(
+      valStillHung[0]?.status,
+      "inflight",
+      "validation must still be hung — prediction did not wait for it",
+    );
+  } finally {
+    releaseValidation(okTelegram());
+    await d.stop();
+    globalThis.fetch = realFetch;
+    clearTelegramEnv();
+    await cleanPoolBudgetRows();
+  }
+});
+
+test("temporal: telegram accepted AFTER target start is dead-lettered as LATE, never delivered", async () => {
+  setTelegramEnv();
+  await cleanPoolBudgetRows();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    // The target starts DURING the Telegram send (after authorization won).
+    await seedStartedRound(
+      "[nw-pool-budget] late-acceptance-round",
+      new Date(),
+    );
+    return okTelegram();
+  }) as typeof fetch;
+  try {
+    // began_at in the FUTURE at claim/auth time — the signal is valid when
+    // authorized, then the round starts while Telegram holds the connection.
+    await seedStartedRound(
+      "[nw-pool-budget] late-acceptance-round",
+      new Date(Date.now() + 60_000),
+    );
+    const { id, notificationId } = await insertPredictionRow({
+      targetGameId: "[nw-pool-budget] late-acceptance-round",
+    });
+    const d = new OutboxDispatcher();
+    const result = await d.tickOnce();
+    assert.equal(result.delivered, 0, "acceptance after target start is NEVER delivered");
+    assert.equal(result.dead, 1);
+    const s = await rowState(id);
+    assert.equal(s.status, "dead_letter");
+    assert.match(s.last_error ?? "", /late_acceptance/);
+    // Forensic outcome must say LATE (persisted detached — poll briefly).
+    const outcome = await pollUntil(async () => {
+      const rows = await (await getSql())<{ delivery_outcome: string | null }>`
+        select delivery_outcome from notification_outbox where notification_id = ${notificationId}::uuid
+      `;
+      return rows[0]?.delivery_outcome === "LATE" ? "LATE" : null;
+    }, 2_000);
+    assert.equal(outcome, "LATE");
+  } finally {
+    globalThis.fetch = realFetch;
+    clearTelegramEnv();
+    await cleanPoolBudgetRows();
+  }
+});
+
+test("min-lead: a prediction with residual budget below DELIVERY_MIN_LEAD_MS is missed, never sent", async () => {
+  setTelegramEnv();
+  await cleanPoolBudgetRows();
+  const sentUrls: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown) => {
+    sentUrls.push(String(url));
+    return okTelegram();
+  }) as typeof fetch;
+  try {
+    // Deadline 200ms ahead < DELIVERY_MIN_LEAD_MS default (500ms): the send
+    // could straddle the validity boundary — refuse BEFORE contacting Telegram.
+    const { id } = await insertPendingRow({ deadlineAheadMs: 200 });
+    const d = new OutboxDispatcher();
+    const result = await d.tickOnce();
+    assert.equal(result.delivered, 0);
+    assert.equal(result.dead, 1);
+    const s = await rowState(id);
+    assert.equal(s.status, "dead_letter");
+    assert.match(s.last_error ?? "", /missed: insufficient remaining lead/);
+    assert.equal(
+      sentUrls.filter((u) => /sendMessage/i.test(u)).length,
+      0,
+      "Telegram must NOT be contacted when remaining lead is insufficient",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    clearTelegramEnv();
+    await cleanPoolBudgetRows();
+  }
+});
+
+test("recovery: a stale inflight prediction whose target already started is dead-lettered, not resurrected", async () => {
+  setTelegramEnv();
+  await cleanPoolBudgetRows();
+  try {
+    const gameId = "[nw-pool-budget] no-resurrect-round";
+    await seedStartedRound(gameId, new Date(Date.now() - 5_000));
+    const sql = await getSql();
+    const id = randomUUID();
+    await sql`
+      insert into notification_outbox (
+        notification_id, type, content, metadata, status, attempt_count,
+        next_attempt_at, target_game_id, updated_at
+      ) values (
+        ${id}::uuid, 'prediction', ${"[nw-behavior] no-resurrect"},
+        ${JSON.stringify({ predictionId: id, targetGameId: gameId })}::jsonb,
+        'inflight', 1, now() - interval '60 seconds', ${gameId},
+        now() - interval '60 seconds'
+      )
+    `;
+    const d = new OutboxDispatcher();
+    await d.recoverStale();
+    const rows = await sql<{ status: string; last_error: string | null }>`
+      select status, last_error from notification_outbox where notification_id = ${id}::uuid
+    `;
+    assert.equal(
+      rows[0]?.status,
+      "dead_letter",
+      "stale recovery must NEVER resurrect a prediction whose target started",
+    );
+    assert.match(rows[0]?.last_error ?? "", /expired_late_signal/);
+  } finally {
+    clearTelegramEnv();
+    await cleanPoolBudgetRows();
+  }
+});
+
+test("wake channel: prediction and normal wakes are tracked as separate lanes", async () => {
+  const {
+    notifyOutbox,
+    waitForOutboxWake,
+    getWakeStats,
+    _resetOutboxWakeForTests,
+  } = await import("@/lib/prediction/live/outbox-wake");
+  _resetOutboxWakeForTests();
+  notifyOutbox("prediction");
+  notifyOutbox("prediction");
+  notifyOutbox("normal");
+  const latched = await waitForOutboxWake(2_000);
+  assert.ok(latched.prediction, "prediction wake must be latched");
+  assert.ok(latched.normal, "normal wake must be latched");
+  const stats = getWakeStats();
+  assert.ok(stats.predictionWakeCount >= 2);
+  assert.ok(stats.normalWakeCount >= 1);
+  assert.ok(stats.lastPredictionNotifyAt != null);
+  // Latch consumed: next wait must block until timeout.
+  const t0 = Date.now();
+  await waitForOutboxWake(150);
+  assert.ok(Date.now() - t0 >= 100, "consumed latch must not resolve the next wait");
 });

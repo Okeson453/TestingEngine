@@ -405,7 +405,7 @@ export class ACIEEngine {
     }
 
     // 4) Heavy validation — FLAG ONLY on hot path (never O(n) evaluate here)
-    let heavyValidationRan = false;
+    const heavyValidationRan = false;
     if (this.online.sinceHeavyValidation >= this.heavyEvery) {
       this.pendingHeavyEvidence = true;
       this.scheduleHeavyEvidence();

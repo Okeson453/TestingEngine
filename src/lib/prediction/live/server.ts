@@ -210,6 +210,13 @@ export async function reEnqueuePrediction(input: z.infer<typeof ReEnqueueInput>)
     `;
     if (r.length > 0) enqueued += 1;
   }
+  if (enqueued > 0) {
+    // Wake the dispatcher immediately — operator re-enqueues should not wait
+    // for the fallback tick (delivery latency belongs to the wake path).
+    void import("@/lib/prediction/live/outbox-wake")
+      .then(({ notifyOutbox }) => notifyOutbox())
+      .catch(() => undefined);
+  }
   return { ok: true, enqueued };
 }
 

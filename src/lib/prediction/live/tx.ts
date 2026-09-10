@@ -29,9 +29,29 @@ function makeTxSql(
   return txSql;
 }
 
+/** Per-stage durations of ONE transaction, measured at the transaction itself.
+ * Remediation plan §4: acquisition must never be derived from a global
+ * "last acquisition" variable — the measurement belongs to the specific
+ * transaction being measured. */
+export interface TxStageTimings {
+  /** Pool/client acquisition for THIS transaction. */
+  acquireMs: number;
+  /** BEGIN round trip. */
+  beginMs: number;
+  /** Duration of the caller's statement(s) inside the transaction. */
+  bodyMs: number;
+  /** COMMIT round trip. */
+  commitMs: number;
+  /** Total pin-to-release wall time (acquire + begin + body + commit). */
+  totalMs: number;
+}
+
+export type TxStageReporter = (t: TxStageTimings) => void;
+
 export async function runInTransaction<T>(
   sql: Sql,
   fn: (tx: Sql) => Promise<T>,
+  onStage?: TxStageReporter,
 ): Promise<T> {
   // POOL-ROUTING FIX: this used to call getPgPool() unconditionally, which
   // returns the GENERAL pool regardless of which Sql the caller passed in.
@@ -46,18 +66,38 @@ export async function runInTransaction<T>(
   // fall back to the general pool only when the tag is absent (e.g. a
   // pre-dual-pool test double).
   const pool = getTaggedPool(sql) ?? getPgPool();
+  const t0 = Date.now();
   if (pool && dbSource === "neon") {
     let client: import("pg").PoolClient | null = null;
+    let acquireMs = 0;
+    let beginMs = 0;
+    let bodyMs = 0;
+    let commitMs = 0;
     try {
+      const acquireT0 = Date.now();
       client = await pool.connect();
+      acquireMs = Date.now() - acquireT0;
+      const beginT0 = Date.now();
       await client.query("BEGIN");
+      beginMs = Date.now() - beginT0;
       const held = client;
       const txSql = makeTxSql(async <U>(text: string, params: unknown[] = []) => {
         const res = await held.query(text, params);
         return res.rows as U[];
       });
+      const bodyT0 = Date.now();
       const result = await fn(txSql);
+      bodyMs = Date.now() - bodyT0;
+      const commitT0 = Date.now();
       await held.query("COMMIT");
+      commitMs = Date.now() - commitT0;
+      onStage?.({
+        acquireMs,
+        beginMs,
+        bodyMs,
+        commitMs,
+        totalMs: Date.now() - t0,
+      });
       return result;
     } catch (err) {
       if (client) {
@@ -74,14 +114,27 @@ export async function runInTransaction<T>(
   }
 
   let done = false;
+  const acquireT0 = Date.now();
   await sql.query("BEGIN");
+  const beginMs = Date.now() - acquireT0;
   try {
     const txSql = makeTxSql(async <U>(text: string, params: unknown[] = []) =>
       sql.query<U>(text, params),
     );
+    const bodyT0 = Date.now();
     const result = await fn(txSql);
+    const bodyMs = Date.now() - bodyT0;
     done = true;
+    const commitT0 = Date.now();
     await sql.query("COMMIT");
+    const commitMs = Date.now() - commitT0;
+    onStage?.({
+      acquireMs: 0, // mono-pool fallback: no pooled client acquisition to time
+      beginMs,
+      bodyMs,
+      commitMs,
+      totalMs: Date.now() - t0,
+    });
     return result;
   } catch (err) {
     if (!done) {

@@ -8,7 +8,7 @@ const logger = getLogger("model-performance");
 
 // P3.7: Add Alert for Constant Predictions
 // Track recent predictions to detect constant output
-let recentPredictions: number[] = [];
+const recentPredictions: number[] = [];
 const MAX_RECENT_PREDICTIONS = 100;
 const CONSTANT_THRESHOLD = 0.01; // If all predictions within 1% range
 

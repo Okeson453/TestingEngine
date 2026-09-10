@@ -11,7 +11,7 @@ export function computeMarkovFeatures(engine: IncrementalStateEngine): Record<st
   const m = engine.snapshot().markov;
   const from = m.lastAbove13 === null ? -1 : m.lastAbove13 ? 1 : 0;
   let support = 0;
-  let pAbove = engine.markovPNextAbove13();
+  const pAbove = engine.markovPNextAbove13();
   if (from >= 0) {
     const row = m.trans[from as 0 | 1];
     support = row[0] + row[1];

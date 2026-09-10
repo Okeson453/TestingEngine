@@ -18,6 +18,7 @@ import { getLogger } from "@/lib/observability/logger";
 const logger = getLogger("delivery-forensics");
 
 export type DeliveryOutcome =
+  | "EARLY"
   | "ON_TIME"
   | "LATE"
   | "EXPIRED"
@@ -42,6 +43,8 @@ export interface DeliveryForensicsRecord {
   leadTimeMs: number | null;
   outcome: DeliveryOutcome;
 }
+
+export const EARLY_LEAD_MS = Number(process.env.DELIVERY_EARLY_LEAD_MS ?? 4_000);
 
 export function classifyDelivery(args: {
   telegramAcceptedAtMs: number | null;
@@ -68,6 +71,11 @@ export function classifyDelivery(args: {
     return { outcome: "UNKNOWN", leadTimeMs: null };
   }
   const leadTimeMs = targetStartedAtMs - telegramAcceptedAtMs;
+  // EARLY: delivered with comfortable margin — operationally distinct from a
+  // 1-2ms hairline ON_TIME delivery (same delivery, different health).
+  if (leadTimeMs >= EARLY_LEAD_MS) {
+    return { outcome: "EARLY", leadTimeMs: Math.round(leadTimeMs) };
+  }
   return {
     outcome: leadTimeMs > 0 ? "ON_TIME" : "LATE",
     leadTimeMs: Math.round(leadTimeMs),
@@ -119,7 +127,11 @@ export async function recordDeliveredForensics(
     createdAt: string;
     dispatchClaimedAt?: string | null;
     sendStartedAtMs: number | null;
+    /** Server-stamped send_started_at (auth RETURNING) — preferred clock. */
+    sendStartedAtServerIso?: string | null;
     telegramAcceptedAtMs: number;
+    /** Server-stamped telegram_accepted_at (finalize RETURNING) — preferred clock. */
+    serverAcceptedAtIso?: string | null;
   },
 ): Promise<DeliveryForensicsRecord> {
   let targetStartedAt: string | null = null;
@@ -149,15 +161,37 @@ export async function recordDeliveredForensics(
   }
 
   const targetMs = targetStartedAt ? new Date(targetStartedAt).getTime() : null;
+  // CLOCK HYGIENE (forensic report Issue 3): server stamps are authoritative;
+  // the client clock is a fallback for rows finalized before the server-stamp
+  // path existed. Each duration below is derived from exactly one clock:
+  //   queueWaitMs    server (dispatch_claimed_at − created_at)
+  //   dispatchMs     server (send_started_at − dispatch_claimed_at)
+  //   telegramSendMs client pair, or server pair when both server stamps exist
+  //   totalDeliveryMs accepted − created (same clock basis as acceptedIso)
+  const acceptedMsAuthoritative = args.serverAcceptedAtIso
+    ? new Date(args.serverAcceptedAtIso).getTime()
+    : args.telegramAcceptedAtMs;
   const { outcome, leadTimeMs } = classifyDelivery({
-    telegramAcceptedAtMs: args.telegramAcceptedAtMs,
+    telegramAcceptedAtMs: acceptedMsAuthoritative,
     targetStartedAtMs: targetMs,
     outboxStatus: "delivered",
   });
 
-  const acceptedIso = new Date(args.telegramAcceptedAtMs).toISOString();
+  const acceptedIso = args.serverAcceptedAtIso
+    ? args.serverAcceptedAtIso
+    : new Date(args.telegramAcceptedAtMs).toISOString();
   const sendIso =
-    args.sendStartedAtMs != null ? new Date(args.sendStartedAtMs).toISOString() : null;
+    args.sendStartedAtServerIso ??
+    (args.sendStartedAtMs != null ? new Date(args.sendStartedAtMs).toISOString() : null);
+  // Telegram-send duration must never mix clocks: prefer the server pair
+  // (send_started_at → telegram_accepted_at), fall back to the client pair.
+  const telegramSendMs =
+    args.serverAcceptedAtIso && args.sendStartedAtServerIso
+      ? msDiff(args.serverAcceptedAtIso, args.sendStartedAtServerIso)
+      : msDiff(
+          new Date(args.telegramAcceptedAtMs).toISOString(),
+          args.sendStartedAtMs != null ? new Date(args.sendStartedAtMs).toISOString() : null,
+        );
 
   const rec: DeliveryForensicsRecord = {
     predictionId: args.predictionId,
@@ -172,7 +206,7 @@ export async function recordDeliveredForensics(
     targetRoundStartedAt: targetStartedAt,
     queueWaitMs: msDiff(args.dispatchClaimedAt ?? null, args.createdAt),
     dispatchMs: msDiff(sendIso, args.dispatchClaimedAt ?? null),
-    telegramSendMs: msDiff(acceptedIso, sendIso),
+    telegramSendMs,
     totalDeliveryMs: msDiff(acceptedIso, args.createdAt),
     leadTimeMs,
     outcome,
@@ -184,6 +218,11 @@ export async function recordDeliveredForensics(
   logger[logLevel](
     {
       component: "delivery-forensics",
+      // Authoritative per-prediction delivery record: one structured line
+      // with the complete timestamp chain (queued -> claimed -> send started
+      // -> Telegram accepted -> target start) so production latency can be
+      // attributed leg-by-leg instead of inferred from adjacent messages.
+      event: "PREDICTION_DELIVERY",
       ...rec,
     },
     `PREDICTION_DELIVERY_FORENSICS ${outcome}`,

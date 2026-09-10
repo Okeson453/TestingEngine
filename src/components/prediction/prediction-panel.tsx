@@ -92,6 +92,7 @@ function formatMs(ms: number | null): string {
 
 function OutcomeCounts({ delivery }: { delivery: NonNullable<DashboardSnapshot["delivery"]> }) {
   const rows: Array<{ label: string; value: number; tone: string }> = [
+    { label: "EARLY", value: delivery.early, tone: "text-high" },
     { label: "ON_TIME", value: delivery.onTime, tone: "text-high" },
     { label: "LATE", value: delivery.late, tone: "text-warn" },
     { label: "UNKNOWN", value: delivery.unknown, tone: "text-muted" },
@@ -100,7 +101,7 @@ function OutcomeCounts({ delivery }: { delivery: NonNullable<DashboardSnapshot["
     { label: "PENDING", value: delivery.pending, tone: "text-subtle" },
   ];
   return (
-    <div className="grid grid-cols-3 gap-2 md:grid-cols-6">
+    <div className="grid grid-cols-3 gap-2 md:grid-cols-7">
       {rows.map((r) => (
         <div key={r.label} className="rounded-lg bg-surface-2 px-3 py-2 text-center">
           <p className={cn("font-mono text-lg tabular-nums", r.tone)}>{r.value}</p>

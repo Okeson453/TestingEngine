@@ -19,7 +19,7 @@ import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/liv
 import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
 import { getSql, getCriticalSql, getPgPool, getLastPoolAcquireMs, type Sql } from "@/lib/db";
-import { runInTransaction } from "@/lib/prediction/live/tx";
+import { runInTransaction, type TxStageTimings } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
 import type { FeaturePath, HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
@@ -189,13 +189,15 @@ let cachedPipelineFn: PipelineFn | null | undefined;
 function getPipelineFn(): PipelineFn | null {
   if (cachedPipelineFn !== undefined) return cachedPipelineFn;
   try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- sync lazy-load with deliberate dual-path fallback
     const mod = require("../../prediction/prediction-pipeline.ts") as {
       runPredictionPipeline: PipelineFn;
     };
     cachedPipelineFn = mod.runPredictionPipeline;
   } catch {
     try {
-      const mod = require("@/lib/prediction/prediction-pipeline") as {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- sync lazy-load with deliberate dual-path fallback
+    const mod = require("@/lib/prediction/prediction-pipeline") as {
         runPredictionPipeline: PipelineFn;
       };
       cachedPipelineFn = mod.runPredictionPipeline;
@@ -223,7 +225,7 @@ const defaultPredictFn = (
   let probability = signal.probability;
   let confidence = signal.confidence;
   let modelVersion = signal.modelVersion ?? "live-v2";
-  let reasoning: string[] = Array.isArray(signal.reasoning)
+  const reasoning: string[] = Array.isArray(signal.reasoning)
     ? [...signal.reasoning]
     : signal.reasoning
       ? [String(signal.reasoning)]
@@ -577,7 +579,9 @@ export async function onGameStart(
         values ('last_error', ${String(e)})
         on conflict (key) do update set value = excluded.value, updated_at = now()
       `;
-    } catch {}
+    } catch {
+      /* worker_state best-effort - the temporal violation is reported regardless */
+    }
     return { kind: "temporal_violation", targetGameId: evt.gameId, beginTime: evt.beginTime, reason: String(e) };
   }
 
@@ -598,10 +602,11 @@ export async function onGameStart(
   );
 
   // Wake dispatcher immediately after TX commit (no setImmediate boundary).
+  // PREDICTION wake (plan §11): the dispatcher's prediction lane runs at once.
   if (outboxEnqueued > 0 && !slaViolated) {
     try {
       const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
-      notifyOutbox();
+      notifyOutbox("prediction");
     } catch {
       /* soft */
     }
@@ -966,90 +971,101 @@ export async function onGameEndPredict(
 
   try {
     const txT0 = Date.now();
-    await runInTransaction(sql, async (tx) => {
-      const ins = await tx<{ prediction_id: string; requested_at: string }>`
-        insert into pending_predictions (
-          prediction_id, target_multiplier, probability, confidence,
-          regime_name, regime_confidence, reasoning, feature_summary,
-          model_version, requested_at, generated_at,
-          target_game_id, source_round_id,
-          correlation_id
-        ) values (
-          ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-          ${signal.confidence}, ${signal.regimeId},
-          ${signal.regimeId ? 0.5 : null},
-          ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-          ${signal.modelVersion}, ${timestamp}, ${timestamp},
-          ${targetGameId}, ${gameId},
-          ${correlationId}
-        )
-        on conflict (target_game_id) where matched = false and target_game_id is not null do nothing
-        returning prediction_id, requested_at
-      `;
 
-      if (ins.length === 0) {
-        // Duplicate — already persisted by another path (DB is the backstop).
-        // Do not insert a second outbox row (would double-notify).
-        pendingWasDuplicate = true;
-        return;
-      }
-
-      // Enqueue prediction Telegram signal (same TX as pending insert)
-      {
-        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
-        const lateTag = slaViolated ? " (delayed)" : "";
-        const predictionContent = [
-          `NEW PREDICTION${regimeText}${lateTag}`,
-          "",
-          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
-          `Probability: ${(signal.probability * 100).toFixed(1)}%`,
-          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
-          "",
-          `Prediction ID: ${predictionId}`,
-          `Generated: ${timestamp}`,
-          recoveryMode ? "Source: poll recovery" : "Source: live ED",
-        ].join("\n");
-        // Shorter live deadline keeps temporal contract tight; recovery keeps more budget.
-        // P1: tighter creation-relative deadline (was 8s). Semantic validity is
-        // still enforced by target-start checks + BG kill; this shrinks the
-        // window where a send can cross round-start while still "in deadline".
-        const deadlineMs = recoveryMode
-          ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 10_000)
-          : Number(process.env.TELEGRAM_DEADLINE_MS ?? 5_000);
-        const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
-        try {
-          await tx`
-            insert into notification_outbox (
-              notification_id, type, content, metadata, status, priority,
-              attempt_count, next_attempt_at, telegram_deadline_at, target_game_id
-            ) values (
-              ${randomUUID()}::uuid, 'prediction',
-              ${predictionContent},
-              ${JSON.stringify({
-                predictionId,
-                correlationId,
-                targetGameId,
-                sourceGameId: gameId,
-                targetMultiplier: Number(DEFAULT_TARGET),
-                probability: signal.probability,
-                confidence: signal.confidence,
-                regimeName: signal.regimeId,
-                slaViolated,
-                slaLagMsActual,
-                kind: "prediction",
-                recoveryMode,
-              })},
-              'pending', 10,
-              0, now(), ${deadlineAt}::timestamptz, ${targetGameId}
-            )
-          `;
-          outboxEnqueued = 1;
-        } catch (err) {
-          (err as { stage?: string }).stage = "outbox_enqueue";
-          throw err;
-        }
-      }
+    // Message content + deadline are pure JS — computed BEFORE the tx so the
+    // transaction holds the pooled client for the minimum possible time.
+    const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
+    const lateTag = slaViolated ? " (delayed)" : "";
+    const predictionContent = [
+      `NEW PREDICTION${regimeText}${lateTag}`,
+      "",
+      `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
+      `Probability: ${(signal.probability * 100).toFixed(1)}%`,
+      `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
+      "",
+      `Prediction ID: ${predictionId}`,
+      `Generated: ${timestamp}`,
+      recoveryMode ? "Source: poll recovery" : "Source: live ED",
+    ].join("\n");
+    // Shorter live deadline keeps temporal contract tight; recovery keeps more budget.
+    // P1: tighter creation-relative deadline (was 8s). Semantic validity is
+    // still enforced by target-start checks + BG kill; this shrinks the
+    // window where a send can cross round-start while still "in deadline".
+    const deadlineMs = recoveryMode
+      ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 10_000)
+      : Number(process.env.TELEGRAM_DEADLINE_MS ?? 5_000);
+    const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
+    const outboxNotificationId = randomUUID();
+    const outboxMetadata = JSON.stringify({
+      predictionId,
+      correlationId,
+      targetGameId,
+      sourceGameId: gameId,
+      targetMultiplier: Number(DEFAULT_TARGET),
+      probability: signal.probability,
+      confidence: signal.confidence,
+      regimeName: signal.regimeId,
+      slaViolated,
+      slaLagMsActual,
+      kind: "prediction",
+      recoveryMode,
     });
+
+    let txStage: TxStageTimings | null = null;
+    await runInTransaction(
+      sql,
+      async (tx) => {
+        // ROUND-TRIP REDUCTION (plan §3): ONE compound statement performs both
+        // inserts atomically. The outbox row is inserted SELECTed from the
+        // pending_predictions RETURNING — if the prediction loses a duplicate
+        // race (conflict DO NOTHING), the CTE is empty, the outbox insert
+        // writes nothing, and we detect the duplicate from 0 returned rows.
+        // Same ACID transaction, same critical-pool client, one network round
+        // trip instead of two (at ~800ms Neon RTT this halves the in-tx time).
+        const ins = await tx<{ notification_id: string }>`
+          with inserted_prediction as (
+            insert into pending_predictions (
+              prediction_id, target_multiplier, probability, confidence,
+              regime_name, regime_confidence, reasoning, feature_summary,
+              model_version, requested_at, generated_at,
+              target_game_id, source_round_id,
+              correlation_id
+            ) values (
+              ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
+              ${signal.confidence}, ${signal.regimeId},
+              ${signal.regimeId ? 0.5 : null},
+              ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
+              ${signal.modelVersion}, ${timestamp}, ${timestamp},
+              ${targetGameId}, ${gameId},
+              ${correlationId}
+            )
+            on conflict (target_game_id) where matched = false and target_game_id is not null do nothing
+            returning prediction_id
+          )
+          insert into notification_outbox (
+            notification_id, type, content, metadata, status, priority,
+            attempt_count, next_attempt_at, telegram_deadline_at, target_game_id
+          )
+          select
+            ${outboxNotificationId}::uuid, 'prediction', ${predictionContent},
+            ${outboxMetadata}::jsonb, 'pending', 10,
+            0, now(), ${deadlineAt}::timestamptz, ${targetGameId}
+          from inserted_prediction
+          returning notification_id
+        `;
+
+        if (ins.length === 0) {
+          // Duplicate — already persisted by another path (DB is the backstop).
+          // No outbox row was inserted (SELECT FROM an empty CTE writes nothing).
+          pendingWasDuplicate = true;
+          return;
+        }
+        outboxEnqueued = 1;
+      },
+      (t) => {
+        txStage = t;
+      },
+    );
 
     // live_event_log outside TX (not required for correctness / delivery)
     void sql`
@@ -1064,14 +1080,20 @@ export async function onGameEndPredict(
       )
     `.catch(() => undefined);
 
-    // Wake outbox dispatcher after TX commit so delivery can start immediately
+    // Wake outbox dispatcher after TX commit so delivery can start immediately.
+    // PREDICTION wake (plan §11): lane-aware — dispatcher runs the prediction
+    // lane immediately, never queued behind normal work.
     try {
       const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
-      notifyOutbox();
+      notifyOutbox("prediction");
     } catch { /* soft */ }
 
     {
       const txMs = Date.now() - txT0;
+      // Per-transaction stage timing (plan §4): acquire/begin/stmt/commit are
+      // measured on THIS transaction via the tx helper's stage reporter —
+      // never derived from a global "last acquisition" variable.
+      const stage = txStage as TxStageTimings | null;
       const profile = {
         component: "live-predictor",
         predictionId,
@@ -1079,12 +1101,22 @@ export async function onGameEndPredict(
         targetGameId,
         correlationId,
         pool_wait_ms: poolWaitMs,
-        pool_acquire_ms: getLastPoolAcquireMs(),
+        transaction_acquire_ms: stage?.acquireMs ?? null,
+        transaction_begin_ms: stage?.beginMs ?? null,
+        prediction_outbox_stmt_ms: stage?.bodyMs ?? null,
+        transaction_commit_ms: stage?.commitMs ?? null,
+        prediction_persistence_ms:
+          stage != null
+            ? poolWaitMs + stage.totalMs
+            : Date.now() - persistT0,
+        crash_end_to_outbox_durable_ms: Math.max(
+          0,
+          Date.now() - new Date(crashedAt).getTime(),
+        ),
         prediction_computation_ms: Math.round(performance.now() - t0) - (Date.now() - persistT0),
         total_persistence_ms: Date.now() - persistT0,
         tx_ms: txMs,
-        transaction_commit_ms: txMs,
-        tx_statements: 2,
+        tx_statements: 1,
         outboxEnqueued,
       };
       if (txMs + poolWaitMs > 300) {

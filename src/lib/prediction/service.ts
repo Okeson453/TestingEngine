@@ -455,7 +455,7 @@ export interface DeliveryTimeline {
   dispatchStartedAt: string | null;
   telegramAcceptedAt: string | null;
   targetRoundStartedAt: string | null;
-  deliveryOutcome: "ON_TIME" | "LATE" | "UNKNOWN" | "EXPIRED" | "FAILED" | null;
+  deliveryOutcome: "EARLY" | "ON_TIME" | "LATE" | "UNKNOWN" | "EXPIRED" | "FAILED" | null;
   leadTimeMs: number | null;
 }
 
@@ -466,6 +466,7 @@ export interface DeliveryTimeline {
 export interface LeadTimeSnapshot {
   windowHours: number;
   total: number;
+  early: number;
   onTime: number;
   late: number;
   unknown: number;
@@ -559,6 +560,7 @@ export async function getLeadTimeSnapshot(windowHours = 24): Promise<LeadTimeSna
     return {
       windowHours,
       total,
+      early: byOutcome.get("EARLY") ?? 0,
       onTime: byOutcome.get("ON_TIME") ?? 0,
       late: byOutcome.get("LATE") ?? 0,
       unknown: byOutcome.get("UNKNOWN") ?? 0,
