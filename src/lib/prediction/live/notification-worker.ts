@@ -16,7 +16,7 @@
  *   INFLIGHT stuck > STALE_MS  --tick-->  PENDING (recovered)
  *   attempts >= MAX_ATTEMPTS  --tick-->  DEAD
  */
-import { getSql, type Sql } from "@/lib/db";
+import { getCriticalSql, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { sendTelegramMessage, type SendResult } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
@@ -140,7 +140,7 @@ export class OutboxDispatcher {
     backlogWarnings: 0,
     lastError: null,
   };
-  private getSqlFn: () => Promise<Sql> = getSql;
+  private getSqlFn: () => Promise<Sql> = getCriticalSql;
   private now: () => number = Date.now;
 
   constructor(opts?: { getSqlFn?: () => Promise<Sql>; now?: () => number }) {
@@ -531,6 +531,24 @@ export class OutboxDispatcher {
                     : null,
                 },
                 "OUTBOX_DISPATCH delivered",
+              );
+              logger.info(
+                {
+                  component: "outbox-dispatcher",
+                  event: "OUTBOX_DISPATCH",
+                  notificationType:
+                    row.type === "prediction"
+                      ? "PREDICTION_SIGNAL"
+                      : row.type === "validation"
+                        ? "RESULT_NOTIFICATION"
+                        : "OTHER_NOTIFICATION",
+                  predictionId: (row.metadata as Record<string, unknown> | null)?.predictionId ?? null,
+                  notificationId: row.notification_id,
+                  sourceGameId: (row.metadata as Record<string, unknown> | null)?.sourceGameId ?? null,
+                  targetGameId: row.target_game_id ?? (row.metadata as Record<string, unknown> | null)?.targetGameId ?? null,
+                  type: row.type,
+                },
+                "OUTBOX_DISPATCH correlated",
               );
               // Forensics: classify ON_TIME/LATE/UNKNOWN vs target start if known
               try {
