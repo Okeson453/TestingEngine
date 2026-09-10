@@ -176,6 +176,50 @@ export class CalibrationState {
   isWarm(): boolean {
     return this.global.pairCount >= 30 || this.global.n >= 30;
   }
+
+  /** Per-regime Brier/ECE/log-loss for dashboard / OOS analysis (P1). */
+  listRegimeMetrics(): Array<{
+    regime: string;
+    ece: number;
+    brier: number;
+    logLoss: number;
+    n: number;
+  }> {
+    const out = [{ regime: 'global', ...this.metrics('global') }];
+    for (const key of this.byRegime.keys()) {
+      const m = this.metrics(key);
+      out.push({ regime: key, ece: m.ece, brier: m.brier, logLoss: m.logLoss, n: m.n });
+    }
+    return out;
+  }
+
+  /** Compare model Brier to constant-base-rate Brier on stored pairs (P1). */
+  compareToConstantBase(baseRate = 1 / 1.3): {
+    modelBrier: number;
+    constantBrier: number;
+    n: number;
+    modelWins: boolean;
+  } {
+    const pairs = this.pairsArray(this.global);
+    if (pairs.length === 0) {
+      return { modelBrier: 0, constantBrier: 0, n: 0, modelWins: false };
+    }
+    let modelSum = 0;
+    let constSum = 0;
+    for (const { p, y } of pairs) {
+      modelSum += brierScore(p, y);
+      constSum += brierScore(baseRate, y);
+    }
+    const n = pairs.length;
+    const modelBrier = modelSum / n;
+    const constantBrier = constSum / n;
+    return {
+      modelBrier,
+      constantBrier,
+      n,
+      modelWins: modelBrier < constantBrier,
+    };
+  }
 }
 
 export const globalCalibrationState = new CalibrationState();
