@@ -235,14 +235,34 @@ export async function bgHandler(payload: unknown): Promise<void> {
       // Hard temporal contract (report #13): BG(N) arriving means round N has
       // STARTED — every undelivered prediction signal targeting N is now
       // EXPIRED. Atomic kill beats waiting for the dispatcher tick.
-      sql`
-        UPDATE notification_outbox
-        SET status = 'dead_letter',
-            last_error = 'expired_late_signal: target round started (BG received)'
-        WHERE type = 'prediction'
-          AND status IN ('pending', 'inflight')
-          AND target_game_id = ${gameId}
-      `.catch(() => undefined),
+      // P0: do NOT fail-open — retry once and log hard if kill cannot run.
+      (async () => {
+        const killSql = async () =>
+          sql`
+            UPDATE notification_outbox
+            SET status = 'dead_letter',
+                last_error = 'expired_late_signal: target round started (BG received)'
+            WHERE type = 'prediction'
+              AND status IN ('pending', 'inflight')
+              AND target_game_id = ${gameId}
+          `;
+        try {
+          await killSql();
+        } catch (e1) {
+          logger.warn(
+            { event: "bg", gameId, error: String(e1), attempt: 1 },
+            "BG temporal kill failed — retrying once",
+          );
+          try {
+            await killSql();
+          } catch (e2) {
+            logger.error(
+              { event: "bg", gameId, error: String(e2), attempt: 2 },
+              "BG temporal kill FAILED after retry — prediction may still be inflight",
+            );
+          }
+        }
+      })(),
       sql`
         INSERT INTO live_event_log (
           correlation_id, event_kind, game_id, payload, received_at, processed_at,
