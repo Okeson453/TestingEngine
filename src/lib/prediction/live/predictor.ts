@@ -18,7 +18,7 @@ import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
 import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
-import { getSql, getPgPool, type Sql } from "@/lib/db";
+import { getSql, getCriticalSql, getPgPool, getLastPoolAcquireMs, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
 import type { FeaturePath, HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
@@ -340,7 +340,8 @@ export async function onGameStart(
       );
     }
   }
-  const getSqlFn = deps.getSqlFn ?? getSql;
+  // P0: reserved critical pool — never queue behind dashboard/general work
+  const getSqlFn = deps.getSqlFn ?? getCriticalSql;
   const predictFn = deps.predictFn ?? defaultPredictFn;
   const now = deps.now ?? Date.now;
   const minHistory = deps.minHistory ?? MIN_HISTORY;
@@ -929,8 +930,11 @@ export async function onGameEndPredict(
   let outboxEnqueued = 0;
   let pendingWasDuplicate = false;
   let sql: Sql;
+  let poolWaitMs = 0;
   try {
+    const poolT0 = Date.now();
     sql = await getSqlFn();
+    poolWaitMs = Date.now() - poolT0;
   } catch (e) {
     logger.error(
       { component: "live-predictor", targetGameId, error: String(e) },
@@ -1063,10 +1067,15 @@ export async function onGameEndPredict(
       const profile = {
         component: "live-predictor",
         predictionId,
+        sourceGameId: gameId,
         targetGameId,
         correlationId,
         pool_wait_ms: poolWaitMs,
+        pool_acquire_ms: getLastPoolAcquireMs(),
+        prediction_computation_ms: Math.round(performance.now() - t0) - (Date.now() - persistT0),
+        total_persistence_ms: Date.now() - persistT0,
         tx_ms: txMs,
+        transaction_commit_ms: txMs,
         tx_statements: 2,
         outboxEnqueued,
       };
