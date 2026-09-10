@@ -130,8 +130,10 @@ export async function attemptNPlusOnePrediction(
     );
     if (trace) trace.marks.prediction_completed = performance.now();
 
+    // Success requires durable outbox handoff (kind === "predicted").
+    // persist_failed / skipped_* / duplicate must not be treated as delivered.
     const attempted =
-      result?.predictionId != null && result.kind !== "duplicate";
+      result?.kind === "predicted" && result?.predictionId != null;
 
     recordAttempt(
       source,
@@ -157,11 +159,12 @@ export async function attemptNPlusOnePrediction(
         targetGameId: result?.targetGameId ?? null,
         predictionId: result?.predictionId ?? null,
         kind: result?.kind ?? null,
+        outboxEnqueued: result?.outboxEnqueued ?? 0,
         recoveryMode,
       },
       attempted
-        ? "N+1 SIGNAL_READY (durability pending)"
-        : "N+1 prediction attempt not owned / skipped",
+        ? "N+1 SIGNAL_READY (durable outbox enqueued)"
+        : "N+1 prediction attempt not owned / skipped / persist_failed",
     );
 
     return {
