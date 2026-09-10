@@ -396,9 +396,51 @@ export async function persistIncrementalState(sql: Sql): Promise<void> {
       "baseline adaptive state persistence failed (soft)",
     );
   }
+  try {
+    const { globalSafeBaseline } = await import(
+      "@/lib/prediction/lifecycle/safe-baseline-controller"
+    );
+    const safeJson = JSON.stringify(globalSafeBaseline.exportState());
+    await sql`
+      INSERT INTO worker_state (key, value, updated_at)
+      VALUES ('safe_baseline_state', ${safeJson}, now())
+      ON CONFLICT (key) DO UPDATE
+      SET value = EXCLUDED.value, updated_at = now()
+    `;
+  } catch (e) {
+    logger.debug(
+      { component: "live-supervisor", error: String(e) },
+      "safe baseline state persistence failed (soft)",
+    );
+  }
 }
 
 /** Restore baseline adaptive state from worker_state (soft on miss/corrupt). */
+export async function restoreSafeBaselineState(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql<{ value: string }>`
+      SELECT value FROM worker_state WHERE key = 'safe_baseline_state' LIMIT 1
+    `;
+    if (!rows.length || !rows[0]?.value) return false;
+    const parsed = JSON.parse(rows[0].value);
+    const { globalSafeBaseline } = await import(
+      "@/lib/prediction/lifecycle/safe-baseline-controller"
+    );
+    globalSafeBaseline.importState(parsed);
+    logger.info(
+      { component: "live-supervisor", mode: globalSafeBaseline.getMode(), n: globalSafeBaseline.snapshot().n },
+      "safe baseline state restored",
+    );
+    return true;
+  } catch (e) {
+    logger.debug(
+      { component: "live-supervisor", error: String(e) },
+      "safe baseline state restore failed (soft)",
+    );
+    return false;
+  }
+}
+
 export async function restoreBaselineAdaptiveState(sql: Sql): Promise<boolean> {
   try {
     const rows = await sql<{ value: string }>`
