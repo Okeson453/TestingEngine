@@ -22,14 +22,14 @@ export class IncrementalFeatureTracker {
 
   seed(rounds: HistoricalRound[]): void {
     this.engine.seed(rounds.map((r) => r.crashPoint));
-    featureHotCache.set('latest', this.toFeatures(), 60_000);
+    featureHotCache.set('latest', this.toFeatures());
   }
 
   onCrash(crashPoint: number): Record<string, number> {
     const t0 = performance.now();
     this.engine.update(crashPoint);
     const features = this.toFeatures();
-    featureHotCache.set('latest', features, 15_000);
+    featureHotCache.set('latest', features);
     featureLatencyMs.observe(performance.now() - t0);
     return features;
   }

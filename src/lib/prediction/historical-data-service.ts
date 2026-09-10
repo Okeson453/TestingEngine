@@ -6,7 +6,9 @@
  * Range/research queries still hit the database.
  */
 
-import { RoundRepository, RoundRecord } from '../persistence/repositories/round-repo.ts';
+import { getSql } from '../db.ts';
+import { RoundRepository } from '../persistence/repositories/round-repo.ts';
+import type { RoundRecord } from '../persistence/repositories/round-repo.ts';
 import { getLogger } from '../observability/logger.ts';
 import type { HistoricalRound } from './types.ts';
 import { RollingHistoryBuffer } from './rolling-history-buffer.ts';
@@ -29,17 +31,20 @@ export class HistoricalDataService {
   }
 
   toHistorical(record: RoundRecord, sequenceIndex?: number): HistoricalRound | null {
-    const crashPoint = record.finalConfirmedCrashPoint ?? record.observedCrashPoint ?? null;
+    // Canonical mapping: crash_rounds carries ONE confirmed crash point
+    // (multiplier). Session / observation-source / data-quality dimensions
+    // are not persisted in this schema — they stay null, never fabricated.
+    const crashPoint = record.crashPoint;
     if (crashPoint == null || !Number.isFinite(crashPoint) || crashPoint <= 0) return null;
     return {
       id: record.id,
       externalRoundId: record.externalRoundId,
-      sessionId: record.sessionId,
+      sessionId: null,
       startedAt: record.startedAt,
       crashedAt: record.crashedAt,
       crashPoint,
-      observationSource: record.observationSource,
-      dataQuality: (record.dataQuality as HistoricalRound['dataQuality']) ?? null,
+      observationSource: null,
+      dataQuality: null,
       createdAt: record.createdAt,
       sequenceIndex,
     };

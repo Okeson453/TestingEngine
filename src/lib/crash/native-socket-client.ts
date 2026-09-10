@@ -207,7 +207,7 @@ export class NativeBcGameSocket {
             ? new Uint8Array(data)
             : data instanceof Uint8Array
               ? data
-              : new Uint8Array(data as Buffer);
+              : new Uint8Array(data as unknown as Buffer);
         this.onBinary(buf);
       });
 

@@ -11,8 +11,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getSql } from "@/lib/db";
 import {
-  onGameStartLegacy,
-  onGameEndLegacy,
+  bgHandler,
+  edHandler,
 } from "@/lib/prediction/events/game-event-handlers";
 import { insertNewRounds } from "@/lib/crash/ingest";
 import type { FetchedRound } from "@/lib/crash/fetch-bc";
@@ -67,7 +67,7 @@ test("Phase 16: ed payload via handlers runs durable handoff + validation path",
   const multiplier = 2.34;
 
   // Simulate BC.Game ed payload shape (not a typed GameEndEvent)
-  await onGameEndLegacy({
+  await edHandler({
     gameId,
     crashedAt: endTime,
     multiplier,
@@ -107,7 +107,7 @@ test("Phase 16: bg payload via handlers is observability-only (no prediction)", 
   const gameId = "92001";
   const beganAt = await ts(-100);
 
-  await onGameStartLegacy({
+  await bgHandler({
     gameId,
     beginTime: beganAt,
   });
@@ -137,7 +137,7 @@ test("Phase 16: full N then N+1 path driven only by handlers", async () => {
   // (optional). Primary assertion is ed → durable state + no throw.
   const gameN = "93060";
   const endN = await ts(0);
-  await onGameEndLegacy({
+  await edHandler({
     id: gameN,
     gameId: gameN,
     endTime: endN,

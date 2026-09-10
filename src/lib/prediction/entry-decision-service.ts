@@ -13,16 +13,9 @@ import { HistoricalDataService } from './historical-data-service.ts';
 import { PredictionEngine } from './prediction-engine.ts';
 import { PredictionSignal, ThresholdTarget } from './types.ts';
 import { isSignalFresh } from './signals/signal.ts';
-import {
-  PredictionRepository,
-  InMemoryPredictionRepository,
-} from '../persistence/repositories/prediction-repo.ts';
-import {
-  PredictionProvenanceRepository,
-  InMemoryPredictionProvenanceRepository,
-} from '../persistence/repositories/prediction-provenance-repo.ts';
+import { PredictionRepository } from '../persistence/repositories/prediction-repo.ts';
+import { PredictionProvenanceRepository } from '../persistence/repositories/prediction-provenance-repo.ts';
 import type { OpportunityRanker as DecisionOpportunityRanker } from '../opportunity/ranker.ts';
-import { bridgeOpportunityToDecisionRanker } from '../opportunity/prediction-bridge.ts';
 import { globalCalibrationState } from './calibration/calibration-state.ts';
 
 import { RoundRepository } from '../persistence/repositories/round-repo.ts';
@@ -37,7 +30,7 @@ import type { StrategyRiskState } from './acie/types.ts';
 import { randomUUID } from 'crypto';
 import {
   LatencyTimer,
-  globalEntryLatencyWindow,
+  entryDecisionMs,
 } from '../observability/performance/latency.ts';
 import { predictionHotCache } from '../observability/performance/hot-cache.ts';
 import { globalIncrementalFeatures } from './features/incremental-features.ts';
@@ -51,7 +44,7 @@ import { tickLearningWithHooks } from './learning/learning-bootstrap.ts';
 import { assertPredictionWarmForLive } from './prewarm.ts';
 import { assertFeatureVersionMatch } from './features/feature-version-assert.ts';
 import { FEATURE_VERSION_V2 } from './features/feature-meta.ts';
-import type { SheathMode } from '../core/sheath-mode/index.ts';
+import { evaluateSheath, type SheathMode } from '../core/sheath-mode/index.ts';
 
 import { PredictionStateRegistry, type PredictionStateSnapshot } from './state-snapshot.ts';
 // Diagnosis fixes (prediction-stack batch): identity registry, rolling
@@ -96,7 +89,7 @@ export class EntryDecisionService {
   private readonly predictionEngine: PredictionEngine;
   private readonly historicalData: HistoricalDataService;
   private readonly riskEngine: RiskEngine;
-  private readonly predictionRepo: PredictionRepository | InMemoryPredictionRepository;
+  private readonly predictionRepo: PredictionRepository;
   private readonly acie: ACIEEngine;
   /** When true, ACIE probability drives the signal (legacy model still runs for features/log). */
   private readonly preferAcie: boolean;
@@ -108,20 +101,20 @@ export class EntryDecisionService {
   private crashCountForSnapshot = 0;
   private sheathMode: SheathMode | null = null;
   private usePipeline = true;
-  private provenanceRepo: PredictionProvenanceRepository | InMemoryPredictionProvenanceRepository;
+  private provenanceRepo: PredictionProvenanceRepository;
   private decisionRanker: DecisionOpportunityRanker | null = null;
 
   constructor(opts?: {
     predictionEngine?: PredictionEngine;
     historicalData?: HistoricalDataService;
     riskEngine?: RiskEngine;
-    predictionRepo?: PredictionRepository | InMemoryPredictionRepository;
+    predictionRepo?: PredictionRepository;
     roundRepo?: RoundRepository;
     acie?: ACIEEngine;
     preferAcie?: boolean;
     sheathMode?: SheathMode | null;
     usePipeline?: boolean;
-    provenanceRepo?: PredictionProvenanceRepository | InMemoryPredictionProvenanceRepository;
+    provenanceRepo?: PredictionProvenanceRepository;
     decisionRanker?: DecisionOpportunityRanker | null;
   }) {
     this.predictionEngine = opts?.predictionEngine ?? new PredictionEngine();
@@ -129,7 +122,7 @@ export class EntryDecisionService {
       opts?.historicalData ??
       new HistoricalDataService(opts?.roundRepo ?? new RoundRepository());
     this.riskEngine = opts?.riskEngine ?? new RiskEngine();
-    this.predictionRepo = opts?.predictionRepo ?? new InMemoryPredictionRepository();
+    this.predictionRepo = opts?.predictionRepo ?? new PredictionRepository();
     this.acie = opts?.acie ?? new ACIEEngine();
     // Best-effort restore from Postgres (async; does not block construction).
     if (!opts?.acie) {
@@ -138,7 +131,7 @@ export class EntryDecisionService {
     this.preferAcie = opts?.preferAcie ?? true;
     this.sheathMode = opts?.sheathMode ?? null;
     this.usePipeline = opts?.usePipeline ?? true;
-    this.provenanceRepo = opts?.provenanceRepo ?? new InMemoryPredictionProvenanceRepository();
+    this.provenanceRepo = opts?.provenanceRepo ?? new PredictionProvenanceRepository();
     this.decisionRanker = opts?.decisionRanker ?? null;
     this.stateRegistry = new PredictionStateRegistry();
     this.lastStateSnapshot = this.stateRegistry.snapshot();
@@ -148,13 +141,21 @@ export class EntryDecisionService {
     return this.historicalData;
   }
 
+  /**
+   * Canonical entries-blocked gate: production controller verdict OR the
+   * sheath late-rate evaluator at its halt threshold.
+   */
+  private entriesBlocked(): boolean {
+    if (!globalProductionController.status().entriesAllowed) return true;
+    if (!this.sheathMode) return false;
+    return evaluateSheath(this.sheathMode).decision === 'halt';
+  }
+
   setDecisionRanker(ranker: DecisionOpportunityRanker | null): void {
     this.decisionRanker = ranker;
   }
 
-  setProvenanceRepo(
-    repo: PredictionProvenanceRepository | InMemoryPredictionProvenanceRepository
-  ): void {
+  setProvenanceRepo(repo: PredictionProvenanceRepository): void {
     this.provenanceRepo = repo;
   }
 
@@ -264,12 +265,16 @@ export class EntryDecisionService {
         tickLearningWithHooks(this.sheathMode);
       }
       const prod = globalProductionController.status();
-      this.sheathMode?.reportPredictionHealth({
-        divergenceLevel: prod.divergence.level,
-        ece: prod.divergence.eceProxy,
-        reason: prod.divergence.reason,
-        coldState: !globalIncrementalState.isWarm(30),
-      });
+      this.logger.debug(
+        {
+          component: 'EntryDecisionService',
+          divergenceLevel: prod.divergence.level,
+          ece: prod.divergence.eceProxy,
+          reason: prod.divergence.reason,
+          coldState: !globalIncrementalState.isWarm(30),
+        },
+        'Prediction health snapshot'
+      );
     } catch { /* non-critical */ }
     // Rolling performance windows (Problem 5): observe EVERY outcome —
     // this is outcome observation, independent of any learning gate.
@@ -361,10 +366,15 @@ export class EntryDecisionService {
   async evaluateEntry(ctx: EntryDecisionContext): Promise<EntryDecisionResult> {
     if (ctx.riskInput?.mode === 'live' && !isReadyForLive()) {
       this.logger.warn({ component: 'EntryDecisionService' }, 'Live entry blocked — prediction not ready');
-      const riskResult = this.riskEngine.evaluate(ctx.riskInput);
+      await this.riskEngine.evaluate(ctx.riskInput);
       return {
         signal: null,
-        riskResult: { ...riskResult, approved: false, rejectionReason: 'PREDICTION_NOT_READY', firstFailure: 'prediction_not_ready' },
+        riskResult: {
+          approved: false,
+          reason: 'PREDICTION_NOT_READY',
+          rejectionReason: 'PREDICTION_NOT_READY',
+          firstFailure: 'prediction_not_ready',
+        },
         predictionPersisted: false,
         acie: null,
       };
@@ -382,7 +392,7 @@ export class EntryDecisionService {
         { component: 'EntryDecisionService', roundId: ctx.roundId },
         'Prediction history is not warm; rejecting decision without DB I/O'
       );
-      const riskResult = this.riskEngine.evaluate({ ...ctx.riskInput, predictionSignal: undefined });
+      const riskResult = await this.riskEngine.evaluate({ ...ctx.riskInput, predictionSignal: undefined });
       return { signal: null, riskResult, predictionPersisted: false, acie: null };
     }
     this.ensureAcieSeeded();
@@ -531,7 +541,7 @@ export class EntryDecisionService {
         if (
           featurePath === 'V1_FALLBACK' &&
           process.env.PREDICT_BLOCK_V1_FALLBACK === '1' &&
-          (ctx.riskInput as { mode?: string }).mode === 'live'
+          ctx.riskInput.mode === 'live'
         ) {
           this.logger.warn(
             { component: 'EntryDecisionService', predictionId: signal.predictionId },
@@ -650,7 +660,6 @@ export class EntryDecisionService {
           { component: 'EntryDecisionService', error: String(err) },
           'LIVE blocked — prediction stack cold'
         );
-        this.sheathMode?.reportPredictionHealth({ divergenceLevel: 0, coldState: true });
         riskInput.predictionSignal = undefined;
         signal = null;
       }
@@ -658,12 +667,11 @@ export class EntryDecisionService {
 
     // Production / divergence sheath may block entries (design §25–26)
     {
-      const prodStatus = globalProductionController.status();
-      if (!prodStatus.entriesAllowed || this.sheathMode?.isPredictionEntriesBlocked()) {
+      if (this.entriesBlocked()) {
         this.logger.info(
           {
             component: 'EntryDecisionService',
-            divergenceLevel: prodStatus.divergence.level,
+            divergenceLevel: globalProductionController.status().divergence.level,
             sheath: sheathState(this.sheathMode),
           },
           'Entries blocked by prediction sheath / divergence'
@@ -673,43 +681,35 @@ export class EntryDecisionService {
     }
 
     timer.mark('pre_risk');
-    const riskResult = this.riskEngine.evaluate(riskInput);
+    const riskResult = await this.riskEngine.evaluate(riskInput);
     timer.record('risk', 'pre_risk');
 
     // Problem 9: record the risk + sheath stage outcomes on the prediction record
     try {
       const rec = globalPredictionRegistry.getByTarget(ctx.roundId);
       if (rec && !rec.resolved) {
-        // riskResult's declared type in this repo is a Promise-like artifact;
-        // cast through unknown rather than propagate the type rot.
-        const rr = riskResult as unknown as { approved?: boolean; rejectionReason?: string | null };
-        rec.stages.riskApproved = rr.approved ?? null;
-        rec.stages.riskRejectionReason = rr.rejectionReason ?? null;
-        const prodStatus = globalProductionController.status();
-        const sm = this.sheathMode as unknown as { isPredictionEntriesBlocked?: () => boolean };
-        rec.stages.sheathBlocked =
-          !prodStatus.entriesAllowed || (sm.isPredictionEntriesBlocked?.() ?? false);
+        rec.stages.riskApproved = riskResult.approved;
+        rec.stages.riskRejectionReason = riskResult.rejectionReason ?? null;
+        rec.stages.sheathBlocked = this.entriesBlocked();
       }
     } catch { /* best-effort */ }
 
     if (signal) {
       this.persistAsync(signal, ctx, riskResult, target);
       // Hot cache for subsequent ranking / workers within same round window
-      predictionHotCache.set(
-        ctx.roundId,
-        {
-          probability: signal.probability,
-          confidence: signal.confidence,
-          regimeId: signal.regimeId ?? null,
-          modelVersion: signal.modelVersion,
-          reasoning: signal.reasoning,
-        },
-        5_000
-      );
+      predictionHotCache.set(ctx.roundId, {
+        probability: signal.probability,
+        confidence: signal.confidence,
+        regimeId: signal.regimeId ?? null,
+        modelVersion: signal.modelVersion,
+        reasoning: signal.reasoning,
+      });
     }
 
     const totalMs = timer.record('entry_total');
-    globalEntryLatencyWindow.push(totalMs);
+    entryDecisionMs.observe(totalMs);
+    const entryP99Raw = entryDecisionMs.percentile(99);
+    const entryP99 = entryP99Raw != null ? Math.round(entryP99Raw * 100) / 100 : null;
 
     this.logger.info(
       {
@@ -720,7 +720,7 @@ export class EntryDecisionService {
         model: signal?.modelVersion,
         acieAction: acieEval?.strategy.action,
         latencyMs: Math.round(totalMs * 100) / 100,
-        entryP99Estimate: Math.round(globalEntryLatencyWindow.p99() * 100) / 100,
+        entryP99Estimate: entryP99,
       },
       riskResult.approved ? 'Entry APPROVED' : 'Entry REJECTED'
     );
@@ -792,11 +792,10 @@ export class EntryDecisionService {
     const probability = pipeline.calibratedProbability;
     const confidence = pipeline.opportunity.confidence;
 
-    // Unify prediction opportunity with decision-layer ranker
+    // Unify prediction opportunity with decision-layer ranker: rank the
+    // pipeline's opportunity through the decision ranker when one is wired.
     try {
-      if (this.decisionRanker) {
-        bridgeOpportunityToDecisionRanker(this.decisionRanker, pipeline.opportunity);
-      }
+      this.decisionRanker?.rank(pipeline.opportunity);
     } catch {
       /* non-critical */
     }

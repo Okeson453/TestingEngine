@@ -288,9 +288,7 @@ export class PollWorker {
             if (r.crashedAt) {
               await markLiveRoundEnded(
                 r.gameId,
-                r.crashedAt instanceof Date
-                  ? r.crashedAt.toISOString()
-                  : String(r.crashedAt),
+                r.crashedAt,
                 Number(r.multiplier),
                 sql,
               );

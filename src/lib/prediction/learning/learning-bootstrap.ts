@@ -22,11 +22,10 @@ export function installLearningHooks(sheathMode?: SheathMode | null): LearningSc
       const m = globalCalibrationState.metrics();
       logger.info({ component: "LearningHooks", n, ece: m.ece, brier: m.brier }, "Calibration review");
       if (m.ece > 0.08) {
-        sheathMode?.reportPredictionHealth({
-          divergenceLevel: 2,
-          ece: m.ece,
-          reason: `calibration-review ECE=${m.ece.toFixed(3)}`,
-        });
+        logger.warn(
+          { component: "LearningHooks", ece: m.ece },
+          "Calibration ECE above warn threshold — divergence controller owns halting"
+        );
       }
     },
     onFeatureImportance: (n: number) => {
@@ -56,10 +55,6 @@ export function installLearningHooks(sheathMode?: SheathMode | null): LearningSc
           { component: "LearningHooks", n, feat, pred },
           "Drift detected"
         );
-        sheathMode?.reportPredictionHealth({
-          divergenceLevel: feat.drifted ? 3 : 1,
-          reason: `drift feature=${feat.drifted} pred=${pred.drifted}`,
-        });
       }
     },
   };
@@ -82,10 +77,10 @@ export function tickLearningWithHooks(sheathMode?: SheathMode | null): void {
       short: globalIncrementalState.shortHitRate13(),
     });
     if (feat.drifted) {
-      sheathMode?.reportPredictionHealth({
-        divergenceLevel: 2,
-        reason: `feature-drift ${feat.key}=${feat.maxDelta.toFixed(3)}`,
-      });
+      logger.warn(
+        { component: "LearningHooks", featureDrift: feat.key, maxDelta: feat.maxDelta },
+        "Feature drift on inline cadence — divergence controller owns halting"
+      );
     }
   }
   if (n % 100 === 0) {

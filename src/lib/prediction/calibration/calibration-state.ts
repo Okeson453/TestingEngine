@@ -188,7 +188,7 @@ export class CalibrationState {
     const out = [{ regime: 'global', ...this.metrics('global') }];
     for (const key of this.byRegime.keys()) {
       const m = this.metrics(key);
-      out.push({ regime: key, ece: m.ece, brier: m.brier, logLoss: m.logLoss, n: m.n });
+      out.push({ regime: key, ...m });
     }
     return out;
   }

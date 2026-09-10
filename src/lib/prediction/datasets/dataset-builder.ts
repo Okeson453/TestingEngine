@@ -3,7 +3,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
-import { HistoricalRound, Dataset, DatasetMeta, DatasetRow } from '../types.ts';
+import type { HistoricalRound, Dataset, DatasetMeta, DatasetRow } from '../types.ts';
 import { FeatureEngine, CURRENT_FEATURE_VERSION } from '../features/feature-engine.ts';
 import { LabelGenerator, CURRENT_TARGET_VERSION } from '../labels/label-generator.ts';
 import { getLogger } from '../../observability/logger.ts';
@@ -42,8 +42,7 @@ export class DatasetBuilder {
     for (const fv of featureVectors) {
       if (seenRoundIds.has(fv.roundId)) {
         throw new CriticalError(
-          `Duplicate round id in dataset features: ${fv.roundId}`,
-          'DATASET_DUPLICATE_ROUND'
+          `[DATASET_DUPLICATE_ROUND] Duplicate round id in dataset features: ${fv.roundId}`
         );
       }
       seenRoundIds.add(fv.roundId);
@@ -51,15 +50,13 @@ export class DatasetBuilder {
       const idx = rounds.findIndex((r) => r.id === fv.roundId);
       if (idx < 0) {
         throw new CriticalError(
-          `Feature roundId ${fv.roundId} not found in source rounds`,
-          'DATASET_ROUND_MISSING'
+          `[DATASET_ROUND_MISSING] Feature roundId ${fv.roundId} not found in source rounds`
         );
       }
       // Feature cutoff: only prior rounds may contribute
       if (idx < minHistory) {
         throw new CriticalError(
-          `Feature generated for round index ${idx} below minHistory ${minHistory}`,
-          'DATASET_HISTORY_VIOLATION'
+          `[DATASET_HISTORY_VIOLATION] Feature generated for round index ${idx} below minHistory ${minHistory}`
         );
       }
       const round = rounds[idx];
@@ -76,8 +73,7 @@ export class DatasetBuilder {
       );
       if (failOnLeakage) {
         throw new CriticalError(
-          `Dataset leakage detected: ${leakageIssues.join('; ')}`,
-          'DATASET_LEAKAGE'
+          `[DATASET_LEAKAGE] Dataset leakage detected: ${leakageIssues.join('; ')}`
         );
       }
     }
@@ -136,8 +132,7 @@ export class DatasetBuilder {
       const cur = new Date(rounds[i].crashedAt ?? rounds[i].createdAt).getTime();
       if (cur < prev) {
         throw new CriticalError(
-          `Rounds not chronological at index ${i}`,
-          'DATASET_NOT_CHRONOLOGICAL'
+          `[DATASET_NOT_CHRONOLOGICAL] Rounds not chronological at index ${i}`
         );
       }
     }

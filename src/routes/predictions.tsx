@@ -8,6 +8,7 @@ export const Route = createFileRoute("/predictions")({
     // P0: one pinned snapshot instead of 7 concurrent server fns (pool exhaustion).
     const snap = await predictionGetDashboardSnapshot();
     return {
+      delivery: snap.delivery,
       dailyTarget: snap.dailyTarget,
       today: snap.today,
       lifetime: snap.lifetime,

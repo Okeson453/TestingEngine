@@ -35,6 +35,29 @@ function makeRecorder(name: string, maxSamples = 200) {
   };
 }
 
+/** Named-mark latency timer for multi-stage paths (decision pipeline). */
+export class LatencyTimer {
+  private readonly startedAt = performance.now();
+  private readonly marks = new Map<string, number>();
+
+  /** Stamp a named stage boundary. */
+  mark(name: string): void {
+    this.marks.set(name, performance.now());
+  }
+
+  /**
+   * Milliseconds elapsed since timer start, or since a named mark when given.
+   * The stage label is accepted for call-site readability / future wiring.
+   */
+  record(_stage: string, sinceMark?: string): number {
+    const from = (sinceMark != null ? this.marks.get(sinceMark) : undefined) ?? this.startedAt;
+    return performance.now() - from;
+  }
+}
+
+/** Entry-decision total latency window (evaluateEntry → result). */
+export const entryDecisionMs = makeRecorder("entryDecision");
+
 export const featureLatencyMs = makeRecorder("feature");
 export const predictionGenerationMs = makeRecorder("predictionGeneration");
 export const predictionPersistMs = makeRecorder("predictionPersist");

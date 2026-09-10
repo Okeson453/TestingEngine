@@ -69,7 +69,7 @@ export interface PoolSizingAdvice {
  */
 export function getPoolSizingAdvice(): PoolSizingAdvice {
   const stats = getPoolStats();
-  const currentMax = stats?.max ?? Number(process.env.PG_POOL_MAX ?? DEFAULT_MAX) || DEFAULT_MAX;
+  const currentMax = (stats?.max ?? Number(process.env.PG_POOL_MAX ?? DEFAULT_MAX)) || DEFAULT_MAX;
   const sorted = samples.slice().sort((a, b) => a - b);
   const p50 = percentile(sorted, 50);
   const p95 = percentile(sorted, 95);

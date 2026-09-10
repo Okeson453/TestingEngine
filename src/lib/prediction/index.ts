@@ -65,10 +65,7 @@ export { LookaheadEngine, globalLookaheadEngine } from './lookahead/lookahead-en
 export { OpportunityWindow, globalOpportunityWindow } from './opportunity/opportunity-window.ts';
 export { runDesignAcceptance } from './validation/design-acceptance.ts';
 export { tickLearningWithHooks, installLearningHooks } from './learning/learning-bootstrap.ts';
-export {
-  PredictionProvenanceRepository,
-  InMemoryPredictionProvenanceRepository,
-} from '../persistence/repositories/prediction-provenance-repo.ts';
+export { PredictionProvenanceRepository } from '../persistence/repositories/prediction-provenance-repo.ts';
 export { runRegimeFitJob, featureRowsFromCrashPoints } from './regimes/regime-fit-job.ts';
 export { computeGroupImportance, DEFAULT_FEATURE_GROUPS } from './features/feature-importance.ts';
 export { fitRegimesOffline } from './workers/regime-fit-offload.ts';

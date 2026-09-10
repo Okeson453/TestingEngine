@@ -954,7 +954,6 @@ export async function onGameEndPredict(
       outboxEnqueued: 0,
     };
   }
-  const poolWaitMs = Date.now() - persistT0;
 
   try {
     const txT0 = Date.now();

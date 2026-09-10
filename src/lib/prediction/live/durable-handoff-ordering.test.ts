@@ -49,7 +49,8 @@ describe("durable prediction handoff ordering (P0)", () => {
 
   it("validator validation outbox uses lower priority than prediction", () => {
     const v = readFileSync(join(__dirname, "validator.ts"), "utf8");
-    // validation priority 2
-    expect(v).toMatch(/'validation'[\s\S]{0,400}'pending',\s*2/);
+    // validation priority 2 (window covers the metadata block between the
+    // 'validation' type and the status/priority columns)
+    expect(v).toMatch(/'validation'[\s\S]{0,900}'pending',\s*2/);
   });
 });

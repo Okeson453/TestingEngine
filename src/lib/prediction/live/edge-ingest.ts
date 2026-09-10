@@ -36,11 +36,13 @@ export type EdgeBgPayload = {
   source?: string;
 };
 
+export type EdgeIngestError = { ok: false; error: string; status: number };
+
 export type EdgeIngestResult =
   | { ok: true; kind: string; gameId?: string; lagMs?: number }
-  | { ok: false; error: string; status: number };
+  | EdgeIngestError;
 
-function requireToken(authHeader: string | null | undefined): EdgeIngestResult | null {
+function requireToken(authHeader: string | null | undefined): EdgeIngestError | null {
   const expected = process.env.EDGE_INGEST_TOKEN?.trim();
   if (!expected) {
     if (process.env.NODE_ENV === "production") {
@@ -242,7 +244,7 @@ export async function ingestEdgeBg(
   return { ok: true, kind: "bg", gameId };
 }
 
-export function verifyEdgeAuth(authHeader?: string | null): EdgeIngestResult | null {
+export function verifyEdgeAuth(authHeader?: string | null): EdgeIngestError | null {
   return requireToken(authHeader);
 }
 
@@ -277,7 +279,9 @@ export async function ingestEdgeFrame(
     const { decodeBinaryPacket, decodeEnd, decodeBegin } = await import(
       "@/lib/crash/transport/bcgame-crash-transport"
     );
-    const pkt = decodeBinaryPacket(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    const frame = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(frame).set(bytes);
+    const pkt = decodeBinaryPacket(frame);
     const event = String(pkt.event || "").toLowerCase();
     const payload = pkt.payload;
 

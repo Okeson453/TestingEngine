@@ -342,7 +342,7 @@ export function normalizeCrashEnd(
  * ED(N): owns N+1 prediction — signal first, persistence async.
  * Phase 2: attemptNPlusOnePrediction is the sole ownership boundary.
  */
-async function edHandler(payload: unknown): Promise<void> {
+export async function edHandler(payload: unknown): Promise<void> {
   // Fencing gate (fix plan Phase 1): a worker that lost authority must not
   // ingest authoritative events or compute predictions. No-op before boot
   // initializes the fencing registry (tests, non-boot processes).

@@ -39,10 +39,10 @@ let softFailUntil = 0;
 function installDomPolyfill(): void {
   const loc = "https://bc.game/game/crash";
   // Minimal DOM stubs for wr_utils — intentionally not full Window/Location types.
-  const g = globalThis as typeof globalThis & {
+  const g = globalThis as unknown as {
     document?: { location: { href: string; toString(): string } };
-    window?: typeof globalThis;
-    self?: typeof globalThis;
+    window?: unknown;
+    self?: unknown;
   };
   const locationLike = {
     href: loc,
@@ -51,8 +51,8 @@ function installDomPolyfill(): void {
     },
   };
   g.document = { location: locationLike };
-  g.window ??= g;
-  g.self ??= g;
+  g.window ??= globalThis;
+  g.self ??= globalThis;
 }
 
 // ——— node:vm sandbox (audit rec 4) ———
@@ -354,13 +354,13 @@ function staleCached(): Signed | null {
   return cachedSign;
 }
 
-export async function signSocketQuery(): Promise<{ p: string; t: string; ua: string }> {
+export async function signSocketQuery(): Promise<Signed> {
   const envP = process.env.BCGAME_SOCKET_P;
   const envT = process.env.BCGAME_SOCKET_T;
-  if (envP && envT) return { p: envP, t: envT, ua: UA };
+  if (envP && envT) return { p: envP, t: envT, ua: UA, at: Date.now() };
 
   if (cachedSign && Date.now() - cachedSign.at < SIGN_TTL_MS) {
-    return { p: cachedSign.p, t: cachedSign.t, ua: cachedSign.ua };
+    return { ...cachedSign };
   }
 
   // Soft-fail window: still serve stale cache so reconnects don't die.
@@ -371,7 +371,7 @@ export async function signSocketQuery(): Promise<{ p: string; t: string; ua: str
         { ageMs: Date.now() - stale.at },
         "using stale sign during soft-fail window",
       );
-      return { p: stale.p, t: stale.t, ua: stale.ua };
+      return { ...stale };
     }
   }
 
@@ -383,7 +383,7 @@ export async function signSocketQuery(): Promise<{ p: string; t: string; ua: str
       cachedSign = signed;
       softFailUntil = 0;
       logger.info({}, "socket query signed");
-      return { p: signed.p, t: signed.t, ua: signed.ua };
+      return { p: signed.p, t: signed.t, ua: signed.ua, at: signed.at };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       softFailUntil = Date.now() + 5_000;
@@ -393,7 +393,7 @@ export async function signSocketQuery(): Promise<{ p: string; t: string; ua: str
           { error: msg, ageMs: Date.now() - stale.at },
           "sign refresh failed — using stale cache",
         );
-        return { p: stale.p, t: stale.t, ua: stale.ua };
+        return { ...stale };
       }
       logger.warn({ error: msg }, "sign failed");
       throw new Error(`socket sign unavailable: ${msg}`);

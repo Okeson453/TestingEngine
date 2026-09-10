@@ -46,7 +46,7 @@ export async function prewarmPredictionStack(
   if (rounds.length > 0) {
     globalIncrementalState.seed(rounds.map((r) => r.crashPoint));
     globalIncrementalFeatures.seed(rounds);
-    featureHotCache.set('latest', globalIncrementalFeatures.toFeatures(), 60_000);
+    featureHotCache.set('latest', globalIncrementalFeatures.toFeatures());
     // Snapshot feature vector once so caches are hot
     globalFeatureEngineV2.snapshotFromState('prewarm', new Date().toISOString());
   }

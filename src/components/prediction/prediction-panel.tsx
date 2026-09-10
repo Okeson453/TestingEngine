@@ -30,6 +30,7 @@ import {
 } from "@/lib/p";
 import type { WorkerStatus } from "@/lib/p";
 import type {
+  DashboardSnapshot,
   DailyTarget,
   TodayStats,
   LifetimeStats,
@@ -80,8 +81,85 @@ function ResultBadge({ result }: { result: "WIN" | "LOSS" }) {
   );
 }
 
+
+function formatMs(ms: number | null): string {
+  if (ms == null) return "\u2014";
+  const sign = ms < 0 ? "-" : "";
+  const abs = Math.abs(ms);
+  if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(2)}s`;
+  return `${sign}${abs}ms`;
+}
+
+function OutcomeCounts({ delivery }: { delivery: NonNullable<DashboardSnapshot["delivery"]> }) {
+  const rows: Array<{ label: string; value: number; tone: string }> = [
+    { label: "ON_TIME", value: delivery.onTime, tone: "text-high" },
+    { label: "LATE", value: delivery.late, tone: "text-warn" },
+    { label: "UNKNOWN", value: delivery.unknown, tone: "text-muted" },
+    { label: "EXPIRED", value: delivery.expired, tone: "text-low" },
+    { label: "FAILED", value: delivery.failed, tone: "text-low" },
+    { label: "PENDING", value: delivery.pending, tone: "text-subtle" },
+  ];
+  return (
+    <div className="grid grid-cols-3 gap-2 md:grid-cols-6">
+      {rows.map((r) => (
+        <div key={r.label} className="rounded-lg bg-surface-2 px-3 py-2 text-center">
+          <p className={cn("font-mono text-lg tabular-nums", r.tone)}>{r.value}</p>
+          <p className="text-[10px] font-medium uppercase tracking-wide text-subtle">{r.label}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function LeadTimeCard({ delivery }: { delivery: DashboardSnapshot["delivery"] }) {
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <Activity className="size-4 text-accent" />
+          <div>
+            <CardTitle>Signal Lead Time</CardTitle>
+            <CardDescription>
+              {delivery
+                ? `Telegram accepted vs target round start \u00b7 last ${delivery.windowHours}h \u00b7 ${delivery.total} signals`
+                : "delivery forensics unavailable (migration 0029 not applied)"}
+            </CardDescription>
+          </div>
+        </div>
+      </CardHeader>
+      {delivery ? (
+        <div className="flex flex-col gap-3 p-6 pt-0">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+            <StatTile label="Latest" value={formatMs(delivery.latestLeadTimeMs)} hint="target start − telegram accepted" />
+            <StatTile label="p50" value={formatMs(delivery.p50LeadTimeMs)} />
+            <StatTile label="p95" value={formatMs(delivery.p95LeadTimeMs)} />
+            <StatTile label="Min" value={formatMs(delivery.minLeadTimeMs)} hint="worst margin" />
+          </div>
+          <OutcomeCounts delivery={delivery} />
+          {delivery.latest ? (
+            <p className="text-xs text-muted">
+              latest: {delivery.latest.predictionId} &rarr; target {delivery.latest.targetGameId ?? "\u2014"}
+              {" \u00b7 "}outcome {delivery.latest.deliveryOutcome ?? "PENDING"}
+              {delivery.latest.leadTimeMs != null ? ` (${formatMs(delivery.latest.leadTimeMs)})` : ""}
+            </p>
+          ) : null}
+          <p className="text-[11px] text-subtle">
+            ON_TIME = telegram accepted before target round started. UNKNOWN = required timestamps missing.
+            Outbox enqueue is not delivery.
+          </p>
+        </div>
+      ) : (
+        <div className="p-6 pt-0 text-sm text-muted">
+          No durable delivery forensics yet.
+        </div>
+      )}
+    </Card>
+  );
+}
+
 interface PredictionPanelProps {
   initial: {
+    delivery: DashboardSnapshot["delivery"];
     dailyTarget: DailyTarget;
     today: TodayStats;
     lifetime: LifetimeStats;
@@ -126,6 +204,7 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
       recent: initial.recent,
       pending: initial.pending,
       worker: { ...initial.worker, healthKind: "UNKNOWN" as const, pool: null },
+      delivery: initial.delivery,
       generatedAt: new Date().toISOString(),
       dbOk: true,
       dbError: null,
@@ -376,6 +455,9 @@ export function PredictionPanel({ initial }: PredictionPanelProps) {
             value={`${streaks.maxWin} / ${streaks.maxLoss}`}
           />
         </section>
+
+        {/* Signal lead-time forensics */}
+        <LeadTimeCard delivery={snapshotQ.data.delivery} />
 
         <div className="grid gap-4 lg:grid-cols-5">
           {/* Live Validation */}

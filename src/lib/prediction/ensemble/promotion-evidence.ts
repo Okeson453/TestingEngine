@@ -20,8 +20,10 @@ export async function loadApprovedEnsembleFlags(
   base: EnsembleFlags = DEFAULT_OFF
 ): Promise<EnsembleFlags> {
   const flags = { ...base };
+  const pool = getPool();
+  if (!pool) return flags;
   try {
-    const r = await getPool().query<{ model_name: string }>(
+    const r = await pool.query<{ model_name: string }>(
       `SELECT model_name FROM model_promotion_evidence WHERE approved_at IS NOT NULL`
     );
     for (const row of r.rows) {

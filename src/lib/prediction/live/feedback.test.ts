@@ -9,6 +9,7 @@ import {
 } from "./feedback.ts";
 import { globalIncrementalState } from "../state/incremental-state-engine.ts";
 import { globalBaselineModel } from "../models/baseline-model.ts";
+import { getSql } from "@/lib/db";
 
 describe("analyzeFailure", () => {
   it("classifies high-prob LOSS as OVERCONFIDENT", () => {
@@ -29,9 +30,17 @@ describe("analyzeFailure", () => {
 });
 
 describe("processResolvedPredictionFeedback", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     resetFeedbackIdempotencyForTests();
     globalIncrementalState.reset();
+    // Durable claim rows persist across runs (PGLite data dir) and would make
+    // every call take the idempotent-skip path. Clear them for the test ids.
+    try {
+      const sql = await getSql();
+      await sql`delete from feedback_jobs where prediction_id like 'pred-%'`;
+    } catch {
+      // pre-migration database — the in-memory map is the claim then
+    }
   });
 
   it("updates incremental state and is idempotent", async () => {

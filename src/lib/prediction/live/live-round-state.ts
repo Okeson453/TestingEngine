@@ -10,6 +10,7 @@
  */
 import { getSql, type Sql } from "@/lib/db";
 import type { FetchedRound } from "@/lib/crash/fetch-bc";
+import type { CrashRound } from "@/lib/crash/types";
 import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("live-round-state");
@@ -170,7 +171,7 @@ export async function markLiveRoundEnded(
 }
 
 export async function upsertLiveRoundFromHistory(
-  round: FetchedRound,
+  round: FetchedRound | CrashRound,
   sql?: Sql,
 ): Promise<void> {
   const db = sql ?? (await getSql());

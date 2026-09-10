@@ -1,5 +1,10 @@
 import { getSql } from "@/lib/db";
 
+/** Timestamps can surface as Date objects or strings depending on the binder. */
+function toIsoText(value: unknown): string {
+  return value instanceof Date ? value.toISOString() : String(value);
+}
+
 // NOTE: validateAgainstNewRounds / generateAndQueuePrediction / pendingByGame
 // and their supporting helpers were removed (second-opinion audit rec 3):
 // runtime-unreachable dead code — the live path is the predictor/validator
@@ -361,14 +366,8 @@ export async function getAllValidationHistory(
     result: r.result as "WIN" | "LOSS",
     modelVersion: r.model_version,
     regimeName: r.regime_name,
-    requestedAt:
-      r.requested_at instanceof Date
-        ? r.requested_at.toISOString()
-        : String(r.requested_at),
-    resolvedAt:
-      r.resolved_at instanceof Date
-        ? r.resolved_at.toISOString()
-        : String(r.resolved_at),
+    requestedAt: toIsoText(r.requested_at),
+    resolvedAt: toIsoText(r.resolved_at),
   }));
 
   return {
@@ -445,6 +444,41 @@ export async function getPendingStatus(): Promise<PendingStatus> {
 }
 
 /** P0: single snapshot for the prediction dashboard (one pool client). */
+/** Delivery-stage timestamps for one prediction signal (durable, from the
+ *  prediction_delivery_timeline view — never inferred from logs). */
+export interface DeliveryTimeline {
+  predictionId: string;
+  sourceGameId: string | null;
+  targetGameId: string | null;
+  generatedAt: string | null;
+  queuedAt: string | null;
+  dispatchStartedAt: string | null;
+  telegramAcceptedAt: string | null;
+  targetRoundStartedAt: string | null;
+  deliveryOutcome: "ON_TIME" | "LATE" | "UNKNOWN" | "EXPIRED" | "FAILED" | null;
+  leadTimeMs: number | null;
+}
+
+/** Lead-time aggregates over the recent delivery window.lead_time_ms and
+ *  delivery_outcome are computed by the worker from authoritative timestamps:
+ *  lead_time_ms = target_round_started_at - telegram_accepted_at
+ *  (positive = ON_TIME); delivery_outcome per migration 0029 rules. */
+export interface LeadTimeSnapshot {
+  windowHours: number;
+  total: number;
+  onTime: number;
+  late: number;
+  unknown: number;
+  expired: number;
+  failed: number;
+  pending: number;
+  latestLeadTimeMs: number | null;
+  p50LeadTimeMs: number | null;
+  p95LeadTimeMs: number | null;
+  minLeadTimeMs: number | null;
+  latest: DeliveryTimeline | null;
+}
+
 export interface DashboardSnapshot {
   dailyTarget: DailyTarget;
   today: TodayStats;
@@ -475,9 +509,88 @@ export interface DashboardSnapshot {
     healthKind: "RUNNING" | "DEGRADED" | "DATABASE_ERROR" | "OFFLINE" | "UNKNOWN";
     pool: { total: number; idle: number; waiting: number; max: number } | null;
   };
+  delivery: LeadTimeSnapshot | null;
   generatedAt: string;
   dbOk: boolean;
   dbError: string | null;
+}
+
+
+/** Lead-time aggregates from the durable delivery timeline (migration 0029).
+ *  Reads ONLY persisted lifecycle timestamps and the worker-recorded
+ *  delivery_outcome / lead_time_ms columns — no log inference. */
+export async function getLeadTimeSnapshot(windowHours = 24): Promise<LeadTimeSnapshot | null> {
+  const { getSql } = await import("@/lib/db");
+  const sql = await getSql();
+  try {
+    const outcomeRows = await sql<{ delivery_outcome: string | null; count: number }>`
+      select delivery_outcome, count(*)::int as count
+      from prediction_delivery_timeline
+      where generated_at >= now() - (${windowHours}::int * interval '1 hour')
+      group by delivery_outcome
+    `;
+    const pctRows = await sql<{ p50: number | null; p95: number | null; min_ms: number | null; latest_ms: number | null; n: number }>`
+      select
+        percentile_cont(0.5) within group (order by lead_time_ms) as p50,
+        percentile_cont(0.95) within group (order by lead_time_ms) as p95,
+        min(lead_time_ms) as min_ms,
+        (array_agg(lead_time_ms order by generated_at desc))[1] as latest_ms,
+        count(*)::int as n
+      from prediction_delivery_timeline
+      where lead_time_ms is not null
+        and generated_at >= now() - (${windowHours}::int * interval '1 hour')
+    `;
+    const latestRows = await sql<Record<string, unknown>>`
+      select prediction_id, source_game_id, target_game_id, generated_at, queued_at,
+             dispatch_started_at, telegram_accepted_at, target_round_started_at,
+             delivery_outcome, lead_time_ms
+      from prediction_delivery_timeline
+      order by generated_at desc
+      limit 1
+    `;
+    const byOutcome = new Map(outcomeRows.map((r) => [r.delivery_outcome ?? "UNKNOWN", r.count]));
+    const total = outcomeRows.reduce((acc, r) => acc + r.count, 0);
+    const delivered = total - (byOutcome.get("UNKNOWN") ?? 0);
+    const latest = latestRows[0];
+    const iso = (v: unknown): string | null => {
+      if (v == null) return null;
+      return v instanceof Date ? v.toISOString() : new Date(String(v)).toISOString();
+    };
+    return {
+      windowHours,
+      total,
+      onTime: byOutcome.get("ON_TIME") ?? 0,
+      late: byOutcome.get("LATE") ?? 0,
+      unknown: byOutcome.get("UNKNOWN") ?? 0,
+      expired: byOutcome.get("EXPIRED") ?? 0,
+      failed: byOutcome.get("FAILED") ?? 0,
+      pending: Math.max(0, total - delivered - (byOutcome.get("EXPIRED") ?? 0) - (byOutcome.get("FAILED") ?? 0)),
+      latestLeadTimeMs: pctRows[0]?.latest_ms ?? null,
+      p50LeadTimeMs: pctRows[0]?.p50 != null ? Math.round(Number(pctRows[0].p50)) : null,
+      p95LeadTimeMs: pctRows[0]?.p95 != null ? Math.round(Number(pctRows[0].p95)) : null,
+      minLeadTimeMs: pctRows[0]?.min_ms != null ? Number(pctRows[0].min_ms) : null,
+      latest: latest
+        ? {
+            predictionId: String(latest.prediction_id),
+            sourceGameId: latest.source_game_id != null ? String(latest.source_game_id) : null,
+            targetGameId: latest.target_game_id != null ? String(latest.target_game_id) : null,
+            generatedAt: iso(latest.generated_at),
+            queuedAt: iso(latest.queued_at),
+            dispatchStartedAt: iso(latest.dispatch_started_at),
+            telegramAcceptedAt: iso(latest.telegram_accepted_at),
+            targetRoundStartedAt: iso(latest.target_round_started_at),
+            deliveryOutcome:
+              latest.delivery_outcome != null
+                ? (String(latest.delivery_outcome) as DeliveryTimeline["deliveryOutcome"])
+                : null,
+            leadTimeMs: latest.lead_time_ms != null ? Number(latest.lead_time_ms) : null,
+          }
+        : null,
+    };
+  } catch {
+    // View may not exist yet (pre-0029 database) — no fabricated numbers.
+    return null;
+  }
 }
 
 export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
@@ -691,6 +804,7 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
       pool: poolSnap(),
     };
 
+    const delivery = await getLeadTimeSnapshot();
     return {
       dailyTarget,
       today,
@@ -699,6 +813,7 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
       recent,
       pending,
       worker,
+      delivery,
       generatedAt,
       dbOk: true,
       dbError: null,
@@ -740,6 +855,7 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
       recent: [],
       pending: { hasPending: false, pendingCount: 0, oldestPendingAt: null },
       worker: w,
+      delivery: null,
       generatedAt,
       dbOk: false,
       dbError: msg,

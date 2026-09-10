@@ -114,7 +114,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const result = await ingestEdgeFrame(body, req.headers.authorization);
-    sendJson(res, result.ok ? 200 : (result.status ?? 500), result);
+    sendJson(res, result.ok ? 200 : result.status, result);
     return;
   }
 
