@@ -208,12 +208,117 @@ function getPipelineFn(): PipelineFn | null {
   return cachedPipelineFn;
 }
 
+/**
+ * P0 authoritative path: observe is done by the caller (onGameEndPredict)
+ * on the shared ACIE; this function evaluates N+1 from that shared state.
+ * Falls back to PredictionEngine only when ACIE is unavailable.
+ */
 const defaultPredictFn = (
   priorRounds: HistoricalRound[],
   targetRoundId: string,
   timestamp: string,
   target: ThresholdTarget,
 ) => {
+  // Prefer ACIE evaluation from the shared singleton (post-observe).
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sharedMod = require("../acie/shared-engine.ts") as {
+      getSharedACIEEngine: () => {
+        historySize: () => number;
+        evaluateNext: (risk?: unknown) => {
+          psi: { estimatedProbability: number; modelUncertainty: number; dataUncertainty: number };
+          regime: string;
+          strategy: { action: string; reason: string; isOpportunity?: boolean };
+          evidence: { status: string };
+        };
+        getOnlineState: () => { observationCount?: number; ewmaHitRate?: number };
+        exportSnapshot: () => { crashPoints: number[] };
+      };
+      getSharedACIEInstanceId: () => string;
+    };
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const provMod = require("../acie/provenance.ts") as {
+      buildAcieFeatureFingerprint: (a: Record<string, unknown>) => string;
+      buildProvenance: (a: Record<string, unknown>) => Record<string, unknown>;
+    };
+    const acie = sharedMod.getSharedACIEEngine();
+    if (acie.historySize() >= 5) {
+      const evaluation = acie.evaluateNext();
+      const online = acie.getOnlineState();
+      const snap = acie.exportSnapshot();
+      const probability = Math.min(
+        0.99,
+        Math.max(0.01, evaluation.psi.estimatedProbability),
+      );
+      const confidence = Math.max(
+        0,
+        Math.min(1, 1 - (evaluation.psi.modelUncertainty ?? 0.3)),
+      );
+      const featureHash = provMod.buildAcieFeatureFingerprint({
+        crashPointsTail: snap.crashPoints,
+        observationCount: online.observationCount ?? 0,
+        regime: String(evaluation.regime ?? "unknown"),
+        ewmaHitRate: online.ewmaHitRate ?? 0,
+        psiProbability: probability,
+      });
+      const provenance = provMod.buildProvenance({
+        sourceGameId: String(
+          (priorRounds[priorRounds.length - 1] as { externalRoundId?: string } | undefined)
+            ?.externalRoundId ?? "",
+        ),
+        targetGameId: targetRoundId,
+        online,
+        evaluation,
+        mode: "NORMAL_ACIE",
+        executionPath: "shared-acie.evaluateNext",
+        probability,
+        confidence,
+        featureHash,
+        modelName: "acie-psi",
+        modelVersion: "acie-v3",
+      });
+      const predictionId = randomUUID();
+      logger.info(
+        {
+          component: "live-predictor",
+          event: "PREDICTION_GENERATION",
+          predictionId,
+          targetGameId: targetRoundId,
+          ...provenance,
+        },
+        "ACIE authoritative prediction generated",
+      );
+      return {
+        predictionId,
+        probability,
+        confidence,
+        regimeId: String(evaluation.regime ?? null),
+        reasoning: [
+          evaluation.strategy?.reason ?? "acie",
+          `action=${evaluation.strategy?.action}`,
+          `evidence=${evaluation.evidence?.status}`,
+          `obs=${online.observationCount ?? 0}`,
+          `feature_hash=${featureHash}`,
+        ],
+        featureSummary: {
+          ...(typeof provenance === "object" ? provenance : {}),
+          acieAuthoritative: true,
+        },
+        modelVersion: "acie-v3",
+        featurePath: "ACIE_STATE",
+      };
+    }
+  } catch (e) {
+    logger.warn(
+      {
+        component: "live-predictor",
+        error: e instanceof Error ? e.message : String(e),
+      },
+      "ACIE evaluateNext unavailable — falling back to PredictionEngine",
+    );
+  }
+
+  // FALLBACK_BASELINE path (must be visible)
   const engine = getSharedPredictionEngine();
   const signal = engine.predict({
     priorRounds,
@@ -225,11 +330,13 @@ const defaultPredictFn = (
   let probability = signal.probability;
   let confidence = signal.confidence;
   let modelVersion = signal.modelVersion ?? "live-v2";
+  let executionMode = "FALLBACK_BASELINE";
   const reasoning: string[] = Array.isArray(signal.reasoning)
     ? [...signal.reasoning]
     : signal.reasoning
       ? [String(signal.reasoning)]
       : [];
+  reasoning.push("execution_mode=FALLBACK_BASELINE");
 
   if (USE_ADVANCED_PIPELINE) {
     try {
@@ -246,10 +353,12 @@ const defaultPredictFn = (
       probability = pipe.calibratedProbability ?? pipe.metaProbability ?? probability;
       confidence = Math.min(1, Math.max(confidence, probability));
       modelVersion = `${modelVersion}+pipeline`;
+      executionMode = "ADVANCED_ACIE";
       reasoning.push(
         `pipeline_action=${pipe.action}`,
         `pipeline_reason=${pipe.reason}`,
         `threshold=${pipe.threshold}`,
+        "execution_mode=ADVANCED_ACIE",
       );
     } catch (e) {
       logger.warn(
@@ -265,7 +374,12 @@ const defaultPredictFn = (
     confidence,
     regimeId: signal.regimeId,
     reasoning,
-    featureSummary: signal.featureSummary,
+    featureSummary: {
+      ...(signal.featureSummary as Record<string, unknown> | undefined),
+      prediction_mode: executionMode,
+      execution_path: "PredictionEngine.predict",
+      acieAuthoritative: false,
+    },
     modelVersion,
     featurePath: signal.featurePath,
   };
@@ -793,6 +907,52 @@ export async function onGameEndPredict(
       sourceGameId: gameId,
       sourceCrashAt: crashedAt,
     };
+  }
+
+  // ── P0: Observe crash N on shared ACIE BEFORE evaluating N+1 ──
+  // Ordering invariant: Crash N → ACIE.observeRound → state advances → evaluate N+1
+  // Never allow PredictionEngine to predict N+1 before ACIE has learned Crash N.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { getSharedACIEEngine, getSharedACIEInstanceId } = require(
+      "../acie/shared-engine.ts",
+    ) as {
+      getSharedACIEEngine: () => {
+        observeRound: (r: {
+          roundId: string;
+          crashPoint: number;
+          timestamp?: string;
+        }) => { online: { observationCount?: number }; evaluation: unknown };
+        historySize: () => number;
+      };
+      getSharedACIEInstanceId: () => string;
+    };
+    const acie = getSharedACIEEngine();
+    const learnResult = acie.observeRound({
+      roundId: gameId,
+      crashPoint: multiplier,
+      timestamp: crashedAt,
+    });
+    logger.info(
+      {
+        component: "live-predictor",
+        event: "ACIE_OBSERVATION",
+        gameId,
+        multiplier,
+        observationCount: learnResult?.online?.observationCount ?? acie.historySize(),
+        acieInstanceId: getSharedACIEInstanceId(),
+      },
+      "ACIE observed crash before N+1 evaluation",
+    );
+  } catch (e) {
+    logger.warn(
+      {
+        component: "live-predictor",
+        sourceGameId: gameId,
+        error: e instanceof Error ? e.message : String(e),
+      },
+      "ACIE observeRound failed on hot path — prediction may use stale/fallback path",
+    );
   }
 
   // ── P0: Prediction computation only (ZERO DB, ZERO Telegram, ZERO outbox) ──
