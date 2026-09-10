@@ -51,7 +51,8 @@ function toIsoString(timestamp: number | string | undefined): string | null {
     return new Date().toISOString();
   }
   const date = new Date(ms);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  return Number.isNaN(date.getT
+ime()) ? null : date.toISOString();
 }
 
 function extractLastGameId(payload: unknown): string | null {
@@ -107,7 +108,8 @@ async function bgHandler(payload: unknown): Promise<void> {
     await Promise.all([
       markLiveRoundStarted(gameId, beganAt, "socket", correlationId, sql).catch(() => undefined),
       // P0 (temporal validity): authoritative round-start backfill on the
-      // prediction registry — re-evaluates createdAt < targetStartedAt.
+      // pre
+diction registry — re-evaluates createdAt < targetStartedAt.
       import("@/lib/prediction/identity/prediction-registry")
         .then(({ globalPredictionRegistry }) => {
           globalPredictionRegistry.noteTargetStarted(gameId, beganAt);
@@ -160,7 +162,8 @@ function normalizeCrashEnd(
   if (!raw.gameId) return null;
   const crashedAt =
     toIsoString((raw.crashedAt ?? raw.endTime) as number | string | undefined) ??
-    new Date().toISOString();
+    new D
+ate().toISOString();
   return {
     gameId: raw.gameId,
     multiplier: raw.multiplier ?? null,
@@ -223,96 +226,79 @@ async function edHandler(payload: unknown): Promise<void> {
     }
     mark(trace, "state_updated");
 
+    
     const targetGameId = nextTargetGameId(gameId);
     trace.targetGameId = targetGameId;
-    const claim = claimTarget(targetGameId, `ed:${gameId}`);
-    mark(trace, "target_claimed");
 
-    if (claim.owned) {
-      // Fix 8: the authoritative shared attempt path (same function poll uses).
-      try {
-        const result = await attemptNPlusOnePrediction({
-          sourceRoundId: gameId,
-          sourceCrashAt: crashedAt,
-          sourceMultiplier: multiplier,
-          source: "ED",
-          correlationId,
-          trace,
-        });
-        const totalMs = finishSignalReady(trace);
-        if (result.attempted) {
-          completeTarget(targetGameId, `ed:${gameId}`);
-          logger.info(
-            {
-              event: sourceEvent,
-              gameId,
-              targetGameId,
-              predictionId: result.predictionId,
-              ed_to_signal_ms: Math.round(totalMs * 100) / 100,
-              correlationId,
-            },
-            "ED→N+1 signal ready",
-          );
-        } else {
-          // soft miss — release so poll can recover if needed
-          releaseTarget(targetGameId, `ed:${gameId}`);
-          logger.info(
-            {
-              event: sourceEvent,
-              gameId,
-              targetGameId,
-              kind: result.kind,
-              ed_to_signal_ms: Math.round(totalMs * 100) / 100,
-            },
-            "ED→N+1 soft result",
-          );
-          // Immediate recovery retry when ED soft-failed/exception before target starts.
-          if (result.kind && (result.kind.startsWith("exception") || result.kind === "insufficient_history")) {
-            scheduleImmediateN1Recovery({
-              sourceRoundId: gameId,
-              sourceCrashAt: crashedAt,
-              sourceMultiplier: multiplier,
-              correlationId,
-            });
-          }
-        }
-      } catch (error) {
-        releaseTarget(targetGameId, `ed:${gameId}`);
-        const err = error instanceof Error ? error : new Error(String(error));
-        logger.error(
+    // PHASE 2: Single ownership boundary - attemptNPlusOnePrediction handles claimTarget
+    try {
+      const result = await attemptNPlusOnePrediction({
+        sourceRoundId: gameId,
+        sourceCrashAt: crashedAt,
+        sourceMultiplier: multiplier,
+        source: "ED",
+        correlationId,
+        trace,
+      });
+      const totalMs = finishSignalReady(trace);
+      if (result.attempted) {
+        completeTarget(targetGameId, `ed:${gameId}`);
+        logger.info(
           {
             event: sourceEvent,
             gameId,
             targetGameId,
+            predictionId: result.predictionId,
+            ed_to_signal_ms: Math.round(totalMs * 100) / 100,
             correlationId,
-            errorName: err.name,
-            errorMessage: err.message,
-            errorStack: err.stack?.slice(0, 2000) ?? null,
           },
-          "ED→N+1 prediction failed",
+          "ED→N+1 signal ready",
         );
-        scheduleImmediateN1Recovery({
-          sourceRoundId: gameId,
-          sourceCrashAt: crashedAt,
-          sourceMultiplier: multiplier,
-          correlationId,
-        });
+      } else {
+        // soft miss — release so poll can recover if needed
+        releaseTarget(targetGameId, `ed:${gameId}`);
+        logger.info(
+          {
+            event: sourceEvent,
+            gameId,
+            targetGameId,
+            kind: result.kind,
+            ed_to_signal_ms: Math.round(totalMs * 100) / 100,
+          },
+          "ED→N+1 soft result",
+        );
+        // Immediate recovery retry when ED soft-failed/exception before target starts.
+        if (result.kind && (result.kind.startsWith("exception") || result.kind === "insufficient_history")) {
+          scheduleImmediateN1Recovery({
+            sourceRoundId: gameId,
+            sourceCrashAt: crashedAt,
+            sourceMultiplier: multiplier,
+            correlationId,
+          });
+        }
       }
-    } else {
-      logger.info(
+    } catch (error) {
+      releaseTarget(targetGameId, `ed:${gameId}`);
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.error(
         {
           event: sourceEvent,
           gameId,
           targetGameId,
-          reason: claim.reason,
-          owner: claim.owner,
+          correlationId,
+          errorName: err.name,
+          errorMessage: err.message,
+          errorStack: err.stack?.slice(0, 2000) ?? null,
         },
-        "ED skip predict — target already claimed",
+        "ED→N+1 prediction failed",
       );
-    }
-
-    // --- P2 DURABILITY / validation async (must not block signal) ---
-    void (async () => {
+      scheduleImmediateN1Recovery({
+        sourceRoundId: gameId,
+        sourceCrashAt: crashedAt,
+        sourceMultiplier: multiplier,
+        correlationId,
+      });
+    }void (async () => {
       mark(trace, "persist_started");
       try {
         const sql = await getSql();
@@ -345,7 +331,8 @@ async function edHandler(payload: unknown): Promise<void> {
         });
         mark(trace, "persist_completed");
       } catch (error) {
-        logger.error({ event: sourceEvent, gameId, error: String(error) }, "ed async persist failed");
+        logger.error({ event: sourceEvent, gameId, error: String(error) }, "ed asy
+nc persist failed");
       }
     })();
   } catch (error) {
@@ -411,7 +398,8 @@ export async function startEventDrivenPipeline(): Promise<void> {
   initializeEventHandlers();
   try {
     const sql = await getSql();
-    if (shouldResyncClock(0)) {
+    if (shouldR
+esyncClock(0)) {
       await syncDbClockOffset(sql).catch(() => undefined);
     }
     const rows = await sql<{ game_id: string }>`
