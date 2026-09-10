@@ -532,6 +532,30 @@ export class OutboxDispatcher {
                 },
                 "OUTBOX_DISPATCH delivered",
               );
+              // Forensics: classify ON_TIME/LATE/UNKNOWN vs target start if known
+              try {
+                const { recordDeliveredForensics } = await import(
+                  "@/lib/prediction/live/delivery-forensics"
+                );
+                const metaF = (row.metadata ?? {}) as Record<string, unknown>;
+                await recordDeliveredForensics(sql, {
+                  notificationId: row.notification_id,
+                  predictionId:
+                    typeof metaF.predictionId === "string" ? metaF.predictionId : null,
+                  correlationId:
+                    typeof metaF.correlationId === "string" ? metaF.correlationId : null,
+                  sourceGameId:
+                    typeof metaF.sourceGameId === "string" ? metaF.sourceGameId : null,
+                  targetGameId:
+                    (row.target_game_id as string | null) ??
+                    (typeof metaF.targetGameId === "string" ? metaF.targetGameId : null),
+                  createdAt: row.created_at,
+                  sendStartedAtMs: lc.sendStartedMs,
+                  telegramAcceptedAtMs: acceptedMs,
+                });
+              } catch {
+                /* soft */
+              }
               logger.info(
                 {
                   component: "timing",
