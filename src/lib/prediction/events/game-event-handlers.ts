@@ -28,6 +28,7 @@ import {
   startTrace,
   mark,
   finishSignalReady,
+  finishPersist,
   logLatencyBudgetSnapshot,
 } from "@/lib/prediction/live/latency-trace";
 import { syncDbClockOffset, shouldResyncClock } from "@/lib/prediction/live/clock-offset";
@@ -35,6 +36,57 @@ import { syncDbClockOffset, shouldResyncClock } from "@/lib/prediction/live/cloc
 const logger = getLogger("game-event-handlers");
 const inFlightEd = new Set<string>();
 const inFlightBg = new Set<string>();
+
+// P0 — native WS duplicate-event dedup (idempotency by canonical round ID).
+// inFlightEd only blocks CONCURRENT re-entry; the same crash event arriving
+// again after the first handler finished (observed 350ms–1.2s apart in prod)
+// re-ran the entire ED pipeline. game ID is the idempotency key — never the
+// timestamp. Bounded ledger: pruned on insert, capped.
+const completedEdRounds = new Map<string, number>();
+const ED_DEDUP_TTL_MS = 10 * 60_000;
+const ED_DEDUP_MAX = 1_000;
+
+export type EdReentryClassification =
+  | "new"
+  | "duplicate_event"
+  | "already_in_progress";
+
+/** Pure classification of a re-entrant ED crash event for one round ID. */
+export function classifyEdReentry(gameId: string): EdReentryClassification {
+  if (completedEdRounds.has(gameId)) return "duplicate_event";
+  if (inFlightEd.has(gameId)) return "already_in_progress";
+  return "new";
+}
+
+function recordEdRoundProcessed(gameId: string): void {
+  const now = Date.now();
+  completedEdRounds.set(gameId, now);
+  // Drop expired entries, then enforce the hard cap (oldest first).
+  for (const [id, ts] of completedEdRounds) {
+    if (now - ts > ED_DEDUP_TTL_MS) completedEdRounds.delete(id);
+  }
+  while (completedEdRounds.size > ED_DEDUP_MAX) {
+    let oldestId: string | null = null;
+    let oldestTs = Number.POSITIVE_INFINITY;
+    for (const [id, ts] of completedEdRounds) {
+      if (ts < oldestTs) {
+        oldestTs = ts;
+        oldestId = id;
+      }
+    }
+    if (oldestId == null) break;
+    completedEdRounds.delete(oldestId);
+  }
+}
+
+/** Test/observability hook: mark a round processed (used by tests). */
+export function recordEdRoundProcessedForTests(gameId: string): void {
+  recordEdRoundProcessed(gameId);
+}
+
+export function _resetEdDedupForTests(): void {
+  completedEdRounds.clear();
+}
 
 // Phase 5: recovery control — max 1 immediate recovery per source, then quarantine.
 const recoveryAttempts = new Map<string, number>();
@@ -241,7 +293,21 @@ function normalizeCrashEnd(
 async function edHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
   if (!gameId) return;
-  if (inFlightEd.has(gameId)) return;
+  // P0: dedupe by canonical round ID BEFORE any computation. Duplicate native
+  // WS events must never reach claim/N+1 compute — classify and stop here.
+  const reentry = classifyEdReentry(gameId);
+  if (reentry !== "new") {
+    logger.info(
+      {
+        component: "game-event-handlers",
+        event: "ed",
+        gameId,
+        ownership_result: reentry,
+      },
+      "ED crash event deduplicated — skipping reprocessing",
+    );
+    return;
+  }
   inFlightEd.add(gameId);
 
   const correlationId = randomUUID();
@@ -311,6 +377,7 @@ async function edHandler(payload: unknown): Promise<void> {
             event: sourceEvent,
             gameId,
             targetGameId,
+            ownership_result: "owned_predicted",
             predictionId: result.predictionId,
             kind: result.kind,
             ed_to_signal_ms: Math.round(totalMs * 100) / 100,
@@ -326,6 +393,8 @@ async function edHandler(payload: unknown): Promise<void> {
             event: sourceEvent,
             gameId,
             targetGameId,
+            ownership_result:
+              result.kind === "duplicate" ? "already_persisted" : `soft:${result.kind ?? "unknown"}`,
             kind: result.kind,
             ed_to_signal_ms: Math.round(totalMs * 100) / 100,
             correlationId,
@@ -403,6 +472,8 @@ async function edHandler(payload: unknown): Promise<void> {
           );
         });
         mark(trace, "persist_completed");
+        // P1: record persist/outbox-enqueue leg durations into the latency budget.
+        finishPersist(trace);
       } catch (error) {
         logger.error({ event: sourceEvent, gameId, error: String(error) }, "ed async persist failed");
       }
@@ -411,6 +482,9 @@ async function edHandler(payload: unknown): Promise<void> {
     logger.error({ event: sourceEvent, gameId, error: String(error) }, "ed handler failed");
   } finally {
     inFlightEd.delete(gameId);
+    // Round fully processed (predict attempt + async persist kicked off).
+    // Any further native WS event for this ID is a duplicate by definition.
+    recordEdRoundProcessed(gameId);
   }
 }
 
@@ -530,6 +604,8 @@ export async function startEventDrivenPipeline(): Promise<void> {
 export async function stopEventDrivenPipeline(): Promise<void> {
   inFlightEd.clear();
   inFlightBg.clear();
+  completedEdRounds.clear();
+  recoveryAttempts.clear();
   try {
     await nativeBcGameSocket.stop();
   } catch {

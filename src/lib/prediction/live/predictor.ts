@@ -16,6 +16,7 @@
 import { randomUUID } from "node:crypto";
 import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
 import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
+import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { getSql, getPgPool, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
@@ -105,6 +106,8 @@ export type OnGameStartResult =
 
 interface PredictorDeps {
   getSqlFn?: () => Promise<Sql>;
+  /** Optional latency trace — marked at outbox enqueue on the ED hot path. */
+  trace?: Trace | null;
   predictFn?: (
     priorRounds: HistoricalRound[],
     targetRoundId: string,
@@ -675,6 +678,7 @@ export async function onGameEndPredict(
   deps: PredictorDeps = {},
 ): Promise<OnGameEndPredictResult> {
   const predictFn = deps.predictFn ?? defaultPredictFn;
+  const trace = deps.trace ?? null;
 
   // ── Latency instrumentation: stage-level timing ──
   const t0 = performance.now(); // WS event received (caller already decoded)
@@ -1047,6 +1051,11 @@ export async function onGameEndPredict(
       try {
         const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
         notifyOutbox();
+      } catch { /* soft */ }
+      // P1 latency chain: outbox row is durably enqueued at this point.
+      try {
+        const { mark } = await import("@/lib/prediction/live/latency-trace");
+        if (trace) mark(trace, "outbox_enqueued");
       } catch { /* soft */ }
 
       try { completeTarget(targetGameId, owner); } catch { /* soft */ }

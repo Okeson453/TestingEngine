@@ -49,8 +49,53 @@ interface OutboxRow {
   status: string;
   attempt_count: number;
   next_attempt_at: string;
+  created_at: string;
   telegram_deadline_at?: string | Date | null;
   priority?: number;
+}
+
+/** Per-attempt lifecycle timestamps captured in memory and persisted at the
+ * terminal transition (delivered / dead / requeued). Zero extra DB round-trips:
+ * the claim stamps dispatch_claimed_at server-side, everything else rides the
+ * completion UPDATE. */
+interface RowLifecycle {
+  claimClientMs: number;
+  sendStartedMs: number | null;
+  telegramAcceptedMs: number | null;
+}
+
+function lifecycleLogFields(
+  row: OutboxRow,
+  lc: RowLifecycle,
+  nowMs: number,
+  status: string,
+): Record<string, unknown> {
+  const createdMs = new Date(row.created_at).getTime();
+  const ageMs = Number.isFinite(createdMs) ? Math.max(0, nowMs - createdMs) : null;
+  const queueWaitMs = Number.isFinite(createdMs)
+    ? Math.max(0, lc.claimClientMs - createdMs)
+    : null;
+  const dispatchMs =
+    lc.sendStartedMs != null ? Math.max(0, lc.sendStartedMs - lc.claimClientMs) : null;
+  const sendMs =
+    lc.sendStartedMs != null && lc.telegramAcceptedMs != null
+      ? Math.max(0, lc.telegramAcceptedMs - lc.sendStartedMs)
+      : null;
+  return {
+    id: row.id,
+    notificationId: row.notification_id,
+    type: row.type,
+    status,
+    attempt: row.attempt_count,
+    ageMs: ageMs != null ? Math.round(ageMs) : null,
+    queueWaitMs: queueWaitMs != null ? Math.round(queueWaitMs) : null,
+    dispatchMs: dispatchMs != null ? Math.round(dispatchMs) : null,
+    sendMs: sendMs != null ? Math.round(sendMs) : null,
+    totalDeliveryMs:
+      ageMs != null && lc.telegramAcceptedMs != null
+        ? Math.round(lc.telegramAcceptedMs - createdMs)
+        : null,
+  };
 }
 
 export interface DispatcherStats {
@@ -115,6 +160,7 @@ export class OutboxDispatcher {
     let delivered = 0;
     let dead = 0;
     let requeued = 0;
+    const tickStartMs = this.now();
 
     const sql = await this.getSqlFn();
 
@@ -137,16 +183,18 @@ export class OutboxDispatcher {
           )
           UPDATE notification_outbox n
           SET status = 'inflight',
-              attempt_count = attempt_count + 1
+              attempt_count = attempt_count + 1,
+              dispatch_claimed_at = now()
           FROM picked
           WHERE n.id = picked.id AND n.status = 'pending'
           RETURNING n.id, n.notification_id, n.type, n.content, n.metadata, n.status,
-                    n.attempt_count, n.next_attempt_at, n.telegram_deadline_at, n.priority
+                    n.attempt_count, n.next_attempt_at, n.created_at,
+                    n.telegram_deadline_at, n.priority
         `;
       } catch {
         const rows = await tx<OutboxRow>`
           select id, notification_id, type, content, metadata, status, attempt_count,
-                 next_attempt_at, telegram_deadline_at, priority
+                 next_attempt_at, created_at, telegram_deadline_at, priority
           from notification_outbox
           where status = 'pending'::text
             and next_attempt_at <= now()
@@ -158,7 +206,8 @@ export class OutboxDispatcher {
         for (const r of rows) {
           await tx`
             update notification_outbox
-            set status = 'inflight', attempt_count = attempt_count + 1
+            set status = 'inflight', attempt_count = attempt_count + 1,
+                dispatch_claimed_at = now()
             where id = ${r.id} and status = 'pending'
           `;
           r.attempt_count = (r.attempt_count ?? 0) + 1;
@@ -170,6 +219,9 @@ export class OutboxDispatcher {
     if (claimed.length > 0) {
       this.stats.claimed += claimed.length;
     }
+    // Client-side claim clock: consistent basis for all in-process durations
+    // (DB now() vs client clock skew must not pollute queue_wait/dispatch ms).
+    const claimClientMs = this.now();
 
     // Parallel dispatch bounded by BATCH_PARALLELISM (P0 / 6.5)
     const parallelism = Math.max(1, BATCH_PARALLELISM);
@@ -177,6 +229,11 @@ export class OutboxDispatcher {
       const chunk = claimed.slice(i, i + parallelism);
       const results = await Promise.all(
         chunk.map(async (row) => {
+          const lc: RowLifecycle = {
+            claimClientMs,
+            sendStartedMs: null,
+            telegramAcceptedMs: null,
+          };
           try {
             // Deadline-aware pre-send check (P0): stop if past telegram_deadline_at
             const deadlineRaw = row.telegram_deadline_at;
@@ -197,10 +254,10 @@ export class OutboxDispatcher {
               logger.warn(
                 {
                   component: "outbox-dispatcher",
-                  notificationId: row.notification_id,
+                  ...lifecycleLogFields(row, lc, this.now(), "dead_expired_before_send"),
                   remainingMs,
                 },
-                "expired before send — not delivering late signal",
+                "OUTBOX_DISPATCH expired before send — not delivering late signal",
               );
               return "dead" as const;
             }
@@ -273,6 +330,7 @@ export class OutboxDispatcher {
               200,
               Math.min(5_000, Number.isFinite(remainingMs) ? remainingMs - 50 : 5_000),
             );
+            lc.sendStartedMs = this.now();
             const sendResults = await sendTelegramMessage(row.content, {
               timeout: sendTimeout,
             });
@@ -297,16 +355,29 @@ export class OutboxDispatcher {
                   "partial Telegram fan-out — delivered to healthy chats",
                 );
               }
-              const t0 = this.now();
-              const acceptedAt = new Date(t0).toISOString();
+              const acceptedMs = this.now();
+              lc.telegramAcceptedMs = acceptedMs;
+              const acceptedAt = new Date(acceptedMs).toISOString();
               await sql`
                 update notification_outbox
                 set status = 'delivered',
                     delivered_at = ${acceptedAt}::timestamptz,
+                    send_started_at = ${new Date(lc.sendStartedMs).toISOString()}::timestamptz,
+                    telegram_accepted_at = ${acceptedAt}::timestamptz,
                     last_error = null
                 where id = ${row.id}
               `;
               this.stats.delivered += 1;
+              logger.info(
+                {
+                  component: "outbox-dispatcher",
+                  ...lifecycleLogFields(row, lc, acceptedMs, "delivered"),
+                  remainingBudgetMs: Number.isFinite(remainingMs)
+                    ? Math.round(remainingMs)
+                    : null,
+                },
+                "OUTBOX_DISPATCH delivered",
+              );
               logger.info(
                 {
                   component: "timing",
@@ -324,19 +395,14 @@ export class OutboxDispatcher {
                 const { outboxDeliveryMs } = await import(
                   "@/lib/observability/performance/latency"
                 );
-                const claimedAt = row.next_attempt_at
-                  ? new Date(row.next_attempt_at).getTime()
-                  : NaN;
-                if (Number.isFinite(claimedAt)) {
-                  outboxDeliveryMs.observe(Math.max(0, t0 - claimedAt));
-                }
+                // Honest measurement: actual claim → Telegram accepted for THIS
+                // attempt (was previously approximated from next_attempt_at).
+                outboxDeliveryMs.observe(Math.max(0, acceptedMs - claimClientMs));
                 // Fix 13: feed the delivery leg into the latency trace chain
                 const { recordDeliveryLatency } = await import(
                   "@/lib/prediction/live/latency-trace"
                 );
-                if (Number.isFinite(claimedAt)) {
-                  recordDeliveryLatency(Math.max(0, t0 - claimedAt));
-                }
+                recordDeliveryLatency(Math.max(0, acceptedMs - claimClientMs));
               } catch { /* metrics optional */ }
 
               // Phase 19 — record lead times when target_round_started_at is known
@@ -406,13 +472,21 @@ export class OutboxDispatcher {
               await sql`
                 update notification_outbox
                 set status = 'dead_letter',
+                    send_started_at = ${new Date(lc.sendStartedMs).toISOString()}::timestamptz,
                     last_error = ${'expired_after_failed_send: ' + (sendResults.find((r) => !r.ok)?.error ?? 'send_failed')}
                 where id = ${row.id}
               `;
               this.stats.dead += 1;
+              logger.warn(
+                {
+                  component: "outbox-dispatcher",
+                  ...lifecycleLogFields(row, lc, this.now(), "dead_expired_after_failed_send"),
+                },
+                "OUTBOX_DISPATCH dead-lettered: no budget for another attempt",
+              );
               return "dead" as const;
             }
-            const updated = await this.handleFailure(sql, row, sendResults);
+            const updated = await this.handleFailure(sql, row, sendResults, lc);
             return updated;
           } catch (e) {
             this.stats.lastError = String(e);
@@ -424,7 +498,7 @@ export class OutboxDispatcher {
               },
               "send threw; treating as retryable",
             );
-            const updated = await this.handleFailure(sql, row, []);
+            const updated = await this.handleFailure(sql, row, [], lc);
             return updated;
           }
         }),
@@ -435,6 +509,25 @@ export class OutboxDispatcher {
         else requeued += 1;
       }
     }
+    if (claimed.length > 0) {
+      // Per-tick observability: proves the dispatcher is alive, how much it
+      // claims per pass, and how long a full drain takes (identifies whether
+      // one slow Telegram request dominates a pass — chunk parallelism makes
+      // drain time ≈ ceil(claimed/parallelism) × slowest send).
+      logger.info(
+        {
+          component: "outbox-dispatcher",
+          claimed: claimed.length,
+          batchSize: BATCH_SIZE,
+          parallelism: BATCH_PARALLELISM,
+          delivered,
+          dead,
+          requeued,
+          drainMs: Math.round(this.now() - tickStartMs),
+        },
+        "OUTBOX_TICK drained claimed rows",
+      );
+    }
     return { recovered: 0, delivered, dead, requeued };
   }
 
@@ -443,39 +536,81 @@ export class OutboxDispatcher {
     const sql = await this.getSqlFn();
 
     // Health signal: pending rows older than 5s mean the dispatcher is lagging.
+    // Split into CLAIMABLE (dispatcher can and should have taken them) vs
+    // EXPIRED (past telegram_deadline_at — the claim query will never take
+    // them; they are zombie rows awaiting recover cleanup). Conflating the
+    // two made healthy dispatches look stalled whenever a non-prediction row
+    // missed its deadline.
     try {
-      const backlog = await sql<{ c: number; oldest_ms: number | null }>`
-        SELECT count(*)::int AS c,
-               EXTRACT(EPOCH FROM (now() - min(next_attempt_at))) * 1000 AS oldest_ms
+      const backlog = await sql<{
+        claimable: number;
+        expired: number;
+        oldest_claimable_ms: number | null;
+        oldest_expired_ms: number | null;
+      }>`
+        SELECT count(*) FILTER (WHERE telegram_deadline_at IS NULL OR telegram_deadline_at > now())::int AS claimable,
+               count(*) FILTER (WHERE telegram_deadline_at IS NOT NULL AND telegram_deadline_at <= now())::int AS expired,
+               EXTRACT(EPOCH FROM (now() - min(next_attempt_at) FILTER (WHERE telegram_deadline_at IS NULL OR telegram_deadline_at > now()))) * 1000 AS oldest_claimable_ms,
+               EXTRACT(EPOCH FROM (now() - min(created_at) FILTER (WHERE telegram_deadline_at IS NOT NULL AND telegram_deadline_at <= now()))) * 1000 AS oldest_expired_ms
         FROM notification_outbox
         WHERE status = 'pending'
           AND next_attempt_at < now() - interval '5 seconds'
-      `.catch(() => [] as { c: number; oldest_ms: number | null }[]);
+      `.catch(
+        () =>
+          [] as {
+            claimable: number;
+            expired: number;
+            oldest_claimable_ms: number | null;
+            oldest_expired_ms: number | null;
+          }[],
+      );
       const row = backlog[0];
-      if (row && row.c > 0) {
+      if (row && (row.claimable > 0 || row.expired > 0)) {
         this.stats.backlogWarnings += 1;
-        logger.warn(
-          {
-            component: "outbox-dispatcher",
-            pendingOlderThan5s: row.c,
-            oldestPendingMs: row.oldest_ms != null ? Math.round(Number(row.oldest_ms)) : null,
-          },
-          "outbox backlog: pending rows older than 5s — dispatcher may be stalled",
-        );
+        if (row.claimable > 0) {
+          logger.warn(
+            {
+              component: "outbox-dispatcher",
+              kind: "claimable_backlog",
+              pendingOlderThan5s: row.claimable,
+              expiredPending: row.expired,
+              oldestClaimableMs:
+                row.oldest_claimable_ms != null
+                  ? Math.round(Number(row.oldest_claimable_ms))
+                  : null,
+            },
+            "outbox backlog: claimable pending rows older than 5s — dispatcher may be stalled",
+          );
+        } else {
+          logger.warn(
+            {
+              component: "outbox-dispatcher",
+              kind: "expired_backlog",
+              expiredPending: row.expired,
+              oldestExpiredMs:
+                row.oldest_expired_ms != null
+                  ? Math.round(Number(row.oldest_expired_ms))
+                  : null,
+            },
+            "outbox backlog: expired pending rows (unclaimable, awaiting recovery cleanup)",
+          );
+        }
       }
     } catch {
       /* soft */
     }
 
-    // Dead-letter overdue prediction rows past telegram deadline (or very old).
-    // Re-queueing them only produces permanent failure / noise and never helps.
+    // Dead-letter overdue rows past telegram deadline (or very old, any type).
+    // Previously restricted to type='prediction', which let expired
+    // validation/alert/summary rows strand as unclaimable pending zombies and
+    // trip the backlog health check forever. Re-queueing them only produces
+    // permanent failure / noise and never helps.
     try {
       await sql`
         update notification_outbox
         set status = 'dead_letter',
             last_error = coalesce(last_error, '') || ' [expired on recover: past deadline or stale]'
-        where type = 'prediction'
-          and status in ('pending', 'inflight')
+        where status in ('pending', 'inflight')
           and (
             (telegram_deadline_at is not null and telegram_deadline_at < now())
             or created_at < now() - interval '2 minutes'
@@ -509,6 +644,7 @@ export class OutboxDispatcher {
     sql: Sql,
     row: OutboxRow,
     results: SendResult[],
+    lc?: RowLifecycle,
   ): Promise<"dead" | "requeued"> {
     // attempt_count was already incremented at claim time
     const attempts = row.attempt_count;
@@ -542,10 +678,23 @@ export class OutboxDispatcher {
         update notification_outbox
         set status = 'dead_letter',
             last_error = ${lastError},
-            next_attempt_at = now()
+            next_attempt_at = now(),
+            send_started_at = ${lc?.sendStartedMs != null ? new Date(lc.sendStartedMs).toISOString() : null}::timestamptz,
+            telegram_accepted_at = ${lc?.telegramAcceptedMs != null ? new Date(lc.telegramAcceptedMs).toISOString() : null}::timestamptz
         where id = ${row.id}
       `;
       this.stats.dead += 1;
+      if (lc) {
+        logger.info(
+          {
+            component: "outbox-dispatcher",
+            ...lifecycleLogFields(row, lc, this.now(), "dead"),
+            httpStatus: firstFailure?.status ?? null,
+            providerError: lastError,
+          },
+          "OUTBOX_DISPATCH dead-lettered",
+        );
+      }
       // Rich diagnostics for operators (Diagnosis P0-6)
       let telegramChatId: string | null = firstFailure?.chatId ?? null;
       let predictionId: string | null = null;
@@ -609,10 +758,25 @@ export class OutboxDispatcher {
       update notification_outbox
       set status = 'pending',
           last_error = ${lastError},
-          next_attempt_at = now() + (${backoff}::int * interval '1 millisecond')
+          next_attempt_at = now() + (${backoff}::int * interval '1 millisecond'),
+          send_started_at = ${lc?.sendStartedMs != null ? new Date(lc.sendStartedMs).toISOString() : null}::timestamptz,
+          telegram_accepted_at = ${lc?.telegramAcceptedMs != null ? new Date(lc.telegramAcceptedMs).toISOString() : null}::timestamptz,
+          dispatch_claimed_at = null
       where id = ${row.id}
     `;
     this.stats.requeued += 1;
+    if (lc) {
+      logger.info(
+        {
+          component: "outbox-dispatcher",
+          ...lifecycleLogFields(row, lc, this.now(), "requeued"),
+          backoffMs: backoff,
+          httpStatus: firstFailure?.status ?? null,
+          providerError: lastError,
+        },
+        "OUTBOX_DISPATCH requeued for retry",
+      );
+    }
     return "requeued";
   }
 

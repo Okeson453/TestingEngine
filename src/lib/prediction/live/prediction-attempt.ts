@@ -126,7 +126,7 @@ export async function attemptNPlusOnePrediction(
       sourceCrashAt,
       sourceMultiplier,
       input.correlationId ?? crypto.randomUUID(),
-      { recoveryMode },
+      { recoveryMode, trace },
     );
     if (trace) trace.marks.prediction_completed = performance.now();
 

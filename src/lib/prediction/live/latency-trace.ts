@@ -15,6 +15,7 @@ export type Stage =
   | "prediction_completed"
   | "signal_ready"
   | "persist_started"
+  | "outbox_enqueued"
   | "persist_completed"
   | "delivery_started"
   | "delivery_accepted";
@@ -75,6 +76,30 @@ export function finishSignalReady(trace: Trace): number {
     }
   }
   return total;
+}
+
+/**
+ * P1: record the async persistence leg (signal → outbox insert → DB done).
+ * Called when the async persist IIFE completes, after finishSignalReady —
+ * the persist marks land on the same trace object after the signal is ready.
+ */
+export function finishPersist(trace: Trace): number {
+  mark(trace, "persist_completed");
+  const persistStart = trace.marks.persist_started;
+  const persistEnd = trace.marks.persist_completed;
+  if (persistStart != null && persistEnd != null) {
+    const arr = (stageSamples["persist"] ??= []);
+    arr.push(persistEnd - persistStart);
+    if (arr.length > MAX_SAMPLES) arr.shift();
+  }
+  const signalAt = trace.marks.signal_ready;
+  if (signalAt != null && persistEnd != null) {
+    const arr = (stageSamples["signal_to_persist"] ??= []);
+    arr.push(persistEnd - signalAt);
+    if (arr.length > MAX_SAMPLES) arr.shift();
+  }
+  const wsAt = trace.marks.ws_received ?? trace.t0;
+  return persistEnd != null ? Math.max(0, persistEnd - wsAt) : 0;
 }
 
 function percentile(arr: number[], p: number): number {

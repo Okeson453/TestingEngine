@@ -21,6 +21,12 @@ export interface InvariantViolation {
   detail: string;
   gameId?: string;
   predictionId?: string;
+  /** What the invariant requires, stated concretely. */
+  expected?: string;
+  /** What was actually observed in the DB. */
+  actual?: string;
+  /** Pipeline stage the violation belongs to (persistence, ownership, feedback…). */
+  stage?: string;
 }
 
 export interface InvariantCheckResult {
@@ -43,6 +49,9 @@ export function checkPredictionBeforeTargetStart(params: {
     return {
       id: "prediction_before_target_start",
       detail: `generated_at=${new Date(gen).toISOString()} >= started_at=${new Date(start).toISOString()}`,
+      expected: `prediction generated before target_round_started_at (${new Date(start).toISOString()})`,
+      actual: `generated_at=${new Date(gen).toISOString()} (Δ ${Math.round(gen - start)}ms after target start)`,
+      stage: "persistence",
     };
   }
   return null;
@@ -70,6 +79,9 @@ export async function sampleProductionInvariants(
         id: "one_active_prediction_per_target",
         detail: `target=${row.target_game_id} active=${row.c}`,
         gameId: row.target_game_id,
+        expected: "exactly 1 active (PENDING, unmatched) prediction per target round",
+        actual: `${row.c} active PENDING predictions for target ${row.target_game_id}`,
+        stage: "ownership/persistence",
       });
     }
   } catch (e) {
@@ -92,6 +104,9 @@ export async function sampleProductionInvariants(
         detail: `feedback not applied within 2m for prediction=${row.prediction_id}`,
         predictionId: row.prediction_id,
         gameId: row.game_id,
+        expected: "feedback_applied_at set within 2 minutes of resolved_at",
+        actual: `feedback_applied_at IS NULL for prediction=${row.prediction_id} (game ${row.game_id})`,
+        stage: "feedback",
       });
     }
   } catch (e) {
@@ -114,11 +129,16 @@ export async function sampleProductionInvariants(
       LIMIT 5
     `;
     for (const row of temporal) {
+      const requested = new Date(row.requested_at).toISOString();
+      const started = new Date(row.target_round_started_at).toISOString();
       violations.push({
         id: "prediction_before_target_start",
         detail: `prediction ${row.prediction_id} generated at/after target start`,
         predictionId: row.prediction_id,
         gameId: row.target_game_id,
+        expected: `requested_at < target_round_started_at (${started})`,
+        actual: `requested_at=${requested} (at/after target start)`,
+        stage: "persistence",
       });
     }
   } catch (e) {
@@ -149,9 +169,12 @@ export async function sampleProductionInvariants(
             detail: v.detail,
             gameId: v.gameId,
             predictionId: v.predictionId,
+            expected: v.expected,
+            actual: v.actual,
+            stage: v.stage,
           })),
         },
-        "production invariant violations detected",
+        `production invariant violations detected: ${[...new Set(violations.map((v) => v.id))].join(",")}`,
       );
     }
   }
