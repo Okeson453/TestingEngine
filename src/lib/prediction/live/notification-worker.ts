@@ -392,12 +392,18 @@ export class OutboxDispatcher {
                 "delivery accepted",
               );
               try {
-                const { outboxDeliveryMs } = await import(
+                const { outboxDeliveryMs, outboxTotalDeliveryMs } = await import(
                   "@/lib/observability/performance/latency"
                 );
                 // Honest measurement: actual claim → Telegram accepted for THIS
                 // attempt (was previously approximated from next_attempt_at).
                 outboxDeliveryMs.observe(Math.max(0, acceptedMs - claimClientMs));
+                // End-to-end: row INSERT → Telegram accepted (splits queue wait
+                // from send when read next to outboxDeliveryMs).
+                const createdMs = new Date(row.created_at).getTime();
+                if (Number.isFinite(createdMs)) {
+                  outboxTotalDeliveryMs.observe(Math.max(0, acceptedMs - createdMs));
+                }
                 // Fix 13: feed the delivery leg into the latency trace chain
                 const { recordDeliveryLatency } = await import(
                   "@/lib/prediction/live/latency-trace"

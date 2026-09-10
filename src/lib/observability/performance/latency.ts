@@ -40,6 +40,9 @@ export const predictionGenerationMs = makeRecorder("predictionGeneration");
 export const predictionPersistMs = makeRecorder("predictionPersist");
 export const edToPredictMs = makeRecorder("edToPredict");
 export const outboxDeliveryMs = makeRecorder("outboxDelivery");
+/** End-to-end: outbox row created (INSERT) → Telegram accepted. Complements
+ * outboxDeliveryMs (claim→accepted); together they split queue wait from send. */
+export const outboxTotalDeliveryMs = makeRecorder("outboxTotalDelivery");
 export const poolWaitMs = makeRecorder("poolWait");
 export const interRoundGapMs = makeRecorder("interRoundGap");
 export const deliveryMissCount = makeRecorder("deliveryMiss");
