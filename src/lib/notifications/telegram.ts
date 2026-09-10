@@ -215,7 +215,11 @@ async function sendToChat(
  * with the empty chat id so callers can record the no-op without crashing.
  *
  * Never throws. Each destination is an independent `AbortController`-bound
- * fetch, so a slow or failing chat never delays or blocks another.
+ * fetch.
+ *
+ * Latency-critical path (predictions): prefer `sendTelegramMessagePrimaryFirst`
+ * so the dispatcher can treat primary acceptance as delivery complete and
+ * detach secondary destinations.
  */
 export async function sendTelegramMessage(
   text: string,
@@ -230,6 +234,42 @@ export async function sendTelegramMessage(
   return Promise.all(
     chatIds.map((chatId) => sendToChat(token, chatId, text, timeoutMs)),
   );
+}
+
+/**
+ * Primary-first delivery for the N+1 prediction lane (P0).
+ *
+ * - Sends to the primary chat (first configured id) and awaits only that result.
+ * - Secondary destinations are started in the background (fire-and-forget);
+ *   their completion does not hold the dispatcher slot.
+ * - Returns results with primary first; secondary results may still be pending
+ *   when the promise resolves (callers should treat primary `ok` as acceptance).
+ *
+ * This makes `telegram_accepted_at` mean "user/primary destination accepted"
+ * rather than "all configured chats finished".
+ */
+export async function sendTelegramMessagePrimaryFirst(
+  text: string,
+  options?: { timeout?: number },
+): Promise<SendResult[]> {
+  const token = readEnv("TELEGRAM_BOT_TOKEN");
+  const chatIds = getConfiguredChatIds();
+  const timeoutMs = options?.timeout ?? SEND_TIMEOUT_MS;
+  if (!token || chatIds.length === 0) {
+    return [{ ok: false, status: 0, error: "not_configured", chatId: "" }];
+  }
+  const [primary, ...secondary] = chatIds;
+  const primaryResult = await sendToChat(token, primary, text, timeoutMs);
+  // Detach secondaries so a slow group/channel cannot occupy the prediction
+  // dispatcher slot. Failures are logged by sendToChat; we do not await them.
+  if (secondary.length > 0) {
+    void Promise.all(
+      secondary.map((chatId) => sendToChat(token, chatId, text, timeoutMs)),
+    ).catch(() => {
+      /* individual sendToChat never throws; defensive */
+    });
+  }
+  return [primaryResult];
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
