@@ -38,12 +38,19 @@ let softFailUntil = 0;
 
 function installDomPolyfill(): void {
   const loc = "https://bc.game/game/crash";
+  // Minimal DOM stubs for wr_utils — intentionally not full Window/Location types.
   const g = globalThis as typeof globalThis & {
-    document?: { location: string };
+    document?: { location: { href: string; toString(): string } };
     window?: typeof globalThis;
     self?: typeof globalThis;
   };
-  g.document = { location: loc };
+  const locationLike = {
+    href: loc,
+    toString() {
+      return loc;
+    },
+  };
+  g.document = { location: locationLike };
   g.window ??= g;
   g.self ??= g;
 }
