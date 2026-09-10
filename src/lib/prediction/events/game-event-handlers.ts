@@ -232,6 +232,17 @@ export async function bgHandler(payload: unknown): Promise<void> {
         WHERE target_game_id = ${gameId}
           AND matched = false
       `.catch(() => undefined),
+      // Forensics: reclassify delivered signals vs authoritative began_at
+      (async () => {
+        try {
+          const { reclassifyOnTargetStart } = await import(
+            "@/lib/prediction/live/delivery-forensics"
+          );
+          await reclassifyOnTargetStart(sql, gameId, beganAt);
+        } catch {
+          /* soft */
+        }
+      })(),
       // P0 (temporal validity): authoritative round-start backfill on the
       // prediction registry — re-evaluates createdAt < targetStartedAt.
       import("@/lib/prediction/identity/prediction-registry")
