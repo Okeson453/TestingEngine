@@ -223,3 +223,15 @@ export class CalibrationState {
 }
 
 export const globalCalibrationState = new CalibrationState();
+
+/** Publish calibrate helper for baseline-model without circular static import. */
+function publishCalibrator(): void {
+  const g = globalThis as {
+    __calibrateProbability__?: (p: number, regimeKey: string, sampleSize: number) => number;
+  };
+  g.__calibrateProbability__ = (p, regimeKey, sampleSize) => {
+    if (!globalCalibrationState.isWarm()) return p;
+    return globalCalibrationState.calibrateWithShrinkage(p, regimeKey, 1 / 1.3, sampleSize);
+  };
+}
+publishCalibrator();
