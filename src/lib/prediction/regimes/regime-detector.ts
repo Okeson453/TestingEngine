@@ -1,3 +1,11 @@
+/**
+ * Regime detector — deterministic classification (not random UUID per detect).
+ *
+ * P0: regime.id is the stable regime key (name). A separate instanceId is
+ * generated per detection for tracing only. Persisted regime_name must be
+ * the deterministic classification so win-rate-by-regime is meaningful.
+ */
+
 import type { HistoricalRound, Regime } from '../types.ts';
 import { mean, std, hitRate } from '../features/calculators.ts';
 import { randomUUID } from 'crypto';
@@ -35,11 +43,23 @@ export class RegimeDetector {
     else if (highConc > 0.2) name = 'high-activity';
     else if (vol > 8) name = 'high-volatility';
     else if (lowConc > 0.6) name = 'low-concentration';
+    // Deterministic id = classification key (NOT randomUUID)
+    const instanceId = randomUUID();
     return {
-      id: randomUUID(), name,
-      dimensions: { lowMultiplierConcentration: lowConc, highMultiplierConcentration: highConc, volatility: vol, streakState, thresholdFrequency, anomalyState },
+      id: name,
+      name,
+      instanceId,
+      dimensions: {
+        lowMultiplierConcentration: lowConc,
+        highMultiplierConcentration: highConc,
+        volatility: vol,
+        streakState,
+        thresholdFrequency,
+        anomalyState,
+      },
       confidence: Math.min(1, Math.max(0.2, n / 50)),
-      explanation, detectedAt: atTimestamp,
+      explanation,
+      detectedAt: atTimestamp,
     };
   }
   private countConsec(cps: number[], pred: (c: number) => boolean): number {
