@@ -196,7 +196,11 @@ export class OutboxDispatcher {
             WHERE status = 'pending'::text
               AND next_attempt_at <= now()
               AND (telegram_deadline_at IS NULL OR telegram_deadline_at > now())
-            ORDER BY priority DESC, next_attempt_at ASC, id ASC
+            ORDER BY
+              CASE WHEN type = 'prediction' THEN 0 ELSE 1 END,
+              priority DESC,
+              next_attempt_at ASC,
+              id ASC
             LIMIT ${BATCH_SIZE}
             FOR UPDATE SKIP LOCKED
           )
@@ -218,7 +222,11 @@ export class OutboxDispatcher {
           where status = 'pending'::text
             and next_attempt_at <= now()
             and (telegram_deadline_at is null or telegram_deadline_at > now())
-          order by priority desc, next_attempt_at asc, id asc
+          order by
+            case when type = 'prediction' then 0 else 1 end,
+            priority desc,
+            next_attempt_at asc,
+            id asc
           limit ${BATCH_SIZE}
           for update skip locked
         `;
