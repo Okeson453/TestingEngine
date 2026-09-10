@@ -57,12 +57,14 @@ export function classifyDelivery(args: {
     return { outcome: "FAILED", leadTimeMs: null };
   }
   if (telegramAcceptedAtMs == null || !Number.isFinite(telegramAcceptedAtMs)) {
-    if (outboxStatus === "delivered") {
-      return { outcome: "UNKNOWN", leadTimeMs: null };
-    }
     return { outcome: "UNKNOWN", leadTimeMs: null };
   }
+  // P0: target not started yet at acceptance ⇒ still on-time relative to known state.
+  // BG reclassify corrects if we later learn acceptance was after began_at.
   if (targetStartedAtMs == null || !Number.isFinite(targetStartedAtMs)) {
+    if (outboxStatus === "delivered") {
+      return { outcome: "ON_TIME", leadTimeMs: null };
+    }
     return { outcome: "UNKNOWN", leadTimeMs: null };
   }
   const leadTimeMs = targetStartedAtMs - telegramAcceptedAtMs;
