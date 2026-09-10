@@ -191,7 +191,13 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
 
   const criticalMax = readCriticalMax();
   const generalMax = readGeneralMax();
-  const idleTimeoutMillis = (Number(process.env.PG_IDLE_TIMEOUT_MS ?? 15_000) || 15_000);
+  // LATENCY FIX: crash rounds are spaced 10–70s. A 15s idle timeout drops the
+  // critical Neon connection between rounds; the next prediction/dispatch then
+  // pays ~700–1500ms TLS+auth. Keep critical clients warm across inter-round gaps.
+  const generalIdleTimeoutMillis =
+    Number(process.env.PG_IDLE_TIMEOUT_MS ?? 60_000) || 60_000;
+  const criticalIdleTimeoutMillis =
+    Number(process.env.PG_CRITICAL_IDLE_TIMEOUT_MS ?? 180_000) || 180_000;
   // Critical path: short acquire timeout (do not sit 30s behind dashboard)
   const criticalConnTimeout =
     (Number(process.env.PG_CRITICAL_CONN_TIMEOUT_MS ?? 5_000) || 5_000);
@@ -200,31 +206,37 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     (Number(process.env.PG_CONN_TIMEOUT_MS ?? 8_000) || 8_000);
   const dashboardConnTimeout =
     (Number(process.env.PG_DASHBOARD_CONN_TIMEOUT_MS ?? 3_000) || 3_000);
+  // Keep ≥2 critical clients: persist + dispatch can overlap on ED.
+  const criticalMin = Math.min(
+    Math.max(1, Number(process.env.PG_CRITICAL_POOL_MIN ?? 2) || 2),
+    criticalMax,
+  );
+  const generalMin = Math.min(
+    Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 1) || 1),
+    generalMax,
+  );
 
   console.log(
-    `[db] Dual pool: critical max=${criticalMax} connTimeoutMs=${criticalConnTimeout}; general max=${generalMax} connTimeoutMs=${generalConnTimeout}; dashboard acquire budget=${dashboardConnTimeout}`,
+    `[db] Dual pool: critical max=${criticalMax} min=${criticalMin} idleTimeoutMs=${criticalIdleTimeoutMillis} connTimeoutMs=${criticalConnTimeout}; general max=${generalMax} min=${generalMin} idleTimeoutMs=${generalIdleTimeoutMillis} connTimeoutMs=${generalConnTimeout}; dashboard acquire budget=${dashboardConnTimeout}`,
   );
 
   const criticalPool = new Pool({
     connectionString: databaseUrl,
     max: criticalMax,
-    // WARM-POOL FIX (production trace 18:35-18:39): with min=0 and a 15s
-    // idle timeout, both pools went cold between rounds (crash rounds are
-    // spaced 10-70s). Every cold acquire paid ~1s of TLS+auth to Neon —
-    // the direct cause of the intermittent ~700-1000ms prediction
-    // persistence leg and ~1.3-2.0s dispatch leg (warm rounds: ~1ms).
-    // min keeps one connection alive; MAX is unchanged — this is connection
-    // warming, not pool-size growth.
-    min: Math.min(Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 1) || 1), criticalMax),
-    idleTimeoutMillis,
+    // WARM-POOL FIX: min≥2 + long idle timeout so Neon TLS is not re-paid on
+    // every ED. Cold acquire was the dominant 0.7–1.5s leg on both persist
+    // and outbox dispatch (warm path is ~1–5ms acquire).
+    min: criticalMin,
+    idleTimeoutMillis: criticalIdleTimeoutMillis,
     connectionTimeoutMillis: criticalConnTimeout,
+    allowExitOnIdle: false,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
   });
   const generalPool = new Pool({
     connectionString: databaseUrl,
     max: generalMax,
-    min: Math.min(Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 1) || 1), generalMax),
-    idleTimeoutMillis,
+    min: generalMin,
+    idleTimeoutMillis: generalIdleTimeoutMillis,
     connectionTimeoutMillis: generalConnTimeout,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
   });
