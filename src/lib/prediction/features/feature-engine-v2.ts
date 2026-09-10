@@ -139,14 +139,15 @@ export class FeatureEngineV2 {
     const e = this.engine;
     const s = e.snapshot();
     const variance = e.variance();
-    // Empirical ≥1.3x rates from incremental state (true crash base-rate ≈ 1/1.3 ≈ 0.77).
+    // Empirical ≥1.3x rates from lag-ring windows (exact semantics).
+    // SHORT_CAP=30 ring remains diagnostic only (short_hit_13) — never aliased as 50/100.
     const short13 = e.shortHitRate13();
     const ewma13 = s.ewmaHit13;
-    // Real hit rates for all targets, including 10x (no more approximations).
+    const w = e.hitRateWindows13();
     const hit10 = e.hitRate(10.0);
-    // BaselineModel still reads fv-1 keys (hit_1_30_50 etc.). Without these
-    // aliases every live signal collapsed to the hard-coded default 0.30 /
-    // ~0.596 confidence — identical on every row in Live Validation.
+    // Genuine independent windows for baseline blend (P0 calibration fix).
+    const hit50 = w.w50;
+    const hit100 = w.w100 > 0 ? w.w100 : hit50;
     return {
       n: s.count,
       sample_size: s.count,
@@ -159,16 +160,21 @@ export class FeatureEngineV2 {
       short_mean: e.shortMean(),
       short_var: e.shortVariance(),
       short_hit_13: short13,
+      // Exact window rates (do not mislabel short-30 as 50/100)
+      hit_rate_20: w.w20,
+      hit_rate_50: w.w50,
+      hit_rate_100: w.w100,
+      hit_rate_200: w.w200,
       quality_score: Math.min(1, s.count / 100),
-      // fv-1 aliases for BaselineModel / registry default
-      hit_1_30_50: short13,
-      hit_1_30_100: ewma13 > 0 ? ewma13 : short13,
-      hit_2_00_50: e.hitRate(2.0),
-      hit_2_00_100: e.hitRate(2.0),
-      hit_5_00_50: e.hitRate(5.0),
-      hit_5_00_100: e.hitRate(5.0),
-      hit_10_00_50: hit10,
-      hit_10_00_100: hit10,
+      // fv-1 keys: now true 50/100-round rates (not SHORT_CAP aliases)
+      hit_1_30_50: hit50,
+      hit_1_30_100: hit100,
+      hit_2_00_50: e.windowHitRate(50, 2.0),
+      hit_2_00_100: e.windowHitRate(100, 2.0),
+      hit_5_00_50: e.windowHitRate(50, 5.0),
+      hit_5_00_100: e.windowHitRate(100, 5.0),
+      hit_10_00_50: e.windowHitRate(50, 10.0),
+      hit_10_00_100: e.windowHitRate(100, 10.0),
       // Rounds-since-last-hit — now tracked incrementally (was hard-coded 0).
       since_1_30: s.since.t13,
       since_2_00: s.since.t20,
