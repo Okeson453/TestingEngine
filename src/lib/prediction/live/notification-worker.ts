@@ -220,6 +220,41 @@ export class OutboxDispatcher {
   /** Guard so at most ONE background (normal-lane) pass runs at a time. */
   private bgRunning = false;
 
+  /** Guard so at most ONE forensic reconciliation sweep runs at a time.
+   * General pool only — maintenance, never the prediction critical path. */
+  private reconcileRunning = false;
+
+  private async reconcileForensics(): Promise<void> {
+    if (this.reconcileRunning) return;
+    this.reconcileRunning = true;
+    try {
+      const sql = await getSql();
+      const { reconcileForensicOutcomes } = await import(
+        "@/lib/prediction/live/delivery-forensics"
+      );
+      const r = await reconcileForensicOutcomes(sql);
+      if (r.reclassified > 0 || r.maskedLate > 0 || r.mismatches > 0) {
+        logger.info(
+          {
+            component: "outbox-dispatcher",
+            scanned: r.scanned,
+            reclassified: r.reclassified,
+            maskedLate: r.maskedLate,
+            mismatches: r.mismatches,
+          },
+          "FORENSIC_RECONCILE sweep complete",
+        );
+      }
+    } catch (e) {
+      logger.warn(
+        { component: "outbox-dispatcher", error: String(e) },
+        "forensic reconciliation sweep failed (will retry next interval)",
+      );
+    } finally {
+      this.reconcileRunning = false;
+    }
+  }
+
   /** Kick a detached normal-lane pass. Never awaited by the drain loop —
    * a slow result/validation Telegram send must not occupy the scheduling
    * path a new N+1 prediction needs (plan §2, §12). SKIP LOCKED claiming
@@ -1367,6 +1402,13 @@ export class OutboxDispatcher {
         // never on the prediction-critical pool.
         if (this.stats.tickCount % 10 === 0) {
           await this.recoverStale();
+        }
+        // DURABLE FORENSIC RECONCILIATION (remediation §5-§7): throttled
+        // sweep that repairs stored delivery_outcome from the authoritative
+        // raw timestamps. Detached — forensic repair never occupies the
+        // scheduling path. Every 30 ticks (~60s at a 2s fallback tick).
+        if (this.stats.tickCount % 30 === 0) {
+          void this.reconcileForensics();
         }
         // PREDICTION LANE: inline, every cycle. A prediction wake resolves
         // the wait below immediately and this claim runs right away — a new

@@ -62,12 +62,13 @@ export function classifyDelivery(args: {
   if (telegramAcceptedAtMs == null || !Number.isFinite(telegramAcceptedAtMs)) {
     return { outcome: "UNKNOWN", leadTimeMs: null };
   }
-  // P0: target not started yet at acceptance ⇒ still on-time relative to known state.
-  // BG reclassify corrects if we later learn acceptance was after began_at.
+  // DELIVERED + NO TARGET START YET = UNKNOWN (documented semantics).
+  // This used to optimistically return ON_TIME, which silently converts
+  // "outcome not yet determinable" into a healthy count — and if the BG
+  // reclassification later fails (best-effort), the row stays miscast as
+  // ON_TIME forever. UNKNOWN is truthful; the forensic reconciliation
+  // sweep upgrades it to EARLY/ON_TIME/LATE once target start is known.
   if (targetStartedAtMs == null || !Number.isFinite(targetStartedAtMs)) {
-    if (outboxStatus === "delivered") {
-      return { outcome: "ON_TIME", leadTimeMs: null };
-    }
     return { outcome: "UNKNOWN", leadTimeMs: null };
   }
   const leadTimeMs = targetStartedAtMs - telegramAcceptedAtMs;
@@ -91,6 +92,15 @@ function msDiff(a: string | Date | null | undefined, b: string | Date | null | u
 }
 
 /** Persist outcome on outbox row (best-effort columns from migration 0029). */
+let forensicWriteFailures = 0;
+
+/** Durable-failure telemetry (remediation §6): forensic writes never break
+ * delivery, but failures are COUNTED and the reconciliation sweep retries
+ * the work from authoritative timestamps — nothing is silently discarded. */
+export function getForensicFailureCount(): number {
+  return forensicWriteFailures;
+}
+
 export async function persistDeliveryOutcome(
   sql: Sql,
   notificationId: string,
@@ -105,11 +115,134 @@ export async function persistDeliveryOutcome(
       WHERE notification_id = ${notificationId}::uuid
     `;
   } catch (e) {
-    // Column may not exist until migration runs — soft fail.
-    logger.debug(
+    forensicWriteFailures += 1;
+    // Column may not exist until migration runs, or the pool may be under
+    // pressure — soft fail for delivery, but NOT silent: counted, warned,
+    // and later repaired by reconcileForensicOutcomes() from raw timestamps.
+    logger.warn(
       { notificationId, error: String(e) },
-      "persistDeliveryOutcome soft-failed (migration 0029 pending?)",
+      "persistDeliveryOutcome failed — queued for forensic reconciliation sweep",
     );
+  }
+}
+
+/**
+ * DURABLE FORENSIC RECONCILIATION (remediation §5/§6/§7/§8).
+ *
+ * Delivered rows whose stored delivery_outcome is NULL/UNKNOWN are
+ * re-derived from the AUTHORITATIVE raw timestamps (telegram_accepted_at vs
+ * target start from live_round_state / crash_rounds / pending_predictions)
+ * and the stored outcome corrected. This is the retry mechanism that makes
+ * best-effort forensic writes safe: any failure (pool timeout, crash) is
+ * repaired on the next sweep. Idempotent; safe to run repeatedly.
+ *
+ * Also reports rows where the stored outcome DISAGREES with the raw
+ * timeline (the "masked LATE" audit) via the returned counts.
+ */
+export interface ForensicReconcileResult {
+  scanned: number;
+  reclassified: number;
+  maskedLate: number;
+  mismatches: number;
+}
+
+export async function reconcileForensicOutcomes(
+  sql: Sql,
+  batchSize = 200,
+): Promise<ForensicReconcileResult> {
+  const result: ForensicReconcileResult = {
+    scanned: 0,
+    reclassified: 0,
+    maskedLate: 0,
+    mismatches: 0,
+  };
+  try {
+    // Delivered rows with incomplete/stale classification. Raw timestamps
+    // are authoritative; delivery_outcome is only a cache.
+    const rows = await sql<{
+      notification_id: string;
+      telegram_accepted_at: string | Date | null;
+      delivery_outcome: string | null;
+      target_started_at: string | Date | null;
+      metadata: Record<string, unknown> | null;
+      created_at: string;
+      dispatch_claimed_at: string | Date | null;
+      send_started_at: string | Date | null;
+      target_game_id: string | null;
+    }>`
+      SELECT o.notification_id, o.telegram_accepted_at, o.delivery_outcome,
+             o.metadata, o.created_at, o.dispatch_claimed_at,
+             o.send_started_at, o.target_game_id,
+             COALESCE(p.target_round_started_at, lrs.began_at, cr.began_at) AS target_started_at
+      FROM notification_outbox o
+      LEFT JOIN pending_predictions p
+        ON p.prediction_id = o.metadata->>'predictionId'
+      LEFT JOIN live_round_state lrs
+        ON lrs.game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId')
+      LEFT JOIN LATERAL (
+        SELECT began_at FROM crash_rounds
+        WHERE game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId')
+        ORDER BY began_at DESC LIMIT 1
+      ) cr ON true
+      WHERE o.type = 'prediction'
+        AND o.status = 'delivered'
+        AND o.telegram_accepted_at IS NOT NULL
+        AND (o.delivery_outcome IS NULL OR o.delivery_outcome IN ('UNKNOWN', 'ON_TIME', 'LATE', 'EARLY'))
+      ORDER BY o.delivered_at DESC NULLS LAST
+      LIMIT ${batchSize}
+    `;
+
+    for (const row of rows) {
+      result.scanned += 1;
+      const acceptedMs = row.telegram_accepted_at
+        ? new Date(row.telegram_accepted_at).getTime()
+        : null;
+      const targetMs = row.target_started_at
+        ? new Date(row.target_started_at).getTime()
+        : null;
+      if (acceptedMs == null || !Number.isFinite(acceptedMs)) continue;
+
+      const { outcome, leadTimeMs } = classifyDelivery({
+        telegramAcceptedAtMs: acceptedMs,
+        targetStartedAtMs: targetMs != null && Number.isFinite(targetMs) ? targetMs : null,
+        outboxStatus: "delivered",
+      });
+
+      // MASKED LATE (remediation §9/§10): the raw timeline says the signal
+      // was accepted at/after target start, but the stored outcome does not
+      // say LATE. This is exactly how real late deliveries used to vanish.
+      if (outcome === "LATE" && row.delivery_outcome !== "LATE") {
+        result.maskedLate += 1;
+      }
+      if (row.delivery_outcome != null && row.delivery_outcome !== outcome) {
+        result.mismatches += 1;
+      }
+
+      if (row.delivery_outcome === outcome) continue;
+
+      await persistDeliveryOutcome(sql, row.notification_id, outcome, leadTimeMs);
+      result.reclassified += 1;
+      const logLevel = outcome === "LATE" ? "warn" : "info";
+      logger[logLevel](
+        {
+          component: "delivery-forensics",
+          event: "PREDICTION_DELIVERY_RECONCILE",
+          notificationId: row.notification_id,
+          previousOutcome: row.delivery_outcome,
+          outcome,
+          leadTimeMs,
+        },
+        `FORENSIC_RECONCILE ${row.delivery_outcome ?? "NULL"} -> ${outcome}`,
+      );
+    }
+    return result;
+  } catch (e) {
+    forensicWriteFailures += 1;
+    logger.warn(
+      { error: String(e) },
+      "reconcileForensicOutcomes sweep failed — will retry next interval",
+    );
+    return result;
   }
 }
 

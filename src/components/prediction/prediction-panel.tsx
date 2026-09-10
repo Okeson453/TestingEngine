@@ -100,14 +100,57 @@ function OutcomeCounts({ delivery }: { delivery: NonNullable<DashboardSnapshot["
     { label: "FAILED", value: delivery.failed, tone: "text-low" },
     { label: "PENDING", value: delivery.pending, tone: "text-subtle" },
   ];
+  // Trust-audit diagnostics (remediation §8-§10): surfaced only when the
+  // stored forensic cache disagrees with the raw timeline, so silent
+  // forensic failures cannot hide behind a healthy-looking UNKNOWN bucket.
+  const audits: Array<{ label: string; value: number; tone: string; title: string }> = [
+    {
+      label: "MASKED LATE",
+      value: delivery.maskedLate,
+      tone: delivery.maskedLate > 0 ? "text-warn" : "text-subtle",
+      title:
+        "Raw timeline says LATE but the stored outcome does not — forensic write failed or outcome not yet reconciled",
+    },
+    {
+      label: "OUTCOME DRIFT",
+      value: delivery.outcomeMismatches,
+      tone: delivery.outcomeMismatches > 0 ? "text-warn" : "text-subtle",
+      title: "Stored delivery_outcome disagrees with the raw-timestamp derivation",
+    },
+    {
+      label: "UNRESOLVED",
+      value: delivery.unknownDelivered,
+      tone: delivery.unknownDelivered > 0 ? "text-muted" : "text-subtle",
+      title:
+        "Delivered but classification incomplete (target start not yet known) — the reconciliation sweep upgrades these as data arrives",
+    },
+  ];
   return (
-    <div className="grid grid-cols-3 gap-2 md:grid-cols-7">
-      {rows.map((r) => (
-        <div key={r.label} className="rounded-lg bg-surface-2 px-3 py-2 text-center">
-          <p className={cn("font-mono text-lg tabular-nums", r.tone)}>{r.value}</p>
-          <p className="text-[10px] font-medium uppercase tracking-wide text-subtle">{r.label}</p>
+    <div className="flex flex-col gap-2">
+      <div className="grid grid-cols-3 gap-2 md:grid-cols-7">
+        {rows.map((r) => (
+          <div key={r.label} className="rounded-lg bg-surface-2 px-3 py-2 text-center">
+            <p className={cn("font-mono text-lg tabular-nums", r.tone)}>{r.value}</p>
+            <p className="text-[10px] font-medium uppercase tracking-wide text-subtle">{r.label}</p>
+          </div>
+        ))}
+      </div>
+      {audits.some((a) => a.value > 0) && (
+        <div className="grid grid-cols-3 gap-2">
+          {audits.map((a) => (
+            <div
+              key={a.label}
+              title={a.title}
+              className="rounded-lg bg-surface-2 px-3 py-2 text-center"
+            >
+              <p className={cn("font-mono text-lg tabular-nums", a.tone)}>{a.value}</p>
+              <p className="text-[10px] font-medium uppercase tracking-wide text-subtle">
+                {a.label}
+              </p>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
     </div>
   );
 }

@@ -472,7 +472,19 @@ export interface LeadTimeSnapshot {
   unknown: number;
   expired: number;
   failed: number;
+  /** Real pending count: outbox rows in 'pending'/'inflight' status.
+   *  NEVER derived from UNKNOWN (the old algebra manufactured fake pending). */
   pending: number;
+  /** Delivered but forensically unresolved (outcome missing/incomplete). */
+  unknownDelivered: number;
+  /** Not yet delivered (legitimately unclassifiable yet). */
+  unknownUndelivered: number;
+  /** Trust audit: rows the raw timeline says were LATE but whose stored
+   *  outcome does not say LATE (forensic write failure / masked late). */
+  maskedLate: number;
+  /** Trust audit: stored delivery_outcome disagrees with raw-timestamp
+   *  derivation. Nonzero means the stored cache is drifting. */
+  outcomeMismatches: number;
   latestLeadTimeMs: number | null;
   p50LeadTimeMs: number | null;
   p95LeadTimeMs: number | null;
@@ -517,41 +529,75 @@ export interface DashboardSnapshot {
 }
 
 
-/** Lead-time aggregates from the durable delivery timeline (migration 0029).
- *  Reads ONLY persisted lifecycle timestamps and the worker-recorded
- *  delivery_outcome / lead_time_ms columns — no log inference. */
+/** Lead-time aggregates over the recent delivery window. Classification is
+ *  sourced from the view's delivery_status, which DERIVES the outcome from
+ *  the authoritative raw timestamps (telegram_accepted_at vs target start)
+ *  whenever the stored delivery_outcome cache is missing — a failed forensic
+ *  write can no longer silently convert a real LATE into UNKNOWN.
+ *  PENDING is counted directly from the outbox status, never derived by
+ *  subtracting terminal counts from UNKNOWN (the old algebra manufactured
+ *  fake pending rows out of forensic gaps). */
 export async function getLeadTimeSnapshot(windowHours = 24): Promise<LeadTimeSnapshot | null> {
   const { getSql } = await import("@/lib/db");
   const sql = await getSql();
   try {
-    const outcomeRows = await sql<{ delivery_outcome: string | null; count: number }>`
-      select delivery_outcome, count(*)::int as count
+    const window = `${Number(windowHours)} hours`;
+    const aggRows = await sql<{
+      total: number;
+      early: number;
+      on_time: number;
+      late: number;
+      unknown: number;
+      expired: number;
+      failed: number;
+      pending: number;
+      unknown_delivered: number;
+      unknown_undelivered: number;
+      masked_late: number;
+      outcome_mismatches: number;
+    }>`
+      select
+        count(*)::int as total,
+        count(*) filter (where delivery_status = 'EARLY')::int as early,
+        count(*) filter (where delivery_status = 'ON_TIME')::int as on_time,
+        count(*) filter (where delivery_status = 'LATE')::int as late,
+        count(*) filter (where delivery_status = 'UNKNOWN')::int as unknown,
+        count(*) filter (where delivery_status = 'EXPIRED')::int as expired,
+        count(*) filter (where delivery_status = 'FAILED')::int as failed,
+        count(*) filter (where outbox_status in ('pending', 'inflight'))::int as pending,
+        count(*) filter (where outbox_status = 'delivered' and delivery_status = 'UNKNOWN')::int as unknown_delivered,
+        count(*) filter (where outbox_status <> 'delivered' and delivery_status = 'UNKNOWN')::int as unknown_undelivered,
+        count(*) filter (where lead_time_computed_ms is not null
+          and lead_time_computed_ms < 0
+          and coalesce(delivery_outcome, '') <> 'LATE')::int as masked_late,
+        count(*) filter (where delivery_outcome is not null
+          and delivery_outcome <> delivery_status)::int as outcome_mismatches
       from prediction_delivery_timeline
-      where generated_at >= now() - (${windowHours}::int * interval '1 hour')
-      group by delivery_outcome
+      where generated_at >= now() - ${window}::interval
     `;
     const pctRows = await sql<{ p50: number | null; p95: number | null; min_ms: number | null; latest_ms: number | null; n: number }>`
       select
-        percentile_cont(0.5) within group (order by lead_time_ms) as p50,
-        percentile_cont(0.95) within group (order by lead_time_ms) as p95,
-        min(lead_time_ms) as min_ms,
-        (array_agg(lead_time_ms order by generated_at desc))[1] as latest_ms,
+        percentile_cont(0.5) within group (order by lead_ms) as p50,
+        percentile_cont(0.95) within group (order by lead_ms) as p95,
+        min(lead_ms) as min_ms,
+        (array_agg(lead_ms order by generated_at desc))[1] as latest_ms,
         count(*)::int as n
-      from prediction_delivery_timeline
-      where lead_time_ms is not null
-        and generated_at >= now() - (${windowHours}::int * interval '1 hour')
+      from (
+        select generated_at, coalesce(lead_time_ms, round(lead_time_computed_ms))::numeric as lead_ms
+        from prediction_delivery_timeline
+        where coalesce(lead_time_ms, lead_time_computed_ms) is not null
+          and generated_at >= now() - ${window}::interval
+      ) t
     `;
     const latestRows = await sql<Record<string, unknown>>`
       select prediction_id, source_game_id, target_game_id, generated_at, queued_at,
              dispatch_started_at, telegram_accepted_at, target_round_started_at,
-             delivery_outcome, lead_time_ms
+             delivery_outcome, delivery_status, lead_time_ms
       from prediction_delivery_timeline
       order by generated_at desc
       limit 1
     `;
-    const byOutcome = new Map(outcomeRows.map((r) => [r.delivery_outcome ?? "UNKNOWN", r.count]));
-    const total = outcomeRows.reduce((acc, r) => acc + r.count, 0);
-    const delivered = total - (byOutcome.get("UNKNOWN") ?? 0);
+    const agg = aggRows[0];
     const latest = latestRows[0];
     const iso = (v: unknown): string | null => {
       if (v == null) return null;
@@ -559,15 +605,19 @@ export async function getLeadTimeSnapshot(windowHours = 24): Promise<LeadTimeSna
     };
     return {
       windowHours,
-      total,
-      early: byOutcome.get("EARLY") ?? 0,
-      onTime: byOutcome.get("ON_TIME") ?? 0,
-      late: byOutcome.get("LATE") ?? 0,
-      unknown: byOutcome.get("UNKNOWN") ?? 0,
-      expired: byOutcome.get("EXPIRED") ?? 0,
-      failed: byOutcome.get("FAILED") ?? 0,
-      pending: Math.max(0, total - delivered - (byOutcome.get("EXPIRED") ?? 0) - (byOutcome.get("FAILED") ?? 0)),
-      latestLeadTimeMs: pctRows[0]?.latest_ms ?? null,
+      total: agg?.total ?? 0,
+      early: agg?.early ?? 0,
+      onTime: agg?.on_time ?? 0,
+      late: agg?.late ?? 0,
+      unknown: agg?.unknown ?? 0,
+      expired: agg?.expired ?? 0,
+      failed: agg?.failed ?? 0,
+      pending: agg?.pending ?? 0,
+      unknownDelivered: agg?.unknown_delivered ?? 0,
+      unknownUndelivered: agg?.unknown_undelivered ?? 0,
+      maskedLate: agg?.masked_late ?? 0,
+      outcomeMismatches: agg?.outcome_mismatches ?? 0,
+      latestLeadTimeMs: pctRows[0]?.latest_ms != null ? Math.round(Number(pctRows[0].latest_ms)) : null,
       p50LeadTimeMs: pctRows[0]?.p50 != null ? Math.round(Number(pctRows[0].p50)) : null,
       p95LeadTimeMs: pctRows[0]?.p95 != null ? Math.round(Number(pctRows[0].p95)) : null,
       minLeadTimeMs: pctRows[0]?.min_ms != null ? Number(pctRows[0].min_ms) : null,
@@ -582,8 +632,8 @@ export async function getLeadTimeSnapshot(windowHours = 24): Promise<LeadTimeSna
             telegramAcceptedAt: iso(latest.telegram_accepted_at),
             targetRoundStartedAt: iso(latest.target_round_started_at),
             deliveryOutcome:
-              latest.delivery_outcome != null
-                ? (String(latest.delivery_outcome) as DeliveryTimeline["deliveryOutcome"])
+              (latest.delivery_status ?? latest.delivery_outcome) != null
+                ? (String(latest.delivery_status ?? latest.delivery_outcome) as DeliveryTimeline["deliveryOutcome"])
                 : null,
             leadTimeMs: latest.lead_time_ms != null ? Number(latest.lead_time_ms) : null,
           }
