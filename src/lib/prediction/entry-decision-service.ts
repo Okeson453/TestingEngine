@@ -123,10 +123,23 @@ export class EntryDecisionService {
       new HistoricalDataService(opts?.roundRepo ?? new RoundRepository());
     this.riskEngine = opts?.riskEngine ?? new RiskEngine();
     this.predictionRepo = opts?.predictionRepo ?? new PredictionRepository();
-    this.acie = opts?.acie ?? new ACIEEngine();
-    // Best-effort restore from Postgres (async; does not block construction).
-    if (!opts?.acie) {
-      void loadAcieStateFromDb(this.acie).catch(() => undefined);
+    // P0: always prefer the process-wide shared ACIE unless an explicit
+    // instance is injected (tests). Never construct a second private engine
+    // that diverges from live observation state.
+    if (opts?.acie) {
+      this.acie = opts.acie;
+    } else {
+      try {
+        // Lazy require to avoid circular init; falls back to local construct.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { getSharedACIEEngine } = require('./acie/shared-engine.ts') as {
+          getSharedACIEEngine: () => ACIEEngine;
+        };
+        this.acie = getSharedACIEEngine();
+      } catch {
+        this.acie = new ACIEEngine();
+        void loadAcieStateFromDb(this.acie).catch(() => undefined);
+      }
     }
     this.preferAcie = opts?.preferAcie ?? true;
     this.sheathMode = opts?.sheathMode ?? null;
