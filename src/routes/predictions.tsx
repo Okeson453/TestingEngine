@@ -1,28 +1,21 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { PredictionPanel } from "@/components/prediction/prediction-panel";
-import {
-  predictionGetDailyTarget,
-  predictionGetTodayStats,
-  predictionGetLifetimeStats,
-  predictionGetStreaks,
-  predictionGetRecent,
-  predictionGetPending,
-  predictionGetWorkerStatus,
-} from "@/lib/p";
+import { predictionGetDashboardSnapshot } from "@/lib/p";
 
 export const Route = createFileRoute("/predictions")({
   component: PredictionsPage,
   loader: async () => {
-    const [dailyTarget, today, lifetime, streaks, recent, pending, worker] = await Promise.all([
-      predictionGetDailyTarget(),
-      predictionGetTodayStats(),
-      predictionGetLifetimeStats(),
-      predictionGetStreaks(),
-      predictionGetRecent(),
-      predictionGetPending(),
-      predictionGetWorkerStatus(),
-    ]);
-    return { dailyTarget, today, lifetime, streaks, recent, pending, worker };
+    // P0: one pinned snapshot instead of 7 concurrent server fns (pool exhaustion).
+    const snap = await predictionGetDashboardSnapshot();
+    return {
+      dailyTarget: snap.dailyTarget,
+      today: snap.today,
+      lifetime: snap.lifetime,
+      streaks: snap.streaks,
+      recent: snap.recent,
+      pending: snap.pending,
+      worker: snap.worker,
+    };
   },
   head: () => ({
     meta: [{ title: "Prediction Validation — CrashWave" }],
