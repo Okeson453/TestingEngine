@@ -96,6 +96,12 @@ function lifecycleLogFields(
     notificationId: row.notification_id,
     predictionId: typeof meta.predictionId === "string" ? meta.predictionId : null,
     correlationId: typeof meta.correlationId === "string" ? meta.correlationId : null,
+    targetGameId:
+      (row.target_game_id as string | null) ??
+      (typeof meta.targetGameId === "string" ? meta.targetGameId : null),
+    sourceGameId: typeof meta.sourceGameId === "string" ? meta.sourceGameId : null,
+    // Canonical timeline aliases for operators (created_at ≈ queued_at)
+    queuedAt: row.created_at,
     type: row.type,
     status,
     attempt: row.attempt_count,
@@ -415,7 +421,49 @@ export class OutboxDispatcher {
                 ? Math.max(50, remainingMs - 50)
                 : 5_000,
             );
+            // P0 correlation: durable send_started_at BEFORE the HTTP call so
+            // in-flight races (BG kill / TOCTOU suppress) still leave a timeline.
             lc.sendStartedMs = this.now();
+            const sendStartedIso = new Date(lc.sendStartedMs).toISOString();
+            try {
+              const stillInflight = await sql<{ id: number }>`
+                update notification_outbox
+                set send_started_at = ${sendStartedIso}::timestamptz
+                where id = ${row.id} and status = 'inflight'
+                returning id
+              `;
+              if (stillInflight.length === 0) {
+                this.stats.dead += 1;
+                logger.warn(
+                  {
+                    component: "outbox-dispatcher",
+                    notificationId: row.notification_id,
+                    type: row.type,
+                  },
+                  "OUTBOX_DISPATCH aborted before send — row no longer inflight (BG/expiry)",
+                );
+                return "dead" as const;
+              }
+            } catch (stampErr) {
+              // Fail closed: do not send if we cannot stamp the timeline.
+              await sql`
+                update notification_outbox
+                set status = 'pending',
+                    next_attempt_at = now() + interval '200 milliseconds',
+                    last_error = ${'send_started_stamp_failed: ' + String(stampErr).slice(0, 160)}
+                where id = ${row.id} and status = 'inflight'
+              `.catch(() => undefined);
+              this.stats.requeued += 1;
+              logger.warn(
+                {
+                  component: "outbox-dispatcher",
+                  notificationId: row.notification_id,
+                  error: String(stampErr),
+                },
+                "send_started_at stamp failed — requeued without Telegram send",
+              );
+              return "requeued" as const;
+            }
             const sendResults = await sendTelegramMessage(row.content, {
               timeout: sendTimeout,
             });
