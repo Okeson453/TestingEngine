@@ -47,3 +47,18 @@ export {
   type AciePersistedSnapshot,
 } from './state-persistence.ts';
 export { ACIE_MAX_HISTORY } from './engine.ts';
+
+// P0: authoritative shared instance + provenance
+export {
+  getSharedACIEEngine,
+  getSharedACIEInstanceId,
+  setSharedACIEEngineForTests,
+  isSharedACIEInitialized,
+} from './shared-engine.ts';
+export {
+  computeFeatureHash,
+  buildAcieFeatureFingerprint,
+  buildProvenance,
+  type AcieProvenance,
+  type PredictionExecutionMode,
+} from './provenance.ts';
