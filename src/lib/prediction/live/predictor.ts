@@ -747,38 +747,41 @@ export async function onGameEndPredict(
   }
 
   // ── P0: History MUST come from memory. NEVER call getSql() here. ──
-  // No SQL fallback allowed on the ED prediction path. If the buffer is cold,
-  // boot should have warmed it. SQL is only for boot/recovery/cold-start.
+  // No SQL fallback on the ED prediction path. Prefer explicit
+  // N+1_UNAVAILABLE_HISTORY over a silent 700–1000ms Neon query.
   let priorRounds: HistoricalRound[] = [];
+  let historyReady = false;
   try {
     const {
       getPriorRoundsSync,
-      isLiveHistoryWarmed,
+      isHistoryReadyForPrediction,
     } = await import("@/lib/prediction/live/live-history-buffer");
 
-    if (!isLiveHistoryWarmed()) {
+    historyReady = isHistoryReadyForPrediction();
+    if (!historyReady) {
       logger.warn(
         { targetGameId, sourceGameId: gameId },
-        "realtime prediction blocked — live history not ready (boot should warm before first ED)",
+        "N+1_UNAVAILABLE_HISTORY — live history not READY (boot must warm >= MIN_HISTORY before ED)",
       );
+    } else {
+      priorRounds = getPriorRoundsSync(MAX_HISTORY, gameId, crashedAt);
     }
-
-    priorRounds = getPriorRoundsSync(MAX_HISTORY, gameId, crashedAt);
   } catch {
     /* soft — priorRounds stays empty */
   }
 
   const t2 = performance.now(); // history loaded from memory
 
-  if (priorRounds.length < MIN_HISTORY) {
+  if (!historyReady || priorRounds.length < MIN_HISTORY) {
     logger.warn(
       {
         targetGameId,
         sourceGameId: gameId,
         historySize: priorRounds.length,
         minHistory: MIN_HISTORY,
+        historyReady,
       },
-      "realtime prediction blocked — insufficient warmed history",
+      "N+1_UNAVAILABLE_HISTORY — insufficient warmed history",
     );
     try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
     recordPredictionOutcome(true);
@@ -1051,7 +1054,7 @@ export async function onGameEndPredict(
           )
           select
             ${outboxNotificationId}::uuid, 'prediction', ${predictionContent},
-            ${outboxMetadata}::jsonb, 'pending', 10,
+            ${outboxMetadata}::jsonb, 'pending', 100,
             0, now(), ${deadlineAt}::timestamptz, ${targetGameId}
           from inserted_prediction
           returning notification_id
