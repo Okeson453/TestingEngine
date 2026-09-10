@@ -158,14 +158,15 @@ describe("Zero-DB ED prediction path — regression tests", () => {
       expect(hotPath).not.toContain("worker_state");
       expect(hotPath).not.toContain("runInTransaction");
 
-      // The async persistence section (after SIGNAL_READY) SHOULD contain DB calls
-      const asyncPath = funcBody.slice(signalReadyIdx);
-      expect(asyncPath).toContain("getSqlFn");
-      expect(asyncPath).toContain("runInTransaction");
-      expect(asyncPath).toContain("pending_predictions");
+      // Durable handoff (after SIGNAL_READY) MUST contain DB + outbox calls
+      const handoffPath = funcBody.slice(signalReadyIdx);
+      expect(handoffPath).toContain("getSqlFn");
+      expect(handoffPath).toContain("runInTransaction");
+      expect(handoffPath).toContain("pending_predictions");
+      expect(handoffPath).toContain("notification_outbox");
     });
 
-    it("persistence is fire-and-forget (not awaited before return)", async () => {
+    it("durable outbox handoff is awaited before returning predicted", async () => {
       const fs = await import("node:fs/promises");
       const source = await fs.readFile(
         require("node:path").join(__dirname, "predictor.ts"),
@@ -175,10 +176,13 @@ describe("Zero-DB ED prediction path — regression tests", () => {
       const funcStart = source.indexOf("export async function onGameEndPredict(");
       const funcBody = source.slice(funcStart);
 
-      // The persistPromise should be created but not awaited
-      // Look for void persistPromise pattern
-      expect(funcBody).toContain("void persistPromise");
-      expect(funcBody).toContain("persistPromise.catch");
+      // P0 fix: fire-and-forget persist must NOT exist; handoff is awaited.
+      expect(funcBody).not.toContain("void persistPromise");
+      expect(funcBody).toContain("awaiting durable outbox handoff");
+      expect(funcBody).toContain("durable prediction handoff complete");
+      // Return predicted only after outbox path (outboxEnqueued on result)
+      expect(funcBody).toContain("outboxEnqueued");
+      expect(funcBody).toContain('kind: "persist_failed"');
     });
   });
 
