@@ -641,7 +641,8 @@ export interface OnGameEndPredictResult {
     | "skipped_stale_source"
     | "skipped_invalid_target"
     | "skipped_no_edge"
-    | "temporally_invalid";
+    | "temporally_invalid"
+    | "persist_failed";
   temporalValidity?: TemporalValidity;
   sourceGameId?: string;
   sourceCrashAt?: string;
@@ -650,6 +651,8 @@ export interface OnGameEndPredictResult {
   predictionLatencyMs?: number;
   availableWindowMs?: number | null;
   remainingBeforeTargetMs?: number | null;
+  /** 1 when prediction outbox row was durably enqueued before return. */
+  outboxEnqueued?: number;
 }
 
 export async function onGameEndPredict(
@@ -890,10 +893,11 @@ export async function onGameEndPredict(
     }
   }
 
-  // ── P0: SIGNAL READY ──
-  // The prediction signal is complete. Everything below is async persistence
-  // that must NOT block the signal path. We return immediately after logging.
-  const t4 = performance.now(); // signal ready
+  // ── P0: SIGNAL READY (model only) ──
+  // Model computation is complete. Durable pending + outbox handoff MUST
+  // complete before we return kind="predicted" so Telegram delivery can
+  // start before BG(N+1). live_event_log remains best-effort async.
+  const t4 = performance.now(); // signal ready (pre-persist)
 
   logger.info(
     {
@@ -903,7 +907,6 @@ export async function onGameEndPredict(
       sourceGameId: gameId,
       correlationId,
       recoveryMode,
-      // Precise stage-level latency instrumentation
       claimMs: Number((t1 - t0).toFixed(2)),
       historyMs: Number((t2 - t1).toFixed(2)),
       predictionMs: Number((t3 - t2).toFixed(2)),
@@ -912,200 +915,215 @@ export async function onGameEndPredict(
       sourceAgeMs: Math.max(0, Date.now() - new Date(crashedAt).getTime()),
       signalReady: true,
     },
-    "PREDICTION_SIGNAL_READY — model computation finished; durable persistence pending (async)",
+    "PREDICTION_SIGNAL_READY — model computation finished; awaiting durable outbox handoff",
   );
   predictionLifecycleCounters.predictionsReady += 1;
 
-  // ── P1/P2: EVERYTHING BELOW IS NON-BLOCKING ──
-  // pending_predictions, notification_outbox, and live_event_log are all
-  // written asynchronously. The DB remains the durability/idempotency
-  // backstop via ON CONFLICT DO NOTHING. If async persistence fails, the
-  // PREDICTION_READY was returned; DB durability still required for outbox/Telegram.
-  // The poll worker and validator will reconcile any missing DB state.
+  // ── P0 DURABLE HANDOFF (awaited): pending_predictions + notification_outbox ──
+  // Investigation root cause: fire-and-forget persist allowed BG(N+1) / temporal
+  // gates to kill or delay the signal until after the target round started.
+  // Returning "predicted" only after outbox commit enforces:
+  //   generate → durable queue → deliver-before-start
+  const getSqlFn = deps.getSqlFn ?? getSql;
+  const persistT0 = Date.now();
+  let outboxEnqueued = 0;
+  let sql: Sql;
+  try {
+    sql = await getSqlFn();
+  } catch (e) {
+    logger.error(
+      { component: "live-predictor", targetGameId, error: String(e) },
+      "durable handoff: getSql failed — not returning predicted without outbox",
+    );
+    predictionLifecycleCounters.persistenceFailures += 1;
+    try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+    return {
+      predictionId,
+      targetGameId,
+      kind: "persist_failed",
+      temporalValidity: "TEMPORALLY_VALID",
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
+      predictionGeneratedAt: timestamp,
+      predictionLatencyMs: Math.round(performance.now() - t0),
+      outboxEnqueued: 0,
+    };
+  }
+  const poolWaitMs = Date.now() - persistT0;
 
-  const persistPromise = (async () => {
-    const getSqlFn = deps.getSqlFn ?? getSql;
-    const persistT0 = Date.now();
-    let sql: Sql;
-    try {
-      sql = await getSqlFn();
-    } catch (e) {
-      logger.error(
-        { component: "live-predictor", targetGameId, error: String(e) },
-        "async persistence: getSql failed — PREDICTION_READY returned but durable handoff pending",
-      );
-      return;
-    }
-    const poolWaitMs = Date.now() - persistT0;
-
-    try {
-      const txT0 = Date.now();
-      await runInTransaction(sql, async (tx) => {
-        const ins = await tx<{ prediction_id: string; requested_at: string }>`
-          insert into pending_predictions (
-            prediction_id, target_multiplier, probability, confidence,
-            regime_name, regime_confidence, reasoning, feature_summary,
-            model_version, requested_at, generated_at,
-            target_game_id, source_round_id,
-            correlation_id
-          ) values (
-            ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
-            ${signal.confidence}, ${signal.regimeId},
-            ${signal.regimeId ? 0.5 : null},
-            ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-            ${signal.modelVersion}, ${timestamp}, ${timestamp},
-            ${targetGameId}, ${gameId},
-            ${correlationId}
-          )
-          on conflict (target_game_id) where matched = false and target_game_id is not null do nothing
-          returning prediction_id, requested_at
-        `;
-
-        if (ins.length === 0) {
-          // Duplicate — already persisted by another path (DB is the backstop)
-          return;
-        }
-
-        // Enqueue prediction Telegram signal
-        {
-          const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
-          const lateTag = slaViolated ? " (delayed)" : "";
-          const predictionContent = [
-            `NEW PREDICTION${regimeText}${lateTag}`,
-            "",
-            `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
-            `Probability: ${(signal.probability * 100).toFixed(1)}%`,
-            `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
-            "",
-            `Prediction ID: ${predictionId}`,
-            `Generated: ${timestamp}`,
-            recoveryMode ? "Source: poll recovery" : "Source: live ED",
-          ].join("\n");
-          const deadlineMs = recoveryMode
-            ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 12_000)
-            : Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000);
-          const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
-          try {
-            await tx`
-              insert into notification_outbox (
-                notification_id, type, content, metadata, status, priority,
-                attempt_count, next_attempt_at, telegram_deadline_at, target_game_id
-              ) values (
-                ${randomUUID()}::uuid, 'prediction',
-                ${predictionContent},
-                ${JSON.stringify({
-                  predictionId,
-                  correlationId,
-                  targetGameId,
-                  sourceGameId: gameId,
-                  targetMultiplier: Number(DEFAULT_TARGET),
-                  probability: signal.probability,
-                  confidence: signal.confidence,
-                  regimeName: signal.regimeId,
-                  slaViolated,
-                  slaLagMsActual,
-                  kind: "prediction",
-                  recoveryMode,
-                })},
-                'pending', 3,
-                0, now(), ${deadlineAt}::timestamptz, ${targetGameId}
-              )
-            `;
-          } catch (err) {
-            // Tag so the outer catch distinguishes outbox_enqueue from
-            // pending_predictions persistence failures.
-            (err as { stage?: string }).stage = "outbox_enqueue";
-            throw err;
-          }
-        }
-      });
-
-      // live_event_log outside TX (not required for correctness)
-      void sql`
-        insert into live_event_log (
-          correlation_id, event_kind, game_id, payload, received_at, processed_at,
-          processor_latency_ms, sla_violated
+  try {
+    const txT0 = Date.now();
+    await runInTransaction(sql, async (tx) => {
+      const ins = await tx<{ prediction_id: string; requested_at: string }>`
+        insert into pending_predictions (
+          prediction_id, target_multiplier, probability, confidence,
+          regime_name, regime_confidence, reasoning, feature_summary,
+          model_version, requested_at, generated_at,
+          target_game_id, source_round_id,
+          correlation_id
         ) values (
-          ${correlationId}::text, 'PREDICT', ${targetGameId},
-          ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode })},
-          ${crashedAt}::timestamptz, now(),
-          ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
+          ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
+          ${signal.confidence}, ${signal.regimeId},
+          ${signal.regimeId ? 0.5 : null},
+          ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
+          ${signal.modelVersion}, ${timestamp}, ${timestamp},
+          ${targetGameId}, ${gameId},
+          ${correlationId}
         )
-      `.catch(() => undefined);
+        on conflict (target_game_id) where matched = false and target_game_id is not null do nothing
+        returning prediction_id, requested_at
+      `;
 
-      // Wake outbox dispatcher after TX commit
-      try {
-        const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
-        notifyOutbox();
-      } catch { /* soft */ }
+      if (ins.length === 0) {
+        // Duplicate — already persisted by another path (DB is the backstop)
+        return;
+      }
 
-      // PERSIST_PROFILE (report #5/#7): decompose the ~1s persist stage into
-      // pool wait vs transaction duration. The TX is BEGIN + 2 inserts +
-      // COMMIT — sequential Neon round trips are the suspected consumer.
-      // Confirms or kills the round-trip theory with one deploy of data;
-      // CTE-merging the inserts is deferred until this confirms.
+      // Enqueue prediction Telegram signal (same TX as pending insert)
       {
-        const txMs = Date.now() - txT0;
-        const profile = {
-          component: "live-predictor",
-          predictionId,
-          targetGameId,
-          correlationId,
-          pool_wait_ms: poolWaitMs,
-          tx_ms: txMs,
-          tx_statements: 2,
-        };
-        if (txMs + poolWaitMs > 300) {
-          logger.info(profile, "PERSIST_PROFILE");
-        } else {
-          logger.debug(profile, "PERSIST_PROFILE");
+        const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
+        const lateTag = slaViolated ? " (delayed)" : "";
+        const predictionContent = [
+          `NEW PREDICTION${regimeText}${lateTag}`,
+          "",
+          `Target: ${Number(DEFAULT_TARGET).toFixed(2)}x`,
+          `Probability: ${(signal.probability * 100).toFixed(1)}%`,
+          `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
+          "",
+          `Prediction ID: ${predictionId}`,
+          `Generated: ${timestamp}`,
+          recoveryMode ? "Source: poll recovery" : "Source: live ED",
+        ].join("\n");
+        // Shorter live deadline keeps temporal contract tight; recovery keeps more budget.
+        const deadlineMs = recoveryMode
+          ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 12_000)
+          : Number(process.env.TELEGRAM_DEADLINE_MS ?? 8_000);
+        const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
+        try {
+          await tx`
+            insert into notification_outbox (
+              notification_id, type, content, metadata, status, priority,
+              attempt_count, next_attempt_at, telegram_deadline_at, target_game_id
+            ) values (
+              ${randomUUID()}::uuid, 'prediction',
+              ${predictionContent},
+              ${JSON.stringify({
+                predictionId,
+                correlationId,
+                targetGameId,
+                sourceGameId: gameId,
+                targetMultiplier: Number(DEFAULT_TARGET),
+                probability: signal.probability,
+                confidence: signal.confidence,
+                regimeName: signal.regimeId,
+                slaViolated,
+                slaLagMsActual,
+                kind: "prediction",
+                recoveryMode,
+              })},
+              'pending', 10,
+              0, now(), ${deadlineAt}::timestamptz, ${targetGameId}
+            )
+          `;
+          outboxEnqueued = 1;
+        } catch (err) {
+          (err as { stage?: string }).stage = "outbox_enqueue";
+          throw err;
         }
       }
-      // P1 latency chain: outbox row is durably enqueued at this point.
-      try {
-        const { mark } = await import("@/lib/prediction/live/latency-trace");
-        if (trace) mark(trace, "outbox_enqueued");
-      } catch { /* soft */ }
+    });
 
-      try { completeTarget(targetGameId, owner); } catch { /* soft */ }
+    // live_event_log outside TX (not required for correctness / delivery)
+    void sql`
+      insert into live_event_log (
+        correlation_id, event_kind, game_id, payload, received_at, processed_at,
+        processor_latency_ms, sla_violated
+      ) values (
+        ${correlationId}::text, 'PREDICT', ${targetGameId},
+        ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode })},
+        ${crashedAt}::timestamptz, now(),
+        ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
+      )
+    `.catch(() => undefined);
 
-      logger.info(
-        {
-          component: "live-predictor",
-          predictionId,
-          targetGameId,
-          correlationId,
-          persistenceMs: Number((performance.now() - t4).toFixed(2)),
-        },
-        "async persistence complete",
-      );
-      predictionLifecycleCounters.predictionsPersisted += 1;
-    } catch (e) {
-      const stage = (e as { stage?: string }).stage ?? "persistence";
-      logger.error(
-        {
-          component: "live-predictor",
-          stage,
-          targetGameId,
-          sourceRoundId: gameId,
-          correlationId,
-          predictionId,
-          failureReason: String(e),
-          errorName: e instanceof Error ? e.name : "Error",
-          errorMessage: e instanceof Error ? e.message : String(e),
-        },
-        stage === "outbox_enqueue"
-          ? "outbox enqueue failed — PREDICTION_READY returned but Telegram handoff failed"
-          : "async prediction persistence failed — PREDICTION_READY returned but durable handoff failed",
-      );
-      predictionLifecycleCounters.persistenceFailures += 1;
-      try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+    // Wake outbox dispatcher after TX commit so delivery can start immediately
+    try {
+      const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
+      notifyOutbox();
+    } catch { /* soft */ }
+
+    {
+      const txMs = Date.now() - txT0;
+      const profile = {
+        component: "live-predictor",
+        predictionId,
+        targetGameId,
+        correlationId,
+        pool_wait_ms: poolWaitMs,
+        tx_ms: txMs,
+        tx_statements: 2,
+        outboxEnqueued,
+      };
+      if (txMs + poolWaitMs > 300) {
+        logger.info(profile, "PERSIST_PROFILE");
+      } else {
+        logger.debug(profile, "PERSIST_PROFILE");
+      }
     }
-  })();
 
-  // Don't await — return the signal immediately.
-  // Keep the promise alive so it doesn't become an unhandled rejection.
-  void persistPromise.catch(() => undefined);
+    try {
+      const { mark } = await import("@/lib/prediction/live/latency-trace");
+      if (trace) mark(trace, "outbox_enqueued");
+    } catch { /* soft */ }
+
+    try { completeTarget(targetGameId, owner); } catch { /* soft */ }
+
+    logger.info(
+      {
+        component: "live-predictor",
+        predictionId,
+        targetGameId,
+        correlationId,
+        outboxEnqueued,
+        persistenceMs: Number((performance.now() - t4).toFixed(2)),
+      },
+      outboxEnqueued > 0
+        ? "durable prediction handoff complete — outbox pending before return"
+        : "durable prediction handoff complete — duplicate pending (outbox may already exist)",
+    );
+    predictionLifecycleCounters.predictionsPersisted += 1;
+  } catch (e) {
+    const stage = (e as { stage?: string }).stage ?? "persistence";
+    logger.error(
+      {
+        component: "live-predictor",
+        stage,
+        targetGameId,
+        sourceRoundId: gameId,
+        correlationId,
+        predictionId,
+        failureReason: String(e),
+        errorName: e instanceof Error ? e.name : "Error",
+        errorMessage: e instanceof Error ? e.message : String(e),
+      },
+      stage === "outbox_enqueue"
+        ? "outbox enqueue failed — not returning predicted without Telegram handoff"
+        : "durable prediction persistence failed — not returning predicted without handoff",
+    );
+    predictionLifecycleCounters.persistenceFailures += 1;
+    try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+    return {
+      predictionId,
+      targetGameId,
+      kind: "persist_failed",
+      temporalValidity: "TEMPORALLY_VALID",
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
+      predictionGeneratedAt: timestamp,
+      predictionLatencyMs: Math.round(performance.now() - t0),
+      outboxEnqueued: 0,
+    };
+  }
 
   // P0 (identity): register the immutable prediction record keyed by target
   // round. Feedback resolves against THIS record — never "last emitted".
@@ -1159,8 +1177,9 @@ export async function onGameEndPredict(
     sourceCrashAt: crashedAt,
     targetStartedAt: null,
     predictionGeneratedAt: timestamp,
-    predictionLatencyMs: Math.round(t4 - t0),
+    predictionLatencyMs: Math.round(performance.now() - t0),
     availableWindowMs: null,
     remainingBeforeTargetMs: null,
+    outboxEnqueued,
   };
 }
