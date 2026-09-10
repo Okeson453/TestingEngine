@@ -21,7 +21,6 @@ import {
 } from "@/lib/prediction/live/live-round-state";
 import { appendCompletedRound } from "@/lib/prediction/live/live-history-buffer";
 import {
-  claimTarget,
   completeTarget,
   releaseTarget,
 } from "@/lib/prediction/live/target-coordinator";
@@ -36,6 +35,71 @@ import { syncDbClockOffset, shouldResyncClock } from "@/lib/prediction/live/cloc
 const logger = getLogger("game-event-handlers");
 const inFlightEd = new Set<string>();
 const inFlightBg = new Set<string>();
+
+// Phase 5: recovery control — max 1 immediate recovery per source, then quarantine.
+const recoveryAttempts = new Map<string, number>();
+const RECOVERY_MAX = 1;
+
+function scheduleImmediateN1Recovery(input: {
+  sourceRoundId: string;
+  sourceCrashAt: string;
+  sourceMultiplier: number;
+  correlationId: string;
+}): void {
+  const key = input.sourceRoundId;
+  const n = (recoveryAttempts.get(key) ?? 0) + 1;
+  recoveryAttempts.set(key, n);
+  if (n > RECOVERY_MAX) {
+    logger.warn(
+      {
+        component: "game-event-handlers",
+        sourceGameId: key,
+        attempts: n,
+        correlationId: input.correlationId,
+      },
+      "N+1 recovery quarantined — max immediate attempts reached; wait for next ED",
+    );
+    return;
+  }
+  // Fire-and-forget single recovery via the authoritative attempt path.
+  void (async () => {
+    try {
+      const result = await attemptNPlusOnePrediction({
+        sourceRoundId: input.sourceRoundId,
+        sourceCrashAt: input.sourceCrashAt,
+        sourceMultiplier: input.sourceMultiplier,
+        source: "RECOVERY",
+        correlationId: input.correlationId,
+      });
+      logger.info(
+        {
+          component: "game-event-handlers",
+          sourceGameId: input.sourceRoundId,
+          targetGameId: result.targetGameId,
+          attempted: result.attempted,
+          kind: result.kind,
+          recoveryAttempt: n,
+        },
+        result.attempted
+          ? "immediate N+1 recovery succeeded"
+          : "immediate N+1 recovery soft result",
+      );
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      logger.error(
+        {
+          component: "game-event-handlers",
+          sourceGameId: input.sourceRoundId,
+          recoveryAttempt: n,
+          errorName: e.name,
+          errorMessage: e.message,
+          errorStack: e.stack?.slice(0, 1500) ?? null,
+        },
+        "immediate N+1 recovery threw",
+      );
+    }
+  })();
+}
 
 function toIsoString(timestamp: number | string | undefined): string | null {
   if (timestamp == null || timestamp === "") return null;
@@ -172,6 +236,7 @@ function normalizeCrashEnd(
 
 /**
  * ED(N): owns N+1 prediction — signal first, persistence async.
+ * Phase 2: attemptNPlusOnePrediction is the sole ownership boundary.
  */
 async function edHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
@@ -225,90 +290,84 @@ async function edHandler(payload: unknown): Promise<void> {
 
     const targetGameId = nextTargetGameId(gameId);
     trace.targetGameId = targetGameId;
-    const claim = claimTarget(targetGameId, `ed:${gameId}`);
+    // Phase 2: attemptNPlusOnePrediction is the sole ownership boundary
+    // (claimTarget lives inside onGameEndPredict). ED no longer double-claims.
     mark(trace, "target_claimed");
 
-    if (claim.owned) {
-      // Fix 8: the authoritative shared attempt path (same function poll uses).
-      try {
-        const result = await attemptNPlusOnePrediction({
-          sourceRoundId: gameId,
-          sourceCrashAt: crashedAt,
-          sourceMultiplier: multiplier,
-          source: "ED",
-          correlationId,
-          trace,
-        });
-        const totalMs = finishSignalReady(trace);
-        if (result.attempted) {
-          completeTarget(targetGameId, `ed:${gameId}`);
-          logger.info(
-            {
-              event: sourceEvent,
-              gameId,
-              targetGameId,
-              predictionId: result.predictionId,
-              ed_to_signal_ms: Math.round(totalMs * 100) / 100,
-              correlationId,
-            },
-            "ED→N+1 signal ready",
-          );
-        } else {
-          // soft miss — release so poll can recover if needed
-          releaseTarget(targetGameId, `ed:${gameId}`);
-          logger.info(
-            {
-              event: sourceEvent,
-              gameId,
-              targetGameId,
-              kind: result.kind,
-              ed_to_signal_ms: Math.round(totalMs * 100) / 100,
-            },
-            "ED→N+1 soft result",
-          );
-          // Immediate recovery retry when ED soft-failed/exception before target starts.
-          if (result.kind && (result.kind.startsWith("exception") || result.kind === "insufficient_history")) {
-            scheduleImmediateN1Recovery({
-              sourceRoundId: gameId,
-              sourceCrashAt: crashedAt,
-              sourceMultiplier: multiplier,
-              correlationId,
-            });
-          }
-        }
-      } catch (error) {
-        releaseTarget(targetGameId, `ed:${gameId}`);
-        const err = error instanceof Error ? error : new Error(String(error));
-        logger.error(
+    try {
+      const result = await attemptNPlusOnePrediction({
+        sourceRoundId: gameId,
+        sourceCrashAt: crashedAt,
+        sourceMultiplier: multiplier,
+        source: "ED",
+        correlationId,
+        trace,
+      });
+      const totalMs = finishSignalReady(trace);
+      if (result.attempted) {
+        completeTarget(targetGameId, `ed:${gameId}`);
+        logger.info(
           {
             event: sourceEvent,
             gameId,
             targetGameId,
+            predictionId: result.predictionId,
+            kind: result.kind,
+            ed_to_signal_ms: Math.round(totalMs * 100) / 100,
             correlationId,
-            errorName: err.name,
-            errorMessage: err.message,
-            errorStack: err.stack?.slice(0, 2000) ?? null,
           },
-          "ED→N+1 prediction failed",
+          "ED→N+1 PREDICTION_READY",
         );
-        scheduleImmediateN1Recovery({
-          sourceRoundId: gameId,
-          sourceCrashAt: crashedAt,
-          sourceMultiplier: multiplier,
-          correlationId,
-        });
+      } else {
+        // soft miss / duplicate / insufficient_history / exception handled in attempt
+        releaseTarget(targetGameId, `ed:${gameId}`);
+        logger.info(
+          {
+            event: sourceEvent,
+            gameId,
+            targetGameId,
+            kind: result.kind,
+            ed_to_signal_ms: Math.round(totalMs * 100) / 100,
+            correlationId,
+          },
+          "ED→N+1 soft result",
+        );
+        if (
+          result.kind &&
+          (result.kind.startsWith("exception") ||
+            result.kind === "insufficient_history")
+        ) {
+          scheduleImmediateN1Recovery({
+            sourceRoundId: gameId,
+            sourceCrashAt: crashedAt,
+            sourceMultiplier: multiplier,
+            correlationId,
+          });
+        }
       }
-    } else {
-      logger.info(
+    } catch (error) {
+      // attemptNPlusOnePrediction already swallows and returns; this is defensive.
+      releaseTarget(targetGameId, `ed:${gameId}`);
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.error(
         {
           event: sourceEvent,
           gameId,
           targetGameId,
-          reason: claim.reason,
-          owner: claim.owner,
+          correlationId,
+          stage: (err as { stage?: string }).stage ?? "unknown",
+          errorName: err.name,
+          errorMessage: err.message,
+          errorStack: err.stack?.slice(0, 2000) ?? null,
         },
-        "ED skip predict — target already claimed",
+        "ED→N+1 prediction failed",
       );
+      scheduleImmediateN1Recovery({
+        sourceRoundId: gameId,
+        sourceCrashAt: crashedAt,
+        sourceMultiplier: multiplier,
+        correlationId,
+      });
     }
 
     // --- P2 DURABILITY / validation async (must not block signal) ---
