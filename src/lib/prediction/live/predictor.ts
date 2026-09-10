@@ -852,14 +852,14 @@ export async function onGameEndPredict(
       sourceAgeMs: Math.max(0, Date.now() - new Date(crashedAt).getTime()),
       signalReady: true,
     },
-    "SIGNAL_READY — prediction generated, persistence async",
+    "PREDICTION_READY — model computation finished; durable handoff async",
   );
 
   // ── P1/P2: EVERYTHING BELOW IS NON-BLOCKING ──
   // pending_predictions, notification_outbox, and live_event_log are all
   // written asynchronously. The DB remains the durability/idempotency
   // backstop via ON CONFLICT DO NOTHING. If async persistence fails, the
-  // signal was already delivered and the prediction is still valid in-memory.
+  // PREDICTION_READY was returned; DB durability still required for outbox/Telegram.
   // The poll worker and validator will reconcile any missing DB state.
 
   const persistPromise = (async () => {
@@ -870,7 +870,7 @@ export async function onGameEndPredict(
     } catch (e) {
       logger.error(
         { component: "live-predictor", targetGameId, error: String(e) },
-        "async persistence: getSql failed — prediction signal was delivered",
+        "async persistence: getSql failed — PREDICTION_READY returned but durable handoff pending",
       );
       return;
     }
@@ -988,7 +988,7 @@ export async function onGameEndPredict(
           correlationId,
           error: String(e),
         },
-        "async prediction persistence failed — prediction signal was already delivered",
+        "async prediction persistence failed — PREDICTION_READY returned but durable handoff failed",
       );
       try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
     }
