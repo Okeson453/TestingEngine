@@ -38,7 +38,10 @@ const logger = getLogger("outbox-dispatcher");
 // empty. The timer is now RECOVERY/FALLBACK ONLY (covers missed wakes,
 // clock drift, operator re-enqueue without wake). Delivery latency is the
 // wake path's job — measured 1ms warm (18:36:33.169 -> .171).
-export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 2_000);
+// Recovery/fallback only — wake path is the primary drain trigger. 500ms
+// bounds missed-wake latency without hammering the critical pool (was 2s,
+// which alone could account for a large fraction of 2.5–4s outbox lag).
+export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 500);
 export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 /** Prediction lane is strictly single-item: freshness over throughput.
  * There is normally only one actionable N+1 prediction at a time. A new
