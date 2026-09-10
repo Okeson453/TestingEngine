@@ -453,16 +453,13 @@ export async function onGameEnd(
       /* soft */
     }
     try {
-      const eng = (
-        globalThis as {
-          __acieEngine__?: {
-            observeRound: (r: { roundId: string; crashPoint: number }) => unknown;
-          };
-        }
-      ).__acieEngine__;
-      eng?.observeRound({ roundId: evt.gameId, crashPoint: evt.multiplier });
+      const { getSharedACIEEngine } = await import(
+        "@/lib/prediction/acie/shared-engine"
+      );
+      const eng = getSharedACIEEngine();
+      eng.observeRound({ roundId: evt.gameId, crashPoint: evt.multiplier });
     } catch {
-      /* soft */
+      /* soft — predictor path is authoritative observer */
     }
   }
 
