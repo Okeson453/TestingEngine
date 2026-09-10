@@ -269,7 +269,7 @@ interface NormalizedCrashEnd {
   sourceEvent: "ed" | "st";
 }
 
-function normalizeCrashEnd(
+export function normalizeCrashEnd(
   raw: { gameId: string; multiplier?: number | null; endTime?: number | string | null; crashedAt?: number | string | null; hash?: string | null },
   sourceEvent: "ed" | "st",
 ): NormalizedCrashEnd | null {

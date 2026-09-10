@@ -60,7 +60,12 @@ export class ModelPerformanceTracker {
     return p;
   }
 
-  observe(name: string, probability: number, actual: 0 | 1): void {
+  observe(
+    name: string,
+    probability: number,
+    actual: 0 | 1,
+    opts?: { silent?: boolean },
+  ): void {
     const p = this.ensure(name);
     const q = Math.min(0.999, Math.max(0.001, probability));
     const ll = actual === 1 ? -Math.log(q) : -Math.log(1 - q);
@@ -75,20 +80,24 @@ export class ModelPerformanceTracker {
       p.recentTotal = Math.floor(p.recentTotal * 0.9);
     }
 
-    // P2.8: Add Metrics Emission for Model Performance
-    // Emit structured metrics after each update
-    const accuracy = p.count > 0 ? p.recentCorrect / Math.max(1, p.recentTotal) : 0;
-    const accuracyPct = (accuracy * 100).toFixed(2);
-    logger.info({
-      component: "model-performance",
-      modelName: name,
-      ewmaLogLoss: Number(p.ewmaLogLoss.toFixed(4)),
-      ewmaBrier: Number(p.ewmaBrier.toFixed(4)),
-      sampleCount: p.count,
-      recentAccuracy: accuracyPct,
-      recentCorrect: p.recentCorrect,
-      recentTotal: p.recentTotal,
-    }, "model performance updated");
+    // P2.8: Emit structured metrics after each update. Aggregate trackers
+    // (e.g. "live") pass silent — they update in the same round as the
+    // per-model observe, so a non-silent log here reads as a duplicate
+    // "model performance updated" line per resolved prediction.
+    if (!opts?.silent) {
+      const accuracy = p.count > 0 ? p.recentCorrect / Math.max(1, p.recentTotal) : 0;
+      const accuracyPct = (accuracy * 100).toFixed(2);
+      logger.info({
+        component: "model-performance",
+        modelName: name,
+        ewmaLogLoss: Number(p.ewmaLogLoss.toFixed(4)),
+        ewmaBrier: Number(p.ewmaBrier.toFixed(4)),
+        sampleCount: p.count,
+        recentAccuracy: accuracyPct,
+        recentCorrect: p.recentCorrect,
+        recentTotal: p.recentTotal,
+      }, "model performance updated");
+    }
 
     // P3.7: Check for constant predictions
     checkForConstantPredictions(probability);

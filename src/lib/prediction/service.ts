@@ -345,7 +345,8 @@ export async function validateAgainstNewRounds(
         "@/lib/prediction/ensemble/model-performance"
       );
       globalModelPerformance.observe(String(p.model_version ?? "baseline"), predicted, actual);
-      globalModelPerformance.observe("live", predicted, actual);
+      // Aggregate tracker: silent (per-model observe above already logged).
+      globalModelPerformance.observe("live", predicted, actual, { silent: true });
     } catch {
       /* soft */
     }

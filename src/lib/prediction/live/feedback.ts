@@ -289,7 +289,9 @@ export async function processResolvedPredictionFeedback(
     const mod = await import("@/lib/prediction/ensemble/model-performance");
     const name = String(input.modelVersion ?? "baseline");
     mod.globalModelPerformance.observe(name, predicted, actual);
-    mod.globalModelPerformance.observe("live", predicted, actual);
+    // Aggregate tracker: silent — one "model performance updated" line per
+    // resolved prediction (the per-model observe above already logged).
+    mod.globalModelPerformance.observe("live", predicted, actual, { silent: true });
     components.modelPerformance = true;
   } catch (e) {
     logger.warn({ error: String(e) }, "model-performance observe failed");
