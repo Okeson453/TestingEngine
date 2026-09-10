@@ -177,15 +177,15 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
 
   const criticalMax = readCriticalMax();
   const generalMax = readGeneralMax();
-  const idleTimeoutMillis = Number(process.env.PG_IDLE_TIMEOUT_MS ?? 15_000) || 15_000;
+  const idleTimeoutMillis = (Number(process.env.PG_IDLE_TIMEOUT_MS ?? 15_000) || 15_000);
   // Critical path: short acquire timeout (do not sit 30s behind dashboard)
   const criticalConnTimeout =
-    Number(process.env.PG_CRITICAL_CONN_TIMEOUT_MS ?? 5_000) || 5_000;
+    (Number(process.env.PG_CRITICAL_CONN_TIMEOUT_MS ?? 5_000) || 5_000);
   // General / dashboard: bounded, still shorter than legacy 30s default
   const generalConnTimeout =
-    Number(process.env.PG_CONN_TIMEOUT_MS ?? 8_000) || 8_000;
+    (Number(process.env.PG_CONN_TIMEOUT_MS ?? 8_000) || 8_000);
   const dashboardConnTimeout =
-    Number(process.env.PG_DASHBOARD_CONN_TIMEOUT_MS ?? 3_000) || 3_000;
+    (Number(process.env.PG_DASHBOARD_CONN_TIMEOUT_MS ?? 3_000) || 3_000);
 
   console.log(
     `[db] Dual pool: critical max=${criticalMax} connTimeoutMs=${criticalConnTimeout}; general max=${generalMax} connTimeoutMs=${generalConnTimeout}; dashboard acquire budget=${dashboardConnTimeout}`,
@@ -315,7 +315,7 @@ export async function withPinnedClient<T>(
 /** Dashboard-only: fail fast if general pool is busy (do not block 30s). */
 export async function withDashboardClient<T>(
   fn: (client: import("pg").PoolClient) => Promise<T>,
-  timeoutMs = Number(process.env.PG_DASHBOARD_CONN_TIMEOUT_MS ?? 3_000) || 3_000,
+  timeoutMs = (Number(process.env.PG_DASHBOARD_CONN_TIMEOUT_MS ?? 3_000) || 3_000),
 ): Promise<T> {
   const pool = getPgPool();
   if (!pool) {
@@ -342,4 +342,33 @@ export async function withDashboardClient<T>(
   } finally {
     client.release();
   }
+}
+
+
+/** Auth bootstrap: ensure general SQL (and PGLite when no DATABASE_URL) is ready. */
+export async function ensureDbReady(): Promise<void> {
+  await getSql();
+}
+
+/**
+ * PGLite handle for Better Auth when running without DATABASE_URL.
+ * Production Neon path should not call this.
+ */
+export async function getPglite(): Promise<import("@electric-sql/pglite").PGlite> {
+  if (databaseUrl) {
+    throw new Error("getPglite() is only available without DATABASE_URL (local PGLite mode)");
+  }
+  const g = globalThis as typeof globalThis & {
+    __pgliteAuth__?: Promise<import("@electric-sql/pglite").PGlite>;
+  };
+  if (!g.__pgliteAuth__) {
+    g.__pgliteAuth__ = (async () => {
+      mkdirSync(pgliteDataPath, { recursive: true });
+      const { PGlite } = await import("@electric-sql/pglite");
+      const db = new PGlite(pgliteDataPath);
+      await db.waitReady;
+      return db;
+    })();
+  }
+  return g.__pgliteAuth__;
 }
