@@ -925,7 +925,16 @@ export async function onGameEndPredict(
   // gates to kill or delay the signal until after the target round started.
   // Returning "predicted" only after outbox commit enforces:
   //   generate → durable queue → deliver-before-start
-  const getSqlFn = deps.getSqlFn ?? getSql;
+  //
+  // POOL-ROUTING FIX: this defaulted to getSql() (the GENERAL pool — shared
+  // with dashboard/analytics/forensics/feedback) despite db.ts existing
+  // specifically to reserve critical-pool capacity for this exact write.
+  // getCriticalPool() (db.ts) was defined but never referenced anywhere —
+  // dead code confirming the oversight. This is the ED(N)→N+1 hot path that
+  // must complete before the round-N+1 deadline; it belongs on the critical
+  // pool like every other caller in this file (see onGameStart above, and
+  // the dispatcher's getCriticalSql default in notification-worker.ts).
+  const getSqlFn = deps.getSqlFn ?? getCriticalSql;
   const persistT0 = Date.now();
   let outboxEnqueued = 0;
   let pendingWasDuplicate = false;

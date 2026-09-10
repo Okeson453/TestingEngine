@@ -51,7 +51,15 @@ const identity = (v: string) => v;
 
 type Run = <T>(text: string, params: unknown[]) => Promise<T[]>;
 
-function toSql(run: Run): Sql {
+/**
+ * Sql wrappers are tagged with the `pg.Pool` they were built from so that
+ * `runInTransaction` (tx.ts) can pin a client from the SAME pool the caller
+ * asked for (critical vs general) instead of always reaching for the
+ * general/dashboard pool. See tx.ts for the bug this closes.
+ */
+type TaggedSql = Sql & { __pgPool?: import("pg").Pool };
+
+function toSql(run: Run, pool?: import("pg").Pool): Sql {
   const sql = (async <T = Record<string, unknown>>(
     strings: TemplateStringsArray,
     ...values: unknown[]
@@ -63,10 +71,16 @@ function toSql(run: Run): Sql {
       text += `$${i + 1}` + (strings[i + 1] ?? "");
     }
     return run<T>(text, params);
-  }) as Sql;
+  }) as TaggedSql;
   sql.query = async <T = Record<string, unknown>>(text: string, params?: unknown[]) =>
     run<T>(text, params ?? []);
+  if (pool) sql.__pgPool = pool;
   return sql;
+}
+
+/** Read back the pool a Sql wrapper was tagged with (if any). Used by tx.ts. */
+export function getTaggedPool(sql: Sql): import("pg").Pool | undefined {
+  return (sql as TaggedSql).__pgPool;
 }
 
 function readTotalMax(): number {
@@ -229,8 +243,8 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   generalPool.on("error", (err) => console.error("[db] general pool error:", err.message));
 
   return {
-    critical: toSql(makeRun(criticalPool, "critical")),
-    general: toSql(makeRun(generalPool, "general")),
+    critical: toSql(makeRun(criticalPool, "critical"), criticalPool),
+    general: toSql(makeRun(generalPool, "general"), generalPool),
   };
 }
 

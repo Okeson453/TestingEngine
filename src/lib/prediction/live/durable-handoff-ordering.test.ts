@@ -31,6 +31,20 @@ describe("durable prediction handoff ordering (P0)", () => {
     expect(body).toMatch(/'pending',\s*10/);
   });
 
+  it("onGameEndPredict durable handoff defaults to the CRITICAL pool, not general", () => {
+    // P0 regression (forensic timing investigation): this hot path used to
+    // default to getSql() (general/dashboard pool) despite the dual-pool
+    // split existing specifically to reserve capacity for it. Guards
+    // against silently reintroducing that regression.
+    const start = predictorSrc.indexOf("export async function onGameEndPredict(");
+    expect(start).toBeGreaterThan(-1);
+    const handoffStart = predictorSrc.indexOf("P0 DURABLE HANDOFF", start);
+    expect(handoffStart).toBeGreaterThan(start);
+    const handoffBody = predictorSrc.slice(handoffStart, handoffStart + 1500);
+    expect(handoffBody).toContain("deps.getSqlFn ?? getCriticalSql");
+    expect(handoffBody).not.toMatch(/deps\.getSqlFn\s*\?\?\s*getSql[^A-Za-z]/);
+  });
+
   it("attemptNPlusOnePrediction only marks attempted when kind is predicted", () => {
     expect(attemptSrc).toContain('result?.kind === "predicted"');
     expect(attemptSrc).toContain("durable outbox enqueued");

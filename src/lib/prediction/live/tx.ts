@@ -3,7 +3,7 @@
  * Always releases the client in `finally` so pool slots cannot leak.
  */
 import type { Sql } from "@/lib/db";
-import { dbSource, getPgPool } from "@/lib/db";
+import { dbSource, getPgPool, getTaggedPool } from "@/lib/db";
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
@@ -33,7 +33,19 @@ export async function runInTransaction<T>(
   sql: Sql,
   fn: (tx: Sql) => Promise<T>,
 ): Promise<T> {
-  const pool = getPgPool();
+  // POOL-ROUTING FIX: this used to call getPgPool() unconditionally, which
+  // returns the GENERAL pool regardless of which Sql the caller passed in.
+  // Every transactional write in the app — prediction persist
+  // (predictor.ts), outbox claim (notification-worker.ts), validator
+  // persist, crash ingest — went through this function, so the dual
+  // critical/general pool split (db.ts) never actually applied to any BEGIN
+  // … COMMIT transaction: they all silently shared the general pool with
+  // dashboard/analytics/forensics traffic, regardless of whether the caller
+  // obtained `sql` via getCriticalSql() or getSql(). Pin a client from the
+  // pool the caller's `sql` was actually built from (tagged in db.ts);
+  // fall back to the general pool only when the tag is absent (e.g. a
+  // pre-dual-pool test double).
+  const pool = getTaggedPool(sql) ?? getPgPool();
   if (pool && dbSource === "neon") {
     let client: import("pg").PoolClient | null = null;
     try {

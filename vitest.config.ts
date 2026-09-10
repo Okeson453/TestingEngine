@@ -15,6 +15,7 @@ export default defineConfig({
       "src/lib/prediction/calibration/calibration-honesty.test.ts",
       "src/lib/prediction/lifecycle/*.test.ts",
       "src/lib/prediction/live/durable-handoff-ordering.test.ts",
+      "src/lib/prediction/live/tx-pool-routing.test.ts",
       "src/lib/prediction/live/zero-db-regression.test.ts",
       "src/lib/prediction/live/outbox-toctou-race.test.ts",
       "src/lib/prediction/live/feedback.test.ts",
