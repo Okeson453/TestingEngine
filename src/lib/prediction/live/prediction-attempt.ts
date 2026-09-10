@@ -160,7 +160,7 @@ export async function attemptNPlusOnePrediction(
         recoveryMode,
       },
       attempted
-        ? "N+1 prediction attempt owned"
+        ? "N+1 PREDICTION_READY"
         : "N+1 prediction attempt not owned / skipped",
     );
 
@@ -173,20 +173,35 @@ export async function attemptNPlusOnePrediction(
   } catch (error) {
     if (trace) trace.marks.prediction_completed = performance.now();
     const err = error instanceof Error ? error : new Error(String(error));
-    const kind = "exception";
+    const stage =
+      (err as { stage?: string }).stage ??
+      (err as { featureStage?: string }).featureStage ??
+      "unknown";
+    const featureStage = (err as { featureStage?: string }).featureStage ?? null;
+    const kind = `exception:${stage}`;
     recordAttempt(source, sourceRoundId, null, kind, false);
-    persistLastRejectionFireAndForget(source, sourceRoundId, null, `${kind}:${err.message}`);
-    // P0: always surface the root cause in production logs (message + stack + name).
+    persistLastRejectionFireAndForget(
+      source,
+      sourceRoundId,
+      null,
+      `${kind}:${err.name}:${err.message}`,
+    );
+    // P0: never emit a generic failure without stage + root cause.
     logger.error(
       {
+        component: "prediction-attempt",
+        event: "n1_attempt_failed",
         source,
         sourceGameId: sourceRoundId,
+        stage,
+        featureStage,
         errorName: err.name,
         errorMessage: err.message,
         errorStack: err.stack?.slice(0, 2000) ?? null,
         errorCode: (err as { code?: string }).code ?? null,
+        correlationId: input.correlationId ?? null,
       },
-      "N+1 prediction attempt failed",
+      `N+1 prediction attempt failed at stage=${stage}`,
     );
     // Do not rethrow — ED must release the claim and schedule recovery; a throw
     // collapsed the failure reason into a single line in some log pipelines.
@@ -194,7 +209,7 @@ export async function attemptNPlusOnePrediction(
       attempted: false,
       predictionId: null,
       targetGameId: null,
-      kind: `exception:${err.name}:${err.message}`.slice(0, 200),
+      kind: `exception:${stage}:${err.name}:${err.message}`.slice(0, 200),
     };
   }
 }
