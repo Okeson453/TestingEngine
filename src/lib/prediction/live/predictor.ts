@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
 import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
+import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
 import { getSql, getPgPool, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
@@ -930,8 +931,9 @@ export async function onGameEndPredict(
       sourceAgeMs: Math.max(0, Date.now() - new Date(crashedAt).getTime()),
       signalReady: true,
     },
-    "PREDICTION_READY — model computation finished; durable handoff async",
+    "PREDICTION_SIGNAL_READY — model computation finished; durable persistence pending (async)",
   );
+  predictionLifecycleCounters.predictionsReady += 1;
 
   // ── P1/P2: EVERYTHING BELOW IS NON-BLOCKING ──
   // pending_predictions, notification_outbox, and live_event_log are all
@@ -971,7 +973,7 @@ export async function onGameEndPredict(
             ${targetGameId}, ${gameId},
             ${correlationId}
           )
-          on conflict (prediction_id) do nothing
+          on conflict (target_game_id) where matched = false and target_game_id is not null do nothing
           returning prediction_id, requested_at
         `;
 
@@ -1070,6 +1072,7 @@ export async function onGameEndPredict(
         },
         "async persistence complete",
       );
+      predictionLifecycleCounters.predictionsPersisted += 1;
     } catch (e) {
       const stage = (e as { stage?: string }).stage ?? "persistence";
       logger.error(
@@ -1088,6 +1091,7 @@ export async function onGameEndPredict(
           ? "outbox enqueue failed — PREDICTION_READY returned but Telegram handoff failed"
           : "async prediction persistence failed — PREDICTION_READY returned but durable handoff failed",
       );
+      predictionLifecycleCounters.persistenceFailures += 1;
       try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
     }
   })();

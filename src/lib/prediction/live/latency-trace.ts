@@ -35,6 +35,15 @@ const stageSamples: Record<string, number[]> = {};
 let lastSignalAt: number | null = null;
 const deliverySamples: number[] = []; // outbox claim → telegram accepted
 
+// Finding 4.2: ready ↔ durable gap counters. A sustained gap (persisted
+// lagging ready) is the early-warning signal for async persistence failures
+// — alertable directly, no log-diffing required.
+export const predictionLifecycleCounters = {
+  predictionsReady: 0,
+  predictionsPersisted: 0,
+  persistenceFailures: 0,
+};
+
 function mono(): number {
   return typeof performance !== "undefined" && performance.now
     ? performance.now()
@@ -113,6 +122,7 @@ export function snapshotLatencyBudget(): Record<string, unknown> {
   const n = samples.length;
   return {
     n,
+    predictionLifecycle: { ...predictionLifecycleCounters },
     ed_to_signal_ms: {
       p50: percentile(samples, 50),
       p95: percentile(samples, 95),

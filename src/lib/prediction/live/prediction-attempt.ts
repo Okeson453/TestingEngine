@@ -160,7 +160,7 @@ export async function attemptNPlusOnePrediction(
         recoveryMode,
       },
       attempted
-        ? "N+1 PREDICTION_READY"
+        ? "N+1 SIGNAL_READY (durability pending)"
         : "N+1 prediction attempt not owned / skipped",
     );
 

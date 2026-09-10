@@ -11,6 +11,7 @@
  *     potentially corrupted worker alive.
  */
 import { pathToFileURL } from "node:url";
+import { registerProcessFailureHandlers } from "./worker-fatal.mjs";
 
 if (!process.env.DATABASE_URL) {
   console.error("[worker] DATABASE_URL is not set (local PGLite mode).");
@@ -21,6 +22,17 @@ if (!process.env.DATABASE_URL) {
   console.error("[worker] To run a separate worker process, set DATABASE_URL (Neon).");
   process.exit(0);
 }
+
+// Phase 13 (fix applied): process failure handlers MUST be installed before
+// ANY boot step — the wr_utils crash fired from a setTimeout during boot,
+// before the previous post-boot registration existed, producing a raw crash
+// loop. endPool resolves lazily: the db module is only imported further down.
+let endPgPoolLazy = null;
+// Disposer kept out only for symmetry with worker-fatal.mjs's test hook; the
+// worker process lives until SIGTERM, so the handlers are never removed.
+const _offFailureHandlers = registerProcessFailureHandlers({
+  endPool: () => endPgPoolLazy?.(),
+});
 
 // The live pipeline runs validation, prediction, feedback, outbox and polling
 // concurrently. A pool of 3 repeatedly saturates under normal round traffic.
@@ -124,6 +136,7 @@ async function ensureMigrations() {
 const liveBoot = await import("@/lib/prediction/live/boot");
 const events = await import("@/lib/prediction/events/game-event-handlers");
 const db = await import("@/lib/db");
+endPgPoolLazy = db.endPgPool;
 const edgeHttp = await import("@/lib/prediction/live/edge-http");
 
 let shuttingDown = false;
@@ -203,64 +216,11 @@ console.log(
 
 /**
  * Phase 13 — Correct worker failure handling.
- * Unrecoverable process-level exceptions must terminate the worker so the
- * runtime (Railway / container) restarts a clean process. Leaving a
- * potentially corrupted process alive is worse than a short outage.
+ * Handlers now live in worker-fatal.mjs and are registered at the VERY TOP
+ * of this file (before migrations / boot), because the wr_utils crash fired
+ * during boot before the previous post-boot registration existed.
+ * See the `registerProcessFailureHandlers` call above the env setup.
  */
-process.on("uncaughtException", (err) => {
-  const errorObj = err instanceof Error ? err : { message: String(err), name: "Unknown" };
-  console.error(
-    JSON.stringify({
-      level: "fatal",
-      time: new Date().toISOString(),
-      component: "worker-entry",
-      msg: "uncaughtException",
-      error: {
-        name: errorObj.name,
-        message: errorObj.message,
-        stack: String(errorObj.stack ?? "").slice(0, 4000),
-      },
-    }),
-  );
-  // Only hard-exit on explicit fatal / OOM-style errors.
-  const stack = String(err?.stack ?? err);
-  const fatal =
-    process.env.WORKER_FATAL_ON_UNCAUGHT === "1" ||
-    /out of memory|Cannot find module|FATAL/i.test(stack);
-  if (fatal) {
-    try {
-      void db.endPgPool?.();
-    } catch {
-      /* ignore */
-    }
-    process.exit(1);
-  }
-});
-
-process.on("unhandledRejection", (reason) => {
-  const reasonObj = reason instanceof Error ? reason : { message: String(reason), name: "Unknown" };
-  console.error(
-    JSON.stringify({
-      level: "fatal",
-      time: new Date().toISOString(),
-      component: "worker-entry",
-      msg: "unhandledRejection",
-      error: {
-        name: reasonObj.name,
-        message: reasonObj.message,
-        stack: String(reasonObj.stack ?? "").slice(0, 4000),
-      },
-    }),
-  );
-  if (process.env.WORKER_FATAL_ON_UNCAUGHT === "1") {
-    try {
-      void db.endPgPool?.();
-    } catch {
-      /* ignore */
-    }
-    process.exit(1);
-  }
-});
 
 const shutdown = async (signal) => {
   if (shuttingDown) return;

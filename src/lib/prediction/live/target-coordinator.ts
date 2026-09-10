@@ -2,6 +2,15 @@
  * In-memory single-owner claim for target game N+1 prediction.
  * First claimant (ED preferred) owns model compute; duplicates reconcile only.
  * DB unique constraint remains the durability backstop.
+ *
+ * DEPLOYMENT CONSTRAINT (Finding 2.4 — documented, do not "fix" blindly):
+ * these claims are PER-PROCESS. This is only correct because production runs
+ * exactly ONE worker replica (see Railway service config). Scaling to >1
+ * replica silently reintroduces the multi-owner race here — two replicas
+ * could both believe they own the same target. The ON CONFLICT partial-index
+ * guard on pending_predictions makes that SAFE (no corruption), but the
+ * wasted compute and confusing ownership logs remain. If you must scale out,
+ * move claim coordination to Postgres/advisory locks FIRST.
  */
 export type ClaimResult =
   | { owned: true; claimedAt: number }

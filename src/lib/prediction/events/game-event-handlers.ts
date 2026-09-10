@@ -383,7 +383,7 @@ async function edHandler(payload: unknown): Promise<void> {
             ed_to_signal_ms: Math.round(totalMs * 100) / 100,
             correlationId,
           },
-          "ED→N+1 PREDICTION_READY",
+          "ED→N+1 SIGNAL_READY (durability pending)",
         );
       } else {
         // soft miss / duplicate / insufficient_history / exception handled in attempt
