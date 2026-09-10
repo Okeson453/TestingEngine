@@ -161,7 +161,14 @@ function FeedBanner({ data }: { data: DashboardPayload }) {
   }
   return (
     <p className="text-sm text-low">
-      Live feed paused{feed.error ? ` — ${feed.error}` : ""}. Showing stored rounds.
+      {(() => {
+                const err = String(feed.error ?? "");
+                const isDb =
+                  /timeout|connect|POOL|database|ECONN|exhaustion/i.test(err);
+                return isDb
+                  ? `Live status unavailable — database connection issue${err ? ` (${err})` : ""}. Showing last known rounds.`
+                  : `Live feed paused${err ? ` — ${err}` : ""}. Showing stored rounds.`;
+              })()}
     </p>
   );
 }
