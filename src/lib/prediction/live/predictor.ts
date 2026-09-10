@@ -39,7 +39,8 @@ const DEFAULT_TARGET: ThresholdTarget = 1.3;
  *  Prior default 0.04 needed ~81% which almost never fired with baseline P≈fair. */
 const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
 const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
-const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
+const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN
+_SIGNAL_CONFIDENCE ?? 0);
 const MIN_HISTORY = 20;
 /** Reduced 100->50: halves history query cost on the hot ED path while
  *  remaining well above MIN_HISTORY for model stability. */
@@ -69,8 +70,72 @@ export const MAX_SOURCE_ROUND_AGE_MS = Number(process.env.MAX_SOURCE_ROUND_AGE_M
 /** Default 500ms (was 100) — P1 recommendation. */
 export const TEMPORAL_TOLERANCE_MS = Number(process.env.TEMPORAL_TOLERANCE_MS ?? 500);
 
+// =============================================================================
+// PHASE 1: STAGE-LEVEL EXCEPTION TELEMETRY (P0 Fix)
+// =============================================================================
+
+/** Prediction execution stages for precise error diagnosis */
+export type PredictionStage = 
+  | 'target_derivation'
+  | 'target_claim'
+  | 'history_buffer_update'
+  | 'history_loading'
+  | 'feature_generation'
+  | 'regime_detection'
+  | 'model_resolution'
+  | 'model_prediction'
+  | 'signal_conversion'
+  | 'signal_validation';
+
+/** Enhanced error context for stage-level telemetry */
+interface StageErrorContext {
+  stage: PredictionStage;
+  sourceGameId: string;
+  targetGameId: string;
+  predictionId: string | null;
+  historySize: number;
+  featurePath: string | null;
+  model: string | null;
+  errorName: string;
+  errorMessage: string;
+  errorStack: string | null;
+  correlationId: string;
+  attemptNumber: number;
+}
+
+/** Global attempt counter for telemetry */
+let attemptCounter = 0;
+
+/** Log stage-level prediction error with full context */
+function logStageError(context: StageErrorContext): void {
+  logger.error(
+    {
+      component: 'live-predictor',
+      event: 'prediction_stage_failure',
+      ...context,
+    },
+    'N+1 prediction failed at stage: ' + context.stage,
+  );
+
+  // Also log to worker_state for durability
+  void (async () => {
+    try {
+      const { getSql } = await import('@/lib/db');
+      const sql = await getSql();
+      const payload = JSON.stringify(context);
+      await sql.unsafe(
+        'insert into worker_state (key, value) values ($1, $2) on conflict (key) do update set value = excluded.value, updated_at = now()',
+        ['last_prediction_stage_error', payload]
+      );
+    } catch {
+      /* soft — telemetry must never throw on the hot path */
+    }
+  })();
+}
+
 // P2.10: SLA Alert threshold for prediction timing
-export const PREDICTION_SLA_THRESHOLD_MS = Number(process.env.PREDICTION_SLA_THRESHOLD_MS ?? 2000);
+export const PREDICTION_SLA_THRESHOLD_MS = Number(process.env.PREDICTION_SLA_THRESHOLD_MS
+ ?? 2000);
 
 export interface GameStartEvent {
   gameId: string;
@@ -139,7 +204,8 @@ function mapRowToHistorical(r: PriorRow): HistoricalRound {
   const beganAt =
     r.began_at instanceof Date
       ? r.began_at.toISOString()
-      : r.began_at
+      :
+ r.began_at
         ? String(r.began_at)
         : null;
   return {
@@ -217,7 +283,8 @@ const defaultPredictFn = (
   let probability = signal.probability;
   let confidence = signal.confidence;
   let modelVersion = signal.modelVersion ?? "live-v2";
-  let reasoning: string[] = Array.isArray(signal.reasoning)
+  let reasoning: string[] = Array.isArray(s
+ignal.reasoning)
     ? [...signal.reasoning]
     : signal.reasoning
       ? [String(signal.reasoning)]
@@ -279,7 +346,8 @@ async function loadPriorRoundsStrict(
     if (!isLiveHistoryWarmed()) {
       await warmLiveHistoryBuffer(sql, Math.max(limit, 100));
     }
-    const fromMem = getPriorRoundsSync(limit, undefined, beganAt);
+    const fromMem = getPriorRoundsSync(limit, undefined, be
+ganAt);
     if (fromMem.length > 0) {
       return fromMem;
     }
@@ -338,7 +406,8 @@ export async function onGameStart(
   const now = deps.now ?? Date.now;
   const minHistory = deps.minHistory ?? MIN_HISTORY;
   const slaLagMs = deps.slaLagMs ?? SLA_LAG_MS;
-  const temporalToleranceMs = deps.temporalToleranceMs ?? TEMPORAL_TOLERANCE_MS;
+  const temporalToleranceMs = deps.temporalTolerance
+Ms ?? TEMPORAL_TOLERANCE_MS;
 
   const correlationId = randomUUID();
   const beginMs = new Date(evt.beginTime).getTime();
@@ -409,7 +478,8 @@ export async function onGameStart(
 
   const existing = await sql<{ prediction_id: string }>`
     select prediction_id from pending_predictions
-    where target_game_id = ${evt.gameId} and matched = false
+    where target_g
+ame_id = ${evt.gameId} and matched = false
     limit 1
   `;
   if (existing.length > 0) {
@@ -466,7 +536,8 @@ export async function onGameStart(
           ${signal.regimeId ? 0.5 : null},
           ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
           ${signal.modelVersion}, ${timestamp},
-          ${evt.gameId}, ${evt.beginTime}, ${evt.sourceRoundGameId},
+          ${evt.gameI
+d}, ${evt.beginTime}, ${evt.sourceRoundGameId},
           ${correlationId}
         )
         on conflict (prediction_id) do nothing
@@ -515,7 +586,8 @@ export async function onGameStart(
               targetBeganAt: evt.beginTime,
               targetMultiplier: Number(DEFAULT_TARGET),
               probability: signal.probability,
-              confidence: signal.confidence,
+           
+   confidence: signal.confidence,
               regimeName: signal.regimeId,
               slaViolated: false,
               kind: "prediction",
@@ -580,7 +652,8 @@ export async function onGameStart(
       : "prediction generated and persisted for next round",
   );
 
-  // Wake dispatcher immediately after TX commit (no setImmediate boundary).
+  // Wake dispatcher immediately after TX
+ commit (no setImmediate boundary).
   if (outboxEnqueued > 0 && !slaViolated) {
     try {
       const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
@@ -657,7 +730,8 @@ export async function onGameEndPredict(
       );
       return {
         predictionId: null,
-        targetGameId: String(gameId ?? "unknown"),
+        
+targetGameId: String(gameId ?? "unknown"),
         kind: "skipped_invalid_target",
         sourceGameId: String(gameId ?? ""),
         sourceCrashAt: crashedAt,
@@ -720,7 +794,8 @@ export async function onGameEndPredict(
   // ── P0: History MUST come from memory. NEVER call getSql() here. ──
   // No SQL fallback allowed on the ED prediction path. If the buffer is cold,
   // boot should have warmed it. SQL is only for boot/recovery/cold-start.
-  let priorRounds: HistoricalRound[] = [];
+  let priorRounds: Historica
+lRound[] = [];
   try {
     const {
       getPriorRoundsSync,
@@ -764,13 +839,76 @@ export async function onGameEndPredict(
   }
 
   // ── P0: Prediction computation only (ZERO DB, ZERO Telegram, ZERO outbox) ──
+  
+  // ── P0: Prediction computation only (ZERO DB, ZERO Telegram, ZERO outbox) ──
   const timestamp = generatedAt;
   const predictT0 = performance.now();
-  const signal = predictFn(priorRounds, targetGameId, timestamp, DEFAULT_TARGET);
+  
+  // PHASE 1: Stage-level exception telemetry for prediction computation
+  let signal: ReturnType<typeof predictFn>;
+  let predictionStage: PredictionStage | null = null;
+  
+  try {
+    predictionStage = 'model_prediction';
+    signal = predictFn(priorRounds, targetGameId, timestamp, DEFAULT_TARGET);
+    predictionStage = 'signal_validation';
+    
+    // Validate signal output
+    if (!signal || typeof signal !== 'object') {
+      throw new Error('predictFn returned invalid signal: ' + String(signal));
+    }
+    if (!signal.predictionId) {
+      throw new Error('predictFn returned signal without predictionId');
+    }
+    if (!Number.isFinite(signal.probability)) {
+      throw new Error('predictFn returned non-finite probability: ' + signal.probability);
+    }
+    if (!Number.isFinite(signal.confidence)) {
+      throw new Error('predictFn returned non-finite confidence: ' + signal.confidence);
+    }
+    
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    const stageError: StageErrorContext = {
+      stage: predictionStage || 'model_prediction',
+      sourceGameId: gameId,
+      targetGameId,
+      predictionId: null,
+      historySize: priorRounds.length,
+      featurePath: 'FeatureEngineV2',
+      model: 'BaselineStatisticalModel',
+      errorName: err.name,
+      errorMessage: err.message,
+      errorStack: err.stack?.slice(0, 2000) ?? null,
+      correlationId,
+      attemptNumber: ++attemptCounter,
+    };
+    
+    logStageError(stageError);
+    
+    // Release target on prediction failure
+    try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+    
+    // Return detailed error result
+    return {
+      predictionId: null,
+      targetGameId,
+      kind: 'error',
+      temporalValidity: 'TEMPORALLY_UNVERIFIED',
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
+    };
+  }
+  
   const predictElapsed = performance.now() - predictT0;
   const t3 = performance.now(); // prediction completed
 
   if (predictElapsed > PREDICT_TIMEOUT_MS) {
+    logger.warn(
+      { targetGameId, predictElapsedMs: predictElapsed, budgetMs: PREDICT_TIMEOUT_MS },
+      "prediction exceeded PREDICT_TIMEOUT_MS budget — consider offloading to worker thread",
+    );
+  }if (predictElapsed > PREDICT_TIMEOUT_MS) {
     logger.warn(
       { targetGameId, predictElapsedMs: predictElapsed, budgetMs: PREDICT_TIMEOUT_MS },
       "prediction exceeded PREDICT_TIMEOUT_MS budget — consider offloading to worker thread",
@@ -783,7 +921,8 @@ export async function onGameEndPredict(
     predictionGenerationMs.observe(predictElapsed);
   } catch { /* metrics optional */ }
 
-  const predictionId = signal.predictionId;
+  const predictionId = signal.pr
+edictionId;
 
   // Compute SLA status (in-memory, no DB clock access)
   const effectiveSlaLagMs = recoveryMode ? SLA_LAG_MS * 2 : SLA_LAG_MS;
@@ -843,7 +982,8 @@ export async function onGameEndPredict(
       sourceGameId: gameId,
       correlationId,
       recoveryMode,
-      // Precise stage-level latency instrumentation
+      // Precise stage-level latency instrumen
+tation
       claimMs: Number((t1 - t0).toFixed(2)),
       historyMs: Number((t2 - t1).toFixed(2)),
       predictionMs: Number((t3 - t2).toFixed(2)),
@@ -890,7 +1030,8 @@ export async function onGameEndPredict(
             ${signal.regimeId ? 0.5 : null},
             ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
             ${signal.modelVersion}, ${timestamp}, ${timestamp},
-            ${targetGameId}, ${gameId},
+    
+        ${targetGameId}, ${gameId},
             ${correlationId}
           )
           on conflict (prediction_id) do nothing
@@ -938,7 +1079,8 @@ export async function onGameEndPredict(
                 confidence: signal.confidence,
                 regimeName: signal.regimeId,
                 slaViolated,
-                slaLagMsActual,
+            
+    slaLagMsActual,
                 kind: "prediction",
                 recoveryMode,
               })},
@@ -958,100 +1100,6 @@ export async function onGameEndPredict(
           ${correlationId}::text, 'PREDICT', ${targetGameId},
           ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode })},
           ${crashedAt}::timestamptz, now(),
-          ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
-        )
-      `.catch(() => undefined);
+          ${Math.max(0, Date.now() - new Date(crashedAt).getTime(
 
-      // Wake outbox dispatcher after TX commit
-      try {
-        const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
-        notifyOutbox();
-      } catch { /* soft */ }
-
-      try { completeTarget(targetGameId, owner); } catch { /* soft */ }
-
-      logger.info(
-        {
-          component: "live-predictor",
-          predictionId,
-          targetGameId,
-          correlationId,
-          persistenceMs: Number((performance.now() - t4).toFixed(2)),
-        },
-        "async persistence complete",
-      );
-    } catch (e) {
-      logger.error(
-        {
-          component: "live-predictor",
-          targetGameId,
-          correlationId,
-          error: String(e),
-        },
-        "async prediction persistence failed — prediction signal was already delivered",
-      );
-      try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
-    }
-  })();
-
-  // Don't await — return the signal immediately.
-  // Keep the promise alive so it doesn't become an unhandled rejection.
-  void persistPromise.catch(() => undefined);
-
-  // P0 (identity): register the immutable prediction record keyed by target
-  // round. Feedback resolves against THIS record — never "last emitted".
-  try {
-    const { globalPredictionRegistry } = await import(
-      "@/lib/prediction/identity/prediction-registry"
-    );
-    const fs = signal.featureSummary as Record<string, unknown> | null | undefined;
-    const featureVersionOf = (signal as { featureVersion?: string | null }).featureVersion ?? null;
-    globalPredictionRegistry.register({
-      predictionId,
-      sourceRoundId: gameId,
-      targetRoundId: targetGameId,
-      createdAt: timestamp,
-      targetStartedAt: null,
-      targetEndedAt: null,
-      rawProbability: signal.probability,
-      calibratedProbability: null,
-      pipelineProbability: null,
-      finalProbability: signal.probability,
-      confidence: signal.confidence,
-      target: Number(DEFAULT_TARGET),
-      regime: signal.regimeId ?? null,
-      modelVersion: signal.modelVersion,
-      featureVersion: featureVersionOf,
-      featurePath: null,
-      temporalValidity: "TEMPORALLY_UNVERIFIED",
-      provenance: {
-        stateVersion: (fs?.stateVersion as string | number | undefined) ?? null,
-        acieStateVersion: (fs?.stateVersion as string | number | undefined) ?? null,
-        calibrationVersion: (fs?.calibrationVersion as string | number | undefined) ?? null,
-        regimeVersion: (fs?.regimeVersion as string | number | undefined) ?? null,
-        pipelineVersion: null,
-      },
-      stages: {
-        acieSignal: true,
-        calibrationApplied: null,
-        pipelineApplied: null,
-        finalSignal: true,
-      },
-      resolved: false,
-    });
-  } catch { /* soft — registry is best-effort */ }
-
-  return {
-    predictionId,
-    targetGameId,
-    kind: "predicted",
-    temporalValidity: "TEMPORALLY_VALID",
-    sourceGameId: gameId,
-    sourceCrashAt: crashedAt,
-    targetStartedAt: null,
-    predictionGeneratedAt: timestamp,
-    predictionLatencyMs: Math.round(t4 - t0),
-    availableWindowMs: null,
-    remainingBeforeTargetMs: null,
-  };
-}
+... [Content truncated]
