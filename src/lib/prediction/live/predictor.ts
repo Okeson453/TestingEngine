@@ -32,7 +32,7 @@ import { getLogger } from "@/lib/observability/logger";
 // FALLBACK_BASELINE). Static ESM imports work in both the Vite dev server
 // and the standalone ESM worker.
 import { getSharedACIEEngine, getSharedACIEInstanceId } from "@/lib/prediction/acie/shared-engine";
-import { buildAcieFeatureFingerprint, buildProvenance } from "@/lib/prediction/acie/provenance";
+import { buildAcieFeatureFingerprint, buildProvenance, computeFeatureHash } from "@/lib/prediction/acie/provenance";
 import { recordAcieObservation, assertFreshAcieState } from "@/lib/prediction/acie/stale-guard";
 import { runPredictionPipeline } from "@/lib/prediction/prediction-pipeline";
 
@@ -360,6 +360,30 @@ const defaultPredictFn = (
     }
   }
 
+  // Forensic provenance for the fallback path: record which shared-ACIE
+  // state existed when the fallback fired, so a FALLBACK_BASELINE row can
+  // never be mistaken for stale ACIE output. Metadata only — never throws.
+  let fallbackAcie: {
+    acie_observation_count: number | null;
+    acie_state_version: number | null;
+    acie_instance_id: string | null;
+  } = {
+    acie_observation_count: null,
+    acie_state_version: null,
+    acie_instance_id: null,
+  };
+  try {
+    const acie = getSharedACIEEngine();
+    const obsCount = acie.getOnlineState().observationCount ?? acie.historySize();
+    fallbackAcie = {
+      acie_observation_count: obsCount,
+      acie_state_version: obsCount,
+      acie_instance_id: getSharedACIEInstanceId(),
+    };
+  } catch {
+    /* forensic metadata only */
+  }
+
   return {
     predictionId: signal.predictionId,
     probability,
@@ -368,6 +392,7 @@ const defaultPredictFn = (
     reasoning,
     featureSummary: {
       ...(signal.featureSummary as Record<string, unknown> | undefined),
+      ...fallbackAcie,
       prediction_mode: executionMode,
       execution_path: "PredictionEngine.predict",
       acieAuthoritative: false,
@@ -921,14 +946,28 @@ export async function onGameEndPredict(
     } catch {
       /* soft */
     }
+    // Forensic provenance: prove the observation advanced the state.
+    // state_version is the monotonic state version (== observationCount);
+    // history_hash fingerprints the observed crash history so a repeat
+    // lineup complaint can be answered from the log alone.
+    let historyHash: string | null = null;
+    try {
+      historyHash = computeFeatureHash({
+        crashPointsTail: acie.exportSnapshot().crashPoints,
+      });
+    } catch {
+      /* forensic metadata only */
+    }
     logger.info(
       {
         component: "live-predictor",
         event: "ACIE_OBSERVATION",
-        gameId,
+        sourceGameId: gameId,
         multiplier,
-        observationCount: obsCount,
+        observation_count: obsCount,
+        state_version: obsCount,
         acieInstanceId: getSharedACIEInstanceId(),
+        history_hash: historyHash,
       },
       "ACIE observed crash before N+1 evaluation",
     );
