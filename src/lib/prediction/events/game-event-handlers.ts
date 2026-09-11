@@ -44,8 +44,7 @@ const inFlightPr = new Set<string>();
 // P0 — native WS duplicate-event dedup (idempotency by canonical round ID).
 // inFlightEd only blocks CONCURRENT re-entry; the same crash event arriving
 // again after the first handler finished (observed 350ms–1.2s apart in prod)
-// re-ran the entire ED pipeline. game 
-ID is the idempotency key — never the
+// re-ran the entire ED pipeline. game ID is the idempotency key — never the
 // timestamp. Bounded ledger: pruned on insert, capped.
 const completedEdRounds = new Map<string, number>();
 const ED_DEDUP_TTL_MS = 10 * 60_000;
@@ -107,8 +106,7 @@ function scheduleImmediateN1Recovery(input: {
   const n = (recoveryAttempts.get(key) ?? 0) + 1;
   recoveryAttempts.set(key, n);
   if (n > RECOVERY_MAX) {
-    logger.war
-n(
+    logger.warn(
       {
         component: "game-event-handlers",
         sourceGameId: key,
@@ -173,8 +171,7 @@ function toIsoString(timestamp: number | string | undefined): string | null {
     return new Date().toISOString();
   }
   const date = new Date(ms);
-  return Number.isNaN
-(date.getTime()) ? null : date.toISOString();
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
 function extractLastGameId(payload: unknown): string | null {
@@ -226,8 +223,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
 
   try {
     const sql = await getSql();
-    // POOL-BUDG
-ET FIX: BG used to launch SIX concurrent general-pool
+    // POOL-BUDGET FIX: BG used to launch SIX concurrent general-pool
     // operations via Promise.all — with general max=5 that self-induced
     // waiting=2/3 pool pressure on every round start. The essential BG
     // lifecycle is now ONE transaction (round start + prediction target
@@ -265,8 +261,7 @@ ET FIX: BG used to launch SIX concurrent general-pool
             AND target_game_id = ${gameId}
         `;
         await tx`
-          INSE
-RT INTO live_event_log (
+          INSERT INTO live_event_log (
             correlation_id, event_kind, game_id, payload, received_at, processed_at,
             processor_latency_ms, sla_violated
           ) VALUES (
@@ -312,49 +307,7 @@ RT INTO live_event_log (
 
     logger.info(
       { event: "bg", gameId, correlationId },
-    // PROACTIVE PREDICTION: Trigger prediction for N+2 when BG(N+1) arrives
-    const nextTarget = nextTargetGameId(gameId);
-    const predCorrelationId = randomUUID();
-    
-    try {
-      const checkSql = await getSql();
-      const existing = await checkSql<{ prediction_id: string }>(
-        `SELECT prediction_id FROM pending_predictions WHERE target_game_id = ${nextTarget} AND matched = false LIMIT 1`
-      );
-      
-      if (existing.length === 0) {
-        const prevGameId = String(BigInt(gameId) - 1n);
-        const prevRow = await checkSql<{ multiplier: string | number }>(
-          `SELECT multiplier FROM crash_rounds WHERE game_id = ${prevGameId} LIMIT 1`
-        );
-        const sourceMultiplier = prevRow.length > 0 ? Number(prevRow[0].multiplier) : 1.0;
-        
-        void (async () => {
-          try {
-            const result = await attemptNPlusOnePrediction({
-              sourceRoundId: gameId,
-              sourceCrashAt: beganAt,
-              sourceMultiplier: sourceMultiplier,
-              source: "BG",
-              correlationId: predCorrelationId,
-            });
-            logger.info(
-              { event: "bg", gameId, targetGameId: result.targetGameId, attempted: result.attempted, correlationId: predCorrelationId },
-              result.attempted ? "BG-triggered N+2 prediction" : "BG-triggered N+2 prediction skipped"
-            );
-          } catch (err) {
-            logger.error({ event: "bg", gameId, error: String(err), correlationId: predCorrelationId }, "BG-triggered N+2 prediction failed");
-          }
-        })();
-      }
-    } catch (e) {
-      logger.debug({ event: "bg", gameId, error: String(e), correlationId }, "BG N+2 prediction check failed (soft)");
-    }
-    
-    logger.info(
-      { event: "bg", gameId, correlationId },
-      "bg reconcile complete",
-    );
+      "bg reconcile complete (no prediction)",
     );
   } catch (error) {
     logger.error({ event: "bg", gameId, error: String(error) }, "bg observability failed");
@@ -367,8 +320,7 @@ RT INTO live_event_log (
  * SEP 11 FIX: `pr` (prepare — betting opens) handler.
  *
  * pr used to be routed into bgHandler, whose unconditional temporal kill
- * dead-lettered every undelivered prediction targe
-ting the round at
+ * dead-lettered every undelivered prediction targeting the round at
  * betting-open, ~9-11s before the round actually started, and whose
  * first-write-wins began_at could never be corrected by the real BG. pr now
  * ONLY writes an attributable live_event_log row (event_kind 'PR'): no
@@ -421,8 +373,7 @@ export async function prHandler(payload: unknown): Promise<void> {
  */
 interface NormalizedCrashEnd {
   gameId: string;
-  mu
-ltiplier: number | null;
+  multiplier: number | null;
   crashedAt: string;
   hash: string | null;
   /** Original protocol event name, for telemetry only. */
@@ -475,8 +426,7 @@ export async function edHandler(payload: unknown): Promise<void> {
       {
         component: "game-event-handlers",
         event: "ed",
-  
-      gameId,
+        gameId,
         ownership_result: reentry,
       },
       "ED crash event deduplicated — skipping reprocessing",
@@ -538,8 +488,7 @@ export async function edHandler(payload: unknown): Promise<void> {
 
     const targetGameId = nextTargetGameId(gameId);
     trace.targetGameId = targetGameId;
-    //
- Phase 2: attemptNPlusOnePrediction is the sole ownership boundary
+    // Phase 2: attemptNPlusOnePrediction is the sole ownership boundary
     // (claimTarget lives inside onGameEndPredict). ED no longer double-claims.
     mark(trace, "target_claimed");
 
@@ -597,7 +546,6 @@ export async function edHandler(payload: unknown): Promise<void> {
             sourceRoundId: gameId,
             sourceCrashAt: crashedAt,
             sourceMultiplier: multiplier,
-
             correlationId,
           });
         }
@@ -652,8 +600,7 @@ export async function edHandler(payload: unknown): Promise<void> {
               multiplier,
               crashedAt,
             });
-          } catc
-h { /* soft */ }
+          } catch { /* soft */ }
         }
         await markLiveRoundEnded(gameId, crashedAt, multiplier, sql, "socket").catch(
           () => undefined,
@@ -708,8 +655,7 @@ export function initializeEventHandlers(): void {
       // SEP 11 ROOT-CAUSE FIX: `pr` is PREPARE (betting opens, ~9-11s before
       // the round starts) — a DISTINCT phase per the repo's own normalizer
       // (realtime/normalizer.ts: pr→"prepare", bg→"begin"). pr used to be
-      // routed into bgHandler, whose unconditional 
-temporal kill dead-lettered
+      // routed into bgHandler, whose unconditional temporal kill dead-lettered
       // every undelivered prediction targeting the round at betting-open
       // ("expired_late_signal: BG received") and stamped began_at ~9-11s early
       // (first-write-wins COALESCE the real bg could never correct). pr now
@@ -763,7 +709,6 @@ export async function startEventDrivenPipeline(): Promise<void> {
       await syncDbClockOffset(sql).catch(() => undefined);
     }
     const rows = await sql<{ game_id: string }>`
-
       SELECT game_id FROM crash_rounds ORDER BY crashed_at DESC LIMIT 100
     `;
     if (rows.length > 0) getRealtimePipeline().hydrate(rows.map((r) => r.game_id));

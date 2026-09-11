@@ -56,7 +56,7 @@ export interface PipelineResult {
   threshold: number;
   thresholdReason: string;
   kelly: KellyResult | null;
-  action: 'ENTRY' | 'REDUCED_ENTRY' | 'SKIP' | 'NO_BET';
+  action: 'ENTRY' | 'REDUCED_ENTRY' | 'SKIP';
   reason: string;
   production: ReturnType<typeof globalProductionController.status>;
 }
@@ -272,29 +272,15 @@ export function runPredictionPipeline(input: PipelineInput): PipelineResult {
   }
 
   // Decision
-  // The system MUST be capable of explicitly deciding "NO BET THIS ROUND".
-  // This is the canonical decision point that determines whether a prediction
-  // becomes a delivered signal.
-  let action: PipelineResult['action'] = 'NO_BET';
+  let action: PipelineResult['action'] = 'SKIP';
   let reason = '';
-  
-  // Gate 1: Production sheath / divergence halt
   if (!production.entriesAllowed) {
     reason = `sheath level ${production.divergence.level}: entries halted`;
-    action = 'NO_BET';
-  }
-  // Gate 2: Probability threshold (1.30x target gate explicitly enforced)
-  else if (selected.calibratedProbability < threshold) {
+  } else if (selected.calibratedProbability < threshold) {
     reason = `P=${selected.calibratedProbability.toFixed(3)} < threshold ${threshold.toFixed(3)} (${thresholdReason})`;
-    action = 'NO_BET';
-  }
-  // Gate 3: Opportunity score
-  else if (opportunity.score <= 0) {
-    reason = 'opportunity score <= 0';
-    action = 'NO_BET';
-  }
-  // Gate 4: All gates passed - this is an actionable prediction
-  else {
+  } else if (opportunity.score <= 0) {
+    reason = 'opportunity score ≤ 0';
+  } else {
     action = selected.calibratedProbability >= threshold + 0.05 ? 'ENTRY' : 'REDUCED_ENTRY';
     reason = `qualified target=${selected.target} score=${opportunity.score.toFixed(4)}`;
   }

@@ -80,14 +80,10 @@ export interface PredictionRecord {
     sheathBlocked?: boolean | null;
     finalSignal: boolean | null;
   };
-  /** NO_BET tracking: explicit decision state from the canonical gate. */
-  decision?: 'ENTRY' | 'REDUCED_ENTRY' | 'SKIP' | 'NO_BET';
-  /** Whether this prediction was actionable (not NO_BET/SKIP). */
-  actionable: boolean;
   resolved: boolean;
   resolvedAt?: string;
   actualMultiplier?: number;
-  result?: "WIN" | "LOSS" | "NO_BET";
+  result?: "WIN" | "LOSS";
 }
 
 function temporalValidityOf(
@@ -112,8 +108,6 @@ class PredictionRegistry {
 
   register(rec: PredictionRecord): PredictionRecord {
     rec.temporalValidity = temporalValidityOf(rec.createdAt, rec.targetStartedAt);
-    // Set actionable based on decision
-    rec.actionable = rec.decision !== 'NO_BET' && rec.decision !== 'SKIP';
     this.byTarget.set(rec.targetRoundId, rec);
     this.byId.set(rec.predictionId, rec);
     this.prune();
@@ -147,18 +141,13 @@ class PredictionRegistry {
     targetRoundId: string,
     actualMultiplier: number,
     target = 1.3,
-  ): { record: PredictionRecord; result: "WIN" | "LOSS" | "NO_BET"; probability: number } | null {
+  ): { record: PredictionRecord; result: "WIN" | "LOSS"; probability: number } | null {
     const rec = this.byTarget.get(targetRoundId);
     if (!rec || rec.resolved) return null;
     rec.resolved = true;
     rec.resolvedAt = new Date().toISOString();
     rec.actualMultiplier = actualMultiplier;
-    // NO_BET predictions should not be graded as WIN/LOSS
-    if (rec.decision === 'NO_BET' || rec.decision === 'SKIP') {
-      rec.result = 'NO_BET';
-    } else {
-      rec.result = actualMultiplier >= target ? "WIN" : "LOSS";
-    }
+    rec.result = actualMultiplier >= target ? "WIN" : "LOSS";
     return { record: rec, result: rec.result, probability: rec.finalProbability };
   }
 

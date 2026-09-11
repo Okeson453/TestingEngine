@@ -20,8 +20,7 @@ describe("prediction delivery correlation timeline", () => {
     const sendIdx = nw.indexOf("sendTelegramMessage(row.content");
     expect(stampIdx).toBeGreaterThan(-1);
     expect(sendIdx).toBeGreaterThan(stampIdx);
-    // The authorization refused message may have been updated
-    expect(nw).toContain("authorization refused");
+    expect(nw).toContain("authorization refused (BG/expiry)");
   });
 
   it("lifecycle logs include predictionId, targetGameId, sourceGameId, queuedAt", () => {

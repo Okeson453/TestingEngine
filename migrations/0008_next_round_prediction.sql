@@ -23,10 +23,6 @@ ALTER TABLE pending_predictions
 ALTER TABLE pending_predictions
   ADD COLUMN IF NOT EXISTS correlation_id text;
 
--- Add decision column for NO_BET tracking
-ALTER TABLE pending_predictions
-  ADD COLUMN IF NOT EXISTS decision text;
-
 -- Add index for efficient lookup of predictions by target game
 CREATE INDEX IF NOT EXISTS pending_predictions_target_game_id_idx 
 ON pending_predictions (target_game_id) WHERE target_game_id IS NOT NULL;

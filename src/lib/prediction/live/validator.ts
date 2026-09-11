@@ -205,29 +205,19 @@ export async function onGameEnd(
           returning began_at, crashed_at
         `;
         state.crashRow = upserted[0] ?? null;
-        // OPTIMIZATION: Eliminate unnecessary fallback SELECT.
-        // If conflict (row existed with crashed_at already set), RETURNING is empty,
-        // but we have the data from the event itself. We only need crashed_at for
-        // validation, which we have from evt.endTime.
-        // This eliminates 1 RTT (~800ms) on duplicate ED events.
-        // if (upserted.length === 0) {
-        //   const fetched = await tx<{
-        //     began_at: string | Date | null;
-        //     crashed_at: string | Date | null;
-        //   }>`
-        //     select began_at, crashed_at
-        //     from crash_rounds
-        //     where game_id = ${evt.gameId}
-        //     limit 1
-        //   `;
-        //   state.crashRow = fetched[0] ?? null;
-        // }
-        // Instead, if no RETURNING, use event data directly
-        if (upserted.length === 0 && state.crashRow == null) {
-          state.crashRow = {
-            began_at: null,
-            crashed_at: evt.endTime,
-          };
+        // If conflict (row existed with crashed_at already set), RETURNING is empty.
+        // Fall back to a single SELECT only in that case.
+        if (upserted.length === 0) {
+          const fetched = await tx<{
+            began_at: string | Date | null;
+            crashed_at: string | Date | null;
+          }>`
+            select began_at, crashed_at
+            from crash_rounds
+            where game_id = ${evt.gameId}
+            limit 1
+          `;
+          state.crashRow = fetched[0] ?? null;
         }
       }
 
@@ -242,15 +232,13 @@ export async function onGameEnd(
       if (lockedRows.length > 0) {
         state.pending = lockedRows[0]!;
       } else {
-        // OPTIMIZATION: Eliminate unnecessary SELECT against prediction_validations.
-        // We can infer "already validated" from pending_predictions.matched = true.
-        // This eliminates 1 RTT (~800ms) per ED event.
-        const matchedPending = await tx<{ prediction_id: string }>`
-          select prediction_id from pending_predictions
-          where target_game_id = ${evt.gameId} and matched = true
+        // Detect: was there a row that was matched already (recovery re-pass)?
+        const matchedRows = await tx<{ prediction_id: string }>`
+          select prediction_id from prediction_validations
+          where game_id = ${evt.gameId}
           limit 1
         `;
-        if (matchedPending.length > 0) {
+        if (matchedRows.length > 0) {
           // Already validated; record live_event_log and return.
           await tx`
             insert into live_event_log (
@@ -383,22 +371,19 @@ export async function onGameEnd(
         `;
       }
 
-      // OPTIMIZATION: Move live_event_log insert outside the critical transaction.
-      // This is BACKGROUND work (not required for correctness/delivery) and can be
-      // fire-and-forget. This reduces transaction hold time.
-      // await tx`
-      //   insert into live_event_log (
-      //     correlation_id, event_kind, game_id, payload, received_at, processed_at,
-      //     processor_latency_ms, sla_violated
-      //   ) values (
-      //     ${state.pending!.correlation_id ?? randomUUID()}::text, 'ED', ${evt.gameId},
-      //     ${JSON.stringify({ endTime: evt.endTime, multiplier: evt.multiplier, result })},
-      //     ${evt.receivedAt}::timestamptz, now(),
-      //     ${Math.max(0, now() - new Date(evt.receivedAt).getTime())},
-      //     false
-      //   )
-      //   on conflict do nothing
-      // `;
+      await tx`
+        insert into live_event_log (
+          correlation_id, event_kind, game_id, payload, received_at, processed_at,
+          processor_latency_ms, sla_violated
+        ) values (
+          ${state.pending!.correlation_id ?? randomUUID()}::text, 'ED', ${evt.gameId},
+          ${JSON.stringify({ endTime: evt.endTime, multiplier: evt.multiplier, result })},
+          ${evt.receivedAt}::timestamptz, now(),
+          ${Math.max(0, now() - new Date(evt.receivedAt).getTime())},
+          false
+        )
+        on conflict do nothing
+      `;
     });
   } catch (e) {
     // Fix 9: structured error telemetry — name, message, stack, game,
@@ -419,10 +404,7 @@ export async function onGameEnd(
       "validator.onGameEnd failed",
     );
     try {
-      // OPTIMIZATION: Batch error context persistence into a single query.
       // Fix 9: persist full error context in worker_state for post-mortem.
-      // Instead of 6 separate INSERTs, use a single multi-column INSERT or
-      // a JSON aggregate. This reduces 6 RTTs to 1 RTT for error handling.
       const errJson = JSON.stringify({
         name: err.name,
         message: err.message,
@@ -432,27 +414,35 @@ export async function onGameEnd(
         multiplier: evt.multiplier,
         at: new Date().toISOString(),
       });
-      // Single INSERT for all error fields
       await sql`
-        INSERT INTO worker_state (key, value)
-        VALUES
-          ('last_error', ${errJson}),
-          ('last_error_name', ${err.name}),
-          ('last_error_message', ${err.message}),
-          ('last_error_stack', ${err.stack ?? ''}),
-          ('last_error_game_id', ${evt.gameId}),
-          ('last_error_at', ${new Date().toISOString()})
-        ON CONFLICT (key) DO UPDATE SET
-          value = CASE
-            WHEN worker_state.key = 'last_error' THEN EXCLUDED.value
-            WHEN worker_state.key = 'last_error_name' THEN EXCLUDED.value
-            WHEN worker_state.key = 'last_error_message' THEN EXCLUDED.value
-            WHEN worker_state.key = 'last_error_stack' THEN EXCLUDED.value
-            WHEN worker_state.key = 'last_error_game_id' THEN EXCLUDED.value
-            WHEN worker_state.key = 'last_error_at' THEN EXCLUDED.value
-            ELSE worker_state.value
-          END,
-          updated_at = excluded.updated_at
+        insert into worker_state (key, value)
+        values ('last_error', ${errJson})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_name', ${err.name})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_message', ${err.message})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_stack', ${err.stack ?? ''})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_game_id', ${evt.gameId})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `;
+      await sql`
+        insert into worker_state (key, value)
+        values ('last_error_at', ${new Date().toISOString()})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
       `;
     } catch {
       /* ignore */
@@ -555,23 +545,11 @@ export async function onGameEnd(
         );
         const rec =
           resolution?.record ?? globalPredictionRegistry.getByTarget(evt.gameId);
-        // NO_BET predictions must NOT be graded as WIN/LOSS
-        // Only grade actionable predictions (ENTRY or REDUCED_ENTRY)
-        if (rec?.temporalValidity !== "TEMPORALLY_INVALID" && rec?.actionable === true) {
+        if (rec?.temporalValidity !== "TEMPORALLY_INVALID") {
           globalRollingPerformance.observe(
             resolution?.probability ?? Number(pendingSnapshot.probability),
             result === "WIN",
             pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
-          );
-        } else if (rec?.decision === 'NO_BET' || rec?.decision === 'SKIP') {
-          logger.info(
-            {
-              component: "live-validator",
-              predictionId: pendingSnapshot.prediction_id,
-              targetGameId: evt.gameId,
-              decision: rec.decision,
-            },
-            "NO_BET prediction: skipping WIN/LOSS grading (no bet was placed)",
           );
         }
       } catch { /* soft — registry is best-effort */ }
@@ -611,39 +589,25 @@ export async function onGameEnd(
           return;
         }
       } catch { /* soft */ }
-      // Skip feedback for NO_BET predictions - no bet was placed
-      const rec = globalPredictionRegistry.getByTarget(evt.gameId);
-      if (rec?.decision !== 'NO_BET' && rec?.decision !== 'SKIP') {
-        void processResolvedPredictionFeedback({
-          predictionId: pendingSnapshot.prediction_id,
-          targetGameId: evt.gameId,
-          predictedProbability: Number(pendingSnapshot.probability),
-          predictedConfidence:
-            pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
-          targetMultiplier: Number(pendingSnapshot.target_multiplier),
-          actualMultiplier: evt.multiplier,
-          result,
-          regimeAtPrediction: pendingSnapshot.regime_name ?? null,
-          modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
-          correlationId: pendingSnapshot.correlation_id ?? null,
-          resolvedAt,
-        }).catch((fbErr) => {
-          logger.warn(
-            { component: "live-validator", error: String(fbErr) },
-            "async closed-loop feedback failed",
-          );
-        });
-      } else {
-        logger.info(
-          {
-            component: "live-validator",
-            predictionId: pendingSnapshot.prediction_id,
-            targetGameId: evt.gameId,
-            decision: rec?.decision,
-          },
-          "NO_BET prediction: skipping feedback (no bet was placed)",
+      void processResolvedPredictionFeedback({
+        predictionId: pendingSnapshot.prediction_id,
+        targetGameId: evt.gameId,
+        predictedProbability: Number(pendingSnapshot.probability),
+        predictedConfidence:
+          pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
+        targetMultiplier: Number(pendingSnapshot.target_multiplier),
+        actualMultiplier: evt.multiplier,
+        result,
+        regimeAtPrediction: pendingSnapshot.regime_name ?? null,
+        modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
+        correlationId: pendingSnapshot.correlation_id ?? null,
+        resolvedAt,
+      }).catch((fbErr) => {
+        logger.warn(
+          { component: "live-validator", error: String(fbErr) },
+          "async closed-loop feedback failed",
         );
-      }
+      });
     })();
   });
 
