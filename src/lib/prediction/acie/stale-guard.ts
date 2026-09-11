@@ -19,6 +19,19 @@ export function recordAcieObservation(gameId: string, observationCount: number):
   lastObservationCount = observationCount;
 }
 
+/**
+ * Seed the in-process last-observation from the persisted ACIE snapshot on
+ * boot. Without this, the first BG prediction after a restart is rejected
+ * with "no ACIE observation recorded in this process" (production
+ * 14:45:32) even though ACIE state itself was restored — the observation
+ * PROVENANCE lived only in process memory.
+ */
+export function seedLastAcieObservation(gameId: string, observationCount: number): void {
+  if (lastObservedGameId) return; // never clobber a live observation
+  lastObservedGameId = String(gameId);
+  lastObservationCount = observationCount;
+}
+
 export function getLastAcieObservation(): {
   gameId: string | null;
   observationCount: number;

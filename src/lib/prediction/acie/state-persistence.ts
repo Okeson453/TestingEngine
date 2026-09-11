@@ -8,6 +8,7 @@
  * - Snapshot stays small (JSONB of online state + crashPoints + consecutiveLosses)
  */
 import { getSql, type Sql } from "@/lib/db";
+import { getLastAcieObservation, seedLastAcieObservation } from "./stale-guard.ts";
 import { getLogger } from "@/lib/observability/logger";
 import type { OnlineAdaptiveState } from "./online-state";
 
@@ -19,6 +20,9 @@ export interface AciePersistedSnapshot {
   online: OnlineAdaptiveState;
   crashPoints: number[];
   consecutiveLosses: number;
+  /** Optional (added sep 11): last source game observed by shared ACIE, so
+   *  the stale-guard provenance survives restarts. Backward compatible. */
+  lastSourceGameId?: string;
 }
 
 export type AcieSnapshotSource = {
@@ -128,6 +132,11 @@ export async function loadAcieStateFromDb(
       return { restored: false, reason: "state_corrupt", error: String(e) };
     }
     const observationCount = rows[0]!.observation_count;
+    // Seed stale-guard provenance so the first BG prediction after restart
+    // isn't rejected with "no ACIE observation recorded in this process".
+    if (snap.lastSourceGameId) {
+      seedLastAcieObservation(snap.lastSourceGameId, observationCount);
+    }
     const crashPoints = snap.crashPoints?.length ?? 0;
     logger.info(
       {
@@ -165,6 +174,7 @@ export async function saveAcieStateToDb(
       online: snap.online,
       crashPoints: snap.crashPoints.slice(-2000), // ACIE_MAX_HISTORY default
       consecutiveLosses: snap.consecutiveLosses,
+      lastSourceGameId: getLastAcieObservation().gameId ?? undefined,
     };
     const sql = await getSqlFn();
     await sql`

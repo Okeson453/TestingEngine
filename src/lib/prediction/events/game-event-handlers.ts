@@ -11,7 +11,6 @@ import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
 import { prewarmSign } from "@/lib/crash/native-sign";
 import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtime-pipeline";
 import { getSql } from "@/lib/db";
-import { runInTransaction } from "@/lib/prediction/live/tx";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
 import { attemptNPlusOnePrediction } from "@/lib/prediction/live/prediction-attempt";
@@ -260,10 +259,13 @@ export async function bgHandler(payload: unknown): Promise<void> {
     // read-modify-write interdependence, so they collapse into ONE
     // data-modifying CTE (single round trip) whose SELECT returns
     // per-table affected-row counts for the reconcile log.
+    // RTT FIX 2 (sep 11 14:45 logs): reconcile measured 300-700ms = BEGIN +
+    // statement + COMMIT (3 RTT). A single statement is already atomic in
+    // Postgres — the explicit transaction added two round trips of pure
+    // overhead. Run the CTE directly: one pool acquire, ONE round trip.
     const beganParam = new Date(beganAt);
-    const runBgTx = () =>
-      runInTransaction(sql, async (tx): Promise<BgReconcileCounts> => {
-        const rows = await tx`
+    const runBgTx = async (): Promise<BgReconcileCounts> => {
+        const rows = await sql`
           WITH cr AS (
             -- Backfill began_at when known from BG (authoritative round start).
             UPDATE crash_rounds
@@ -332,7 +334,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
           targets_stamped: Number(rows[0]?.targets_stamped ?? 0),
           signals_killed: Number(rows[0]?.signals_killed ?? 0),
         };
-      });
+    };
     let bgCounts: BgReconcileCounts | null = null;
     try {
       bgCounts = await runBgTx();
