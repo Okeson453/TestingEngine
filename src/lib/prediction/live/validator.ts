@@ -297,6 +297,73 @@ export async function onGameEnd(
         state.pending!.requested_at instanceof Date
           ? state.pending!.requested_at.toISOString()
           : String(state.pending!.requested_at);
+
+      // Pass 14 RTT collapse: the validation outbox row moves INTO this
+      // statement as the `ob` CTE (was a third sequential round trip).
+      // The user-facing Telegram content stays JS-built — it is passed as
+      // params, never computed in SQL. The `ob` CTE is guarded by
+      // exists(select 1 from ins), which is exactly the old
+      // `if (!alreadyValidated)` JS guard: a duplicate validation re-run
+      // leaves ins empty and skips the outbox insert, same as before.
+      // ONE outbox row per validation event.
+      // sendTelegramMessage() broadcasts to all configured chats — do NOT
+      // insert one row per chat (that caused N×M duplicate deliveries).
+      // Use the same WIN/LOSS formatter as createValidationNotification.
+      const resultEmoji = result === "WIN" ? "🎉" : "💥";
+      const multiplierText =
+        evt.multiplier >= target
+          ? `Actual: ${evt.multiplier.toFixed(2)}x`
+          : `Crashed: ${evt.multiplier.toFixed(2)}x`;
+      const validationContent = [
+        `${resultEmoji} PREDICTION ${result}`,
+        ``,
+        `Target: ${target.toFixed(2)}x`,
+        multiplierText,
+        `Probability: ${(Number(state.pending!.probability) * 100).toFixed(1)}%`,
+        ``,
+        `Game ID: ${evt.gameId}`,
+        `Prediction ID: ${state.pending!.prediction_id}`,
+        `Resolved: ${resolvedAt}`,
+      ].join("\n");
+
+      // P1.6: Populate telegram_deadline_at for validation messages too.
+      // Validation messages have a longer deadline (5 min) since they're
+      // for completed rounds and are never stale in the prediction sense.
+      //
+      // ORDERING FIX: ED of round N enqueues BOTH the N+1 prediction signal
+      // and the WIN/LOSS for the prediction about N. If both are claimable
+      // immediately, the dispatcher prediction lane and normal lane fire
+      // Telegram in parallel → user sees signal + result at the same time.
+      // Defer validation claimability so the N+1 signal always goes first.
+      // CLOCK HYGIENE (co-delivery fix 1): these absolutes are compared
+      // against the DB clock (claim SQL `next_attempt_at <= now()`,
+      // `telegram_deadline_at > clock_timestamp()`). Container Date.now()
+      // with DB-ahead skew >= validationDelayMs collapsed the 800ms
+      // separator to zero (prod: validation enqueued .023, delivered .0249).
+      // Use the DB-synced clock so the delay holds in DB time.
+      const valDeadlineAt = new Date(authoritativeNowMs() + 300_000).toISOString();
+      // Keep short: only long enough for the N+1 prediction Telegram to
+      // complete first. 800ms ≪ prior 2500ms which inflated result lag.
+      const validationDelayMs = Number(
+        process.env.VALIDATION_DISPATCH_DELAY_MS ?? 800,
+      );
+      const valNextAttemptAt = new Date(
+        authoritativeNowMs() + Math.max(0, validationDelayMs),
+      ).toISOString();
+      const validationMetadata = JSON.stringify({
+        predictionId: state.pending!.prediction_id,
+        gameId: evt.gameId,
+        correlationId: state.pending!.correlation_id,
+        targetMultiplier: target,
+        actualMultiplier: evt.multiplier,
+        probability: Number(state.pending!.probability),
+        result,
+        resolvedAt,
+        slaViolated: false,
+        kind: "validation",
+        dispatchDelayMs: validationDelayMs,
+      });
+
       const validateOutcome = await tx<{
         inserted_prediction_id: string | null;
       }>`
@@ -338,82 +405,23 @@ export async function onGameEnd(
             false
           )
           on conflict do nothing
+        ),
+        ob as (
+          insert into notification_outbox (
+            notification_id, type, content, metadata, status, priority,
+            attempt_count, next_attempt_at, telegram_deadline_at
+          )
+          select
+            ${randomUUID()}::uuid, 'validation',
+            ${validationContent}, ${validationMetadata}::jsonb,
+            'pending', 2, 0,
+            ${valNextAttemptAt}::timestamptz, ${valDeadlineAt}::timestamptz
+          where exists (select 1 from ins)
+          returning 1
         )
         select (select prediction_id from ins) as inserted_prediction_id
       `;
       const alreadyValidated = validateOutcome[0]!.inserted_prediction_id == null;
-
-      if (!alreadyValidated) {
-        // ONE outbox row per validation event.
-        // sendTelegramMessage() broadcasts to all configured chats — do NOT
-        // insert one row per chat (that caused N×M duplicate deliveries).
-        // Use the same WIN/LOSS formatter as createValidationNotification.
-        const resultEmoji = result === "WIN" ? "🎉" : "💥";
-        const multiplierText =
-          evt.multiplier >= target
-            ? `Actual: ${evt.multiplier.toFixed(2)}x`
-            : `Crashed: ${evt.multiplier.toFixed(2)}x`;
-        const validationContent = [
-          `${resultEmoji} PREDICTION ${result}`,
-          ``,
-          `Target: ${target.toFixed(2)}x`,
-          multiplierText,
-          `Probability: ${(Number(state.pending!.probability) * 100).toFixed(1)}%`,
-          ``,
-          `Game ID: ${evt.gameId}`,
-          `Prediction ID: ${state.pending!.prediction_id}`,
-          `Resolved: ${resolvedAt}`,
-        ].join("\n");
-
-        // P1.6: Populate telegram_deadline_at for validation messages too.
-        // Validation messages have a longer deadline (5 min) since they're
-        // for completed rounds and are never stale in the prediction sense.
-        //
-        // ORDERING FIX: ED of round N enqueues BOTH the N+1 prediction signal
-        // and the WIN/LOSS for the prediction about N. If both are claimable
-        // immediately, the dispatcher prediction lane and normal lane fire
-        // Telegram in parallel → user sees signal + result at the same time.
-        // Defer validation claimability so the N+1 signal always goes first.
-        // CLOCK HYGIENE (co-delivery fix 1): these absolutes are compared
-        // against the DB clock (claim SQL `next_attempt_at <= now()`,
-        // `telegram_deadline_at > clock_timestamp()`). Container Date.now()
-        // with DB-ahead skew >= validationDelayMs collapsed the 800ms
-        // separator to zero (prod: validation enqueued .023, delivered .0249).
-        // Use the DB-synced clock so the delay holds in DB time.
-        const valDeadlineAt = new Date(authoritativeNowMs() + 300_000).toISOString();
-        // Keep short: only long enough for the N+1 prediction Telegram to
-        // complete first. 800ms ≪ prior 2500ms which inflated result lag.
-        const validationDelayMs = Number(
-          process.env.VALIDATION_DISPATCH_DELAY_MS ?? 800,
-        );
-        const valNextAttemptAt = new Date(
-          authoritativeNowMs() + Math.max(0, validationDelayMs),
-        ).toISOString();
-        await tx`
-          insert into notification_outbox (
-            notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at, telegram_deadline_at
-          ) values (
-            ${randomUUID()}::uuid, 'validation',
-            ${validationContent},
-            ${JSON.stringify({
-              predictionId: state.pending!.prediction_id,
-              gameId: evt.gameId,
-              correlationId: state.pending!.correlation_id,
-              targetMultiplier: target,
-              actualMultiplier: evt.multiplier,
-              probability: Number(state.pending!.probability),
-              result,
-              resolvedAt,
-              slaViolated: false,
-              kind: "validation",
-              dispatchDelayMs: validationDelayMs,
-            })},
-            'pending', 2,
-            0, ${valNextAttemptAt}::timestamptz, ${valDeadlineAt}::timestamptz
-          )
-        `;
-      }
 
       // (ED live_event_log write moved into the el CTE above — pass 12.)
     }, logSlowTxStages("validator.onGameEnd.persist"));
