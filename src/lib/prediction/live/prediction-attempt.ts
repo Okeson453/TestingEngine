@@ -179,7 +179,7 @@ export async function attemptNPlusOnePrediction(
       },
       attempted
         ? "N+1 SIGNAL_READY (durable outbox enqueued)"
-        : "N+1 prediction attempt not owned / skipped / persist_failed",
+        : `N+1 prediction not persisted (kind=${result?.kind ?? "null"})`,
     );
 
     return {
