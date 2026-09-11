@@ -1589,18 +1589,30 @@ export async function onGameEndPredict(
       outboxEnqueued = 1;
     }
 
-    // live_event_log outside TX (not required for correctness / delivery)
-    void sql`
-      insert into live_event_log (
-        correlation_id, event_kind, game_id, payload, received_at, processed_at,
-        processor_latency_ms, sla_violated
-      ) values (
-        ${correlationId}::text, 'PREDICT', ${targetGameId},
-        ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode, triggerEvent })},
-        ${crashedAt}::timestamptz, now(),
-        ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
-      )
-    `.catch(() => undefined);
+    // live_event_log outside TX (not required for correctness / delivery).
+    // TELEMETRY POOL FIX (sep 11 pool pass): `sql` here is the CRITICAL
+    // pool — the fire-and-forget audit insert was occupying a critical
+    // client for a full RTT during the durable handoff window. Audit rows
+    // are best-effort telemetry: run them on the GENERAL pool so they can
+    // never compete with persist/claim/dispatch on critical.
+    void (async () => {
+      try {
+        const eventSql = await getSql();
+        await eventSql`
+          insert into live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) values (
+            ${correlationId}::text, 'PREDICT', ${targetGameId},
+            ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode, triggerEvent })},
+            ${crashedAt}::timestamptz, now(),
+            ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
+          )
+        `;
+      } catch {
+        /* soft — audit row is best-effort, never blocks the handoff */
+      }
+    })();
 
     // Wake outbox dispatcher after TX commit so delivery can start immediately.
     // PREDICTION wake (plan §11): lane-aware — dispatcher runs the prediction

@@ -112,8 +112,11 @@ describe("realtime vs background pool isolation (source contract)", () => {
     expect(reclassifyBody).toContain("if (classified.length > 0)");
   });
 
-  it("invariant probes fan out concurrently via Promise.all", () => {
-    expect(invariantsSrc).toContain("const probes: Promise<void>[] = [];");
-    expect(invariantsSrc).toContain("await Promise.all(probes);");
+  it("invariant probes run under the capped runner (supersedes Promise.all fan-out)", () => {
+    expect(invariantsSrc).toContain("const probes: Array<() => Promise<void>> = [];");
+    expect(invariantsSrc).toContain(
+      "await runWithConcurrency(probes, INVARIANT_PROBE_CONCURRENCY);",
+    );
+    expect(invariantsSrc).toContain("export const INVARIANT_PROBE_CONCURRENCY = 2;");
   });
 });

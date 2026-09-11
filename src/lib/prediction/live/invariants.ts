@@ -63,6 +63,39 @@ export function checkPredictionBeforeTargetStart(params: {
   return null;
 }
 
+/**
+ * Probe concurrency cap (sep 11 pool pass): the invariant monitor runs every
+ * 30s on the general pool. Five simultaneous probes + heartbeat CTE + any
+ * event-log insert = 6+ simultaneous slot demands — exactly the general max
+ * (6 under the deployed PG_POOL_MAX=10), producing waiting=1-3 queue blips.
+ * 2 concurrent probes keep worst-case monitor occupancy at ~2-3 slots for
+ * ~450ms per cycle; nothing else ever queues behind it.
+ */
+export const INVARIANT_PROBE_CONCURRENCY = 2;
+
+/**
+ * Deterministic bounded-concurrency runner. Tasks are lazily started;
+ * at most `limit` run at once; total run count and error isolation are
+ * preserved (each task's own rejections propagate to its awaiter only).
+ * Exported for contention regression tests.
+ */
+export async function runWithConcurrency(
+  tasks: Array<() => Promise<void>>,
+  limit: number,
+): Promise<void> {
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < tasks.length) {
+      const task = tasks[next];
+      next += 1;
+      await task();
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(limit, tasks.length)) }, worker),
+  );
+}
+
 /** Run DB-backed invariant sample (cheap, for heartbeat / poll). */
 export async function sampleProductionInvariants(
   sql?: Sql,
@@ -72,12 +105,17 @@ export async function sampleProductionInvariants(
 
   // CONCURRENCY FIX (sep 11 pool pass): the five invariant probes are
   // independent, bounded, read-only SELECTs. Sequential awaits held a
-  // general-pool client for ~5 RTT (~750ms-1s) every 30s cycle; concurrent
-  // fan-out finishes in ~1 RTT and frees the pool faster. Violation
-  // aggregation is unchanged (each probe catches its own errors).
-  const probes: Promise<void>[] = [];
+  // general-pool client for ~5 RTT (~750ms-1s) every 30s cycle. Full
+  // fan-out (Promise.all) finished in ~1 RTT but demanded FIVE pool slots
+  // at once — production (17:33:00-17:35:26, general max=6) showed
+  // waiting=1-3 blips every 30s cycle when probes + heartbeat + event-log
+  // inserts overlapped. Cap concurrency at 2: worst-case occupancy ~2-3
+  // slots for ~450ms instead of 5-6 slots; no other caller ever queues
+  // behind the monitor. Violation aggregation unchanged (each probe
+  // catches its own errors).
+  const probes: Array<() => Promise<void>> = [];
 
-  probes.push((async () => { try {
+  probes.push(() => (async () => { try {
     // Multiple active pending rows for same target
     const dups = await db<{ target_game_id: string; c: number }>`
       SELECT target_game_id, count(*)::int AS c
@@ -101,7 +139,7 @@ export async function sampleProductionInvariants(
     logger.debug({ error: String(e) }, "invariant sample skip (pending dups)");
   }})());
 
-  probes.push((async () => { try {
+  probes.push(() => (async () => { try {
     // Validations without feedback_applied_at older than 2 minutes (stuck feedback)
     const stuck = await db<{ prediction_id: string; game_id: string }>`
       SELECT prediction_id, game_id
@@ -130,7 +168,7 @@ export async function sampleProductionInvariants(
     logger.debug({ error: String(e) }, "invariant sample skip (feedback)");
   }})());
 
-  probes.push((async () => { try {
+  probes.push(() => (async () => { try {
     // Fix plan Phase 14: duplicate/contradictory feedback state. A row that is
     // BOTH skipped (intentionally never applied) and marked applied is
     // corrupted state — one of the two markers is wrong.
@@ -155,7 +193,7 @@ export async function sampleProductionInvariants(
     logger.debug({ error: String(e) }, "invariant sample skip (feedback contradiction)");
   }})());
 
-  probes.push((async () => { try {
+  probes.push(() => (async () => { try {
     // Temporal violations on recent pending rows
     const temporal = await db<{
       prediction_id: string;
@@ -187,7 +225,7 @@ export async function sampleProductionInvariants(
     logger.debug({ error: String(e) }, "invariant sample skip (temporal)");
   }})());
 
-  probes.push((async () => { try {
+  probes.push(() => (async () => { try {
     // Hard temporal delivery contract (migration 0027): NO prediction signal
     // may be delivered after its target round started. The join uses the
     // validation row's authoritative target_round_started_at (BG-supplied).
@@ -229,7 +267,7 @@ export async function sampleProductionInvariants(
     logger.debug({ error: String(e) }, "invariant sample skip (late delivery)");
   }})());
 
-  await Promise.all(probes);
+  await runWithConcurrency(probes, INVARIANT_PROBE_CONCURRENCY);
 
   if (violations.length > 0) {
     const fp = violations
