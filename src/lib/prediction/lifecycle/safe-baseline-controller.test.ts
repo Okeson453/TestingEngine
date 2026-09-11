@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { SafeBaselineController } from "./safe-baseline-controller.ts";
+import {
+  SafeBaselineController,
+  liveSafeModeOverride,
+} from "./safe-baseline-controller.ts";
 import { EMPIRICAL_BASE_1_30 } from "../models/baseline-model.ts";
 
 describe("SafeBaselineController", () => {
@@ -42,5 +45,46 @@ describe("SafeBaselineController", () => {
     const c2 = new SafeBaselineController();
     c2.importState(snap);
     expect(c2.getMode()).toBe(c.getMode());
+  });
+});
+
+describe("liveSafeModeOverride (pass 17 — live-path gating)", () => {
+  const G = globalThis as {
+    __safeBaselineMode__?: boolean;
+    __safeBaselineProb__?: number;
+  };
+
+  it("returns null when MODEL_ACTIVE (no override on the live path)", () => {
+    G.__safeBaselineMode__ = false;
+    G.__safeBaselineProb__ = 0.769;
+    expect(liveSafeModeOverride(0.85, 0.9)).toBeNull();
+  });
+
+  it("returns null when the global is unset (fail-open to MODEL_ACTIVE)", () => {
+    delete G.__safeBaselineMode__;
+    expect(liveSafeModeOverride(0.85, 0.9)).toBeNull();
+  });
+
+  it("overrides probability to the safe base rate and caps confidence", () => {
+    G.__safeBaselineMode__ = true;
+    G.__safeBaselineProb__ = EMPIRICAL_BASE_1_30;
+    const out = liveSafeModeOverride(0.87, 0.96);
+    expect(out).not.toBeNull();
+    expect(out!.probability).toBeCloseTo(EMPIRICAL_BASE_1_30, 10);
+    expect(out!.confidence).toBe(0.55);
+  });
+
+  it("keeps a lower confidence below the cap", () => {
+    G.__safeBaselineMode__ = true;
+    G.__safeBaselineProb__ = EMPIRICAL_BASE_1_30;
+    const out = liveSafeModeOverride(0.87, 0.3);
+    expect(out!.confidence).toBe(0.3);
+  });
+
+  it("falls back to the empirical base rate when the global prob is missing", () => {
+    G.__safeBaselineMode__ = true;
+    delete G.__safeBaselineProb__;
+    const out = liveSafeModeOverride(0.87, 0.96);
+    expect(out!.probability).toBeCloseTo(EMPIRICAL_BASE_1_30, 10);
   });
 });

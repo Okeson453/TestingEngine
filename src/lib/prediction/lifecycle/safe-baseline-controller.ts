@@ -245,3 +245,39 @@ export class SafeBaselineController {
 }
 
 export const globalSafeBaseline = new SafeBaselineController();
+
+/**
+ * PASS 17 (sep 11, win-rate phase): SAFE_BASELINE must gate the LIVE
+ * (ACIE-authoritative) path, not only the FALLBACK_BASELINE path in
+ * baseline-model.ts. Before this, the controller could flip to
+ * SAFE_BASELINE ("model worse than always saying the base rate") while the
+ * authoritative path kept emitting inflated probabilities — the production
+ * logs showed the SAFE_BASELINE warning every round with no behavioral
+ * change, which is the definition of a disconnected control.
+ *
+ * Returns null when MODEL_ACTIVE (no override). When SAFE_BASELINE is
+ * active, returns the empirical base-rate probability with confidence
+ * capped to the same 0.55 ceiling the fallback path uses. The live
+ * selectivity gate (shouldSkipSignal: needP = fair + MIN_SIGNAL_EDGE =
+ * 0.769 + 0.015) then suppresses the signal — the honest output of a model
+ * that currently cannot demonstrate edge is NO BET.
+ */
+export function liveSafeModeOverride(
+  probability: number,
+  confidence: number,
+): { probability: number; confidence: number } | null {
+  const g = globalThis as {
+    __safeBaselineMode__?: boolean;
+    __safeBaselineProb__?: number;
+  };
+  if (g.__safeBaselineMode__ !== true) return null;
+  const p =
+    typeof g.__safeBaselineProb__ === 'number'
+      ? g.__safeBaselineProb__
+      : EMPIRICAL_BASE_1_30;
+  return {
+    probability: Math.min(0.99, Math.max(0.01, p)),
+    confidence: Math.min(confidence, 0.55),
+  };
+}
+

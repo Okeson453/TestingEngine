@@ -35,6 +35,7 @@ import { getLogger } from "@/lib/observability/logger";
 // FALLBACK_BASELINE). Static ESM imports work in both the Vite dev server
 // and the standalone ESM worker.
 import { getSharedACIEEngine, getSharedACIEInstanceId } from "@/lib/prediction/acie/shared-engine";
+import { liveSafeModeOverride } from "@/lib/prediction/lifecycle/safe-baseline-controller";
 import { buildAcieFeatureFingerprint, buildProvenance, computeFeatureHash } from "@/lib/prediction/acie/provenance";
 import { recordAcieObservation, assertFreshAcieState, getLastAcieObservation } from "@/lib/prediction/acie/stale-guard";
 import { runPredictionPipeline } from "@/lib/prediction/prediction-pipeline";
@@ -366,14 +367,27 @@ const defaultPredictFn = (
       const evaluation = acie.evaluateNext();
       const online = acie.getOnlineState();
       const snap = acie.exportSnapshot();
-      const probability = Math.min(
+      let probability = Math.min(
         0.99,
         Math.max(0.01, evaluation.psi.estimatedProbability),
       );
-      const confidence = Math.max(
+      let confidence = Math.max(
         0,
         Math.min(1, 1 - (evaluation.psi.modelUncertainty ?? 0.3)),
       );
+      // PASS 17: SAFE_BASELINE gates the AUTHORITATIVE path too (the
+      // controller previously only overrode the FALLBACK_BASELINE path —
+      // the SAFE_BASELINE warning fired every round with no behavioral
+      // change). While the degradation controller holds the model in safe
+      // mode, the live probability is the empirical base rate and
+      // confidence is capped — the existing selectivity gate
+      // (needP = fair + MIN_SIGNAL_EDGE) then suppresses the signal.
+      const safeOverride = liveSafeModeOverride(probability, confidence);
+      const liveSafeMode = safeOverride != null;
+      if (safeOverride) {
+        probability = safeOverride.probability;
+        confidence = safeOverride.confidence;
+      }
       const featureHash = provMod.buildAcieFeatureFingerprint({
         crashPointsTail: snap.crashPoints,
         observationCount: online.observationCount ?? 0,
@@ -389,7 +403,7 @@ const defaultPredictFn = (
         targetGameId: targetRoundId,
         online,
         evaluation,
-        mode: "NORMAL_ACIE",
+        mode: liveSafeMode ? "SAFE_BASELINE" : "NORMAL_ACIE",
         executionPath: "shared-acie.evaluateNext",
         probability,
         confidence,
@@ -406,7 +420,9 @@ const defaultPredictFn = (
           targetGameId: targetRoundId,
           ...provenance,
         },
-        "ACIE authoritative prediction generated",
+        liveSafeMode
+          ? "ACIE prediction generated — SAFE_BASELINE active (base-rate probability enforced on live path)"
+          : "ACIE authoritative prediction generated",
       );
       const strategyAction = evaluation.strategy?.action ?? null;
       return {
@@ -420,11 +436,18 @@ const defaultPredictFn = (
           `evidence=${evaluation.evidence?.status}`,
           `obs=${online.observationCount ?? 0}`,
           `feature_hash=${featureHash}`,
+          ...(liveSafeMode
+            ? [
+                "SAFE_BASELINE active on live path — probability = empirical base rate (pass 17)",
+                `safe_prob=${probability}`,
+              ]
+            : []),
         ],
         featureSummary: {
           ...(typeof provenance === "object" ? provenance : {}),
           acieAuthoritative: true,
           strategy_action: strategyAction,
+          ...(liveSafeMode ? { safe_baseline: 1 } : {}),
         },
         modelVersion: "acie-v3",
         featurePath: "ACIE_STATE",
