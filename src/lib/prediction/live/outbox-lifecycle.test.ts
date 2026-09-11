@@ -79,10 +79,11 @@ async function insertPendingRow(opts: {
   deadlineAheadMs?: number | null;
   ageMinutes?: number;
   targetGameId?: string;
+  metadata?: Record<string, unknown>;
 } = {}): Promise<number> {
   const id = randomUUID();
   const content = `[ol-test] ${id}`;
-  const metadata = JSON.stringify({ predictionId: id });
+  const metadata = JSON.stringify({ predictionId: id, ...opts.metadata });
   const age = opts.ageMinutes ?? 0;
   const deadlineIso =
     opts.deadlineAheadMs != null
@@ -354,6 +355,70 @@ test("temporal contract: BG arrival atomically kills undelivered signals for tha
     );
     const validation = await lifecycleOf(validationId);
     assert.equal(validation.status, "pending", "non-prediction rows must NOT be killed");
+  } finally {
+    await cleanSuiteRows();
+    clearTelegramEnv();
+  }
+});
+
+test("ordering: result N cannot claim while the correlated N+1 signal is still pending", async () => {
+  setTelegramEnv();
+  await cleanSuiteRows();
+  const d = new OutboxDispatcher();
+  try {
+    const roundN = `ol-rag-${randomUUID()}`;
+    // The N+1 signal: a pending prediction row whose sourceGameId = round N
+    // (born from crash N). Claimable immediately.
+    const signalId = await insertPendingRow({
+      deadlineAheadMs: 30_000,
+      metadata: { sourceGameId: roundN },
+    });
+    // The WIN/LOSS for round N: validation row with gameId = round N.
+    // next_attempt_at is in the past — the ONLY thing holding it must be
+    // the result-after-signal gate, not the delay.
+    const validationId = await insertPendingRow({
+      type: "validation",
+      metadata: { gameId: roundN },
+    });
+    // Control: an unrelated alert (no gameId) must NOT be held.
+    const alertId = await insertPendingRow({ type: "alert" });
+
+    let telegramCalls = 0;
+    await withStubbedFetch(
+      async () => {
+        telegramCalls += 1;
+        return okTelegram();
+      },
+      async () => d.processLane("normal"),
+    );
+
+    const signal = await lifecycleOf(signalId);
+    assert.equal(signal.status, "pending", "prediction lane untouched by this pass");
+    const validation = await lifecycleOf(validationId);
+    assert.equal(
+      validation.status,
+      "pending",
+      "result N must NOT claim while its correlated signal is still pending",
+    );
+    const alert = await lifecycleOf(alertId);
+    assert.equal(alert.status, "delivered", "unrelated rows must not be held by the gate");
+
+    // Signal delivered (prediction lane) → result becomes claimable.
+    await withStubbedFetch(
+      async () => okTelegram(),
+      async () => d.processLane("prediction"),
+    );
+    assert.equal((await lifecycleOf(signalId)).status, "delivered");
+    await withStubbedFetch(
+      async () => okTelegram(),
+      async () => d.processLane("normal"),
+    );
+    const validationAfter = await lifecycleOf(validationId);
+    assert.equal(
+      validationAfter.status,
+      "delivered",
+      "result N must claim once the correlated signal is terminal",
+    );
   } finally {
     await cleanSuiteRows();
     clearTelegramEnv();

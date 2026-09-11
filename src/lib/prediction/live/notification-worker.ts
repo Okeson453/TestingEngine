@@ -378,6 +378,22 @@ export class OutboxDispatcher {
               AND type <> 'prediction'
               AND next_attempt_at <= now()
               AND (telegram_deadline_at IS NULL OR telegram_deadline_at > now())
+              -- RESULT-AFTER-SIGNAL GATE (sep 11): a result for round N must
+              -- never claim while the correlated N+1 signal (prediction row
+              -- with sourceGameId = N) is still pending/inflight. The 800ms
+              -- VALIDATION_DISPATCH_DELAY_MS is measured from ENQUEUE, but
+              -- measured dispatch latency is 1.4-2.2s — the delay loses the
+              -- race and signal + result deliver together. This gate binds
+              -- the result to the signal's terminal state instead. The 30s
+              -- bound stops a stuck (retrying) signal from holding the
+              -- result hostage; alerts have no gameId and never match.
+              AND NOT EXISTS (
+                SELECT 1 FROM notification_outbox p
+                WHERE p.type = 'prediction'
+                  AND p.status IN ('pending', 'inflight')
+                  AND p.created_at > now() - interval '30 seconds'
+                  AND p.metadata->>'sourceGameId' = notification_outbox.metadata->>'gameId'
+              )
             ORDER BY priority DESC, next_attempt_at ASC, id ASC
             LIMIT ${claimLimit}
             FOR UPDATE SKIP LOCKED
@@ -419,6 +435,13 @@ export class OutboxDispatcher {
                   and type <> 'prediction'
                   and next_attempt_at <= now()
                   and (telegram_deadline_at is null or telegram_deadline_at > now())
+                  and not exists (
+                    select 1 from notification_outbox p
+                    where p.type = 'prediction'
+                      and p.status in ('pending', 'inflight')
+                      and p.created_at > now() - interval '30 seconds'
+                      and p.metadata->>'sourceGameId' = notification_outbox.metadata->>'gameId'
+                  )
                 order by priority desc, next_attempt_at asc, id asc
                 limit ${claimLimit}
                 for update skip locked
