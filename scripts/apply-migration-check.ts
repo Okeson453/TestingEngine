@@ -22,6 +22,17 @@ for (const f of files) {
   }
 }
 
+// --- PRE-MIGRATION-0037 seed: rows that must SURVIVE later constraint
+// re-definitions. Regression guard (2026-09-11): 0037 first shipped WITHOUT
+// 'ED_RECEIVED' (missed that 0020 had widened the constraint) — prod has
+// ED_RECEIVED rows, so ADD CONSTRAINT failed validation and the worker
+// crash-looped. A fresh-DB check passes vacuously when no pre-existing rows
+// exist; this seed makes constraint-narrowing regressions fail HERE.
+await db.exec(`
+  insert into live_event_log (correlation_id, event_kind, game_id, payload, received_at, processed_at, processor_latency_ms, sla_violated)
+  values ('seed-ed-received', 'ED_RECEIVED', 'seed-game', '{}'::jsonb, now(), now(), 1, false);
+`);
+
 // --- Seed a delivered prediction with complete raw timestamps (accepted AFTER target start)
 await db.exec(`
   insert into pending_predictions (prediction_id, target_multiplier, probability, confidence,

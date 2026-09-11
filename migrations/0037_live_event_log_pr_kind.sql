@@ -16,5 +16,6 @@ ALTER TABLE live_event_log
 ALTER TABLE live_event_log
   ADD CONSTRAINT live_event_log_event_kind_check
   CHECK (event_kind IN (
-    'BG', 'ED', 'PG', 'POLL_RECONCILE', 'BOOT_BACKFILL', 'PREDICT', 'VALIDATE', 'PR'
+    'BG', 'ED', 'ED_RECEIVED', 'PG', 'POLL_RECONCILE', 'BOOT_BACKFILL',
+    'PREDICT', 'VALIDATE', 'PR'
   ));
