@@ -273,6 +273,114 @@ export async function bgHandler(payload: unknown): Promise<void> {
   }
 
   try {
+    // PASS 15 OVERLAP TIMING: reconcile duration is captured when its
+    // continuation resumes; the concurrent attempt reads it at profile
+    // emission.
+    const reconcileT0 = Date.now();
+    let reconcileMs: number | null = null;
+
+    // ── PRIMARY N+1 PREDICTION TRIGGER (sep 11 architecture change) ──
+    // Round N has just started; its N+1 prediction is generated NOW, during
+    // the round, instead of waiting for ED(N). Fire-and-forget, launched
+    // CONCURRENTLY with the reconcile TX (pass 15 overlap): the attempt
+    // shares ZERO data dependencies with the reconcile (disjoint rows —
+    // target N+1 vs round N; claim/temporal gates are memory-only; history
+    // is the in-process buffer), so serializing them cost one full Neon
+    // RTT of pure ordering. Ownership is reserved synchronously BEFORE
+    // both; the dispatcher pre-send gate remains the backstop if the
+    // reconcile fails after retry. attemptNPlusOnePrediction is the
+    // SINGLE ownership boundary — atomic claim inside; if any other trigger
+    // (duplicate BG, WS+poll race, ED fallback) already owns target N+1,
+    // this returns duplicate/completed and no compute happens.
+    // Fencing: a worker that lost authority must not compute predictions.
+    // Numeric-ID gate: BG reconciliation is exercised by tests with
+    // non-round IDs; prediction targets are strictly numeric sequences.
+    // LATENCY PROFILE (sep 11 P1): production measured ~1.24s between BG
+    // receipt and "reconcile complete" — the reconcile TX (pool acquire +
+    // 5 statements), NOT the model, owns that cost. bg_receipt_to_reconcile
+    // and bg_to_prediction_total below make the split visible per round.
+    if (isAuthoritative() && /^\d+$/.test(gameId)) {
+      void (async () => {
+        const bgCorrelationId = `${correlationId}:bg-n1`;
+        const bgTrace = startTrace(bgCorrelationId, gameId);
+        const bgReceivedMs = new Date(receivedAt).getTime();
+        const attemptT0 = Date.now();
+        try {
+          const result = await attemptNPlusOnePrediction({
+            sourceRoundId: gameId,
+            sourceCrashAt: beganAt,
+            source: "BG",
+            correlationId: bgCorrelationId,
+            trace: bgTrace,
+          });
+          const predictionMs = Date.now() - attemptT0;
+          const targetGameId = nextTargetGameId(gameId);
+          // Timing split: event receipt → reconcile TX commit → prediction
+          // done. bg_receipt_to_reconcile_ms isolates the DB reconcile cost
+          // (pool pressure shows up here first); prediction_ms is the model
+          // + persist leg.
+          const profile = {
+            component: "game-event-handlers",
+            event: "bg",
+            gameId,
+            targetGameId,
+            trigger: "BG_PRIMARY",
+            kind: result.kind,
+            // PASS 15: reconcile now OVERLAPS the attempt — the holder is
+            // set by the reconcile continuation; if the attempt finishes
+            // first, fall back to elapsed-at-emission (both honest).
+            bg_receipt_to_reconcile_ms: reconcileMs ?? Math.max(
+              0,
+              Date.now() - bgReceivedMs - predictionMs,
+            ),
+            prediction_ms: predictionMs,
+            bg_receipt_to_prediction_done_ms: Math.max(0, Date.now() - bgReceivedMs),
+            predictionId: result.predictionId,
+            correlationId: bgCorrelationId,
+          };
+          if (result.attempted) {
+            completeTarget(targetGameId, `bg:${gameId}`);
+            logger.info(
+              profile,
+              `BG→N+1 SIGNAL_READY (primary path — durable outbox enqueued) [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`,
+            );
+          } else {
+            // P0 state semantics (sep 11): skipped_no_edge is an EVALUATED,
+            // TERMINAL NO_BET — the claim was completed, not released, so ED
+            // must not recompute. Only genuine failures (exception:*,
+            // insufficient_history, persist_failed, skipped window) release
+            // the claim and leave the target recoverable by ED fallback.
+            if (result.kind !== "skipped_no_edge") {
+              releaseTarget(targetGameId, `bg:${gameId}`);
+            }
+            logger.info(
+              { ...profile, terminal_no_bet: result.kind === "skipped_no_edge" },
+              result.kind === "duplicate"
+                ? `BG→N+1 already claimed/persisted by another trigger [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`
+                : result.kind === "skipped_no_edge"
+                  ? `BG→N+1 evaluated NO_BET (terminal — ED will not recompute) [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`
+                  : `BG→N+1 soft result kind=${result.kind} — target recoverable by ED fallback [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`,
+            );
+          }
+        } catch (err) {
+          const e = err instanceof Error ? err : new Error(String(err));
+          logger.error(
+            {
+              component: "game-event-handlers",
+              event: "bg",
+              gameId,
+              trigger: "BG_PRIMARY",
+              errorName: e.name,
+              errorMessage: e.message,
+              errorStack: e.stack?.slice(0, 1500) ?? null,
+            },
+            "BG→N+1 primary prediction attempt threw — ED(N) remains fallback",
+          );
+        }
+      })();
+    }
+
+
     // PRIORITY-ISOLATION FIX (sep 11 18:20 logs): this CTE is REALTIME-
     // CRITICAL (began_at stamp + live_round_state + temporal kill) and the
     // BG→N+1 prediction attempt only fires AFTER it resolves — yet it ran
@@ -393,6 +501,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
         );
       }
     }
+    reconcileMs = Date.now() - reconcileT0;
 
     // NON-FATAL BG RECONCILE TELEMETRY (unchanged): analytics and in-memory
     // registry work must never gate (or roll back with) the temporal kill.
@@ -401,99 +510,6 @@ export async function bgHandler(payload: unknown): Promise<void> {
         globalPredictionRegistry.noteTargetStarted(gameId, beganAt);
       })
       .catch(() => undefined);
-
-    // ── PRIMARY N+1 PREDICTION TRIGGER (sep 11 architecture change) ──
-    // Round N has just started; its N+1 prediction is generated NOW, during
-    // the round, instead of waiting for ED(N). Fire-and-forget: reconcile
-    // (temporal kill + began_at) already committed above; this must never
-    // block or fail the reconcile path. attemptNPlusOnePrediction is the
-    // SINGLE ownership boundary — atomic claim inside; if any other trigger
-    // (duplicate BG, WS+poll race, ED fallback) already owns target N+1,
-    // this returns duplicate/completed and no compute happens.
-    // Fencing: a worker that lost authority must not compute predictions.
-    // Numeric-ID gate: BG reconciliation is exercised by tests with
-    // non-round IDs; prediction targets are strictly numeric sequences.
-    // LATENCY PROFILE (sep 11 P1): production measured ~1.24s between BG
-    // receipt and "reconcile complete" — the reconcile TX (pool acquire +
-    // 5 statements), NOT the model, owns that cost. bg_receipt_to_reconcile
-    // and bg_to_prediction_total below make the split visible per round.
-    if (isAuthoritative() && /^\d+$/.test(gameId)) {
-      void (async () => {
-        const bgCorrelationId = `${correlationId}:bg-n1`;
-        const bgTrace = startTrace(bgCorrelationId, gameId);
-        const bgReceivedMs = new Date(receivedAt).getTime();
-        const attemptT0 = Date.now();
-        try {
-          const result = await attemptNPlusOnePrediction({
-            sourceRoundId: gameId,
-            sourceCrashAt: beganAt,
-            source: "BG",
-            correlationId: bgCorrelationId,
-            trace: bgTrace,
-          });
-          const predictionMs = Date.now() - attemptT0;
-          const targetGameId = nextTargetGameId(gameId);
-          // Timing split: event receipt → reconcile TX commit → prediction
-          // done. bg_receipt_to_reconcile_ms isolates the DB reconcile cost
-          // (pool pressure shows up here first); prediction_ms is the model
-          // + persist leg.
-          const profile = {
-            component: "game-event-handlers",
-            event: "bg",
-            gameId,
-            targetGameId,
-            trigger: "BG_PRIMARY",
-            kind: result.kind,
-            bg_receipt_to_reconcile_ms: Math.max(
-              0,
-              Date.now() - bgReceivedMs - predictionMs,
-            ),
-            prediction_ms: predictionMs,
-            bg_receipt_to_prediction_done_ms: Math.max(0, Date.now() - bgReceivedMs),
-            predictionId: result.predictionId,
-            correlationId: bgCorrelationId,
-          };
-          if (result.attempted) {
-            completeTarget(targetGameId, `bg:${gameId}`);
-            logger.info(
-              profile,
-              `BG→N+1 SIGNAL_READY (primary path — durable outbox enqueued) [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`,
-            );
-          } else {
-            // P0 state semantics (sep 11): skipped_no_edge is an EVALUATED,
-            // TERMINAL NO_BET — the claim was completed, not released, so ED
-            // must not recompute. Only genuine failures (exception:*,
-            // insufficient_history, persist_failed, skipped window) release
-            // the claim and leave the target recoverable by ED fallback.
-            if (result.kind !== "skipped_no_edge") {
-              releaseTarget(targetGameId, `bg:${gameId}`);
-            }
-            logger.info(
-              { ...profile, terminal_no_bet: result.kind === "skipped_no_edge" },
-              result.kind === "duplicate"
-                ? `BG→N+1 already claimed/persisted by another trigger [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`
-                : result.kind === "skipped_no_edge"
-                  ? `BG→N+1 evaluated NO_BET (terminal — ED will not recompute) [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`
-                  : `BG→N+1 soft result kind=${result.kind} — target recoverable by ED fallback [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`,
-            );
-          }
-        } catch (err) {
-          const e = err instanceof Error ? err : new Error(String(err));
-          logger.error(
-            {
-              component: "game-event-handlers",
-              event: "bg",
-              gameId,
-              trigger: "BG_PRIMARY",
-              errorName: e.name,
-              errorMessage: e.message,
-              errorStack: e.stack?.slice(0, 1500) ?? null,
-            },
-            "BG→N+1 primary prediction attempt threw — ED(N) remains fallback",
-          );
-        }
-      })();
-    }
 
     setImmediate(() => {
       void (async () => {
@@ -524,7 +540,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
         targets_stamped: bgCounts?.targets_stamped ?? null,
         signals_killed: bgCounts?.signals_killed ?? null,
       },
-      "bg reconcile complete — N+1 primary prediction trigger fired",
+      "bg reconcile complete — N+1 trigger in flight (launched concurrently, pass 15)",
     );
   } catch (error) {
     logger.error({ event: "bg", gameId, error: String(error) }, "bg observability failed");
