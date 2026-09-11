@@ -1498,14 +1498,19 @@ export async function onGameEndPredict(
     // itself in Postgres — so the explicit transaction adds two round
     // trips of pure overhead to the SIGNAL_READY critical path. Run it
     // directly: one acquire, one round trip (~200ms expected).
+    //
+    // ROUND-TRIP REDUCTION (plan §3): ONE compound statement performs both
+    // inserts atomically. The outbox row is inserted SELECTed from the
+    // pending_predictions RETURNING — if the prediction loses a duplicate
+    // race (conflict DO NOTHING), the CTE is empty, the outbox insert
+    // writes nothing, and we detect the duplicate from 0 returned rows.
+    // Same ACID guarantees, one network round trip instead of three.
+    //
+    // REGRESSION GUARD (sep 11 15:22 logs): these comments were briefly
+    // left INSIDE the template literal above (48006b3), so the slash-slash
+    // text shipped to Postgres as SQL and every persist failed with a
+    // syntax error. Comments live OUTSIDE the template literal. Always.
     const ins = await sql<{ notification_id: string }>`
-        // ROUND-TRIP REDUCTION (plan §3): ONE compound statement performs both
-        // inserts atomically. The outbox row is inserted SELECTed from the
-        // pending_predictions RETURNING — if the prediction loses a duplicate
-        // race (conflict DO NOTHING), the CTE is empty, the outbox insert
-        // writes nothing, and we detect the duplicate from 0 returned rows.
-        // Same ACID transaction, same critical-pool client, one network round
-        // trip instead of two (at ~800ms Neon RTT this halves the in-tx time).
           with inserted_prediction as (
             insert into pending_predictions (
               prediction_id, target_multiplier, probability, confidence,
