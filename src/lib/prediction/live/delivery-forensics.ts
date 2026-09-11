@@ -467,6 +467,23 @@ export async function reclassifyOnTargetStart(
         AND telegram_accepted_at IS NOT NULL
     `;
 
+    // BATCHED WRITE (sep 11 pool pass): this used to issue one
+    // persistDeliveryOutcome UPDATE per delivered row — N general-pool
+    // round trips per round start (N≥1 every round, ~150-200ms RTT each,
+    // more under contention). Classification is pure JS over timestamps,
+    // so collect rows first, then commit every outcome in ONE
+    // UPDATE...FROM (VALUES ...) statement. Per-row forensic logging is
+    // unchanged and does zero DB.
+    type Classified = {
+      notificationId: string;
+      outcome: DeliveryOutcome;
+      leadTimeMs: number | null;
+      logLevel: "info" | "warn";
+      meta: Record<string, unknown>;
+      telegramAcceptedAt: string | null;
+      createdAt: string;
+    };
+    const classified: Classified[] = [];
     for (const row of delivered) {
       const acceptedMs = row.telegram_accepted_at
         ? new Date(row.telegram_accepted_at).getTime()
@@ -476,31 +493,66 @@ export async function reclassifyOnTargetStart(
         targetStartedAtMs: beganMs,
         outboxStatus: "delivered",
       });
-      const meta = (row.metadata ?? {}) as Record<string, unknown>;
-      await persistDeliveryOutcome(sql, row.notification_id, outcome, leadTimeMs);
-      const logLevel = outcome === "LATE" ? "warn" : "info";
+      classified.push({
+        notificationId: row.notification_id,
+        outcome,
+        leadTimeMs,
+        logLevel: outcome === "LATE" ? "warn" : "info",
+        meta: (row.metadata ?? {}) as Record<string, unknown>,
+        telegramAcceptedAt: row.telegram_accepted_at
+          ? new Date(row.telegram_accepted_at).toISOString()
+          : null,
+        createdAt: new Date(row.created_at).toISOString(),
+      });
+    }
+
+    if (classified.length > 0) {
+      // The tagged wrapper does not support nested fragments, so the batch
+      // is built with sql.query ($n params) — same pattern as the
+      // REPAIR/AUDIT scans above.
+      const params: unknown[] = [];
+      const tuples = classified.map((c) => {
+        const pId = params.push(c.notificationId);
+        const pOutcome = params.push(c.outcome);
+        const pLead = params.push(c.leadTimeMs);
+        return `($${pId}::uuid, $${pOutcome}::text, $${pLead}::bigint)`;
+      });
+      await sql
+        .query(
+          `UPDATE notification_outbox o
+           SET delivery_outcome = v.outcome,
+               lead_time_ms = v.lead_time_ms
+           FROM (VALUES ${tuples.join(", ")}) AS v(notification_id, outcome, lead_time_ms)
+           WHERE o.notification_id = v.notification_id
+             AND (o.delivery_outcome IS DISTINCT FROM v.outcome
+                  OR o.lead_time_ms IS DISTINCT FROM v.lead_time_ms)`,
+          params,
+        )
+        .catch((e: unknown) => {
+          logger.warn(
+            { targetGameId, error: String(e) },
+            "batched reclassify UPDATE failed — reconcileForensicOutcomes will repair",
+          );
+        });
+    }
+
+    for (const c of classified) {
+      const logLevel = c.logLevel;
       logger[logLevel](
         {
           component: "delivery-forensics",
-          predictionId: typeof meta.predictionId === "string" ? meta.predictionId : null,
-          notificationId: row.notification_id,
-          correlationId: typeof meta.correlationId === "string" ? meta.correlationId : null,
-          sourceGameId: typeof meta.sourceGameId === "string" ? meta.sourceGameId : null,
+          predictionId: typeof c.meta.predictionId === "string" ? c.meta.predictionId : null,
+          notificationId: c.notificationId,
+          correlationId: typeof c.meta.correlationId === "string" ? c.meta.correlationId : null,
+          sourceGameId: typeof c.meta.sourceGameId === "string" ? c.meta.sourceGameId : null,
           targetGameId,
-          telegramAcceptedAt: row.telegram_accepted_at
-            ? new Date(row.telegram_accepted_at).toISOString()
-            : null,
+          telegramAcceptedAt: c.telegramAcceptedAt,
           targetRoundStartedAt: beganIso,
-          leadTimeMs,
-          outcome,
-          totalDeliveryMs: msDiff(
-            row.telegram_accepted_at
-              ? new Date(row.telegram_accepted_at).toISOString()
-              : null,
-            row.created_at,
-          ),
+          leadTimeMs: c.leadTimeMs,
+          outcome: c.outcome,
+          totalDeliveryMs: msDiff(c.telegramAcceptedAt, c.createdAt),
         },
-        `PREDICTION_DELIVERY_FORENSICS ${outcome} (BG reclassify)`,
+        `PREDICTION_DELIVERY_FORENSICS ${c.outcome} (BG reclassify)`,
       );
     }
 

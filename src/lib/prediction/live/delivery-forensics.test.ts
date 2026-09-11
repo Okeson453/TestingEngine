@@ -69,21 +69,49 @@ describe("reconcileForensicOutcomes (durable forensic retry)", () => {
    *  forensic UPDATE is captured for assertions. No DB required. */
   function makeFakeSql(seedRows: Array<Record<string, unknown>>) {
     const updates: Array<{ id: string; outcome: string; lead: number | null }> = [];
-    const sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
-      const text = strings.join("?");
+    // The split scans (REPAIR/AUDIT) and the batched reclassify write use
+    // sql.query(text, params) — the tagged wrapper does not support nested
+    // fragments. The stub routes BOTH shapes through the same matcher.
+    const runQuery = (text: string, values: unknown[]) => {
       if (text.includes("FROM notification_outbox o")) {
-        return Promise.resolve(seedRows);
+        // pg Result is an array subclass (iterable + rowCount) — spread-consumed
+        // by the sweep ([...repairRows, ...auditRows]). Route by scan semantics
+        // so a row is returned by exactly one scan, like the real partial
+        // indexes: REPAIR targets NULL/UNKNOWN, AUDIT targets ON_TIME/EARLY.
+        const isAudit = text.includes("IN ('ON_TIME', 'EARLY')");
+        const matched = seedRows.filter((r) =>
+          isAudit
+            ? r.delivery_outcome === "ON_TIME" || r.delivery_outcome === "EARLY"
+            : r.delivery_outcome == null || r.delivery_outcome === "UNKNOWN",
+        );
+        return Promise.resolve(Object.assign([...matched], { rowCount: matched.length }));
       }
       if (text.includes("UPDATE notification_outbox")) {
-        updates.push({
-          outcome: String(values[0]),
-          lead: (values[1] as number | null) ?? null,
-          id: String(values[2]),
-        });
-        return Promise.resolve([]);
+        if (text.includes("AS v(notification_id, outcome, lead_time_ms)")) {
+          // Batched reclassify: params are (id, outcome, lead) tuples.
+          for (let i = 0; i < values.length; i += 3) {
+            updates.push({
+              id: String(values[i]),
+              outcome: String(values[i + 1]),
+              lead: (values[i + 2] as number | null) ?? null,
+            });
+          }
+        } else {
+          updates.push({
+            outcome: String(values[0]),
+            lead: (values[1] as number | null) ?? null,
+            id: String(values[2]),
+          });
+        }
+        return Promise.resolve(Object.assign([], { rowCount: 0 }));
       }
-      return Promise.resolve([]);
-    }) as unknown as Parameters<typeof reconcileForensicOutcomes>[0];
+      return Promise.resolve(Object.assign([], { rowCount: 0 }));
+    };
+    const sql = Object.assign(
+      (strings: TemplateStringsArray, ...values: unknown[]) =>
+        runQuery(strings.join("?"), values),
+      { query: <R>(text: string, values?: unknown[]) => runQuery(text, values ?? []) as Promise<R[] & { rowCount: number }> },
+    ) as unknown as Parameters<typeof reconcileForensicOutcomes>[0];
     return { sql, updates };
   }
 
@@ -123,13 +151,16 @@ describe("reconcileForensicOutcomes (durable forensic retry)", () => {
     ]);
   });
 
-  it("is idempotent: a second pass over repaired rows changes nothing", async () => {
+  it("is idempotent: a second pass over stable rows changes nothing", async () => {
+    // Split-sweep semantics (5a6ac90): REPAIR covers NULL/UNKNOWN, AUDIT
+    // covers ON_TIME/EARLY — a stable row is scanned exactly once and, being
+    // already correct, produces no write.
     const { sql, updates } = makeFakeSql([
       {
         notification_id: "n-ok",
         telegram_accepted_at: new Date(0),
-        delivery_outcome: "LATE", // already correct
-        target_started_at: new Date(0),
+        delivery_outcome: "ON_TIME", // already correct, AUDIT window
+        target_started_at: new Date(1_000), // accepted strictly before start → ON_TIME
       },
     ]);
     const r = await reconcileForensicOutcomes(sql);

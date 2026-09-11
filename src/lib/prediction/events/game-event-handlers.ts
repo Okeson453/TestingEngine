@@ -10,7 +10,7 @@ import { bcGameSocket } from "@/lib/crash/socket-client";
 import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
 import { prewarmSign } from "@/lib/crash/native-sign";
 import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtime-pipeline";
-import { getSql } from "@/lib/db";
+import { getSql, getCriticalSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
 import { attemptNPlusOnePrediction } from "@/lib/prediction/live/prediction-attempt";
@@ -273,7 +273,16 @@ export async function bgHandler(payload: unknown): Promise<void> {
   }
 
   try {
-    const sql = await getSql();
+    // PRIORITY-ISOLATION FIX (sep 11 18:20 logs): this CTE is REALTIME-
+    // CRITICAL (began_at stamp + live_round_state + temporal kill) and the
+    // BG→N+1 prediction attempt only fires AFTER it resolves — yet it ran
+    // on the GENERAL pool, queueing behind every background sweep. Measured
+    // general acquires of ~1.0-1.16s with total=7 therefore landed directly
+    // on the BG→prediction critical path (the 1.5-1.8s skipped_no_edge
+    // result lag = this acquire + 1 CTE RTT + attempt). Run it on the
+    // critical pool: one acquire, one round trip, isolated from sweeps.
+    // Forensics reclassify below stays on the general pool (telemetry).
+    const sql = await getCriticalSql();
     // POOL-BUDGET FIX: BG used to launch SIX concurrent general-pool
     // operations via Promise.all — with general max=5 that self-induced
     // waiting=2/3 pool pressure on every round start. The essential BG
@@ -491,7 +500,10 @@ export async function bgHandler(payload: unknown): Promise<void> {
         const { reclassifyOnTargetStart } = await import(
           "@/lib/prediction/live/delivery-forensics"
         );
-        await reclassifyOnTargetStart(sql, gameId, beganAt);
+        // Telemetry, not realtime: deliberately on the GENERAL pool so the
+        // forensic reclassify can never queue behind / steal critical slots.
+        const generalSql = await getSql();
+        await reclassifyOnTargetStart(generalSql, gameId, beganAt);
       })().catch(() => {
         /* soft */
       });

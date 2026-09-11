@@ -146,23 +146,35 @@ describe("Zero-DB ED prediction path — regression tests", () => {
 
       const hotPath = funcBody.slice(0, signalReadyIdx);
 
+      // Strip line comments before substring checks — the invariant is about
+      // CODE, and comments (e.g. the BG-reserve explanation mentioning
+      // pending_predictions) live on the hot path by design.
+      const hotCode = hotPath
+        .split("\n")
+        .map((l) => l.replace(/(^|[^:])\/\/.*$/, "$1"))
+        .join("\n");
+
       // The hot path must NOT contain getSqlFn() or getSql() call
       // (it can reference deps.getSqlFn in the type, but not call it)
-      expect(hotPath).not.toContain("await getSqlFn()");
-      expect(hotPath).not.toContain("await getSql()");
-      expect(hotPath).not.toContain("const sql = await");
+      expect(hotCode).not.toContain("await getSqlFn()");
+      expect(hotCode).not.toContain("await getSql()");
+      expect(hotCode).not.toContain("const sql = await");
 
       // The hot path must NOT contain DB eligibility queries
-      expect(hotPath).not.toContain("pending_predictions");
-      expect(hotPath).not.toContain("live_round_state");
+      expect(hotCode).not.toContain("pending_predictions");
+      expect(hotCode).not.toContain("live_round_state");
       expect(hotPath).not.toContain("crash_rounds");
       expect(hotPath).not.toContain("worker_state");
       expect(hotPath).not.toContain("runInTransaction");
 
-      // Durable handoff (after SIGNAL_READY) MUST contain DB + outbox calls
+      // Durable handoff (after SIGNAL_READY) MUST contain DB + outbox calls.
+      // Since the RTT fix (48006b3/6a37bcb) the persist is ONE compound
+      // statement (pending_predictions insert RETURNING feeding the outbox
+      // insert) run directly on the pool — atomic without an explicit
+      // transaction, so runInTransaction is deliberately GONE here.
       const handoffPath = funcBody.slice(signalReadyIdx);
       expect(handoffPath).toContain("getSqlFn");
-      expect(handoffPath).toContain("runInTransaction");
+      expect(handoffPath).toContain("inserted_prediction");
       expect(handoffPath).toContain("pending_predictions");
       expect(handoffPath).toContain("notification_outbox");
     });

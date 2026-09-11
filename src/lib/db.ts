@@ -83,19 +83,28 @@ export function getTaggedPool(sql: Sql): import("pg").Pool | undefined {
   return (sql as TaggedSql).__pgPool;
 }
 
-function readTotalMax(): number {
-  const raw = Number(process.env.PG_POOL_MAX ?? 10);
-  return Math.max(2, Math.min(Number.isFinite(raw) ? raw : 10, 12));
+/** Pool sizing readers — exported for regression tests (pure env math). */
+export function readTotalMax(): number {
+  // sep 11 18:20 pass: 10 -> 12. Production pinned the GENERAL pool at its
+  // max (total=7) with ~1.0-1.16s acquires — real concurrent demand from
+  // sweeps + heartbeats + event-log writes. 12 keeps critical at 4 and
+  // gives the general pool 8 (burst headroom without Neon pressure).
+  const raw = Number(process.env.PG_POOL_MAX ?? 12);
+  return Math.max(2, Math.min(Number.isFinite(raw) ? raw : 12, 12));
 }
 
-function readCriticalMax(): number {
+export function readCriticalMax(): number {
   const total = readTotalMax();
-  const raw = Number(process.env.PG_CRITICAL_POOL_MAX ?? 3);
-  const crit = Math.max(1, Math.min(Number.isFinite(raw) ? raw : 3, total - 1));
+  // sep 11 pass: 3 -> 4. Critical consumers per round boundary: BG reconcile
+  // CTE (now routed here) + N+1 persist + dispatcher claim/auth/finalize can
+  // legally overlap 3-wide; a 4th slot removes the tail wait (one 1065ms
+  // critical blip observed at 14:50:29 during SIGNAL_READY persist).
+  const raw = Number(process.env.PG_CRITICAL_POOL_MAX ?? 4);
+  const crit = Math.max(1, Math.min(Number.isFinite(raw) ? raw : 4, total - 1));
   return crit;
 }
 
-function readGeneralMax(): number {
+export function readGeneralMax(): number {
   return Math.max(1, readTotalMax() - readCriticalMax());
 }
 
@@ -218,7 +227,10 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     criticalMax,
   );
   const generalMin = Math.min(
-    Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 2) || 2),
+    // sep 11 pass: 2 -> 3. Steady-state general concurrency is heartbeat (1)
+    // + at least one periodic sweep; a 3rd warm client avoids re-paying the
+    // ~1s Neon TLS+auth on the first burst above min.
+    Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 3) || 3),
     generalMax,
   );
 

@@ -70,7 +70,14 @@ export async function sampleProductionInvariants(
   const db = sql ?? (await getSql());
   const violations: InvariantViolation[] = [];
 
-  try {
+  // CONCURRENCY FIX (sep 11 pool pass): the five invariant probes are
+  // independent, bounded, read-only SELECTs. Sequential awaits held a
+  // general-pool client for ~5 RTT (~750ms-1s) every 30s cycle; concurrent
+  // fan-out finishes in ~1 RTT and frees the pool faster. Violation
+  // aggregation is unchanged (each probe catches its own errors).
+  const probes: Promise<void>[] = [];
+
+  probes.push((async () => { try {
     // Multiple active pending rows for same target
     const dups = await db<{ target_game_id: string; c: number }>`
       SELECT target_game_id, count(*)::int AS c
@@ -92,9 +99,9 @@ export async function sampleProductionInvariants(
     }
   } catch (e) {
     logger.debug({ error: String(e) }, "invariant sample skip (pending dups)");
-  }
+  }})());
 
-  try {
+  probes.push((async () => { try {
     // Validations without feedback_applied_at older than 2 minutes (stuck feedback)
     const stuck = await db<{ prediction_id: string; game_id: string }>`
       SELECT prediction_id, game_id
@@ -121,9 +128,9 @@ export async function sampleProductionInvariants(
     }
   } catch (e) {
     logger.debug({ error: String(e) }, "invariant sample skip (feedback)");
-  }
+  }})());
 
-  try {
+  probes.push((async () => { try {
     // Fix plan Phase 14: duplicate/contradictory feedback state. A row that is
     // BOTH skipped (intentionally never applied) and marked applied is
     // corrupted state — one of the two markers is wrong.
@@ -146,9 +153,9 @@ export async function sampleProductionInvariants(
     }
   } catch (e) {
     logger.debug({ error: String(e) }, "invariant sample skip (feedback contradiction)");
-  }
+  }})());
 
-  try {
+  probes.push((async () => { try {
     // Temporal violations on recent pending rows
     const temporal = await db<{
       prediction_id: string;
@@ -178,9 +185,9 @@ export async function sampleProductionInvariants(
     }
   } catch (e) {
     logger.debug({ error: String(e) }, "invariant sample skip (temporal)");
-  }
+  }})());
 
-  try {
+  probes.push((async () => { try {
     // Hard temporal delivery contract (migration 0027): NO prediction signal
     // may be delivered after its target round started. The join uses the
     // validation row's authoritative target_round_started_at (BG-supplied).
@@ -220,7 +227,9 @@ export async function sampleProductionInvariants(
     }
   } catch (e) {
     logger.debug({ error: String(e) }, "invariant sample skip (late delivery)");
-  }
+  }})());
+
+  await Promise.all(probes);
 
   if (violations.length > 0) {
     const fp = violations
