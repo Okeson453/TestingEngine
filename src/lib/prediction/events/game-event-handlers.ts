@@ -412,6 +412,10 @@ export async function edHandler(payload: unknown): Promise<void> {
   }
   const gameId = extractLastGameId(payload);
   if (!gameId) return;
+  // ED RECEIPT ANCHOR: the earliest in-process instant for this authoritative
+  // crash event. Threads through the attempt chain into outbox metadata as
+  // ed_received_at — the start of the measured ED→Telegram critical path.
+  const edReceivedAt = new Date().toISOString();
   // P0: dedupe by canonical round ID BEFORE any computation. Duplicate native
   // WS events must never reach claim/N+1 compute — classify and stop here.
   const reentry = classifyEdReentry(gameId);
@@ -494,6 +498,7 @@ export async function edHandler(payload: unknown): Promise<void> {
         source: "ED",
         correlationId,
         trace,
+        edReceivedAt,
       });
       const totalMs = finishSignalReady(trace);
       if (result.attempted) {
@@ -506,6 +511,7 @@ export async function edHandler(payload: unknown): Promise<void> {
             ownership_result: "owned_predicted",
             predictionId: result.predictionId,
             kind: result.kind,
+            ed_received_at: edReceivedAt,
             ed_to_signal_ms: Math.round(totalMs * 100) / 100,
             correlationId,
           },

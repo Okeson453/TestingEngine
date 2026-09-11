@@ -102,6 +102,11 @@ export interface AttemptNPlusOneInput {
   correlationId?: string | null;
   /** Optional latency trace to mark stages on (ED hot path). */
   trace?: Trace | null;
+  /**
+   * ISO instant the authoritative ED(N) event entered the worker. Threaded
+   * through to outbox metadata as ed_received_at (undefined on recovery).
+   */
+  edReceivedAt?: string;
 }
 
 export interface AttemptNPlusOneResult {
@@ -126,7 +131,7 @@ export async function attemptNPlusOnePrediction(
       sourceCrashAt,
       sourceMultiplier,
       input.correlationId ?? crypto.randomUUID(),
-      { recoveryMode, trace },
+      { recoveryMode, trace, edReceivedAt: input.edReceivedAt },
     );
     if (trace) trace.marks.prediction_completed = performance.now();
 

@@ -122,6 +122,13 @@ interface PredictorDeps {
   getSqlFn?: () => Promise<Sql>;
   /** Optional latency trace — marked at outbox enqueue on the ED hot path. */
   trace?: Trace | null;
+  /**
+   * ISO instant the authoritative live ED(N) event entered the worker.
+   * Anchors the delivery timeline at true receipt (ed_received_at) so the
+   * full ED→Telegram latency is measurable end-to-end from outbox metadata
+   * alone. Undefined on poll-recovery attempts (there is no ED event).
+   */
+  edReceivedAt?: string;
   predictFn?: (
     priorRounds: HistoricalRound[],
     targetRoundId: string,
@@ -1294,7 +1301,10 @@ export async function onGameEndPredict(
       // when it is actually for the UPCOMING round N+1 (delivered during
       // round N+1's betting window). Game ID matches the Game ID the
       // WIN/LOSS message later reports, so the pair is verifiable.
+      // The completed SOURCE round is stated explicitly so the signal can
+      // never be misread as a prediction FOR round N.
       `Game ID: ${targetGameId} (bet NOW — round starting)`,
+      `Source round: ${gameId} completed — predicting round ${targetGameId}`,
       `Prediction ID: ${predictionId}`,
       `Generated: ${generatedAt}`,
       recoveryMode ? "Source: poll recovery" : "Source: live ED",
@@ -1342,6 +1352,11 @@ export async function onGameEndPredict(
       predictionStartedAt: attemptStartedAt,
       predictionComputeMs,
       predictionGeneratedAt: generatedAt,
+      // ED RECEIPT ANCHOR (sep 11): true ED(N) worker-receipt instant — the
+      // start of the measured critical path. Persist-commit / outbox-enqueue
+      // instants are the outbox row's created_at (same TX commit); dispatch
+      // start / telegram accept are send_started_at / telegram_accepted_at.
+      edReceivedAt: deps.edReceivedAt ?? null,
     });
 
     let txStage: TxStageTimings | null = null;
@@ -1460,6 +1475,10 @@ export async function onGameEndPredict(
         tx_ms: txMs,
         tx_statements: 1,
         outboxEnqueued,
+        // Full pre-dispatch timeline in one line: ED receipt (undefined on
+        // recovery) → persist commit = outbox created_at = outbox_enqueued_at.
+        persisted_at: new Date().toISOString(),
+        ed_received_at: deps.edReceivedAt ?? null,
       };
       if (txMs + poolWaitMs > 300) {
         logger.info(profile, "PERSIST_PROFILE");

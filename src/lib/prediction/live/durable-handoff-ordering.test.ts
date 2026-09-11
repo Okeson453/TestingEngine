@@ -77,4 +77,23 @@ describe("durable prediction handoff ordering (P0)", () => {
     // 'validation' type and the status/priority columns)
     expect(v).toMatch(/'validation'[\s\S]{0,900}'pending',\s*2/);
   });
+
+  it("ED receipt instant threads to outbox metadata; message names source/target rounds", () => {
+    // ED RECEIPT ANCHOR: ed_received_at starts the measured critical path.
+    // The ED handler must capture receipt at entry and thread it through the
+    // attempt chain into outbox metadata — a dropped link here makes the
+    // ED→Telegram latency unmeasurable.
+    expect(handlersSrc).toContain("const edReceivedAt = new Date().toISOString();");
+    expect(handlersSrc).toMatch(/source: "ED"[\s\S]{0,200}edReceivedAt/);
+    // Attempt layer forwards it into predictor deps (recovery leaves it undefined).
+    expect(attemptSrc).toContain("edReceivedAt: input.edReceivedAt");
+    // Predictor persists it in outbox metadata for end-to-end timeline queries.
+    expect(predictorSrc).toContain("edReceivedAt: deps.edReceivedAt ?? null");
+    // Message contract: explicit target with bet-now wording + explicit
+    // completed source round (N never masquerades as the prediction target).
+    expect(predictorSrc).toContain("(bet NOW — round starting)");
+    expect(predictorSrc).toContain(
+      "`Source round: ${gameId} completed — predicting round ${targetGameId}`",
+    );
+  });
 });
