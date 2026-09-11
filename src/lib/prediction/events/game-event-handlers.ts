@@ -15,9 +15,9 @@ import { runInTransaction } from "@/lib/prediction/live/tx";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
 import { attemptNPlusOnePrediction } from "@/lib/prediction/live/prediction-attempt";
+import { observeCrashForACIE } from "@/lib/prediction/live/predictor";
 import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
 import {
-  markLiveRoundStarted,
   markLiveRoundEnded,
 } from "@/lib/prediction/live/live-round-state";
 import { appendCompletedRound } from "@/lib/prediction/live/live-history-buffer";
@@ -37,6 +37,13 @@ import { syncDbClockOffset, shouldResyncClock } from "@/lib/prediction/live/cloc
 import { noteRoundEnded, noteRoundStarted } from "@/lib/prediction/live/live-round-registry";
 
 const logger = getLogger("game-event-handlers");
+
+/** Affected-row counts returned by the single-CTE BG reconcile statement. */
+interface BgReconcileCounts {
+  crash_backfilled: number;
+  targets_stamped: number;
+  signals_killed: number;
+}
 const inFlightEd = new Set<string>();
 const inFlightBg = new Set<string>();
 const inFlightPr = new Set<string>();
@@ -246,45 +253,86 @@ export async function bgHandler(payload: unknown): Promise<void> {
     // AUDIT 2026-09-11: the began_at backfill UPDATE was a SEPARATE round
     // trip before this TX — folded in as the first statement (one less
     // general-pool round trip per round start, same COALESCE semantics).
+    // ROUND-TRIP FIX (sep 11 logs, post-5a6ac90): production still measured
+    // 1.1-1.4s between "bc bg event" and "bg reconcile complete" with NO
+    // pool pressure — the TX was FIVE sequential Neon round trips (~200ms
+    // RTT each). All five writes target disjoint tables with no
+    // read-modify-write interdependence, so they collapse into ONE
+    // data-modifying CTE (single round trip) whose SELECT returns
+    // per-table affected-row counts for the reconcile log.
+    const beganParam = new Date(beganAt);
     const runBgTx = () =>
-      runInTransaction(sql, async (tx) => {
-        // Backfill began_at when known from BG (authoritative round start).
-        await tx`
-          UPDATE crash_rounds
-          SET began_at = COALESCE(began_at, ${new Date(beganAt)})
-          WHERE game_id = ${gameId}
+      runInTransaction(sql, async (tx): Promise<BgReconcileCounts> => {
+        const rows = await tx`
+          WITH cr AS (
+            -- Backfill began_at when known from BG (authoritative round start).
+            UPDATE crash_rounds
+            SET began_at = COALESCE(began_at, ${beganParam})
+            WHERE game_id = ${gameId}
+          ),
+          pp AS (
+            -- P0 correlation: stamp target_round_started_at on the pending prediction for N
+            UPDATE pending_predictions
+            SET target_round_started_at = COALESCE(target_round_started_at, ${beganParam})
+            WHERE target_game_id = ${gameId}
+              AND matched = false
+          ),
+          lrs AS (
+            -- markLiveRoundStarted, inlined (idempotent lifecycle upsert)
+            INSERT INTO live_round_state (
+              game_id, lifecycle, began_at, source, correlation_id, updated_at
+            ) VALUES (
+              ${gameId}, 'STARTED', ${beganParam}, 'socket', ${correlationId}, now()
+            )
+            ON CONFLICT (game_id) DO UPDATE SET
+              lifecycle = CASE
+                WHEN live_round_state.lifecycle IN ('DISCOVERED') THEN 'STARTED'
+                WHEN live_round_state.lifecycle IN ('STARTED', 'RUNNING', 'ENDED', 'RECONCILED')
+                  THEN live_round_state.lifecycle
+                ELSE 'STARTED'
+              END,
+              began_at = COALESCE(live_round_state.began_at, EXCLUDED.began_at),
+              source = CASE
+                WHEN live_round_state.source = 'socket' THEN live_round_state.source
+                ELSE EXCLUDED.source
+              END,
+              correlation_id = COALESCE(live_round_state.correlation_id, EXCLUDED.correlation_id),
+              updated_at = now()
+          ),
+          ob AS (
+            -- Hard temporal contract (report #13): BG(N) arriving means round N
+            -- has STARTED — every undelivered prediction signal targeting N is
+            -- now EXPIRED. Atomic kill beats waiting for the dispatcher tick.
+            UPDATE notification_outbox
+            SET status = 'dead_letter',
+                last_error = 'expired_late_signal: target round started (BG received)'
+            WHERE type = 'prediction'
+              AND status IN ('pending', 'inflight')
+              AND target_game_id = ${gameId}
+          ),
+          lel AS (
+            INSERT INTO live_event_log (
+              correlation_id, event_kind, game_id, payload, received_at, processed_at,
+              processor_latency_ms, sla_violated
+            ) VALUES (
+              ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: false, predictionTrigger: "BG_PRIMARY" })},
+              ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
+            ) ON CONFLICT DO NOTHING
+          )
+          SELECT
+            (SELECT count(*) FROM cr) AS crash_backfilled,
+            (SELECT count(*) FROM pp) AS targets_stamped,
+            (SELECT count(*) FROM ob) AS signals_killed
         `;
-        // P0 correlation: stamp target_round_started_at on the pending prediction for N
-        await tx`
-          UPDATE pending_predictions
-          SET target_round_started_at = COALESCE(target_round_started_at, ${new Date(beganAt)})
-          WHERE target_game_id = ${gameId}
-            AND matched = false
-        `;
-        await markLiveRoundStarted(gameId, beganAt, "socket", correlationId, tx);
-        // Hard temporal contract (report #13): BG(N) arriving means round N
-        // has STARTED — every undelivered prediction signal targeting N is
-        // now EXPIRED. Atomic kill beats waiting for the dispatcher tick.
-        await tx`
-          UPDATE notification_outbox
-          SET status = 'dead_letter',
-              last_error = 'expired_late_signal: target round started (BG received)'
-          WHERE type = 'prediction'
-            AND status IN ('pending', 'inflight')
-            AND target_game_id = ${gameId}
-        `;
-        await tx`
-          INSERT INTO live_event_log (
-            correlation_id, event_kind, game_id, payload, received_at, processed_at,
-            processor_latency_ms, sla_violated
-          ) VALUES (
-            ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: false, predictionTrigger: "BG_PRIMARY" })},
-            ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
-          ) ON CONFLICT DO NOTHING
-        `;
+        return {
+          crash_backfilled: Number(rows[0]?.crash_backfilled ?? 0),
+          targets_stamped: Number(rows[0]?.targets_stamped ?? 0),
+          signals_killed: Number(rows[0]?.signals_killed ?? 0),
+        };
       });
+    let bgCounts: BgReconcileCounts | null = null;
     try {
-      await runBgTx();
+      bgCounts = await runBgTx();
     } catch (txErr1) {
       logger.warn(
         { event: "bg", gameId, error: String(txErr1), attempt: 1 },
@@ -421,6 +469,11 @@ export async function bgHandler(payload: unknown): Promise<void> {
         // ~1.24s here (pool contention) vs ~2ms of model time — this
         // field is the per-round proof of where the cost sits.
         bg_receipt_to_reconcile_ms: Math.max(0, Date.now() - new Date(receivedAt).getTime()),
+        // Per-table affected-row counts from the single-CTE reconcile:
+        // signals_killed>0 is the proof the temporal kill actually ran.
+        crash_backfilled: bgCounts?.crash_backfilled ?? null,
+        targets_stamped: bgCounts?.targets_stamped ?? null,
+        signals_killed: bgCounts?.signals_killed ?? null,
       },
       "bg reconcile complete — N+1 primary prediction trigger fired",
     );
@@ -600,6 +653,19 @@ export async function edHandler(payload: unknown): Promise<void> {
       });
     } catch {
       /* soft */
+    }
+    // SEP 11 FIX (production 14:28:18 STALE_REJECTED): learning is not
+    // ownership. When BG already claimed/decided target N+1 (duplicate or
+    // terminal NO_BET), onGameEndPredict returns early WITHOUT observing
+    // round N — so ACIE last-observed lagged the history buffer tail and the
+    // next BG prediction was rejected as stale. Observe every authoritative
+    // crash here, unconditionally, before the ownership boundary. The helper
+    // is idempotent per round, so the owned path's internal observe is a
+    // no-op, and the bgTrigger mode in onGameEndPredict never double-counts.
+    try {
+      observeCrashForACIE(gameId, multiplier, crashedAt);
+    } catch {
+      /* soft — never block the prediction path on observation */
     }
     mark(trace, "state_updated");
 
@@ -826,7 +892,7 @@ export function initializeEventHandlers(): void {
     );
   });
 
-  logger.info({ component: "game-event-handlers" }, "event handlers wired (ED-first)");
+  logger.info({ component: "game-event-handlers" }, "event handlers wired (BG-primary, ED-fallback)");
 }
 
 /** Called by worker boot — native WS primary; socket.io optional fallback. */

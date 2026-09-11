@@ -35,7 +35,7 @@ import { getLogger } from "@/lib/observability/logger";
 // and the standalone ESM worker.
 import { getSharedACIEEngine, getSharedACIEInstanceId } from "@/lib/prediction/acie/shared-engine";
 import { buildAcieFeatureFingerprint, buildProvenance, computeFeatureHash } from "@/lib/prediction/acie/provenance";
-import { recordAcieObservation, assertFreshAcieState } from "@/lib/prediction/acie/stale-guard";
+import { recordAcieObservation, assertFreshAcieState, getLastAcieObservation } from "@/lib/prediction/acie/stale-guard";
 import { runPredictionPipeline } from "@/lib/prediction/prediction-pipeline";
 
 import {
@@ -45,6 +45,75 @@ import {
 
 const logger = getLogger("live-predictor");
 // SYNTAX_GUARD_20260906: file must parse under node --experimental-strip-types
+
+/**
+ * Observe crash N on shared ACIE — IDEMPOTENT, ownership-independent.
+ *
+ * SEP 11 FIX (production 14:28:18 STALE_REJECTED): ACIE observation was
+ * inline in onGameEndPredict AFTER the target claim, so when BG(N) had
+ * already claimed/decided target N+1 (duplicate or terminal NO_BET), the
+ * ED(N) attempt returned early and round N was NEVER observed. The next
+ * BG(N+1) evaluation then proved stale (ACIE last observed N-1, buffer
+ * tail N) and was rejected — the BG-primary path starved its own model.
+ *
+ * Learning is not ownership: every authoritative crash is observed exactly
+ * once per process, regardless of who owns the prediction. The
+ * last-observation guard makes double calls (edHandler direct + inside
+ * onGameEndPredict on the owned path) a no-op.
+ */
+export function observeCrashForACIE(
+  gameId: string,
+  multiplier: number,
+  crashedAt: string,
+): void {
+  const prev = getLastAcieObservation();
+  if (prev.gameId === String(gameId) && prev.observationCount > 0) return;
+  try {
+    const acie = getSharedACIEEngine();
+    const learnResult = acie.observeRound({
+      roundId: gameId,
+      crashPoint: multiplier,
+      timestamp: crashedAt,
+    });
+    const obsCount =
+      learnResult?.online?.observationCount ?? acie.historySize();
+    try {
+      recordAcieObservation(gameId, obsCount);
+    } catch {
+      /* soft */
+    }
+    // Forensic provenance: prove the observation advanced the state.
+    // state_version is the monotonic state version (== observationCount);
+    // history_hash fingerprints the observed crash history so a repeat
+    // lineup complaint can be answered from the log alone.
+    let historyHash: string | null = null;
+    try {
+      historyHash = computeFeatureHash({
+        crashPointsTail: acie.exportSnapshot().crashPoints,
+      });
+    } catch {
+      /* forensic metadata only */
+    }
+    logger.info(
+      {
+        component: "live-predictor",
+        event: "ACIE_OBSERVATION",
+        sourceGameId: gameId,
+        multiplier,
+        observation_count: obsCount,
+        state_version: obsCount,
+        acieInstanceId: getSharedACIEInstanceId(),
+        history_hash: historyHash,
+      },
+      "ACIE observed crash before N+1 evaluation",
+    );
+  } catch (e) {
+    logger.warn(
+      { component: "live-predictor", sourceGameId: gameId, error: String(e) },
+      "ACIE observeRound failed on hot path — prediction may use stale/fallback path",
+    );
+  }
+}
 
 /** Prediction-related constants. */
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
@@ -1082,60 +1151,10 @@ export async function onGameEndPredict(
   // Never allow PredictionEngine to predict N+1 before ACIE has learned Crash N.
   // BG-PRIMARY: round N has NOT crashed — observing it would poison ACIE
   // state with a phantom crash. ACIE state advances through N-1 (observed at
-  // ED(N-1)); the N+1 evaluation is a valid "one round ahead" projection and
-  // ED(N) remains the fallback with the fuller observation.
-  if (!deps.bgTrigger) try {
-    // P0 FIX: was require() — ReferenceError under ESM made observeRound
-    // fail on every crash ("ACIE observeRound failed on hot path"). Static
-    // import now.
-    const acie = getSharedACIEEngine();
-    const learnResult = acie.observeRound({
-      roundId: gameId,
-      crashPoint: multiplier,
-      timestamp: crashedAt,
-    });
-    const obsCount =
-      learnResult?.online?.observationCount ?? acie.historySize();
-    try {
-      recordAcieObservation(gameId, obsCount);
-    } catch {
-      /* soft */
-    }
-    // Forensic provenance: prove the observation advanced the state.
-    // state_version is the monotonic state version (== observationCount);
-    // history_hash fingerprints the observed crash history so a repeat
-    // lineup complaint can be answered from the log alone.
-    let historyHash: string | null = null;
-    try {
-      historyHash = computeFeatureHash({
-        crashPointsTail: acie.exportSnapshot().crashPoints,
-      });
-    } catch {
-      /* forensic metadata only */
-    }
-    logger.info(
-      {
-        component: "live-predictor",
-        event: "ACIE_OBSERVATION",
-        sourceGameId: gameId,
-        multiplier,
-        observation_count: obsCount,
-        state_version: obsCount,
-        acieInstanceId: getSharedACIEInstanceId(),
-        history_hash: historyHash,
-      },
-      "ACIE observed crash before N+1 evaluation",
-    );
-  } catch (e) {
-    logger.warn(
-      {
-        component: "live-predictor",
-        sourceGameId: gameId,
-        error: e instanceof Error ? e.message : String(e),
-      },
-      "ACIE observeRound failed on hot path — prediction may use stale/fallback path",
-    );
-  }
+  // ED(N-1) via observeCrashForACIE); the N+1 evaluation is a valid "one
+  // round ahead" projection and ED(N) remains the fallback with the fuller
+  // observation.
+  if (!deps.bgTrigger) observeCrashForACIE(gameId, multiplier, crashedAt);
 
   // ── P0: Prediction computation only (ZERO DB, ZERO Telegram, ZERO outbox) ──
   const timestamp = attemptStartedAt;
