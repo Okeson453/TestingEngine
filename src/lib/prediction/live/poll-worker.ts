@@ -178,6 +178,72 @@ export class PollWorker {
   private lastError: string | null = null;
   /** Guard: at most one BC.Game request in flight. */
   private fetchInFlight = false;
+  /**
+   * AUDIT 2026-09-11 (bandwidth): while the native WS is healthy, every poll
+   * tick still fetched a full 50-round page (~10-15KB) from bc.game every
+   * 2-5s — ~200-600MB/day of upstream traffic that insertNewRounds then
+   * discarded as already-known rounds. When the WS delivered an ED within
+   * WS_FRESH_MAX_AGE_MS, the REST page carries no information the live
+   * stream didn't already provide. Skip the fetch on those ticks.
+   *
+   * Guard rails:
+   *   - POLL_SKIP_FETCH_WHEN_WS_HEALTHY=0 disables (default on).
+   *   - After MAX_CONSECUTIVE_SKIPS consecutive skips, force one verification
+   *     fetch so REST parity is re-proven at least once per ~minute.
+   *   - Any WS degradation (age >= WS_FRESH_MAX_AGE_MS) resumes fetching
+   *     immediately — recovery behavior is untouched.
+   *   - Skipped ticks still run stuck-recovery reconcile.
+   */
+  private consecutiveSkips = 0;
+  private skippedFetches = 0;
+  /** Injectable for tests — production reads the live socket snapshot. */
+  lastEdAgeMsFn: () => number | null = () => {
+    const snap = liveSocketSnapshot();
+    return snap.lastEdAt == null ? null : Date.now() - snap.lastEdAt;
+  };
+  /** Injectable for tests — production uses the module-level wsStreamState(). */
+  wsHealthFn: () => "healthy" | "degraded" | "dead" = wsStreamState;
+
+  private static readonly WS_FRESH_MAX_AGE_MS = 10_000;
+  private static readonly MAX_CONSECUTIVE_SKIPS = 12;
+
+  private skipFetchEnabled(): boolean {
+    return process.env.POLL_SKIP_FETCH_WHEN_WS_HEALTHY !== "0";
+  }
+
+  /** True when the live WS makes this tick's REST fetch redundant. */
+  private shouldSkipFetchForHealthyWs(): boolean {
+    if (!this.skipFetchEnabled()) return false;
+    if (this.wsHealthFn() !== "healthy") {
+      this.consecutiveSkips = 0;
+      return false;
+    }
+    // "healthy" already means last ED < 15s; require the tighter fresh window.
+    const edAgeMs = this.lastEdAgeMsFn();
+    if (edAgeMs == null || edAgeMs > PollWorker.WS_FRESH_MAX_AGE_MS) {
+      this.consecutiveSkips = 0;
+      return false;
+    }
+    // Periodic REST parity verification.
+    if (this.consecutiveSkips >= PollWorker.MAX_CONSECUTIVE_SKIPS) {
+      this.consecutiveSkips = 0;
+      return false;
+    }
+    this.consecutiveSkips += 1;
+    this.skippedFetches += 1;
+    if (this.consecutiveSkips === 1 || this.consecutiveSkips % 10 === 0) {
+      logger.info(
+        {
+          component: "poll-worker",
+          consecutiveSkips: this.consecutiveSkips,
+          totalSkipped: this.skippedFetches,
+          lastEdAgeMs: edAgeMs,
+        },
+        "poll fetch skipped — WS healthy and ED fresh (REST page redundant)",
+      );
+    }
+    return true;
+  }
 
   constructor(opts?: {
     getSqlFn?: () => Promise<Sql>;
@@ -237,6 +303,21 @@ export class PollWorker {
       // Enforce single active BC.Game request
       if (this.fetchInFlight) {
         logger.warn({ component: "poll-worker" }, "skip tick — fetch already in flight");
+        return result;
+      }
+      // Bandwidth + DB guard (audit 2026-09-11): when the native WS just
+      // delivered an ED, the REST page is redundant — skip the fetch AND the
+      // stuck-recovery reconcile (a general-pool query) this tick. While WS
+      // healthy, the ED path owns prediction and stuck recovery only needs
+      // its verification-fetch cadence (~once per MAX_CONSECUTIVE_SKIPS
+      // ticks, ~24s at the healthy 2s cadence; SLA is minutes). Degraded/dead
+      // WS never skips, so recovery behavior is untouched.
+      if (this.shouldSkipFetchForHealthyWs()) {
+        // Keep periodic in-tick maintenance cadence honest (thin-history
+        // reseed keys off tickCount) even on skipped ticks.
+        this.tickCount += 1;
+        result.fetched = 0;
+        pollTickMs.observe(performance.now() - tickT0);
         return result;
       }
       this.fetchInFlight = true;
