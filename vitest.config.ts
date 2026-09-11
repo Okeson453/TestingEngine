@@ -18,6 +18,7 @@ export default defineConfig({
       "src/lib/prediction/live/tx-pool-routing.test.ts",
       "src/lib/prediction/live/tx-stage-timing.test.ts",
       "src/lib/prediction/live/latency-attribution.test.ts",
+      "src/lib/prediction/live/skew-monitor-batching.test.ts",
       "src/lib/prediction/live/zero-db-regression.test.ts",
       "src/lib/prediction/live/outbox-toctou-race.test.ts",
       "src/lib/prediction/live/live-round-registry.test.ts",
