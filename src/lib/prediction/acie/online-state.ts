@@ -184,18 +184,21 @@ export function applyOnlineUpdate(
   }
 
   // Online ensemble weight update: reward models closer to actual.
-  // Stronger multiplicative update (was 0.9/0.1) so recent accuracy
-  // shifts the ensemble within ~30–50 rounds instead of hundreds.
+  // Moderate adaptation + per-model floor/ceiling prevents one pattern from
+  // monopolizing the ensemble after a short lucky streak (anti-overfit).
+  const W_FLOOR = 0.06;
+  const W_CEIL = 0.32;
   let weightSum = 0;
   for (const name of MODEL_NAMES) {
     const mp = params.modelProbabilities[name] ?? p;
     const mRes = mp - actual;
     const mSq = mRes * mRes;
-    // Lower squared error → higher weight; faster adaptation
-    const score = Math.exp(-4.5 * mSq);
-    next.ensembleWeights[name] =
-      (state.ensembleWeights[name] ?? equalWeight()) * (0.82 + 0.18 * score);
-    weightSum += next.ensembleWeights[name];
+    const score = Math.exp(-4 * mSq);
+    let w =
+      (state.ensembleWeights[name] ?? equalWeight()) * (0.88 + 0.12 * score);
+    w = w < W_FLOOR ? W_FLOOR : w > W_CEIL ? W_CEIL : w;
+    next.ensembleWeights[name] = w;
+    weightSum += w;
   }
   if (weightSum > 0) {
     for (const name of MODEL_NAMES) {

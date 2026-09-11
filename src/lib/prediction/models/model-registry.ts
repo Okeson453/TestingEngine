@@ -3,6 +3,10 @@ import { globalBaselineModel } from './baseline-model.ts';
 import type { ModelIdentity } from '../types.ts';
 import { getLogger } from '../../observability/logger.ts';
 
+/**
+ * Offline / FALLBACK_BASELINE registry only.
+ * Live ED/BG N+1 scoring uses ACIE PSI models in `acie/psi.ts`, not these classes.
+ */
 export class ModelRegistry {
   private readonly logger = getLogger();
   private readonly models = new Map<string, PredictiveModel>();

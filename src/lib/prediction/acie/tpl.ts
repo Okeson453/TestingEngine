@@ -110,7 +110,7 @@ export class TemporalPatternLearner {
   ): { conditional: number; baseline: number; improvement: number; matchCount: number } {
     const len = history.length;
     if (len === 0) {
-      return { conditional: 0.65, baseline: 0.65, improvement: 0, matchCount: 0 };
+      return { conditional: 1 / 1.3, baseline: 1 / 1.3, improvement: 0, matchCount: 0 };
     }
 
     const start = len > scanLimit ? len - scanLimit : 0;
@@ -140,7 +140,7 @@ export class TemporalPatternLearner {
       if (r.reached130) matchHits++;
     }
 
-    const baseline = baselineN > 0 ? baselineHits / baselineN : 0.65;
+    const baseline = baselineN > 0 ? baselineHits / baselineN : 1 / 1.3;
     const conditional = matchCount >= minMatches ? matchHits / matchCount : baseline;
 
     return {

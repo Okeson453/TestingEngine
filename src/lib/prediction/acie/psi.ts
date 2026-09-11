@@ -108,9 +108,31 @@ export class PredictiveSequenceIntelligence {
 
     const models = this.modelScratch;
     const nModels = models.length;
-    for (let i = 0; i < nModels; i++) this.probScratch[i] = models[i].probability;
 
-    this.resolveWeightsInto(models, history.length, params.ensembleWeights);
+    // Baseline for shrinkage: prefer EWMA / rolling hit rate over a hard-coded prior.
+    const baseline =
+      params.ewmaHitRate != null && params.ewmaHitRate > 0
+        ? params.ewmaHitRate
+        : sequenceState.rolling100HitRate > 0
+          ? sequenceState.rolling100HitRate
+          : 1 / 1.3;
+
+    // Per-model regularization: clip extreme deviations from baseline so a
+    // single noisy pattern cannot dominate the ensemble (anti-overfit).
+    const MAX_DEV = Number(process.env.ACIE_MODEL_MAX_DEV ?? 0.10);
+    for (let i = 0; i < nModels; i++) {
+      const raw = models[i].probability;
+      const clipped =
+        raw < baseline - MAX_DEV
+          ? baseline - MAX_DEV
+          : raw > baseline + MAX_DEV
+            ? baseline + MAX_DEV
+            : raw;
+      this.probScratch[i] = clipped;
+      models[i].probability = clipped;
+    }
+
+    this.resolveWeightsInto(models, history.length, params.ensembleWeights, baseline);
 
     let pSum = 0;
     let maxW = -1;
@@ -123,8 +145,14 @@ export class PredictiveSequenceIntelligence {
       }
     }
 
-    const estimatedProbability = clamp01(pSum);
     const modelUncertainty = Math.sqrt(varianceInPlace(this.probScratch, nModels));
+    // Shrink ensemble toward baseline when models disagree — high dispersion
+    // historically tracked noise, not durable edge.
+    const shrink =
+      modelUncertainty <= 0.02
+        ? 0
+        : Math.min(0.45, (modelUncertainty - 0.02) / 0.12);
+    const estimatedProbability = clamp01(pSum * (1 - shrink) + baseline * shrink);
     const dataN = history.length > crashPoints.length ? history.length : crashPoints.length;
     const dataUncertainty = 1 / Math.sqrt(dataN > 0 ? dataN : 1);
     const ci = this.parametricUncertaintyInterval(estimatedProbability, modelUncertainty);
@@ -194,7 +222,8 @@ export class PredictiveSequenceIntelligence {
     } else if (regime === 'volatile') {
       regimeAdj = clamp01(baseline * 0.97);
     } else if (regime === 'high-activity') {
-      regimeAdj = clamp01(baseline + 0.025);
+      // Mild tilt only — large bumps overfit short high-hit windows.
+      regimeAdj = clamp01(baseline + 0.012);
     }
 
     const streakAware = this.fastStreakAware(baseline, sequenceState, history);
@@ -310,13 +339,21 @@ export class PredictiveSequenceIntelligence {
   private resolveWeightsInto(
     models: ModelEstimate[],
     sampleSize: number,
-    online?: Record<string, number>
+    online?: Record<string, number>,
+    baseline = 1 / 1.3,
   ): void {
     const n = models.length;
+    const FLOOR = 0.06;
+    const CEIL = 0.32;
+
     if (online && Object.keys(online).length > 0) {
       let sum = 0;
       for (let i = 0; i < n; i++) {
-        const w = online[models[i].modelName] ?? 1 / n;
+        // Down-weight models that collapsed to baseline (no unique signal).
+        const nearBaseline =
+          Math.abs(models[i].probability - baseline) < 0.008 ? 0.55 : 1;
+        let w = (online[models[i].modelName] ?? 1 / n) * nearBaseline;
+        w = w < FLOOR ? FLOOR : w > CEIL ? CEIL : w;
         this.weightScratch[i] = w;
         sum += w;
       }
@@ -326,10 +363,13 @@ export class PredictiveSequenceIntelligence {
     }
 
     const mature = sampleSize >= 200;
-    // Static weights aligned with MODEL_NAMES order
+    // Prefer sequence-conditioned models (Conditional, Streak) over raw
+    // frequency / weak momentum when the history is mature. Order = MODEL_NAMES:
+    // Frequency, ConditionalFrequency, RegimeAdjusted, StreakAware,
+    // MomentumReversion, ShortWindowBayesian, VolatilityAdjusted.
     const raw = mature
-      ? [0.12, 0.22, 0.14, 0.16, 0.14, 0.12, 0.1]
-      : [0.28, 0.18, 0.12, 0.14, 0.12, 0.1, 0.06];
+      ? [0.10, 0.24, 0.12, 0.20, 0.08, 0.14, 0.12]
+      : [0.22, 0.20, 0.12, 0.16, 0.10, 0.12, 0.08];
     let sum = 0;
     for (let i = 0; i < n; i++) {
       this.weightScratch[i] = raw[i] ?? 0.1;
