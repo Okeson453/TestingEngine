@@ -80,34 +80,58 @@ function toIso(v: string | number | Date | null | undefined): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-/** Record edge heartbeat for poll deferral. */
+/** Process-local edge heartbeat — poll reads this first (zero DB RTT). */
+let memEdgeAtMs: number | null = null;
+let memEdgeGameId: string | null = null;
+let memEdgeIso: string | null = null;
+
+/** Record edge heartbeat for poll deferral (memory first, durable async). */
 export async function touchEdgeHealth(
   gameId: string,
   sql?: Sql,
 ): Promise<void> {
-  const s = sql ?? (await getSql());
-  const now = new Date().toISOString();
-  try {
-    await s`
-      INSERT INTO worker_state (key, value)
-      VALUES
-        ('last_edge_event_at', ${now}),
-        ('last_edge_game_id', ${gameId})
-      ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
-    `;
-  } catch (e) {
-    logger.debug({ error: String(e) }, "touchEdgeHealth soft-failed");
-  }
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  memEdgeAtMs = nowMs;
+  memEdgeGameId = gameId;
+  memEdgeIso = now;
+  // Durable write is best-effort BACKGROUND — must not block edge ingest or poll.
+  void (async () => {
+    try {
+      const s = sql ?? (await getSql());
+      await s`
+        INSERT INTO worker_state (key, value)
+        VALUES
+          ('last_edge_event_at', ${now}),
+          ('last_edge_game_id', ${gameId})
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
+      `;
+    } catch (e) {
+      logger.debug({ error: String(e) }, "touchEdgeHealth soft-failed");
+    }
+  })();
 }
 
-/** True when a browser-edge event arrived recently — poll should defer N+1. */
+/** True when a browser-edge event arrived recently — poll should defer N+1.
+ * Prefer process memory (updated by touchEdgeHealth). DB is cold-start only. */
 export async function isEdgeFresh(sql?: Sql): Promise<{
   fresh: boolean;
   ageMs: number | null;
   lastGameId: string | null;
 }> {
-  const s = sql ?? (await getSql());
+  if (memEdgeAtMs != null) {
+    const ageMs = Date.now() - memEdgeAtMs;
+    if (Number.isFinite(ageMs) && ageMs >= 0) {
+      return {
+        fresh: ageMs <= EDGE_STALE_MS,
+        ageMs,
+        lastGameId: memEdgeGameId,
+      };
+    }
+  }
+  // Cold path (boot / different process): one DB read, then warm memory.
   try {
+    const s = sql ?? (await getSql());
     const rows = await s<{ key: string; value: string }>`
       SELECT key, value FROM worker_state
       WHERE key IN ('last_edge_event_at', 'last_edge_game_id')
@@ -119,10 +143,14 @@ export async function isEdgeFresh(sql?: Sql): Promise<{
       if (r.key === "last_edge_game_id") gameId = r.value;
     }
     if (!at) return { fresh: false, ageMs: null, lastGameId: gameId };
-    const ageMs = Date.now() - new Date(at).getTime();
+    const atMs = new Date(at).getTime();
+    const ageMs = Date.now() - atMs;
     if (!Number.isFinite(ageMs) || ageMs < 0) {
       return { fresh: false, ageMs: null, lastGameId: gameId };
     }
+    memEdgeAtMs = atMs;
+    memEdgeGameId = gameId;
+    memEdgeIso = at;
     return { fresh: ageMs <= EDGE_STALE_MS, ageMs, lastGameId: gameId };
   } catch {
     return { fresh: false, ageMs: null, lastGameId: null };

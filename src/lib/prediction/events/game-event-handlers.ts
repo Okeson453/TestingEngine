@@ -581,13 +581,24 @@ export async function edHandler(payload: unknown): Promise<void> {
         const crashedAtDate = new Date(crashedAt);
         // began_at NULL until BG arrives (BG is the authoritative round start)
         if (!Number.isNaN(crashedAtDate.getTime())) {
+          // Column is `salt` (not seed) — prior INSERT failed silently every ED.
           await sql`
-            INSERT INTO crash_rounds (game_id, multiplier, hash, seed, began_at, crashed_at)
+            INSERT INTO crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
             VALUES (${gameId}, ${multiplier}, null, null, null, ${crashedAtDate})
             ON CONFLICT (game_id) DO UPDATE SET
               multiplier = EXCLUDED.multiplier,
               crashed_at = COALESCE(EXCLUDED.crashed_at, crash_rounds.crashed_at)
           `.catch(() => undefined);
+          try {
+            const { globalRecentRoundCache } = await import(
+              "@/lib/observability/performance/hot-cache"
+            );
+            globalRecentRoundCache.set({
+              gameId,
+              multiplier,
+              crashedAt,
+            });
+          } catch { /* soft */ }
         }
         await markLiveRoundEnded(gameId, crashedAt, multiplier, sql, "socket").catch(
           () => undefined,

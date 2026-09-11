@@ -4,7 +4,6 @@ import type { FetchedRound } from "./fetch-bc";
 import type { CrashRound } from "./types";
 import { globalRecentRoundCache } from "@/lib/observability/performance/hot-cache";
 import { ingestMs } from "@/lib/observability/performance/latency";
-import { runInTransaction } from "@/lib/prediction/live/tx";
 
 export type RoundRow = {
   game_id: string;
@@ -112,48 +111,50 @@ export async function insertNewRounds(
   const affectedDates = new Set<string>();
   const insertedRounds: CrashRound[] = [];
 
-  // Phase 10 — try single-statement multi-row insert first
+  // Phase 10/15 — single multi-row INSERT via unnest (1 RTT, 1 parse plan).
+  // Prior path issued N INSERT statements inside one TX (~N RTTs of parse/
+  // bind on Neon). For a 50-round poll page that was the dominant ingest cost.
   let batchOk = false;
   if (prepared.length >= 1) {
     try {
-      // Build multi-value INSERT via sequential parameter binding.
-      // node-pg tagged template does not expand arrays as row lists, so we
-      // fall back to a transactional per-row path when the batch path is awkward.
-      // For small N (typical poll page = ≤50) a single transaction of inserts
-      // is still a large win vs N separate autocommit round-trips.
-      await runInTransaction(sql, async (tx) => {
-        for (const p of prepared) {
-          const result = await tx<{ game_id: string }>`
-            insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
-            values (
-              ${p.gameId},
-              ${p.multiplier},
-              ${p.hash},
-              ${p.salt},
-              ${p.beganParam},
-              ${p.crashedAt}
-            )
-            on conflict (game_id) do nothing
-            returning game_id
-          `;
-          if (result.length > 0) {
-            affectedDates.add(p.crashedAt.toISOString().slice(0, 10));
-            insertedRounds.push({
-              gameId: p.gameId,
-              multiplier: p.multiplier,
-              hash: p.hash,
-              salt: p.salt,
-              beganAt: p.beganParam ? p.beganParam.toISOString() : null,
-              crashedAt: p.crashedAt.toISOString(),
-            });
-          }
+      const gameIds = prepared.map((p) => p.gameId);
+      const multipliers = prepared.map((p) => p.multiplier);
+      const hashes = prepared.map((p) => p.hash);
+      const salts = prepared.map((p) => p.salt);
+      const beganAts = prepared.map((p) => p.beganParam);
+      const crashedAts = prepared.map((p) => p.crashedAt);
+      const result = await sql.query<{ game_id: string }>(
+        `INSERT INTO crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
+         SELECT * FROM unnest(
+           $1::text[],
+           $2::numeric[],
+           $3::text[],
+           $4::text[],
+           $5::timestamptz[],
+           $6::timestamptz[]
+         ) AS t(game_id, multiplier, hash, salt, began_at, crashed_at)
+         ON CONFLICT (game_id) DO NOTHING
+         RETURNING game_id`,
+        [gameIds, multipliers, hashes, salts, beganAts, crashedAts],
+      );
+      const returned = new Set(result.map((r) => r.game_id));
+      for (const p of prepared) {
+        if (returned.has(p.gameId)) {
+          affectedDates.add(p.crashedAt.toISOString().slice(0, 10));
+          insertedRounds.push({
+            gameId: p.gameId,
+            multiplier: p.multiplier,
+            hash: p.hash,
+            salt: p.salt,
+            beganAt: p.beganParam ? p.beganParam.toISOString() : null,
+            crashedAt: p.crashedAt.toISOString(),
+          });
         }
-      });
+      }
       batchOk = true;
     } catch (batchErr) {
-      // Soft-fail: fall through to independent per-row inserts
       console.error(
-        `[ingest] batch insert failed, falling back per-row: ${String(batchErr)}`,
+        `[ingest] multi-row unnest insert failed, falling back per-row: ${String(batchErr)}`,
       );
       insertedRounds.length = 0;
       affectedDates.clear();
@@ -205,7 +206,11 @@ export async function insertNewRounds(
   );
 
   if (affectedDates.size > 0) {
-    await recomputeDaily(Array.from(affectedDates));
+    // Daily aggregates are BACKGROUND — never hold the poll/recovery tick.
+    // Failure is soft; next tick or cleanup job can recompute.
+    void recomputeDaily(Array.from(affectedDates)).catch((e) => {
+      console.error(`[ingest] recomputeDaily soft-failed: ${String(e)}`);
+    });
   }
 
   ingestMs.observe(performance.now() - t0);

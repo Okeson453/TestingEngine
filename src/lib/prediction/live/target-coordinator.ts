@@ -68,6 +68,20 @@ export function hasCompletedTarget(targetGameId: string): boolean {
   return claims.get(targetGameId)?.completed === true;
 }
 
+/** True when any owner currently holds (or completed) a claim for target. */
+export function hasActiveOrCompletedClaim(targetGameId: string): boolean {
+  return claims.has(targetGameId);
+}
+
+/** Peek claim without mutating — for poll recovery gates. */
+export function peekClaim(
+  targetGameId: string,
+): { owner: string; completed: boolean; claimedAt: number } | null {
+  const e = claims.get(targetGameId);
+  if (!e) return null;
+  return { owner: e.owner, completed: e.completed, claimedAt: e.claimedAt };
+}
+
 /** Test helper */
 export function _resetTargetCoordinatorForTests(): void {
   claims.clear();

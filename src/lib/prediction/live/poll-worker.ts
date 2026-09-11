@@ -43,6 +43,9 @@ import {
   socketHealthCheckMs,
 } from "@/lib/observability/performance/latency";
 import { isEdgeFresh } from "@/lib/prediction/live/edge-ingest";
+import { hasActiveOrCompletedClaim, peekClaim } from "@/lib/prediction/live/target-coordinator";
+import { isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
+import { globalRecentRoundCache } from "@/lib/observability/performance/hot-cache";
 import { isAuthoritative } from "@/lib/prediction/live/fencing";
 
 /** Prefer native WS health (workspace breakthrough) over socket.io-client state. */
@@ -266,18 +269,25 @@ export class PollWorker {
           const med = this.medianGapMs();
           if (med != null) {
             try {
-              await sql`
+              const { setMedianInterRoundGapMs } = await import(
+                "@/lib/prediction/live/gate-cache"
+              );
+              setMedianInterRoundGapMs(med);
+            } catch { /* soft */ }
+            // Rate-limit durable write: memory is authoritative for hot path;
+            // DB only every 20 ticks or when gap moves >15%.
+            const shouldPersistGap =
+              this.tickCount % 20 === 0 ||
+              this._lastPersistedGapMs == null ||
+              Math.abs(med - this._lastPersistedGapMs) / Math.max(1, this._lastPersistedGapMs) > 0.15;
+            if (shouldPersistGap) {
+              this._lastPersistedGapMs = med;
+              void sql`
                 INSERT INTO worker_state (key, value)
                 VALUES ('median_inter_round_gap_ms', ${String(med)})
                 ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
-              `;
-              try {
-                const { setMedianInterRoundGapMs } = await import(
-                  "@/lib/prediction/live/gate-cache"
-                );
-                setMedianInterRoundGapMs(med);
-              } catch { /* soft */ }
-            } catch { /* soft */ }
+              `.catch(() => undefined);
+            }
           }
         } catch { /* ignore */ }
 
@@ -489,17 +499,62 @@ export class PollWorker {
       return false;
     }
 
-    const existing = await sql<{ c: number }>`
-      SELECT count(*)::int AS c FROM pending_predictions
-      WHERE target_game_id = ${targetGameId} AND status = 'PENDING'
-    `;
-    if ((existing[0]?.c ?? 0) > 0) return false;
+    // ── Memory-first gates (zero DB RTT) ──
+    // Same-process ED claim / registry / recent-round cache answer the common
+    // "already handled" cases without competing for the general pool.
+    if (hasActiveOrCompletedClaim(targetGameId)) {
+      const peek = peekClaim(targetGameId);
+      logger.debug(
+        {
+          component: "poll-worker",
+          targetGameId,
+          owner: peek?.owner,
+          completed: peek?.completed,
+        },
+        "skip poll prediction: in-memory claim already owns target",
+      );
+      return false;
+    }
+    if (isTargetPastBettingWindow(targetGameId)) {
+      logger.info(
+        { component: "poll-worker", targetGameId },
+        "skip poll prediction: registry says target already started/ended",
+      );
+      return false;
+    }
+    if (globalRecentRoundCache.has(targetGameId)) {
+      logger.info(
+        { component: "poll-worker", targetGameId },
+        "skip poll prediction: target already in recent-round cache",
+      );
+      return false;
+    }
 
-    const live = await sql<{ lifecycle: string }>`
-      SELECT lifecycle FROM live_round_state WHERE game_id = ${targetGameId} LIMIT 1
-    `.catch(() => [] as { lifecycle: string }[]);
-    if (live.length > 0) {
-      const lc = live[0]!.lifecycle;
+    // ── Single combined DB gate (only if memory is inconclusive) ──
+    // Collapses prior 3–4 sequential SELECTs into one round-trip.
+    const gate = await sql<{
+      pending_c: number;
+      lifecycle: string | null;
+      crash_exists: boolean;
+    }>`
+      SELECT
+        (SELECT count(*)::int FROM pending_predictions
+          WHERE target_game_id = ${targetGameId} AND status = 'PENDING') AS pending_c,
+        (SELECT lifecycle FROM live_round_state
+          WHERE game_id = ${targetGameId} LIMIT 1) AS lifecycle,
+        EXISTS (SELECT 1 FROM crash_rounds WHERE game_id = ${targetGameId}) AS crash_exists
+    `.catch(() => [] as { pending_c: number; lifecycle: string | null; crash_exists: boolean }[]);
+    const g = gate[0];
+    if (g) {
+      if ((g.pending_c ?? 0) > 0) return false;
+      if (g.crash_exists) {
+        logger.info(
+          { component: "poll-worker", targetGameId },
+          "newest target already in crash_rounds — skip poll prediction",
+        );
+        return false;
+      }
+      const lc = g.lifecycle;
       if (lc === "ENDED" || lc === "RECONCILED") {
         logger.info(
           { component: "poll-worker", targetGameId, lifecycle: lc },
@@ -508,35 +563,13 @@ export class PollWorker {
         return false;
       }
       if (lc === "STARTED" || lc === "RUNNING") {
-        // ED may have thrown before insert; if no pending row, allow recovery
-        // (recoveryMode uses relaxed residual). Otherwise skip to avoid duplicates.
-        const pending = await sql<{ c: number }>`
-          SELECT count(*)::int AS c FROM pending_predictions
-          WHERE target_game_id = ${targetGameId} AND matched = false
-        `.catch(() => [{ c: 1 }]);
-        if ((pending[0]?.c ?? 1) > 0) {
-          logger.info(
-            { component: "poll-worker", targetGameId, lifecycle: lc },
-            "newest target already live — skip poll prediction",
-          );
-          return false;
-        }
+        // Pending already checked above (pending_c); force recovery only when
+        // lifecycle is live but no pending row exists.
         logger.warn(
           { component: "poll-worker", targetGameId, lifecycle: lc },
           "target live but no pending prediction — forcing recovery attempt",
         );
       }
-    }
-
-    const already = await sql<{ game_id: string }>`
-      SELECT game_id FROM crash_rounds WHERE game_id = ${targetGameId} LIMIT 1
-    `;
-    if (already.length > 0) {
-      logger.info(
-        { component: "poll-worker", targetGameId },
-        "newest target already in crash_rounds — skip poll prediction",
-      );
-      return false;
     }
 
     // Stream health: only defer if ED path is generating current predictions
