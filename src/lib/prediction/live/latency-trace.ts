@@ -11,9 +11,12 @@ export type Stage =
   | "decoded"
   | "normalized"
   | "state_updated"
+  | "ownership_reserved"
   | "target_claimed"
+  | "state_acquired"
   | "prediction_started"
   | "prediction_completed"
+  | "gates_passed"
   | "signal_ready"
   | "persist_started"
   | "outbox_enqueued"
@@ -70,10 +73,16 @@ export function finishSignalReady(trace: Trace): number {
   lastSignalAt = Date.now();
 
   const stages: Array<[string, Stage, Stage]> = [
+    ["ws_to_ownership", "ws_received", "ownership_reserved"],
     ["ws_to_state", "ws_received", "state_updated"],
+    ["ownership_to_claim", "ownership_reserved", "target_claimed"],
     ["state_to_claim", "state_updated", "target_claimed"],
+    ["claim_to_state_acq", "target_claimed", "state_acquired"],
+    ["state_to_predict", "state_acquired", "prediction_started"],
     ["claim_to_predict", "target_claimed", "prediction_started"],
     ["prediction_compute", "prediction_started", "prediction_completed"],
+    ["predict_to_gates", "prediction_completed", "gates_passed"],
+    ["gates_to_signal", "gates_passed", "signal_ready"],
     ["predict_to_signal", "prediction_completed", "signal_ready"],
   ];
   for (const [name, a, b] of stages) {

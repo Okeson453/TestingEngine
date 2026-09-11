@@ -997,6 +997,13 @@ export async function onGameEndPredict(
       : `ed:${gameId}`;
   const claim = claimTarget(targetGameId, owner);
   const t1 = performance.now(); // target claimed
+  if (trace) {
+    // ownership_reserved may already be set by bgHandler reserve; claim promotes it.
+    if (trace.marks.ownership_reserved == null) {
+      trace.marks.ownership_reserved = t1;
+    }
+    trace.marks.target_claimed = t1;
+  }
 
   if (!claim.owned) {
     const blockedKind: OnGameEndPredictResult["kind"] =
@@ -1154,6 +1161,10 @@ export async function onGameEndPredict(
   }
 
   const t2 = performance.now(); // history loaded from memory
+  if (trace) {
+    trace.marks.state_updated = t2;
+    trace.marks.state_acquired = t2;
+  }
 
   if (!historyReady || priorRounds.length < MIN_HISTORY) {
     logger.warn(
@@ -1190,6 +1201,7 @@ export async function onGameEndPredict(
 
   // ── P0: Prediction computation only (ZERO DB, ZERO Telegram, ZERO outbox) ──
   const timestamp = attemptStartedAt;
+    if (trace) trace.marks.prediction_started = performance.now();
   const predictT0 = performance.now();
   let signal: ReturnType<NonNullable<PredictorDeps["predictFn"]>>;
   try {
@@ -1244,6 +1256,12 @@ export async function onGameEndPredict(
   // outbox → dispatch → telegram_accepted. No derived back-dating.
   const generatedAt = new Date().toISOString();
   const predictionComputeMs = Math.round(predictElapsed);
+  if (trace) {
+    trace.marks.prediction_completed = performance.now();
+    // Mandatory safety/temporal/edge gates evaluated inside predictFn;
+    // mark gates_passed at the same instant signal is accepted for persist.
+    trace.marks.gates_passed = performance.now();
+  }
 
   if (predictElapsed > PREDICT_TIMEOUT_MS) {
     logger.warn(

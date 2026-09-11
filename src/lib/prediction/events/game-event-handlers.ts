@@ -306,6 +306,9 @@ export async function bgHandler(payload: unknown): Promise<void> {
         const bgReceivedMs = new Date(receivedAt).getTime();
         const attemptT0 = Date.now();
         try {
+          // Stage: ownership already reserved synchronously at handler entry.
+          bgTrace.marks.ownership_reserved = bgReserveAt;
+          bgTrace.marks.ws_received = bgReceivedMs;
           const result = await attemptNPlusOnePrediction({
             sourceRoundId: gameId,
             sourceCrashAt: beganAt,
@@ -340,8 +343,26 @@ export async function bgHandler(payload: unknown): Promise<void> {
           };
           if (result.attempted) {
             completeTarget(targetGameId, `bg:${gameId}`);
+            // Independent stage samples for BG critical path forensics.
+            const totalMs = finishSignalReady(bgTrace);
+            const stageBreakdown: Record<string, number | null> = {};
+            const marks = bgTrace.marks;
+            const pairs: Array<[string, keyof typeof marks, keyof typeof marks]> = [
+              ["receipt_to_ownership", "ws_received", "ownership_reserved"],
+              ["ownership_to_claim", "ownership_reserved", "target_claimed"],
+              ["claim_to_state", "target_claimed", "state_acquired"],
+              ["state_to_predict", "state_acquired", "prediction_started"],
+              ["prediction_compute", "prediction_started", "prediction_completed"],
+              ["gates_to_signal", "gates_passed", "signal_ready"],
+            ];
+            for (const [name, a, b] of pairs) {
+              const ta = marks[a];
+              const tb = marks[b];
+              stageBreakdown[name] =
+                ta != null && tb != null ? Math.round(tb - ta) : null;
+            }
             logger.info(
-              profile,
+              { ...profile, total_signal_ms: Math.round(totalMs), stages: stageBreakdown },
               `BG→N+1 SIGNAL_READY (primary path — durable outbox enqueued) [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`,
             );
           } else {
@@ -456,6 +477,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
             -- Hard temporal contract (report #13): BG(N) arriving means round N
             -- has STARTED — every undelivered prediction signal targeting N is
             -- now EXPIRED. Atomic kill beats waiting for the dispatcher tick.
+            -- MUST-BLOCK on critical pool: prevents late signal delivery.
             UPDATE notification_outbox
             SET status = 'dead_letter',
                 last_error = 'expired_late_signal: target round started (BG received)'
@@ -463,16 +485,9 @@ export async function bgHandler(payload: unknown): Promise<void> {
               AND status IN ('pending', 'inflight')
               AND target_game_id = ${gameId}
             RETURNING 1
-          ),
-          lel AS (
-            INSERT INTO live_event_log (
-              correlation_id, event_kind, game_id, payload, received_at, processed_at,
-              processor_latency_ms, sla_violated
-            ) VALUES (
-              ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: false, predictionTrigger: "BG_PRIMARY" })},
-              ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
-            ) ON CONFLICT DO NOTHING
           )
+          -- HOT-PATH REDUCTION: live_event_log is telemetry/audit only.
+          -- Deferred to general pool after critical CTE (see below).
           SELECT
             (SELECT count(*) FROM cr) AS crash_backfilled,
             (SELECT count(*) FROM pp) AS targets_stamped,
@@ -502,6 +517,29 @@ export async function bgHandler(payload: unknown): Promise<void> {
       }
     }
     reconcileMs = Date.now() - reconcileT0;
+
+    // CAN-BE-DEFERRED: live_event_log audit row — not required for ownership,
+    // temporal kill, prediction correctness, or crash recovery. Runs on the
+    // general pool so it never contends with BG→N+1 persist / outbox handoff.
+    setImmediate(() => {
+      void (async () => {
+        try {
+          const generalSql = await getSql();
+          await generalSql`
+            INSERT INTO live_event_log (
+              correlation_id, event_kind, game_id, payload, received_at, processed_at,
+              processor_latency_ms, sla_violated
+            ) VALUES (
+              ${correlationId}::text, 'BG', ${gameId},
+              ${JSON.stringify({ beganAt, reconcileOnly: false, predictionTrigger: "BG_PRIMARY" })},
+              ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
+            ) ON CONFLICT DO NOTHING
+          `;
+        } catch {
+          /* soft — audit only */
+        }
+      })();
+    });
 
     // NON-FATAL BG RECONCILE TELEMETRY (unchanged): analytics and in-memory
     // registry work must never gate (or roll back with) the temporal kill.
