@@ -159,6 +159,31 @@ export async function reconcileForensicOutcomes(
   try {
     // Delivered rows with incomplete/stale classification. Raw timestamps
     // are authoritative; delivery_outcome is only a cache.
+    //
+    // AUDIT 2026-09-11 (general-pool latency — the recurrent ~725ms query):
+    // Two waste patterns in the original shape, both fixed here:
+    //
+    // 1. 'LATE' was in the re-check set, but LATE is TERMINAL: accepted_at
+    //    is frozen and target_started_at backfills only move EARLIER
+    //    (COALESCE picks the first resolved begin time; BG/lrs/cr all stamp
+    //    the same event), so the lead can only shrink — a stored LATE can
+    //    never recompute to non-LATE. Including it re-fetched every stable
+    //    late row every sweep, forever.
+    // 2. No recency bound: with `ORDER BY delivered_at DESC LIMIT 200` the
+    //    sweep rescanned the newest 200 delivered rows (plus their 3-join
+    //    fan-out ≈ 800 row lookups) every ~60s even when all were already
+    //    correctly classified — the same head rows for hours (200 rows ≈ 2h
+    //    of deliveries). Classification stabilizes within ~1 minute of
+    //    delivery (BG(N) backfills started_at right after the signal), so a
+    //    2h window is ~120x headroom; older rows age out of the working set
+    //    instead of being rescanned forever.
+    //
+    // The 0035 partial index (delivered_at DESC NULLS LAST WHERE type/
+    // status/accepted filters) serves the bounded range scan directly.
+    const windowHours = (() => {
+      const raw = Number(process.env.FORENSIC_RECONCILE_WINDOW_HOURS ?? 2);
+      return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 2;
+    })();
     const rows = await sql<{
       notification_id: string;
       telegram_accepted_at: string | Date | null;
@@ -187,7 +212,8 @@ export async function reconcileForensicOutcomes(
       WHERE o.type = 'prediction'
         AND o.status = 'delivered'
         AND o.telegram_accepted_at IS NOT NULL
-        AND (o.delivery_outcome IS NULL OR o.delivery_outcome IN ('UNKNOWN', 'ON_TIME', 'LATE', 'EARLY'))
+        AND o.delivered_at > now() - (${windowHours}::int * interval '1 hour')
+        AND (o.delivery_outcome IS NULL OR o.delivery_outcome IN ('UNKNOWN', 'ON_TIME', 'EARLY'))
       ORDER BY o.delivered_at DESC NULLS LAST
       LIMIT ${batchSize}
     `;
