@@ -1500,7 +1500,11 @@ export class OutboxDispatcher {
         // PLAN §8: recoverStale now runs on the GENERAL pool (maintenance),
         // never on the prediction-critical pool.
         if (this.stats.tickCount % 10 === 0) {
-          await this.recoverStale();
+          // DETACHED (sep 11 advisor D12): recovery is maintenance — awaiting
+          // it inline delayed the loop's return to the wake wait, so a
+          // prediction wake latching during a slow sweep waited for the full
+          // general-pool round trips. Nothing downstream needs it synchronously.
+          void this.recoverStale().catch(() => undefined);
         }
         // DURABLE FORENSIC RECONCILIATION (remediation §5-§7): throttled
         // sweep that repairs stored delivery_outcome from the authoritative

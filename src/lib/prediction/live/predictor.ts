@@ -15,6 +15,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
+import { getMedianBettingWindowMs } from "@/lib/prediction/live/live-round-registry";
+import { getEffectiveSkipBelowMs } from "@/lib/prediction/live/gate-cache";
 import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
@@ -780,6 +782,7 @@ export interface OnGameEndPredictResult {
     | "error"
     | "skipped_stale_source"
     | "skipped_invalid_target"
+    | "skipped_insufficient_window"
     | "skipped_no_edge"
     | "temporally_invalid"
     | "persist_failed";
@@ -854,6 +857,47 @@ export async function onGameEndPredict(
       kind: "duplicate",
       sourceGameId: gameId,
       sourceCrashAt: crashedAt,
+    };
+  }
+
+  // ── TARGET-ANCHORED SCHEDULING (sep 11 advisor P0.2/P0.3) ──
+  // The only deadline that matters is the START of round N+1. Predict it from
+  // the in-process betting-window median (bg(N) − ed(N−1), measured by the
+  // live-round registry — NOT the crash-to-crash gap, which includes run
+  // time). Enforce the previously-dead window guards here: a prediction with
+  // no remaining window is refused AT GENERATION instead of being persisted,
+  // enqueued, and delivered into a round that already began.
+  const crashedAtMs = new Date(crashedAt).getTime();
+  const bettingWindowMs = getMedianBettingWindowMs();
+  const predictedStartMs = (Number.isFinite(crashedAtMs) ? crashedAtMs : Date.now()) + bettingWindowMs;
+  const remainingBeforeTargetMs = predictedStartMs - Date.now();
+  const minWindowMs = Math.max(
+    MIN_REQUIRED_WINDOW_MS,
+    getEffectiveSkipBelowMs() ?? SKIP_BELOW_MS,
+  );
+  if (remainingBeforeTargetMs < minWindowMs) {
+    completeTarget(targetGameId, owner);
+    logger.warn(
+      {
+        component: "live-predictor",
+        sourceGameId: gameId,
+        targetGameId,
+        recoveryMode: !!deps.recoveryMode,
+        bettingWindowMs,
+        remainingBeforeTargetMs,
+        minWindowMs,
+      },
+      "skipping prediction: insufficient window before predicted target start",
+    );
+    return {
+      predictionId: null,
+      targetGameId,
+      kind: "skipped_insufficient_window",
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
+      availableWindowMs: bettingWindowMs,
+      remainingBeforeTargetMs,
+      outboxEnqueued: 0,
     };
   }
 
@@ -1227,7 +1271,17 @@ export async function onGameEndPredict(
     // clock_timestamp() in the claim/auth queries. Container Date.now() with
     // DB-ahead skew silently shrank the prediction's send budget by the skew.
     // Use the DB-synced clock (boot + 5-min resync) so the budget is real.
-    const deadlineAt = new Date(authoritativeNowMs() + deadlineMs).toISOString();
+    // TARGET-ANCHORED CLAMP (sep 11 advisor G1/G2): the creation-relative
+    // budget alone cannot express "deliver before the target round starts".
+    // Clamp the deadline to predictedStart(N+1) − safety margin, with the
+    // predicted start expressed on the same DB clock. A late-arriving ED now
+    // produces a signal that is dead-lettered past its round start, never
+    // delivered into a crashed round.
+    const DELIVERY_SAFETY_MS = Number(process.env.DELIVERY_SAFETY_MS ?? 500);
+    const deadlineAt = new Date(Math.min(
+      authoritativeNowMs() + deadlineMs,
+      authoritativeNowMs() + remainingBeforeTargetMs - DELIVERY_SAFETY_MS,
+    )).toISOString();
     const outboxNotificationId = randomUUID();
     const outboxMetadata = JSON.stringify({
       predictionId,
@@ -1490,8 +1544,8 @@ export async function onGameEndPredict(
     targetStartedAt: null,
     predictionGeneratedAt: timestamp,
     predictionLatencyMs: Math.round(performance.now() - t0),
-    availableWindowMs: null,
-    remainingBeforeTargetMs: null,
+    availableWindowMs: bettingWindowMs,
+    remainingBeforeTargetMs,
     outboxEnqueued,
   };
 }

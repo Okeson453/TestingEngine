@@ -31,6 +31,13 @@ interface RoundPhase {
 
 const registry = new Map<string, RoundPhase>();
 
+/** Rolling betting-window samples (bg(N) began_at − ed(N−1) receipt), used to
+ * predict when the next round starts. Measured in-process from the same event
+ * stream the dispatcher trusts — no DB round trip. */
+const bettingWindows: number[] = [];
+const BETTING_WINDOW_SAMPLES = 20;
+let lastEnded: { gameId: string; at: number } | null = null;
+
 /** Entries older than this are pruned; predictions die at their 5s deadline
  * long before this horizon, so retention only bounds memory. */
 const RETENTION_MS = 10 * 60_000;
@@ -53,18 +60,45 @@ function prune(now: number): void {
  * bgHandler entry — MUST NOT be called from pr (betting-open) paths. */
 export function noteRoundStarted(gameId: string, startedAt: number = Date.now()): void {
   const phase = registry.get(gameId) ?? {};
+  const firstStart = phase.startedAt === undefined;
   phase.startedAt = startedAt;
   registry.set(gameId, phase);
+  // Track the betting window (crash of N−1 → start of N) once per round —
+  // duplicate BG events must not skew the median.
+  if (
+    firstStart &&
+    lastEnded !== null &&
+    lastEnded.gameId !== gameId &&
+    startedAt > lastEnded.at
+  ) {
+    const w = startedAt - lastEnded.at;
+    if (w < 60_000) {
+      bettingWindows.push(w);
+      if (bettingWindows.length > BETTING_WINDOW_SAMPLES) bettingWindows.shift();
+    }
+  }
   prune(startedAt);
 }
 
 /** Round N ENDED (crash). Called synchronously at edHandler entry — before
- * any await — so the registry never lags the crash. */
+ * any await — so the registry never lags the crash. Receipt time is used
+ * deliberately: protocol crash timestamps are decode-clock anyway
+ * (native-protocol endTime = Date.now()). */
 export function noteRoundEnded(gameId: string, endedAt: number = Date.now()): void {
   const phase = registry.get(gameId) ?? {};
   phase.endedAt = endedAt;
   registry.set(gameId, phase);
+  lastEnded = { gameId, at: endedAt };
   prune(endedAt);
+}
+
+/** Median betting window (crash N → start of N+1) from in-process BG/ED
+ * observations. This — not the crash-to-crash gap — is the budget a signal
+ * for N+1 actually has. Fallback covers cold start before BG events flow. */
+export function getMedianBettingWindowMs(fallback = 4_000): number {
+  if (bettingWindows.length < 3) return fallback;
+  const sorted = [...bettingWindows].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)]!;
 }
 
 /** True when the dispatcher must refuse a signal for this target: the round
@@ -85,4 +119,6 @@ export function getRoundPhase(gameId: string): RoundPhase | undefined {
 /** Test hook — clear all state. */
 export function resetRoundRegistry(): void {
   registry.clear();
+  bettingWindows.length = 0;
+  lastEnded = null;
 }

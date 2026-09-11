@@ -4,6 +4,7 @@ import {
   noteRoundEnded,
   isTargetPastBettingWindow,
   getRoundPhase,
+  getMedianBettingWindowMs,
   resetRoundRegistry,
 } from "./live-round-registry";
 
@@ -43,5 +44,27 @@ describe("live-round-registry (zero-RTT temporal gate)", () => {
     // The write that inserted 'fresh' prunes 'old'.
     expect(getRoundPhase("old")).toBeUndefined();
     expect(isTargetPastBettingWindow("fresh")).toBe(true);
+  });
+
+  it("measures the betting window from bg(N) − ed(N−1) and returns its median", () => {
+    expect(getMedianBettingWindowMs()).toBe(4_000); // cold fallback
+    noteRoundEnded("r10", 1_000);
+    noteRoundStarted("r11", 11_000); // window 10s
+    noteRoundEnded("r11", 16_000);
+    noteRoundStarted("r12", 21_000); // window 5s
+    noteRoundEnded("r12", 25_000);
+    noteRoundStarted("r13", 31_000); // window 6s
+    expect(getMedianBettingWindowMs()).toBe(6_000); // median(10s,5s,6s)
+  });
+
+  it("ignores duplicate bg events and absurd windows", () => {
+    noteRoundEnded("r20", 1_000);
+    noteRoundStarted("r21", 2_000); // 1s
+    noteRoundStarted("r21", 2_500); // duplicate — must not sample
+    noteRoundEnded("r21", 3_000);
+    noteRoundStarted("r22", 3_000 + 120_000); // 120s gap — absurd, ignored
+    // Only ONE valid sample: below the 3-sample median floor, so the cold
+    // fallback is returned.
+    expect(getMedianBettingWindowMs()).toBe(4_000);
   });
 });
