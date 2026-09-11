@@ -4,21 +4,22 @@
  * Flow (see prediction-engine.ts):
  *
  *   PredictionOutput
- *     → validatePredictionOutput()      [stage: prediction_output_validation]
- *     → toSignal(output, context)       [stage: signal_conversion]
- *     → Object.freeze() (inside toSignal, after complete construction)
- *     → validatePredictionSignal()      [stage: signal_validation]
- *     → persistence
- *     → outbox
- *     → Telegram
+ *     \u2192 validatePredictionOutput()      [stage: prediction_output_validation]
+ *     \u2192 toSignal(output, context)       [stage: signal_conversion]
+ *     \u2192 Object.freeze() (inside toSignal, after complete construction)
+ *     \u2192 validatePredictionSignal()      [stage: signal_validation]
+ *     \u2192 persistence
+ *     \u2192 outbox
+ *     \u2192 Telegram
  *
  * Rules:
  *   - No silent coercion, no fake defaults. Invalid output fails loudly
  *     with a typed error carrying field/expectedType/actualType.
- *   - Never dump raw model objects into logs — use summarizePredictionOutput()
+ *   - Never dump raw model objects into logs \u2014 use summarizePredictionOutput()
  *     for a bounded, safe diagnostic summary.
  */
-import type { FeaturePath, PredictionOutput, PredictionSignal } from '../types.ts';
+import type { FeaturePath, PredictionDecision, PredictionOutput, PredictionSignal } from '../types.ts';
+import { isActionableSignal } from './signal.ts';
 
 const FEATURE_PATHS: readonly FeaturePath[] = ['V2_INCREMENTAL', 'V1_FALLBACK', 'ACIE_STATE'];
 
@@ -108,7 +109,7 @@ function parseableDate(v: unknown): boolean {
 /**
  * Bounded, safe summary of a PredictionOutput (or anything resembling one)
  * for structured diagnostics. Never includes the full featureSummary or
- * reasoning arrays — only scalar identity fields.
+ * reasoning arrays \u2014 only scalar identity fields.
  */
 export function summarizePredictionOutput(output: unknown): Record<string, unknown> {
   if (!isPlainObject(output)) return { present: false, type: typeName(output) };
@@ -282,8 +283,16 @@ export function validatePredictionSignal(signal: unknown): asserts signal is Pre
   if (!parseableDate(obj.expiresAt)) {
     fail('expiresAt not a parseable date', 'expiresAt', 'ISO-8601 string', obj.expiresAt);
   }
+  // Validate decision field if present
+  const decision = obj.decision as string | undefined;
+  if (decision !== undefined) {
+    const validDecisions: PredictionDecision[] = ['ENTRY', 'REDUCED_ENTRY', 'SKIP', 'NO_BET'];
+    if (!validDecisions.includes(decision as PredictionDecision)) {
+      fail('decision not a valid PredictionDecision', 'decision', "'ENTRY' | 'REDUCED_ENTRY' | 'SKIP' | 'NO_BET'", decision);
+    }
+  }
   if (!Object.isFrozen(signal)) {
-    fail('signal is not frozen — immutability invariant violated', 'signal', 'frozen object', 'not frozen');
+    fail('signal is not frozen - immutability invariant violated', 'signal', 'frozen object', 'not frozen');
   }
 }
 

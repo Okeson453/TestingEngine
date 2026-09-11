@@ -555,11 +555,23 @@ export async function onGameEnd(
         );
         const rec =
           resolution?.record ?? globalPredictionRegistry.getByTarget(evt.gameId);
-        if (rec?.temporalValidity !== "TEMPORALLY_INVALID") {
+        // NO_BET predictions must NOT be graded as WIN/LOSS
+        // Only grade actionable predictions (ENTRY or REDUCED_ENTRY)
+        if (rec?.temporalValidity !== "TEMPORALLY_INVALID" && rec?.actionable === true) {
           globalRollingPerformance.observe(
             resolution?.probability ?? Number(pendingSnapshot.probability),
             result === "WIN",
             pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
+          );
+        } else if (rec?.decision === 'NO_BET' || rec?.decision === 'SKIP') {
+          logger.info(
+            {
+              component: "live-validator",
+              predictionId: pendingSnapshot.prediction_id,
+              targetGameId: evt.gameId,
+              decision: rec.decision,
+            },
+            "NO_BET prediction: skipping WIN/LOSS grading (no bet was placed)",
           );
         }
       } catch { /* soft — registry is best-effort */ }
@@ -599,25 +611,39 @@ export async function onGameEnd(
           return;
         }
       } catch { /* soft */ }
-      void processResolvedPredictionFeedback({
-        predictionId: pendingSnapshot.prediction_id,
-        targetGameId: evt.gameId,
-        predictedProbability: Number(pendingSnapshot.probability),
-        predictedConfidence:
-          pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
-        targetMultiplier: Number(pendingSnapshot.target_multiplier),
-        actualMultiplier: evt.multiplier,
-        result,
-        regimeAtPrediction: pendingSnapshot.regime_name ?? null,
-        modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
-        correlationId: pendingSnapshot.correlation_id ?? null,
-        resolvedAt,
-      }).catch((fbErr) => {
-        logger.warn(
-          { component: "live-validator", error: String(fbErr) },
-          "async closed-loop feedback failed",
+      // Skip feedback for NO_BET predictions - no bet was placed
+      const rec = globalPredictionRegistry.getByTarget(evt.gameId);
+      if (rec?.decision !== 'NO_BET' && rec?.decision !== 'SKIP') {
+        void processResolvedPredictionFeedback({
+          predictionId: pendingSnapshot.prediction_id,
+          targetGameId: evt.gameId,
+          predictedProbability: Number(pendingSnapshot.probability),
+          predictedConfidence:
+            pendingSnapshot.confidence != null ? Number(pendingSnapshot.confidence) : null,
+          targetMultiplier: Number(pendingSnapshot.target_multiplier),
+          actualMultiplier: evt.multiplier,
+          result,
+          regimeAtPrediction: pendingSnapshot.regime_name ?? null,
+          modelVersion: (pendingSnapshot as { model_version?: string | null }).model_version ?? null,
+          correlationId: pendingSnapshot.correlation_id ?? null,
+          resolvedAt,
+        }).catch((fbErr) => {
+          logger.warn(
+            { component: "live-validator", error: String(fbErr) },
+            "async closed-loop feedback failed",
+          );
+        });
+      } else {
+        logger.info(
+          {
+            component: "live-validator",
+            predictionId: pendingSnapshot.prediction_id,
+            targetGameId: evt.gameId,
+            decision: rec?.decision,
+          },
+          "NO_BET prediction: skipping feedback (no bet was placed)",
         );
-      });
+      }
     })();
   });
 

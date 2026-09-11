@@ -10,6 +10,12 @@ export type TargetVersion = string;
 /** Which feature-generation path produced the model's input. */
 export type FeaturePath = 'V2_INCREMENTAL' | 'V1_FALLBACK' | 'ACIE_STATE';
 
+/**
+ * Canonical prediction decision states.
+ * The system MUST be capable of explicitly deciding "NO BET THIS ROUND".
+ */
+export type PredictionDecision = 'ENTRY' | 'REDUCED_ENTRY' | 'SKIP' | 'NO_BET';
+
 export interface ModelIdentity {
   name: string;
   version: string;
@@ -79,7 +85,7 @@ export interface Regime {
   /** Deterministic regime classification key (e.g. "neutral", "deep-low"). */
   id: string;
   name: string;
-  /** Optional per-detection UUID for tracing only — not for grouping. */
+  /** Optional per-detection UUID for tracing only  not for grouping. */
   instanceId?: string;
   dimensions: {
     lowMultiplierConcentration: number;
@@ -112,7 +118,7 @@ export interface PredictionOutput {
 /**
  * Canonical, immutable prediction signal.
  *
- * One canonical signal schema — callers are NOT permitted to augment or
+ * One canonical signal schema  callers are NOT permitted to augment or
  * mutate a signal after construction. `toSignal()` builds the complete
  * object (including featurePath and targetRoundId) and freezes it; nothing
  * downstream may add fields. If a field is needed, it belongs in this
@@ -134,6 +140,12 @@ export interface PredictionSignal {
   readonly reasoning: readonly string[];
   readonly expiresAt: string;
   readonly featureSummary: Readonly<Record<string, number>>;
+  /**
+   * Canonical decision state. MUST be one of: 'ENTRY', 'REDUCED_ENTRY', 'SKIP', 'NO_BET'
+   * This is the authoritative gate result - if decision is 'NO_BET' or 'SKIP',
+   * this prediction must NOT be delivered as a signal.
+   */
+  readonly decision?: PredictionDecision;
 }
 
 export interface ValidationMetrics {
@@ -198,17 +210,4 @@ export interface BacktestResult {
     expectedValue: number;
     exposure: number;
   };
-  generatedAt: string;
-}
-
-export interface WalkForwardWindow {
-  trainFrom: string;
-  trainTo: string;
-  valFrom: string;
-  valTo: string;
-  testFrom: string;
-  testTo: string;
-  validationMetrics: ValidationMetrics;
-  testMetrics: ValidationMetrics;
-  backtest?: BacktestResult;
 }

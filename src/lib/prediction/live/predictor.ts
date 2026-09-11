@@ -58,8 +58,22 @@ export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.015);
 export const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
 export const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
 
-/** Pure selectivity decision used by onGameEndPredict (and unit tests).
- *  Returns true when this evaluation must NOT become a delivered signal. */
+/**
+ * Canonical NO_BET gate: returns true when this evaluation must NOT become a delivered signal.
+ * This is the authoritative decision point for "NO BET THIS ROUND".
+ *
+ * The required production behavior is:
+ *   ROUND ENDS -> EVALUATE -> APPLY ALL GATES -> ACTIONABLE PREDICTION OR NO_BET
+ *
+ * This function implements the "APPLY ALL GATES" step. It checks:
+ *   1. Probability threshold: p >= fair_odds + min_edge (or min_probability if set)
+ *   2. Confidence threshold: c >= min_confidence
+ *   3. Strategy veto: pipeline_action or strategy_action === "SKIP"
+ *   4. Reasoning veto: reasoning contains action=SKIP or pipeline_action=SKIP
+ *
+ * If ANY gate fails, this returns true (NO_BET/SKIP) and the prediction must NOT
+ * be delivered as a signal.
+ */
 export function shouldSkipSignal(input: {
   probability: number;
   confidence: number;
@@ -87,13 +101,28 @@ export function shouldSkipSignal(input: {
   const reasoningSaysSkip =
     /\baction=SKIP\b/i.test(reasoningJoined) ||
     /\bpipeline_action=SKIP\b/i.test(reasoningJoined);
-  const noEdge =
+  
+  // Gate 1: Probability threshold (1.30x target gate explicitly enforced)
+  // For 1.3x: fair = 1/1.3 ≈ 0.7692, needP = max(minP, 0.7692 + minEdge)
+  // With default minEdge=0.015: needP = max(0, 0.7692 + 0.015) = 0.7842
+  // This is the 1.30x target gate: probability must beat fair odds by minEdge
+  const probabilityGateFailed =
     (Number.isFinite(minEdge) && minEdge > 0 && p < needP) ||
-    (minP > 0 && p < minP) ||
-    (minC > 0 && c < minC);
-  const strategySkip =
-    strategyAction === "SKIP" || pipelineAction === "SKIP" || reasoningSaysSkip;
-  return noEdge || strategySkip;
+    (minP > 0 && p < minP);
+  
+  // Gate 2: Confidence threshold
+  const confidenceGateFailed = minC > 0 && c < minC;
+  
+  // Gate 3: Strategy/pipeline veto
+  const strategyGateFailed =
+    strategyAction === "SKIP" || 
+    pipelineAction === "SKIP" || 
+    reasoningSaysSkip;
+  
+  // NO_BET if ANY gate fails
+  const noBet = probabilityGateFailed || confidenceGateFailed || strategyGateFailed;
+  
+  return noBet;
 }
 const MIN_HISTORY = 20;
 /** Reduced 100->50: halves history query cost on the hot ED path while
@@ -405,10 +434,12 @@ const defaultPredictFn = (
         "execution_mode=ADVANCED_ACIE",
       );
       // Stash for the selectivity gate (SKIP must become a real no-signal path)
+      // Also store threshold for later verification
       (signal as { featureSummary?: Record<string, unknown> }).featureSummary = {
         ...((signal.featureSummary as Record<string, unknown> | undefined) ?? {}),
         pipeline_action: pipe.action,
         pipeline_reason: pipe.reason,
+        pipeline_threshold: pipe.threshold,
       };
     } catch (e) {
       logger.warn(
@@ -694,15 +725,8 @@ export async function onGameStart(
         returning prediction_id, requested_at
       `;
       if (ins.length === 0) {
-        const dup = await tx<{ prediction_id: string }>`
-          select prediction_id from pending_predictions
-          where target_game_id = ${evt.gameId} and matched = false
-          limit 1
-        `;
-        if (dup.length === 0) {
-          throw new Error("PREDICTION_DUPLICATE_BUT_UNREADABLE");
-        }
-        predictionId = dup[0]!.prediction_id;
+        // Duplicate - claimTarget already ensures we own this target
+        // No need for additional DB query
         return;
       }
       predictionId = ins[0]!.prediction_id;
@@ -1258,6 +1282,51 @@ export async function onGameEndPredict(
           : "skip signal — no edge vs fair odds (not every round should fire)",
       );
       try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+      // Register NO_BET decision in registry for tracking
+      try {
+        const { globalPredictionRegistry } = await import(
+          "@/lib/prediction/identity/prediction-registry"
+        );
+        const fs = signal.featureSummary as Record<string, unknown> | null | undefined;
+        const featureVersionOf = (signal as { featureVersion?: string | null }).featureVersion ?? null;
+        const pipelineAction = String((fs as Record<string, unknown>)?.pipeline_action ?? "") || null;
+        const pipelineReason = String((fs as Record<string, unknown>)?.pipeline_reason ?? "") || null;
+        globalPredictionRegistry.register({
+          predictionId: null,
+          sourceRoundId: gameId,
+          targetRoundId: targetGameId,
+          createdAt: timestamp,
+          targetStartedAt: null,
+          targetEndedAt: null,
+          rawProbability: signal.probability,
+          calibratedProbability: null,
+          pipelineProbability: null,
+          finalProbability: signal.probability,
+          confidence: signal.confidence,
+          target: Number(DEFAULT_TARGET),
+          regime: signal.regimeId ?? null,
+          modelVersion: signal.modelVersion,
+          featureVersion: featureVersionOf,
+          featurePath: (signal.featurePath as FeaturePath | undefined) ?? null,
+          temporalValidity: "TEMPORALLY_VALID",
+          provenance: {
+            stateVersion: (fs?.stateVersion as string | number | undefined) ?? null,
+            acieStateVersion: (fs?.acieStateVersion as string | number | undefined) ?? null,
+            calibrationVersion: (fs?.calibrationVersion as string | number | undefined) ?? null,
+            regimeVersion: (fs?.regimeVersion as string | number | undefined) ?? null,
+            pipelineVersion: null,
+          },
+          stages: {
+            acieSignal: true,
+            calibrationApplied: null,
+            pipelineApplied: null,
+            finalSignal: false,
+          },
+          decision: 'NO_BET',
+          actionable: false,
+          resolved: false,
+        });
+      } catch { /* soft */ }
       return {
         predictionId: null,
         targetGameId,
@@ -1416,6 +1485,33 @@ export async function onGameEndPredict(
       edReceivedAt: deps.edReceivedAt ?? null,
     });
 
+    // Extract pipeline decision from featureSummary if present
+    const fs = (signal.featureSummary ?? {}) as Record<string, unknown>;
+    const pipelineAction = String(fs.pipeline_action ?? "") || null;
+    const strategyAction = String(fs.strategy_action ?? "") || null;
+    
+    // Determine the canonical decision state for this prediction
+    // This MUST be propagated through to the signal and registry
+    let decision: 'ENTRY' | 'REDUCED_ENTRY' | 'SKIP' | 'NO_BET' = 'ENTRY';
+    
+    // Check if this should be NO_BET based on gates
+    const shouldSkip = shouldSkipSignal({
+      probability: signal.probability,
+      confidence: signal.confidence,
+      target: Number(DEFAULT_TARGET),
+      strategyAction,
+      pipelineAction,
+      reasoning: signal.reasoning,
+    });
+    
+    if (shouldSkip) {
+      decision = 'NO_BET';
+    } else if (pipelineAction === 'SKIP' || strategyAction === 'SKIP') {
+      decision = 'SKIP';
+    } else if (pipelineAction === 'REDUCED_ENTRY') {
+      decision = 'REDUCED_ENTRY';
+    }
+
     let txStage: TxStageTimings | null = null;
     await runInTransaction(
       sql,
@@ -1436,7 +1532,8 @@ export async function onGameEndPredict(
               target_game_id, source_round_id,
               correlation_id,
               acie_instance_id, acie_observation_count, acie_state_version,
-              feature_hash, prediction_mode, execution_path, strategy_action
+              feature_hash, prediction_mode, execution_path, strategy_action,
+              decision
             ) values (
               ${predictionId}, ${DEFAULT_TARGET}, ${signal.probability},
               ${signal.confidence}, ${signal.regimeId},
@@ -1451,7 +1548,8 @@ export async function onGameEndPredict(
               ${String((signal.featureSummary as Record<string, unknown> | undefined)?.feature_hash ?? "") || null},
               ${String((signal.featureSummary as Record<string, unknown> | undefined)?.prediction_mode ?? "UNKNOWN")},
               ${String((signal.featureSummary as Record<string, unknown> | undefined)?.execution_path ?? "") || null},
-              ${String((signal.featureSummary as Record<string, unknown> | undefined)?.strategy_action ?? "") || null}
+              ${String((signal.featureSummary as Record<string, unknown> | undefined)?.strategy_action ?? "") || null},
+              ${decision}
             )
             on conflict (target_game_id) where matched = false and target_game_id is not null do nothing
             returning prediction_id
@@ -1652,6 +1750,8 @@ export async function onGameEndPredict(
         pipelineApplied: null,
         finalSignal: true,
       },
+      decision,
+      actionable: decision !== 'NO_BET' && decision !== 'SKIP',
       resolved: false,
     });
   } catch { /* soft — registry is best-effort */ }
@@ -1669,5 +1769,6 @@ export async function onGameEndPredict(
     availableWindowMs: bettingWindowMs,
     remainingBeforeTargetMs,
     outboxEnqueued,
+    decision,
   };
 }
