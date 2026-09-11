@@ -269,6 +269,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
             UPDATE crash_rounds
             SET began_at = COALESCE(began_at, ${beganParam})
             WHERE game_id = ${gameId}
+            RETURNING 1
           ),
           pp AS (
             -- P0 correlation: stamp target_round_started_at on the pending prediction for N
@@ -276,6 +277,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
             SET target_round_started_at = COALESCE(target_round_started_at, ${beganParam})
             WHERE target_game_id = ${gameId}
               AND matched = false
+            RETURNING 1
           ),
           lrs AS (
             -- markLiveRoundStarted, inlined (idempotent lifecycle upsert)
@@ -309,6 +311,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
             WHERE type = 'prediction'
               AND status IN ('pending', 'inflight')
               AND target_game_id = ${gameId}
+            RETURNING 1
           ),
           lel AS (
             INSERT INTO live_event_log (
@@ -336,14 +339,14 @@ export async function bgHandler(payload: unknown): Promise<void> {
     } catch (txErr1) {
       logger.warn(
         { event: "bg", gameId, error: String(txErr1), attempt: 1 },
-        "BG transaction failed — retrying once",
+        `BG transaction failed — retrying once: ${String(txErr1).slice(0, 300)}`,
       );
       try {
         await runBgTx();
       } catch (txErr2) {
         logger.error(
           { event: "bg", gameId, error: String(txErr2), attempt: 2 },
-          "BG transaction FAILED after retry — temporal kill may not have run",
+          `BG transaction FAILED after retry — temporal kill may not have run: ${String(txErr2).slice(0, 300)}`,
         );
       }
     }
