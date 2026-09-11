@@ -166,6 +166,13 @@ export class PollWorker {
   /** When true, poll may call onGameEnd for the single newest eligible round. */
   private allowNewestPredict = true;
   private tickCount = 0;
+  /**
+   * Last median inter-round gap written durably to worker_state. Rate-limits
+   * the durable write (memory gate-cache stays authoritative). Declared here:
+   * a5c6bd0 referenced this property without declaring it (tsc TS2339 ×4,
+   * undefined at runtime).
+   */
+  private _lastPersistedGapMs: number | null = null;
   /** Consecutive failed ticks — drives exponential backoff to avoid pool thrash. */
   private consecutiveFailures = 0;
   private lastError: string | null = null;
