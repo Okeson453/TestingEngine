@@ -194,8 +194,14 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   // LATENCY FIX: crash rounds are spaced 10–70s. A 15s idle timeout drops the
   // critical Neon connection between rounds; the next prediction/dispatch then
   // pays ~700–1500ms TLS+auth. Keep critical clients warm across inter-round gaps.
+  // CHURN FIX (sep 11 15:58 logs): the GENERAL pool still churned — min=1 with
+  // a 60s idle timeout closed connections between bursts, and every burst above
+  // min re-paid ~1.0-1.1s of Neon TLS+auth on the hot path (observed general
+  // pool_acquire_ms=1059/1128 at boot and ~1159ms mid-stream). min=2 + 300s
+  // idle keeps enough clients warm that steady-state acquires are local (~0ms).
+  // This is churn elimination, not pool-size increase: max stays 5.
   const generalIdleTimeoutMillis =
-    Number(process.env.PG_IDLE_TIMEOUT_MS ?? 60_000) || 60_000;
+    Number(process.env.PG_IDLE_TIMEOUT_MS ?? 300_000) || 300_000;
   const criticalIdleTimeoutMillis =
     Number(process.env.PG_CRITICAL_IDLE_TIMEOUT_MS ?? 180_000) || 180_000;
   // Critical path: short acquire timeout (do not sit 30s behind dashboard)
@@ -212,7 +218,7 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     criticalMax,
   );
   const generalMin = Math.min(
-    Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 1) || 1),
+    Math.max(0, Number(process.env.PG_POOL_MIN_IDLE ?? 2) || 2),
     generalMax,
   );
 

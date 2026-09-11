@@ -44,7 +44,11 @@ import {
 } from "@/lib/observability/performance/latency";
 import { isEdgeFresh } from "@/lib/prediction/live/edge-ingest";
 import { hasActiveOrCompletedClaim, peekClaim } from "@/lib/prediction/live/target-coordinator";
-import { isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
+import {
+  isTargetPastBettingWindow,
+  noteRoundStarted,
+  getMedianBettingWindowMs,
+} from "@/lib/prediction/live/live-round-registry";
 import { globalRecentRoundCache } from "@/lib/observability/performance/hot-cache";
 import { isAuthoritative } from "@/lib/prediction/live/fencing";
 
@@ -647,14 +651,17 @@ export class PollWorker {
       pending_c: number;
       lifecycle: string | null;
       crash_exists: boolean;
+      began_at: string | Date | null;
     }>`
       SELECT
         (SELECT count(*)::int FROM pending_predictions
           WHERE target_game_id = ${targetGameId} AND status = 'PENDING') AS pending_c,
         (SELECT lifecycle FROM live_round_state
           WHERE game_id = ${targetGameId} LIMIT 1) AS lifecycle,
+        (SELECT began_at FROM live_round_state
+          WHERE game_id = ${targetGameId} LIMIT 1) AS began_at,
         EXISTS (SELECT 1 FROM crash_rounds WHERE game_id = ${targetGameId}) AS crash_exists
-    `.catch(() => [] as { pending_c: number; lifecycle: string | null; crash_exists: boolean }[]);
+    `.catch(() => [] as { pending_c: number; lifecycle: string | null; crash_exists: boolean; began_at: string | Date | null }[]);
     const g = gate[0];
     if (g) {
       if ((g.pending_c ?? 0) > 0) return false;
@@ -676,6 +683,32 @@ export class PollWorker {
         return false;
       }
       if (lc === "STARTED" || lc === "RUNNING") {
+        // BOOT-RACE FIX (sep 11 15:58 logs): after a restart the in-memory
+        // registry is empty, so the cheap registry check above misses for a
+        // round that started pre-boot; this gate then forced a recovery
+        // attempt the predictor's temporal gate declined anyway
+        // ("insufficient window") — a wasted attempt plus boot noise on
+        // every cold start with a live round. Seed the registry from
+        // live_round_state.began_at so the cheap path catches this round
+        // from now on, and skip QUIETLY when the betting window has
+        // already elapsed: the temporal contract forbids predicting a
+        // target that is about to start or already live, and BG-primary
+        // owns the NEXT round's N+1 via its BG event (proven at 15:59:08
+        // in the same window). A round whose window is still open still
+        // gets a genuine recovery attempt below.
+        const beganMs = g.began_at ? new Date(g.began_at).getTime() : NaN;
+        const startedAgoMs = Number.isFinite(beganMs) ? Date.now() - beganMs : NaN;
+        try {
+          noteRoundStarted(targetGameId, Number.isFinite(beganMs) ? beganMs : Date.now());
+        } catch { /* soft */ }
+        if (Number.isFinite(startedAgoMs) && startedAgoMs > getMedianBettingWindowMs()) {
+          logSkipOncePerInterval(
+            `boot-window:${targetGameId}`,
+            { targetGameId, lifecycle: lc, startedAgoMs: Math.round(startedAgoMs) },
+            "live target past betting window (post-boot) — no recovery attempt; BG-primary owns next N+1",
+          );
+          return false;
+        }
         // Pending already checked above (pending_c); force recovery only when
         // lifecycle is live but no pending row exists.
         logger.warn(

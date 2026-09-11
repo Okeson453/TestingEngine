@@ -37,8 +37,13 @@ const WAF_BACKOFF_MS = Number(process.env.WAF_BACKOFF_MS ?? 12_000);
  */
 /** No crash events for this long → status "degraded" (fix 5: event age, not timer cycles). */
 const LIVE_EVENT_TIMEOUT_MS = Number(process.env.NATIVE_WS_DEGRADED_MS ?? 15_000);
-/** No crash events for this long → force reconnect (keep path hot). */
-const RECONNECT_TIMEOUT_MS = Number(process.env.NATIVE_WS_STALE_MS ?? 25_000);
+// WATCHDOG CALIBRATION (sep 11 15:58 logs): the 25s default fired a false
+// reconnect 25s after boot while a round was mid-flight, and observed normal
+// inter-event gaps on this stream reach 42-65s (long rounds, BG→ED across a
+// round boundary). A reconnect tears down a HEALTHY socket and risks missing
+// the next event for ~400ms. 90s = ~3x the max observed normal gap; a real
+// stall still reconnects well inside one recovery cycle. Env-overridable.
+const RECONNECT_TIMEOUT_MS = Number(process.env.NATIVE_WS_STALE_MS ?? 90_000);
 /** 5s keepalive — match BC.Game Engine.IO pingInterval. */
 const PING_MS = 5_000;
 const TRACKED = new Set(["pr", "bg", "pg", "ed", "st"]);
