@@ -238,31 +238,41 @@ console.log(
  * See the `registerProcessFailureHandlers` call above the env setup.
  */
 
+const SHUTDOWN_DEADLINE_MS = Math.max(
+  3_000,
+  Number(process.env.WORKER_SHUTDOWN_MS ?? 12_000) || 12_000,
+);
+
 const shutdown = async (signal) => {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`[worker] ${signal} received — graceful shutdown`);
-  try {
-    await edgeHttp.stopEdgeHttpServer();
-  } catch (e) {
-    console.error("[worker] stopEdgeHttpServer:", e?.message ?? e);
-  }
-  try {
-    await events.stopEventDrivenPipeline();
-  } catch (e) {
-    console.error("[worker] stopEventDrivenPipeline:", e?.message ?? e);
-  }
-  try {
-    await liveBoot.stopLiveBoot();
-  } catch (e) {
-    console.error("[worker] stopLiveBoot:", e?.message ?? e);
-  }
-  try {
+  console.log(
+    `[worker] ${signal} received — graceful shutdown (deadline ${SHUTDOWN_DEADLINE_MS}ms)`,
+  );
+  const forceTimer = setTimeout(() => {
+    console.error(
+      `[worker] shutdown exceeded ${SHUTDOWN_DEADLINE_MS}ms — forcing exit`,
+    );
+    process.exit(1);
+  }, SHUTDOWN_DEADLINE_MS);
+  forceTimer.unref?.();
+
+  const step = async (name, fn) => {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`[worker] ${name}:`, e?.message ?? e);
+    }
+  };
+
+  await step("stopEdgeHttpServer", () => edgeHttp.stopEdgeHttpServer());
+  await step("stopEventDrivenPipeline", () => events.stopEventDrivenPipeline());
+  await step("stopLiveBoot", () => liveBoot.stopLiveBoot());
+  await step("endPgPool", async () => {
     await db.endPgPool();
     console.log("[worker] pg pool closed");
-  } catch (e) {
-    console.error("[worker] endPgPool:", e?.message ?? e);
-  }
+  });
+  clearTimeout(forceTimer);
   process.exit(0);
 };
 process.on("SIGINT", () => void shutdown("SIGINT"));

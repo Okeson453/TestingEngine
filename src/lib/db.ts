@@ -160,10 +160,28 @@ function makeRun(
       client = await pool.connect();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[db] ${label} POOL ACQUIRE FAILED: ${msg} | total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${pool.options.max}`,
-      );
-      throw err;
+      const transient =
+        /timeout|ECONNRESET|ECONNREFUSED|Connection terminated|remaining connection slots|too many clients/i.test(
+          msg,
+        );
+      if (transient) {
+        // One short retry: absorbs Neon blips without masking real exhaustion.
+        await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 60)));
+        try {
+          client = await pool.connect();
+        } catch (err2) {
+          const msg2 = err2 instanceof Error ? err2.message : String(err2);
+          console.error(
+            `[db] ${label} POOL ACQUIRE FAILED (retry): ${msg2} | total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${pool.options.max}`,
+          );
+          throw err2;
+        }
+      } else {
+        console.error(
+          `[db] ${label} POOL ACQUIRE FAILED: ${msg} | total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} max=${pool.options.max}`,
+        );
+        throw err;
+      }
     }
     const acquireMs = Date.now() - t0;
     globalRef.__lastPoolAcquireMs__ = acquireMs;
@@ -251,6 +269,16 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     `[db] Dual pool: critical max=${criticalMax} min=${criticalMin} idleTimeoutMs=${criticalIdleTimeoutMillis} connTimeoutMs=${criticalConnTimeout}; general max=${generalMax} min=${generalMin} idleTimeoutMs=${generalIdleTimeoutMillis} connTimeoutMs=${generalConnTimeout}; dashboard acquire budget=${dashboardConnTimeout}`,
   );
 
+  // Bound runaway queries so a stuck statement cannot pin a pool client
+  // forever (worker resilience). Critical stays tighter than general.
+  const criticalStatementTimeoutMs = Math.max(
+    1_000,
+    Number(process.env.PG_CRITICAL_STATEMENT_TIMEOUT_MS ?? 12_000) || 12_000,
+  );
+  const generalStatementTimeoutMs = Math.max(
+    1_000,
+    Number(process.env.PG_STATEMENT_TIMEOUT_MS ?? 30_000) || 30_000,
+  );
   const criticalPool = new Pool({
     connectionString: databaseUrl,
     max: criticalMax,
@@ -263,6 +291,10 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     allowExitOnIdle: false,
     keepAlive: true,
     keepAliveInitialDelayMillis: 10_000,
+    application_name: process.env.PG_APP_NAME
+      ? `${process.env.PG_APP_NAME}-critical`
+      : "testingengine-critical",
+    options: `-c statement_timeout=${criticalStatementTimeoutMs} -c idle_in_transaction_session_timeout=${criticalStatementTimeoutMs + 5_000}`,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
   });
   const generalPool = new Pool({
@@ -276,6 +308,10 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     allowExitOnIdle: false,
     keepAlive: true,
     keepAliveInitialDelayMillis: 10_000,
+    application_name: process.env.PG_APP_NAME
+      ? `${process.env.PG_APP_NAME}-general`
+      : "testingengine-general",
+    options: `-c statement_timeout=${generalStatementTimeoutMs} -c idle_in_transaction_session_timeout=${generalStatementTimeoutMs + 10_000}`,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
   });
 
@@ -325,7 +361,7 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
           ),
         );
     }
-  }, 25_000);
+  }, Number(process.env.PG_KEEPALIVE_MS ?? 20_000) || 20_000);
   keepAlive.unref?.();
 
   const monitor = setInterval(() => {

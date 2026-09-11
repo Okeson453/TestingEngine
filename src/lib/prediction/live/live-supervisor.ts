@@ -14,6 +14,7 @@
  * joined AND recent ED — never a bare online/offline string.
  */
 import { getSql, getCriticalSql, getPoolStats, type Sql } from "@/lib/db";
+import { observePoolPressure } from "@/lib/db/pool-sizing";
 import { getLogger } from "@/lib/observability/logger";
 import { nativeBcGameSocket } from "@/lib/crash/native-socket-client";
 import { getLastSignalAt } from "@/lib/prediction/live/latency-trace";
@@ -60,6 +61,8 @@ export class LiveSupervisor {
   private lastDbOkAt: number | null = null;
   /** Consecutive zero-row lock heartbeats — >=2 triggers self-demotion. */
   private lockLostStrikes = 0;
+  /** Consecutive connection-warmer failures — DB path health. */
+  private warmerFailStrikes = 0;
   private lastHeartbeatAt: number | null = null;
   private lifecycle: WorkerHealth["lifecycle"] = "COLD";
   private lastHealth: WorkerHealth | null = null;
@@ -178,6 +181,7 @@ export class LiveSupervisor {
           const ownsLock = await heartbeatWorkerLock(sql);
           if (ownsLock) {
             this.lockLostStrikes = 0;
+            try { observePoolPressure(); } catch { /* soft */ }
           } else {
             this.lockLostStrikes += 1;
             logger.error(
@@ -225,8 +229,30 @@ export class LiveSupervisor {
       ])
         .then(() => {
           this.lastDbOkAt = Date.now();
+          if (this.warmerFailStrikes > 0) {
+            logger.info(
+              {
+                component: "live-supervisor",
+                recoveredAfter: this.warmerFailStrikes,
+              },
+              "DB connection warmer recovered",
+            );
+          }
+          this.warmerFailStrikes = 0;
         })
-        .catch(() => undefined);
+        .catch((e) => {
+          this.warmerFailStrikes += 1;
+          if (this.warmerFailStrikes === 1 || this.warmerFailStrikes % 10 === 0) {
+            logger.warn(
+              {
+                component: "live-supervisor",
+                warmerFailStrikes: this.warmerFailStrikes,
+                error: String(e),
+              },
+              "DB connection warmer failed — pools may be cold or unreachable",
+            );
+          }
+        });
     }, CONNECTION_WARMER_MS);
     this.warmerTimer.unref?.();
   }

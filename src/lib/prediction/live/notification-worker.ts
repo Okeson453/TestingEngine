@@ -254,6 +254,8 @@ export class OutboxDispatcher {
   /** Guard so at most ONE forensic reconciliation sweep runs at a time.
    * General pool only — maintenance, never the prediction critical path. */
   private reconcileRunning = false;
+  /** Consecutive drainLoop errors — drives short backoff to avoid hot-spin. */
+  private consecutiveTickErrors = 0;
 
   private async reconcileForensics(): Promise<void> {
     if (this.reconcileRunning) return;
@@ -1549,12 +1551,28 @@ export class OutboxDispatcher {
         if (runNormal) {
           this.runBackgroundDetached();
         }
+        this.consecutiveTickErrors = 0;
       } catch (e) {
         this.stats.lastError = String(e);
+        this.consecutiveTickErrors += 1;
         logger.error(
-          { component: "outbox-dispatcher", error: String(e) },
+          {
+            component: "outbox-dispatcher",
+            error: String(e),
+            consecutiveTickErrors: this.consecutiveTickErrors,
+          },
           "tick error",
         );
+        if (this.consecutiveTickErrors >= 2) {
+          const backoffMs = Math.min(
+            5_000,
+            100 * 2 ** Math.min(this.consecutiveTickErrors - 1, 5),
+          );
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, backoffMs);
+            timer.unref?.();
+          });
+        }
       }
       if (!this.running) break;
       wake = await this.waitForNextTick();

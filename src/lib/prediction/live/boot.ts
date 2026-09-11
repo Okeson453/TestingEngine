@@ -241,6 +241,7 @@ class LiveBoot {
   private pollWorker: PollWorker | null = null;
   private clockMonitor: ClockSkewMonitor | null = null;
   private started = false;
+  private historyRewarmTimer: ReturnType<typeof setInterval> | null = null;
   private lastResult: BootResult | null = null;
 
   async start(deps: BootDeps = {}): Promise<BootResult> {
@@ -597,6 +598,35 @@ class LiveBoot {
     await pollWorker.start();
     await clockMonitor.start();
 
+    // Resilience: if the in-memory history buffer drops below READY (cold
+    // boot race, partial warm, long WS gap), re-warm from crash_rounds on a
+    // slow cadence without touching the prediction hot path.
+    if (!this.historyRewarmTimer) {
+      this.historyRewarmTimer = setInterval(() => {
+        void (async () => {
+          try {
+            const {
+              isHistoryReadyForPrediction,
+              warmLiveHistoryBuffer,
+            } = await import("./live-history-buffer");
+            if (isHistoryReadyForPrediction()) return;
+            const sql = await getSql();
+            await warmLiveHistoryBuffer(sql, 200, true);
+            logger.info(
+              { component: "live-boot" },
+              "history buffer re-warm completed (was not READY)",
+            );
+          } catch (e) {
+            logger.warn(
+              { component: "live-boot", error: String(e) },
+              "history buffer re-warm failed (soft)",
+            );
+          }
+        })();
+      }, Number(process.env.HISTORY_REWARM_MS ?? 60_000) || 60_000);
+      this.historyRewarmTimer.unref?.();
+    }
+
     this.started = true;
     this.lastResult = { seed, bootStartedAt };
     return this.lastResult;
@@ -619,6 +649,10 @@ class LiveBoot {
   }
 
   async stop(): Promise<void> {
+    if (this.historyRewarmTimer) {
+      clearInterval(this.historyRewarmTimer);
+      this.historyRewarmTimer = null;
+    }
     if (!this.started) return;
     this.started = false;
     // Clean shutdown revokes authority explicitly (fencing registry).
