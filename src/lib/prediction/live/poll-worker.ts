@@ -137,6 +137,27 @@ export const POLL_INTERVAL_MS = Number(
 );
 export const STALE_PREDICTED_MS = Number(process.env.STUCK_STALE_MS ?? 5 * 60 * 1_000);
 
+/** Rate limiter for repetitive skip logs (sep 11 poll noise fix): the same
+ * "target already handled" condition fires every tick while WS is healthy —
+ * identical payload, zero new information. Log INFO at most once per 30s
+ * per key; demote the rest to debug. */
+const skipLogLastAt = new Map<string, number>();
+const SKIP_LOG_INTERVAL_MS = 30_000;
+function logSkipOncePerInterval(
+  key: string,
+  fields: Record<string, unknown>,
+  message: string,
+): void {
+  const now = Date.now();
+  const last = skipLogLastAt.get(key) ?? 0;
+  if (now - last < SKIP_LOG_INTERVAL_MS) {
+    logger.debug({ component: "poll-worker", ...fields }, message);
+    return;
+  }
+  skipLogLastAt.set(key, now);
+  logger.info({ component: "poll-worker", ...fields }, message);
+}
+
 export interface PollTickResult {
   fetched: number;
   inserted: number;
@@ -604,15 +625,17 @@ export class PollWorker {
       return false;
     }
     if (isTargetPastBettingWindow(targetGameId)) {
-      logger.info(
-        { component: "poll-worker", targetGameId },
+      logSkipOncePerInterval(
+        `registry:${targetGameId}`,
+        { targetGameId },
         "skip poll prediction: registry says target already started/ended",
       );
       return false;
     }
     if (globalRecentRoundCache.has(targetGameId)) {
-      logger.info(
-        { component: "poll-worker", targetGameId },
+      logSkipOncePerInterval(
+        `cache:${targetGameId}`,
+        { targetGameId },
         "skip poll prediction: target already in recent-round cache",
       );
       return false;
@@ -636,16 +659,18 @@ export class PollWorker {
     if (g) {
       if ((g.pending_c ?? 0) > 0) return false;
       if (g.crash_exists) {
-        logger.info(
-          { component: "poll-worker", targetGameId },
+        logSkipOncePerInterval(
+          `crash_rounds:${targetGameId}`,
+          { targetGameId },
           "newest target already in crash_rounds — skip poll prediction",
         );
         return false;
       }
       const lc = g.lifecycle;
       if (lc === "ENDED" || lc === "RECONCILED") {
-        logger.info(
-          { component: "poll-worker", targetGameId, lifecycle: lc },
+        logSkipOncePerInterval(
+          `lifecycle:${targetGameId}`,
+          { targetGameId, lifecycle: lc },
           "newest target already finished — skip poll prediction",
         );
         return false;

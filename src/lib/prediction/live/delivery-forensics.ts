@@ -161,40 +161,39 @@ export async function reconcileForensicOutcomes(
     // are authoritative; delivery_outcome is only a cache.
     //
     // AUDIT 2026-09-11 (general-pool latency — the recurrent ~725ms query):
-    // Two waste patterns in the original shape, both fixed here:
+    // Three waste patterns fixed across revisions:
     //
     // 1. 'LATE' was in the re-check set, but LATE is TERMINAL: accepted_at
     //    is frozen and target_started_at backfills only move EARLIER
     //    (COALESCE picks the first resolved begin time; BG/lrs/cr all stamp
     //    the same event), so the lead can only shrink — a stored LATE can
-    //    never recompute to non-LATE. Including it re-fetched every stable
-    //    late row every sweep, forever.
-    // 2. No recency bound: with `ORDER BY delivered_at DESC LIMIT 200` the
-    //    sweep rescanned the newest 200 delivered rows (plus their 3-join
-    //    fan-out ≈ 800 row lookups) every ~60s even when all were already
-    //    correctly classified — the same head rows for hours (200 rows ≈ 2h
-    //    of deliveries). Classification stabilizes within ~1 minute of
-    //    delivery (BG(N) backfills started_at right after the signal), so a
-    //    2h window is ~120x headroom; older rows age out of the working set
-    //    instead of being rescanned forever.
+    //    never recompute to non-LATE. Excluded entirely.
+    // 2. No recency bound originally: the sweep rescanned the newest 200
+    //    delivered rows (plus their 3-join fan-out) every ~60s forever.
+    // 3. PRODUCTION 2026-09-11 (slow_query_ms=700-757 persisted even after
+    //    the 2h window): the masked-late audit re-checked ON_TIME/EARLY rows
+    //    for the FULL 2h window. Classification stabilizes within ~1 minute
+    //    of delivery (BG(N) backfills started_at right after the signal), so
+    //    re-checking a stable ON_TIME row for 2h is ~120x wasted work — and
+    //    that standing scan occupied a general-pool connection (max 5) while
+    //    the BG prediction path was waiting on the same pool.
     //
-    // The 0035 partial index (delivered_at DESC NULLS LAST WHERE type/
-    // status/accepted filters) serves the bounded range scan directly.
-    const windowHours = (() => {
-      const raw = Number(process.env.FORENSIC_RECONCILE_WINDOW_HOURS ?? 2);
-      return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 2;
+    // FIX: split into TWO bounded scans, each served by its own partial
+    // index (migration 0040):
+    //   REPAIR — NULL/UNKNOWN outcomes, 24h window (recovery of failed
+    //            forensic writes; idempotent, rare).
+    //   AUDIT  — ON_TIME/EARLY outcomes, 15-minute window (masked-late
+    //            detection; outcome is immutable after target start
+    //            backfills, which happens ≤1 min post-delivery).
+    const repairHours = (() => {
+      const raw = Number(process.env.FORENSIC_REPAIR_WINDOW_HOURS ?? 24);
+      return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 24;
     })();
-    const rows = await sql<{
-      notification_id: string;
-      telegram_accepted_at: string | Date | null;
-      delivery_outcome: string | null;
-      target_started_at: string | Date | null;
-      metadata: Record<string, unknown> | null;
-      created_at: string;
-      dispatch_claimed_at: string | Date | null;
-      send_started_at: string | Date | null;
-      target_game_id: string | null;
-    }>`
+    const auditMinutes = (() => {
+      const raw = Number(process.env.FORENSIC_AUDIT_WINDOW_MINUTES ?? 15);
+      return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 15;
+    })();
+    const selectColumns = `
       SELECT o.notification_id, o.telegram_accepted_at, o.delivery_outcome,
              o.metadata, o.created_at, o.dispatch_claimed_at,
              o.send_started_at, o.target_game_id,
@@ -209,14 +208,50 @@ export async function reconcileForensicOutcomes(
         WHERE game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId')
         ORDER BY began_at DESC LIMIT 1
       ) cr ON true
+    `;
+    type ForensicRow = {
+      notification_id: string;
+      telegram_accepted_at: string | Date | null;
+      delivery_outcome: string | null;
+      target_started_at: string | Date | null;
+      metadata: Record<string, unknown> | null;
+      created_at: string;
+      dispatch_claimed_at: string | Date | null;
+      send_started_at: string | Date | null;
+      target_game_id: string | null;
+    };
+
+    // REPAIR scan: rows whose forensic write never landed (crash between
+    // delivery and persist). Bounded to 24h — older NULLs are noise.
+    // sql.query (raw text + params) — the tagged wrapper does not support
+    // nested fragments, so the shared SELECT body is inlined verbatim.
+    const repairRows = await sql.query<ForensicRow>(
+      `${selectColumns}
       WHERE o.type = 'prediction'
         AND o.status = 'delivered'
         AND o.telegram_accepted_at IS NOT NULL
-        AND o.delivered_at > now() - (${windowHours}::int * interval '1 hour')
-        AND (o.delivery_outcome IS NULL OR o.delivery_outcome IN ('UNKNOWN', 'ON_TIME', 'EARLY'))
+        AND o.delivered_at > now() - ($1::int * interval '1 hour')
+        AND (o.delivery_outcome IS NULL OR o.delivery_outcome = 'UNKNOWN')
       ORDER BY o.delivered_at DESC NULLS LAST
-      LIMIT ${batchSize}
-    `;
+      LIMIT $2`,
+      [repairHours, batchSize],
+    );
+
+    // AUDIT scan: recently-delivered, optimistically-classified rows —
+    // the only place a "masked LATE" can still be hiding. 15 minutes.
+    const auditRows = await sql.query<ForensicRow>(
+      `${selectColumns}
+      WHERE o.type = 'prediction'
+        AND o.status = 'delivered'
+        AND o.telegram_accepted_at IS NOT NULL
+        AND o.delivered_at > now() - ($1::int * interval '1 minute')
+        AND o.delivery_outcome IN ('ON_TIME', 'EARLY')
+      ORDER BY o.delivered_at DESC NULLS LAST
+      LIMIT $2`,
+      [auditMinutes, batchSize],
+    );
+
+    const rows = [...repairRows, ...auditRows];
 
     for (const row of rows) {
       result.scanned += 1;

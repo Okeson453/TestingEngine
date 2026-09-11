@@ -523,7 +523,11 @@ export async function sweepStuckFeedback(
   sql: import("@/lib/db").Sql,
   opts: { olderThanMinutes?: number; limit?: number } = {},
 ): Promise<{ swept: number; applied: number; failed: number }> {
-  const olderThanMinutes = opts.olderThanMinutes ?? 5;
+  // SLA ALIGNMENT (sep 11): the production invariant flags a missing
+  // feedback_applied_at at 2 minutes — the sweep must repair at the same
+  // threshold, not 5, or every stuck row burns ≥3 extra minutes flagged as
+  // feedback_not_applied_within_sla before self-healing.
+  const olderThanMinutes = opts.olderThanMinutes ?? 2;
   const limit = opts.limit ?? 20;
   const stuck = await sql<{
     prediction_id: string;

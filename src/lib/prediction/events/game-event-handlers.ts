@@ -319,10 +319,16 @@ export async function bgHandler(payload: unknown): Promise<void> {
     // Fencing: a worker that lost authority must not compute predictions.
     // Numeric-ID gate: BG reconciliation is exercised by tests with
     // non-round IDs; prediction targets are strictly numeric sequences.
+    // LATENCY PROFILE (sep 11 P1): production measured ~1.24s between BG
+    // receipt and "reconcile complete" — the reconcile TX (pool acquire +
+    // 5 statements), NOT the model, owns that cost. bg_receipt_to_reconcile
+    // and bg_to_prediction_total below make the split visible per round.
     if (isAuthoritative() && /^\d+$/.test(gameId)) {
       void (async () => {
         const bgCorrelationId = `${correlationId}:bg-n1`;
         const bgTrace = startTrace(bgCorrelationId, gameId);
+        const bgReceivedMs = new Date(receivedAt).getTime();
+        const attemptT0 = Date.now();
         try {
           const result = await attemptNPlusOnePrediction({
             sourceRoundId: gameId,
@@ -331,40 +337,50 @@ export async function bgHandler(payload: unknown): Promise<void> {
             correlationId: bgCorrelationId,
             trace: bgTrace,
           });
+          const predictionMs = Date.now() - attemptT0;
           const targetGameId = nextTargetGameId(gameId);
+          // Timing split: event receipt → reconcile TX commit → prediction
+          // done. bg_receipt_to_reconcile_ms isolates the DB reconcile cost
+          // (pool pressure shows up here first); prediction_ms is the model
+          // + persist leg.
+          const profile = {
+            component: "game-event-handlers",
+            event: "bg",
+            gameId,
+            targetGameId,
+            trigger: "BG_PRIMARY",
+            kind: result.kind,
+            bg_receipt_to_reconcile_ms: Math.max(
+              0,
+              Date.now() - bgReceivedMs - predictionMs,
+            ),
+            prediction_ms: predictionMs,
+            bg_receipt_to_prediction_done_ms: Math.max(0, Date.now() - bgReceivedMs),
+            predictionId: result.predictionId,
+            correlationId: bgCorrelationId,
+          };
           if (result.attempted) {
             completeTarget(targetGameId, `bg:${gameId}`);
             logger.info(
-              {
-                component: "game-event-handlers",
-                event: "bg",
-                gameId,
-                targetGameId,
-                trigger: "BG_PRIMARY",
-                predictionId: result.predictionId,
-                kind: result.kind,
-                correlationId: bgCorrelationId,
-              },
+              profile,
               "BG→N+1 SIGNAL_READY (primary path — durable outbox enqueued)",
             );
           } else {
-            // duplicate/completed = another trigger owns N+1 (ED fallback
-            // remains available when the target was NOT persisted: skipped_*,
-            // insufficient_history, persist_failed all release the claim).
-            releaseTarget(targetGameId, `bg:${gameId}`);
+            // P0 state semantics (sep 11): skipped_no_edge is an EVALUATED,
+            // TERMINAL NO_BET — the claim was completed, not released, so ED
+            // must not recompute. Only genuine failures (exception:*,
+            // insufficient_history, persist_failed, skipped window) release
+            // the claim and leave the target recoverable by ED fallback.
+            if (result.kind !== "skipped_no_edge") {
+              releaseTarget(targetGameId, `bg:${gameId}`);
+            }
             logger.info(
-              {
-                component: "game-event-handlers",
-                event: "bg",
-                gameId,
-                targetGameId,
-                trigger: "BG_PRIMARY",
-                kind: result.kind,
-                correlationId: bgCorrelationId,
-              },
+              { ...profile, terminal_no_bet: result.kind === "skipped_no_edge" },
               result.kind === "duplicate"
                 ? "BG→N+1 already claimed/persisted by another trigger"
-                : `BG→N+1 soft result kind=${result.kind} — target recoverable by ED fallback`,
+                : result.kind === "skipped_no_edge"
+                  ? "BG→N+1 evaluated NO_BET (terminal — ED will not recompute)"
+                  : `BG→N+1 soft result kind=${result.kind} — target recoverable by ED fallback`,
             );
           }
         } catch (err) {
@@ -397,7 +413,15 @@ export async function bgHandler(payload: unknown): Promise<void> {
     });
 
     logger.info(
-      { event: "bg", gameId, correlationId },
+      {
+        event: "bg",
+        gameId,
+        correlationId,
+        // Event receipt → reconcile TX committed. Production measured
+        // ~1.24s here (pool contention) vs ~2ms of model time — this
+        // field is the per-round proof of where the cost sits.
+        bg_receipt_to_reconcile_ms: Math.max(0, Date.now() - new Date(receivedAt).getTime()),
+      },
       "bg reconcile complete — N+1 primary prediction trigger fired",
     );
   } catch (error) {
@@ -616,19 +640,31 @@ export async function edHandler(payload: unknown): Promise<void> {
         );
       } else {
         // soft miss / duplicate / insufficient_history / exception handled in attempt
-        releaseTarget(targetGameId, `ed:${gameId}`);
+        // P0 state semantics (sep 11): skipped_no_edge is a TERMINAL NO_BET —
+        // the predictor completed the claim with a NO_BET decision; releasing
+        // it here would re-open the target for pointless recomputes. Failures
+        // still release and stay recoverable (immediate recovery below).
+        if (result.kind !== "skipped_no_edge") {
+          releaseTarget(targetGameId, `ed:${gameId}`);
+        }
         logger.info(
           {
             event: sourceEvent,
             gameId,
             targetGameId,
             ownership_result:
-              result.kind === "duplicate" ? "already_persisted" : `soft:${result.kind ?? "unknown"}`,
+              result.kind === "duplicate"
+                ? "already_persisted"
+                : result.kind === "skipped_no_edge"
+                  ? "terminal_no_bet"
+                  : `soft:${result.kind ?? "unknown"}`,
             kind: result.kind,
             ed_to_signal_ms: Math.round(totalMs * 100) / 100,
             correlationId,
           },
-          "ED→N+1 soft result",
+          result.kind === "skipped_no_edge"
+            ? "ED→N+1 evaluated NO_BET (terminal — target closed)"
+            : "ED→N+1 soft result",
         );
         if (
           result.kind &&

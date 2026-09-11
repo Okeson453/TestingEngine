@@ -1294,7 +1294,16 @@ export async function onGameEndPredict(
           ? "skip signal — strategy/pipeline veto (NO BET this round)"
           : "skip signal — no edge vs fair odds (not every round should fire)",
       );
-      try { releaseTarget(targetGameId, owner); } catch { /* soft */ }
+      // P0 (sep 11 state semantics): an EVALUATED skip — no edge vs fair
+      // odds, or strategy/pipeline veto — is a TERMINAL NO_BET decision for
+      // this target, not a failure. Complete the claim (not release) so the
+      // ED fallback and poll recovery never re-pay the model compute for a
+      // decision that was already made. Only genuine failures (persist
+      // errors, exceptions, insufficient history/window) leave the target
+      // recoverable.
+      try {
+        completeTarget(targetGameId, owner, { decision: "NO_BET" });
+      } catch { /* soft */ }
       return {
         predictionId: null,
         targetGameId,

@@ -14,12 +14,21 @@
  */
 export type ClaimResult =
   | { owned: true; claimedAt: number }
-  | { owned: false; reason: "duplicate" | "completed"; owner?: string };
+  | {
+      owned: false;
+      reason: "duplicate" | "completed";
+      owner?: string;
+      /** True when the completed claim was an EVALUATED NO_BET decision
+       * (edge/selectivity veto). Terminal by design — never recompute. */
+      noBet?: boolean;
+    };
 
 type Entry = {
   owner: string;
   claimedAt: number;
   completed: boolean;
+  /** Set when completion was an evaluated NO_BET (not a failure). */
+  noBet?: boolean;
 };
 
 const claims = new Map<string, Entry>();
@@ -41,7 +50,14 @@ export function claimTarget(targetGameId: string, owner: string): ClaimResult {
   prune();
   const existing = claims.get(targetGameId);
   if (existing) {
-    if (existing.completed) return { owned: false, reason: "completed", owner: existing.owner };
+    if (existing.completed) {
+      return {
+        owned: false,
+        reason: "completed",
+        owner: existing.owner,
+        noBet: existing.noBet,
+      };
+    }
     if (existing.owner === owner) return { owned: true, claimedAt: existing.claimedAt };
     return { owned: false, reason: "duplicate", owner: existing.owner };
   }
@@ -50,11 +66,16 @@ export function claimTarget(targetGameId: string, owner: string): ClaimResult {
   return { owned: true, claimedAt };
 }
 
-export function completeTarget(targetGameId: string, owner?: string): void {
+export function completeTarget(
+  targetGameId: string,
+  owner?: string,
+  opts?: { decision?: "PREDICTED" | "NO_BET" },
+): void {
   const e = claims.get(targetGameId);
   if (!e) return;
   if (owner && e.owner !== owner) return;
   e.completed = true;
+  if (opts?.decision === "NO_BET") e.noBet = true;
 }
 
 export function releaseTarget(targetGameId: string, owner?: string): void {
