@@ -169,6 +169,14 @@ interface PredictorDeps {
    * alone. Undefined on poll-recovery attempts (there is no ED event).
    */
   edReceivedAt?: string;
+  /**
+   * BG-PRIMARY trigger (sep 11 architecture change): the source round N has
+   * STARTED (BG(N) received) — it has NOT crashed yet. Round N's multiplier
+   * is unknown and must NOT be appended to history or observed on ACIE;
+   * features/history run through N-1 only. Target is still sourceRoundId+1
+   * and ALL gates apply unchanged.
+   */
+  bgTrigger?: boolean;
   predictFn?: (
     priorRounds: HistoricalRound[],
     targetRoundId: string,
@@ -903,7 +911,14 @@ export async function onGameEndPredict(
   }
 
   // ── P0: In-memory target claim (ZERO DB) ──
-  const owner = deps.recoveryMode ? `poll:${gameId}` : `ed:${gameId}`;
+  // ONE target round → ONE prediction owner. BG (primary), ED (fallback) and
+  // poll (recovery) all contend here first; the DB unique constraint on
+  // pending_predictions(target_game_id) is the durability backstop.
+  const owner = deps.recoveryMode
+    ? `poll:${gameId}`
+    : deps.bgTrigger
+      ? `bg:${gameId}`
+      : `ed:${gameId}`;
   const claim = claimTarget(targetGameId, owner);
   const t1 = performance.now(); // target claimed
 
@@ -996,17 +1011,21 @@ export async function onGameEndPredict(
   // The edHandler in game-event-handlers.ts already calls appendCompletedRound
   // before this function, but we keep it here as a belt-and-suspenders measure
   // for the poll-worker path which calls onGameEndPredict directly.
-  try {
-    const { appendCompletedRound } = await import(
-      "@/lib/prediction/live/live-history-buffer"
-    );
-    appendCompletedRound({
-      gameId,
-      multiplier,
-      crashedAt,
-    });
-  } catch {
-    /* soft — buffer is best-effort */
+  // BG-PRIMARY: the source round N has NOT crashed — appending it would
+  // corrupt the history buffer with a phantom round. Skip.
+  if (!deps.bgTrigger) {
+    try {
+      const { appendCompletedRound } = await import(
+        "@/lib/prediction/live/live-history-buffer"
+      );
+      appendCompletedRound({
+        gameId,
+        multiplier,
+        crashedAt,
+      });
+    } catch {
+      /* soft — buffer is best-effort */
+    }
   }
 
   // ── P0: History MUST come from memory. NEVER call getSql() here. ──
@@ -1061,7 +1080,11 @@ export async function onGameEndPredict(
   // ── P0: Observe crash N on shared ACIE BEFORE evaluating N+1 ──
   // Ordering invariant: Crash N → ACIE.observeRound → state advances → evaluate N+1
   // Never allow PredictionEngine to predict N+1 before ACIE has learned Crash N.
-  try {
+  // BG-PRIMARY: round N has NOT crashed — observing it would poison ACIE
+  // state with a phantom crash. ACIE state advances through N-1 (observed at
+  // ED(N-1)); the N+1 evaluation is a valid "one round ahead" projection and
+  // ED(N) remains the fallback with the fuller observation.
+  if (!deps.bgTrigger) try {
     // P0 FIX: was require() — ReferenceError under ESM made observeRound
     // fail on every crash ("ACIE observeRound failed on hot path"). Static
     // import now.
@@ -1187,15 +1210,20 @@ export async function onGameEndPredict(
   const predictionId = signal.predictionId;
 
   // P1: Reject emission from stale ACIE state (must have observed this source).
+  // BG-PRIMARY: round N is in flight — freshness is proven against the last
+  // COMPLETED round (N-1, the tail of the history the evaluation used).
   try {
-    // P0 FIX: was require() — ReferenceError under ESM. Static import now.
-    const check = assertFreshAcieState(gameId);
+    const freshnessSource = deps.bgTrigger
+      ? (priorRounds[priorRounds.length - 1]?.externalRoundId ?? gameId)
+      : gameId;
+    const check = assertFreshAcieState(freshnessSource);
     if (!check.ok) {
       logger.error(
         {
           component: "live-predictor",
           event: "STALE_REJECTED",
           sourceGameId: gameId,
+          freshnessSource,
           targetGameId,
           reason: check.reason,
           predictionId,
@@ -1370,10 +1398,16 @@ export async function onGameEndPredict(
       // The completed SOURCE round is stated explicitly so the signal can
       // never be misread as a prediction FOR round N.
       `Game ID: ${targetGameId} (bet NOW — round starting)`,
-      `Source round: ${gameId} completed — predicting round ${targetGameId}`,
+      deps.bgTrigger
+        ? `Trigger round: ${gameId} started — predicting round ${targetGameId}`
+        : `Source round: ${gameId} completed — predicting round ${targetGameId}`,
       `Prediction ID: ${predictionId}`,
       `Generated: ${generatedAt}`,
-      recoveryMode ? "Source: poll recovery" : "Source: live ED",
+      recoveryMode
+        ? "Source: poll recovery"
+        : deps.bgTrigger
+          ? "Source: live BG (generated during previous round)"
+          : "Source: live ED",
     ].join("\n");
     // Shorter live deadline keeps temporal contract tight; recovery keeps more budget.
     // P1: tighter creation-relative deadline (was 8s). Semantic validity is
@@ -1398,11 +1432,16 @@ export async function onGameEndPredict(
       authoritativeNowMs() + remainingBeforeTargetMs - DELIVERY_SAFETY_MS,
     )).toISOString();
     const outboxNotificationId = randomUUID();
+    // EXPLICIT PROVENANCE (sep 11 item 8): trigger identity + full timeline
+    // on every prediction, proving N+1 was generated ahead of its round.
+    const triggerEvent = deps.bgTrigger ? "BG" : recoveryMode ? "POLL" : "ED";
     const outboxMetadata = JSON.stringify({
       predictionId,
       correlationId,
       targetGameId,
       sourceGameId: gameId,
+      triggerEvent,
+      triggerRoundId: gameId,
       targetMultiplier: Number(DEFAULT_TARGET),
       probability: signal.probability,
       confidence: signal.confidence,
@@ -1418,6 +1457,7 @@ export async function onGameEndPredict(
       predictionStartedAt: attemptStartedAt,
       predictionComputeMs,
       predictionGeneratedAt: generatedAt,
+      signalReadyAt: generatedAt,
       // ED RECEIPT ANCHOR (sep 11): true ED(N) worker-receipt instant — the
       // start of the measured critical path. Persist-commit / outbox-enqueue
       // instants are the outbox row's created_at (same TX commit); dispatch
@@ -1444,6 +1484,7 @@ export async function onGameEndPredict(
               model_version, requested_at, generated_at,
               target_game_id, source_round_id,
               correlation_id,
+              trigger_event, trigger_round_id,
               acie_instance_id, acie_observation_count, acie_state_version,
               feature_hash, prediction_mode, execution_path, strategy_action
             ) values (
@@ -1454,6 +1495,7 @@ export async function onGameEndPredict(
               ${signal.modelVersion}, ${attemptStartedAt}, ${generatedAt},
               ${targetGameId}, ${gameId},
               ${correlationId},
+              ${triggerEvent}, ${gameId},
               ${String((signal.featureSummary as Record<string, unknown> | undefined)?.acie_instance_id ?? "") || null},
               ${Number((signal.featureSummary as Record<string, unknown> | undefined)?.acie_observation_count) || null},
               ${Number((signal.featureSummary as Record<string, unknown> | undefined)?.acie_state_version) || null},
@@ -1497,7 +1539,7 @@ export async function onGameEndPredict(
         processor_latency_ms, sla_violated
       ) values (
         ${correlationId}::text, 'PREDICT', ${targetGameId},
-        ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode })},
+        ${JSON.stringify({ sourceGameId: gameId, targetGameId, recoveryMode, triggerEvent })},
         ${crashedAt}::timestamptz, now(),
         ${Math.max(0, Date.now() - new Date(crashedAt).getTime())}, ${slaViolated}
       )

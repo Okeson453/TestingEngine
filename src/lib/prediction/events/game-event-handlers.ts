@@ -1,8 +1,8 @@
 /**
  * BC.Game native WS → live prediction pipeline.
  *
- * ED(N)  → owns N+1 prediction (signal-first)
- * BG(N+1) → reconciliation only (no prediction)
+ * BG(N)  → PRIMARY N+1 prediction trigger (predicts N+1 while round N runs)
+ * ED(N)  → validation of N + FALLBACK N+1 prediction (only if BG missed)
  * Poll   → recovery only
  */
 import { randomUUID } from "node:crypto";
@@ -193,7 +193,20 @@ function nextTargetGameId(sourceGameId: string): string {
 }
 
 /**
- * BG: reconcile target start only — never create a new prediction.
+ * BG(N): reconcile target start + PRIMARY N+1 prediction trigger.
+ *
+ * SEP 11 ARCHITECTURE CHANGE (BG-primary / ED-fallback):
+ *  1. Reconcile (unchanged): stamp began_at + target_round_started_at on the
+ *     pending prediction for N, hard temporal kill of late signals for N.
+ *  2. NEW PRIMARY PATH: immediately claim and generate the prediction for
+ *     N+1 — while round N is still running. Round N's crash is unknown at
+ *     this instant (bgTrigger mode: history/ACIE run through N-1); every
+ *     existing gate (edge/selectivity/strategy/temporal/1.30x target) applies
+ *     unchanged. Ownership is enforced by the SAME single boundary
+ *     (attemptNPlusOnePrediction → claimTarget + pending_predictions unique
+ *     constraint): one target round → one prediction owner. ED(N) later sees
+ *     the target already claimed/persisted and skips — it is now the
+ *     FALLBACK path, not the primary.
  */
 // Exported for tests: the BG-arrival signal-kill contract is asserted
 // directly against this handler (see outbox-lifecycle.test.ts).
@@ -265,7 +278,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
             correlation_id, event_kind, game_id, payload, received_at, processed_at,
             processor_latency_ms, sla_violated
           ) VALUES (
-            ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: true })},
+            ${correlationId}::text, 'BG', ${gameId}, ${JSON.stringify({ beganAt, reconcileOnly: false, predictionTrigger: "BG_PRIMARY" })},
             ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
           ) ON CONFLICT DO NOTHING
         `;
@@ -287,13 +300,91 @@ export async function bgHandler(payload: unknown): Promise<void> {
       }
     }
 
-    // Nonessential after commit — analytics and in-memory registry work must
-    // never gate (or roll back with) the temporal kill above.
+    // NON-FATAL BG RECONCILE TELEMETRY (unchanged): analytics and in-memory
+    // registry work must never gate (or roll back with) the temporal kill.
     import("@/lib/prediction/identity/prediction-registry")
       .then(({ globalPredictionRegistry }) => {
         globalPredictionRegistry.noteTargetStarted(gameId, beganAt);
       })
       .catch(() => undefined);
+
+    // ── PRIMARY N+1 PREDICTION TRIGGER (sep 11 architecture change) ──
+    // Round N has just started; its N+1 prediction is generated NOW, during
+    // the round, instead of waiting for ED(N). Fire-and-forget: reconcile
+    // (temporal kill + began_at) already committed above; this must never
+    // block or fail the reconcile path. attemptNPlusOnePrediction is the
+    // SINGLE ownership boundary — atomic claim inside; if any other trigger
+    // (duplicate BG, WS+poll race, ED fallback) already owns target N+1,
+    // this returns duplicate/completed and no compute happens.
+    // Fencing: a worker that lost authority must not compute predictions.
+    // Numeric-ID gate: BG reconciliation is exercised by tests with
+    // non-round IDs; prediction targets are strictly numeric sequences.
+    if (isAuthoritative() && /^\d+$/.test(gameId)) {
+      void (async () => {
+        const bgCorrelationId = `${correlationId}:bg-n1`;
+        const bgTrace = startTrace(bgCorrelationId, gameId);
+        try {
+          const result = await attemptNPlusOnePrediction({
+            sourceRoundId: gameId,
+            sourceCrashAt: beganAt,
+            source: "BG",
+            correlationId: bgCorrelationId,
+            trace: bgTrace,
+          });
+          const targetGameId = nextTargetGameId(gameId);
+          if (result.attempted) {
+            completeTarget(targetGameId, `bg:${gameId}`);
+            logger.info(
+              {
+                component: "game-event-handlers",
+                event: "bg",
+                gameId,
+                targetGameId,
+                trigger: "BG_PRIMARY",
+                predictionId: result.predictionId,
+                kind: result.kind,
+                correlationId: bgCorrelationId,
+              },
+              "BG→N+1 SIGNAL_READY (primary path — durable outbox enqueued)",
+            );
+          } else {
+            // duplicate/completed = another trigger owns N+1 (ED fallback
+            // remains available when the target was NOT persisted: skipped_*,
+            // insufficient_history, persist_failed all release the claim).
+            releaseTarget(targetGameId, `bg:${gameId}`);
+            logger.info(
+              {
+                component: "game-event-handlers",
+                event: "bg",
+                gameId,
+                targetGameId,
+                trigger: "BG_PRIMARY",
+                kind: result.kind,
+                correlationId: bgCorrelationId,
+              },
+              result.kind === "duplicate"
+                ? "BG→N+1 already claimed/persisted by another trigger"
+                : `BG→N+1 soft result kind=${result.kind} — target recoverable by ED fallback`,
+            );
+          }
+        } catch (err) {
+          const e = err instanceof Error ? err : new Error(String(err));
+          logger.error(
+            {
+              component: "game-event-handlers",
+              event: "bg",
+              gameId,
+              trigger: "BG_PRIMARY",
+              errorName: e.name,
+              errorMessage: e.message,
+              errorStack: e.stack?.slice(0, 1500) ?? null,
+            },
+            "BG→N+1 primary prediction attempt threw — ED(N) remains fallback",
+          );
+        }
+      })();
+    }
+
     setImmediate(() => {
       void (async () => {
         const { reclassifyOnTargetStart } = await import(
@@ -307,7 +398,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
 
     logger.info(
       { event: "bg", gameId, correlationId },
-      "bg reconcile complete (no prediction)",
+      "bg reconcile complete — N+1 primary prediction trigger fired",
     );
   } catch (error) {
     logger.error({ event: "bg", gameId, error: String(error) }, "bg observability failed");
@@ -398,8 +489,10 @@ export function normalizeCrashEnd(
 }
 
 /**
- * ED(N): owns N+1 prediction — signal first, persistence async.
- * Phase 2: attemptNPlusOnePrediction is the sole ownership boundary.
+ * ED(N): FALLBACK N+1 prediction (BG(N) is the primary trigger).
+ * attemptNPlusOnePrediction is the sole ownership boundary: if BG(N) already
+ * claimed/persisted target N+1, this attempt returns duplicate and skips —
+ * ED only computes when the BG primary path failed or produced nothing.
  */
 export async function edHandler(payload: unknown): Promise<void> {
   // Fencing gate (fix plan Phase 1): a worker that lost authority must not
@@ -611,7 +704,7 @@ export async function edHandler(payload: unknown): Promise<void> {
           endTime: crashedAt,
           multiplier,
           receivedAt: new Date().toISOString(),
-          skipPredict: true, // ED already owns N+1
+          skipPredict: true, // N+1 owned by BG primary (ED is fallback)
         }).catch((error) => {
           logger.error(
             { event: sourceEvent, gameId, error: String(error), correlationId },

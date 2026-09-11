@@ -5,7 +5,8 @@
  * function so target ownership, temporal gating and result logging behave
  * identically regardless of who calls:
  *
- *   ED(N)      → attemptNPlusOnePrediction({ source: "ED" })
+ *   BG(N)      → attemptNPlusOnePrediction({ source: "BG" })   [PRIMARY — fires while round N runs]
+ *   ED(N)      → attemptNPlusOnePrediction({ source: "ED" })   [FALLBACK — only if BG(N) failed/missing]
  *   Poll(N)    → attemptNPlusOnePrediction({ source: "RECOVERY" })
  *
  * Layers of duplicate defence (in order):
@@ -21,7 +22,7 @@ import type { Trace } from "@/lib/prediction/live/latency-trace";
 
 const logger = getLogger("prediction-attempt");
 
-export type PredictionSource = "ED" | "RECOVERY";
+export type PredictionSource = "ED" | "RECOVERY" | "BG";
 
 // ── Batch 3: rejection telemetry ────────────────────────────────────────────
 // Every N+1 attempt that does NOT produce a signal is counted by
@@ -97,7 +98,12 @@ function persistLastRejectionFireAndForget(
 export interface AttemptNPlusOneInput {
   sourceRoundId: string;
   sourceCrashAt: string;
-  sourceMultiplier: number;
+  /**
+   * Source round crash multiplier. REQUIRED for ED/POLL (the round has
+   * ended). NOT meaningful for BG triggers — round N is still running when
+   * BG(N) fires, so the multiplier is unknown and unused on that path.
+   */
+  sourceMultiplier?: number;
   source: PredictionSource;
   correlationId?: string | null;
   /** Optional latency trace to mark stages on (ED hot path). */
@@ -122,6 +128,10 @@ export async function attemptNPlusOnePrediction(
   const { sourceRoundId, sourceCrashAt, sourceMultiplier, source } = input;
   const trace = input.trace ?? null;
   const recoveryMode = source === "RECOVERY";
+  // BG-PRIMARY (sep 11 architecture change): source === "BG" means round N
+  // has STARTED (BG(N) received) and we are predicting N+1 while it runs.
+  // Round N's crash is UNKNOWN — the predictor must not observe or append it.
+  const bgTrigger = source === "BG";
 
   if (trace) trace.marks.prediction_started = performance.now();
 
@@ -129,9 +139,9 @@ export async function attemptNPlusOnePrediction(
     const result = await onGameEndPredict(
       sourceRoundId,
       sourceCrashAt,
-      sourceMultiplier,
+      bgTrigger ? Number.NaN : (sourceMultiplier as number),
       input.correlationId ?? crypto.randomUUID(),
-      { recoveryMode, trace, edReceivedAt: input.edReceivedAt },
+      { recoveryMode, trace, edReceivedAt: input.edReceivedAt, bgTrigger },
     );
     if (trace) trace.marks.prediction_completed = performance.now();
 
@@ -205,7 +215,7 @@ export async function attemptNPlusOnePrediction(
           (err as { targetRoundId?: string }).targetRoundId ??
           (err as { context?: { targetRoundId?: string } }).context?.targetRoundId ??
           null,
-        predictionType: `N+1:${source === "ED" ? "live" : "recovery"}`,
+        predictionType: `N+1:${source === "ED" ? "live" : source === "BG" ? "bg-primary" : "recovery"}`,
         predictionResult: (err as { predictionResult?: unknown }).predictionResult ?? null,
         stage,
         featureStage,
