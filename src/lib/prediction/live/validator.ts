@@ -17,6 +17,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { getSql, type Sql } from "@/lib/db";
+import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
@@ -329,14 +330,20 @@ export async function onGameEnd(
         // immediately, the dispatcher prediction lane and normal lane fire
         // Telegram in parallel → user sees signal + result at the same time.
         // Defer validation claimability so the N+1 signal always goes first.
-        const valDeadlineAt = new Date(Date.now() + 300_000).toISOString();
+        // CLOCK HYGIENE (co-delivery fix 1): these absolutes are compared
+        // against the DB clock (claim SQL `next_attempt_at <= now()`,
+        // `telegram_deadline_at > clock_timestamp()`). Container Date.now()
+        // with DB-ahead skew >= validationDelayMs collapsed the 800ms
+        // separator to zero (prod: validation enqueued .023, delivered .0249).
+        // Use the DB-synced clock so the delay holds in DB time.
+        const valDeadlineAt = new Date(authoritativeNowMs() + 300_000).toISOString();
         // Keep short: only long enough for the N+1 prediction Telegram to
         // complete first. 800ms ≪ prior 2500ms which inflated result lag.
         const validationDelayMs = Number(
           process.env.VALIDATION_DISPATCH_DELAY_MS ?? 800,
         );
         const valNextAttemptAt = new Date(
-          Date.now() + Math.max(0, validationDelayMs),
+          authoritativeNowMs() + Math.max(0, validationDelayMs),
         ).toISOString();
         await tx`
           insert into notification_outbox (

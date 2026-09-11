@@ -1217,7 +1217,11 @@ export async function onGameEndPredict(
     const deadlineMs = recoveryMode
       ? Number(process.env.TELEGRAM_DEADLINE_RECOVERY_MS ?? 10_000)
       : Number(process.env.TELEGRAM_DEADLINE_MS ?? 5_000);
-    const deadlineAt = new Date(Date.now() + deadlineMs).toISOString();
+    // CLOCK HYGIENE (co-delivery fix 1): deadline is compared against DB
+    // clock_timestamp() in the claim/auth queries. Container Date.now() with
+    // DB-ahead skew silently shrank the prediction's send budget by the skew.
+    // Use the DB-synced clock (boot + 5-min resync) so the budget is real.
+    const deadlineAt = new Date(authoritativeNowMs() + deadlineMs).toISOString();
     const outboxNotificationId = randomUUID();
     const outboxMetadata = JSON.stringify({
       predictionId,

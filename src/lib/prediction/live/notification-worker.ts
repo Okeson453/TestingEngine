@@ -184,10 +184,21 @@ export class OutboxDispatcher {
     lastError: null,
   };
   private getSqlFn: () => Promise<Sql> = getCriticalSql;
+  /** Normal lane (validation/alert rows) pool. CO-DELIVERY FIX 3: defaults
+   * to the GENERAL pool — normal-lane claim/auth/stamp/finalize DB work was
+   * riding the critical pool (max=3) and starving the N+1 prediction persist
+   * TX (measured 570-890ms persists during detached normal-lane passes).
+   * Lanes are disjoint row sets, so this never crosses the prediction path. */
+  private getNormalSqlFn: () => Promise<Sql> = getSql;
   private now: () => number = Date.now;
 
-  constructor(opts?: { getSqlFn?: () => Promise<Sql>; now?: () => number }) {
+  constructor(opts?: {
+    getSqlFn?: () => Promise<Sql>;
+    getNormalSqlFn?: () => Promise<Sql>;
+    now?: () => number;
+  }) {
     if (opts?.getSqlFn) this.getSqlFn = opts.getSqlFn;
+    if (opts?.getNormalSqlFn) this.getNormalSqlFn = opts.getNormalSqlFn;
     if (opts?.now) this.now = opts.now;
   }
 
@@ -316,9 +327,10 @@ export class OutboxDispatcher {
     let requeued = 0;
     const tickStartMs = this.now();
 
-    const sql = await this.getSqlFn();
-
-    // Claim batch: SELECT FOR UPDATE SKIP LOCKED → set status=inflight → COMMIT.
+    // CO-DELIVERY FIX 3: prediction lane keeps the critical pool; the normal
+    // lane (validation/alerts) runs its claim/auth/finalize on the general
+    // pool so a detached background pass can never starve the N+1 persist TX.
+    const sql = await (lane === "prediction" ? this.getSqlFn() : this.getNormalSqlFn());
     // Exclude rows past telegram_deadline_at so we never deliver "predicts the past".
     // Single round-trip claim inside one TX (UPDATE…FROM…RETURNING).
     // At ~800ms Neon RTT, N per-row UPDATEs were costing seconds per tick.
@@ -1414,6 +1426,16 @@ export class OutboxDispatcher {
         break;
       }
       try {
+        // PREDICTION LANE: always checked first. A prediction wake resolves
+        // immediately and this claim runs before any validation/result work.
+        // CO-DELIVERY FIX 2: recoverStale was awaited INLINE before this
+        // claim every 10th tick, adding its full general-pool round trips
+        // (~1s on slow rounds) to the N+1 dispatch path — dispatch landed
+        // 1.6-2.2s after enqueue, the WIN/LOSS became claimable meanwhile,
+        // and slow-round predictions missed target-start (LATE refusals).
+        // Recovery now runs AFTER the prediction claim; it is maintenance,
+        // one tick of extra staleness is immaterial (STALE_INFLIGHT_MS 30s).
+        await this.processLane("prediction");
         // P2.4: Throttle recoverStale to every 10 ticks (250ms at 25ms tick)
         // instead of every tick. Stale recovery is non-critical and the DB
         // UPDATE it runs was consuming ~5-10ms on every tick.
@@ -1429,9 +1451,6 @@ export class OutboxDispatcher {
         if (this.stats.tickCount % 30 === 0) {
           void this.reconcileForensics();
         }
-        // PREDICTION LANE: always checked first. A prediction wake resolves
-        // immediately and this claim runs before any validation/result work.
-        await this.processLane("prediction");
         // NORMAL LANE: only when woken for normal work or on timer recovery
         // (wake == null). Skip on pure prediction wakes so WIN/LOSS does not
         // race the N+1 signal on the same ED tick (ordering fix).
