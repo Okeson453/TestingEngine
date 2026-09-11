@@ -1206,6 +1206,12 @@ export async function onGameEndPredict(
       `Probability: ${(signal.probability * 100).toFixed(1)}%`,
       `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
       "",
+      // SEP 11: the message previously had NO round identifier — a signal
+      // delivered ~2s after crash N read as a LATE prediction for round N,
+      // when it is actually for the UPCOMING round N+1 (delivered during
+      // round N+1's betting window). Game ID matches the Game ID the
+      // WIN/LOSS message later reports, so the pair is verifiable.
+      `Game ID: ${targetGameId} (bet NOW — round starting)`,
       `Prediction ID: ${predictionId}`,
       `Generated: ${timestamp}`,
       recoveryMode ? "Source: poll recovery" : "Source: live ED",

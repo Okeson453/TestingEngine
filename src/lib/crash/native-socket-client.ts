@@ -345,9 +345,13 @@ export class NativeBcGameSocket {
     }
     if (!gameId) return;
     if (packet.event === "ed" || packet.event === "bg") {
+      // SEP 11: name the event kind in the msg itself — Railway's collector
+      // displays ONLY the msg field, and "crash event from native WS" for a
+      // bg (round START) packet made every round start look like a crash
+      // that produced no prediction. Now reads "bc ed event" / "bc bg event".
       logger.info(
         { component: "native-bc-socket", event: packet.event, gameId, multiplier },
-        "crash event from native WS",
+        `bc ${packet.event} event from native WS`,
       );
     }
 
