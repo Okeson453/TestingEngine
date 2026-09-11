@@ -1487,8 +1487,28 @@ export async function onGameEndPredict(
     // produces a signal that is dead-lettered past its round start, never
     // delivered into a crashed round.
     const DELIVERY_SAFETY_MS = Number(process.env.DELIVERY_SAFETY_MS ?? 500);
+    // PASS 16 — RESULT-TRIGGERED DELIVERY (user-approved 2026-09-11): the
+    // signal HOLDS in the outbox until round N's RESULT lands (the ED(N)
+    // validator release CTE sets next_attempt_at = now()), so the Telegram
+    // message arrives when the previous outcome is known and the target
+    // round's betting window opens ~4s later — instead of a full round
+    // early while round N is still on screen (user-visible as "the round I
+    // should bet on already started"). The hold is DB-clock based
+    // (now() + interval in the INSERT below). If ED(N) never arrives, the
+    // row stays held until the bg(target) temporal kill dead-letters it —
+    // a signal that missed its result trigger has no honest delivery
+    // moment. Backstops unchanged: bg(target) kill + dispatcher pre-send
+    // auth remain the final gates.
+    const resultHoldMs = Math.max(
+      0,
+      Number(process.env.PREDICTION_RESULT_HOLD_MS ?? 30_000),
+    );
+    // The deadline must outlive the hold or a slow round (long run time)
+    // dead-letters the row before its release ever fires. The binding
+    // semantic constraint is unchanged: never deliver into the target
+    // round (remaining − safety clamp below).
     const deadlineAt = new Date(Math.min(
-      authoritativeNowMs() + deadlineMs,
+      authoritativeNowMs() + resultHoldMs + deadlineMs,
       authoritativeNowMs() + remainingBeforeTargetMs - DELIVERY_SAFETY_MS,
     )).toISOString();
     const outboxNotificationId = randomUUID();
@@ -1510,6 +1530,10 @@ export async function onGameEndPredict(
       slaLagMsActual,
       kind: "prediction",
       recoveryMode,
+      // PASS 16: result-triggered delivery — the row is held until ED(N)
+      // (validator release CTE). Provenance for forensics + ops.
+      deliverySchedule: "ed_result_release",
+      resultHoldMs,
       // Immutable stage timeline for PREDICTION_DELIVERY_FORENSICS — every
       // stage that is known at enqueue time. Later stages (OUTBOX_CLAIMED,
       // DISPATCH_*, DELIVERY_CONFIRMED) come from outbox columns.
@@ -1580,7 +1604,7 @@ export async function onGameEndPredict(
           select
             ${outboxNotificationId}::uuid, 'prediction', ${predictionContent},
             ${outboxMetadata}::jsonb, 'pending', 100,
-            0, now(), ${deadlineAt}::timestamptz, ${targetGameId}
+            0, now() + (${resultHoldMs} * interval '1 millisecond'), ${deadlineAt}::timestamptz, ${targetGameId}
           from inserted_prediction
           returning notification_id
         `;

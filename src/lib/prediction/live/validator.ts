@@ -174,6 +174,19 @@ export async function onGameEnd(
     crashRow: { began_at: string | Date | null; crashed_at: string | Date | null } | null;
   } = { pending: null, crashRow: null };
 
+  // PASS 16 result-triggered delivery: ED(N) releases the held prediction
+  // signal for N+1 (mirrors nextTargetGameId in game-event-handlers; inlined
+  // to avoid an import cycle). Non-numeric ids (tests) release nothing.
+  const nextGameId = (() => {
+    try {
+      return String(BigInt(evt.gameId) + 1n);
+    } catch {
+      const n = Number(evt.gameId);
+      return Number.isFinite(n) ? String(n + 1) : null;
+    }
+  })();
+  let releasedPrediction = false;
+
   try {
     await runInTransaction(sql, async (tx) => {
       // First, anchor the round's crash outcome AND claim the pending
@@ -204,6 +217,7 @@ export async function onGameEnd(
           regime_name: string | null;
           correlation_id: string | null;
           requested_at: string | Date | null;
+          released_prediction: boolean | null;
         }>`
           with cr_ins as (
             insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
@@ -225,6 +239,26 @@ export async function onGameEnd(
             where target_game_id = ${evt.gameId} and matched = false
             limit 1
             for update skip locked
+          ),
+          rel as (
+            -- PASS 16 result-triggered delivery: ED(N) landing means round
+            -- N's result is known — release the held prediction signal for
+            -- N+1 so it claims immediately (user-approved: deliver the
+            -- prediction when the previous round's result is delivered,
+            -- not a full round early while N is still running). Runs on
+            -- EVERY ED path (this statement always executes). Idempotent:
+            -- released rows have next_attempt_at = now(), so the
+            -- "greater than now()" predicate is false on duplicate ED
+            -- re-runs. nextGameId null (non-numeric
+            -- test ids) matches nothing. Covered by 0027's partial index
+            -- outbox_prediction_pending_target_idx.
+            UPDATE notification_outbox
+            SET next_attempt_at = now()
+            WHERE type = 'prediction'
+              AND status = 'pending'
+              AND target_game_id = ${nextGameId}
+              AND next_attempt_at > now()
+            RETURNING 1
           )
           select
             coalesce(
@@ -236,11 +270,15 @@ export async function onGameEnd(
               (select c.crashed_at from crash_rounds c where c.game_id = ${evt.gameId} limit 1)
             ) as crashed_at,
             l.prediction_id, l.target_multiplier, l.probability, l.confidence,
-            l.regime_name, l.correlation_id, l.requested_at
+            l.regime_name, l.correlation_id, l.requested_at,
+            (select exists(select 1 from rel)) as released_prediction
           from (select 1) x
           left join locked l on true
         `;
         const anchorRow = anchorAndClaim[0]!;
+        // PASS 16: ED(N) just released the held prediction signal for N+1 —
+        // wake the prediction lane after the TX commits (below).
+        releasedPrediction = anchorRow.released_prediction == true;
         state.crashRow =
           anchorRow.began_at == null && anchorRow.crashed_at == null
             ? null
@@ -425,6 +463,17 @@ export async function onGameEnd(
 
       // (ED live_event_log write moved into the el CTE above — pass 12.)
     }, logSlowTxStages("validator.onGameEnd.persist"));
+
+    // PASS 16: the TX committed, so the held prediction signal for N+1 is
+    // now claimable (next_attempt_at = now(), DB clock). Wake the
+    // prediction lane so delivery happens THIS instant instead of waiting
+    // for the next recovery tick — the release only matters if the
+    // dispatcher finds out. Fire-and-forget, never blocks validation.
+    if (releasedPrediction) {
+      void import("@/lib/prediction/live/outbox-wake")
+        .then(({ notifyOutbox }) => notifyOutbox("prediction"))
+        .catch(() => undefined);
+    }
   } catch (e) {
     // Fix 9: structured error telemetry — name, message, stack, game,
     // correlation and event context. `String(e)` alone is not enough to
