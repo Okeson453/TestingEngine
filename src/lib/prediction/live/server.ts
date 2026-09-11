@@ -171,11 +171,12 @@ export async function reEnqueuePrediction(input: z.infer<typeof ReEnqueueInput>)
   const sql = await getSql();
   const prediction = await sql<{
     prediction_id: string;
+    target_game_id: string | null;
     target_multiplier: number;
     probability: number;
     confidence: number;
   }>`
-    select prediction_id, target_multiplier, probability, confidence
+    select prediction_id, target_game_id, target_multiplier, probability, confidence
     from pending_predictions
     where prediction_id = ${parsed.predictionId}
     limit 1
@@ -194,7 +195,7 @@ export async function reEnqueuePrediction(input: z.infer<typeof ReEnqueueInput>)
   for (const chatId of chatIds) {
     const r = await sql<{ id: number }>`
       insert into notification_outbox (
-        notification_id, type, content, metadata, status, priority
+        notification_id, type, content, metadata, target_game_id, status, priority
       ) values (
         ${crypto.randomUUID()}, 'prediction',
         ${`[operator re-enqueue] target=${p.prediction_id}`},
@@ -203,6 +204,7 @@ export async function reEnqueuePrediction(input: z.infer<typeof ReEnqueueInput>)
           chatId,
           kind: "prediction",
         })},
+        ${p.target_game_id ?? null},
         'pending', 2
       )
       on conflict do nothing

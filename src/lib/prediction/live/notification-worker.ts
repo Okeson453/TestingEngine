@@ -25,6 +25,7 @@ import {
 } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { isAuthoritative } from "@/lib/prediction/live/fencing";
+import { isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
 import { getWakeStats } from "@/lib/prediction/live/outbox-wake";
 
 const logger = getLogger("outbox-dispatcher");
@@ -547,6 +548,40 @@ export class OutboxDispatcher {
                 "OUTBOX_DISPATCH missed — remaining lead below minimum safety budget",
               );
               return "dead" as const;
+            }
+
+            // ZERO-RTT TEMPORAL GATE (sep 11): in-memory registry written
+            // synchronously at ED/BG handler entry in the same process
+            // (worker fencing). The DB gates below read live_round_state /
+            // crash_rounds that LAG the real crash by 1-3s (crash_rounds is
+            // persisted detached after the N+1 attempt completes) — in that
+            // window a late signal passed auth and delivered into a crashed
+            // round. This gate closes it with zero DB round trips; the DB
+            // auth below remains the contract for every other case.
+            if (row.type === "prediction") {
+              const regMeta = (row.metadata ?? {}) as Record<string, unknown>;
+              const regTarget =
+                (row.target_game_id as string | null) ??
+                ((regMeta.targetGameId as string) || (regMeta.target_game_id as string) || null);
+              if (regTarget && isTargetPastBettingWindow(regTarget)) {
+                await sql`
+                  update notification_outbox
+                  set status = 'dead_letter',
+                      last_error = 'expired_late_signal: target started/crashed (registry gate)'
+                  where id = ${row.id} and status = 'inflight'
+                `;
+                this.stats.dead += 1;
+                logger.warn(
+                  {
+                    component: "outbox-dispatcher",
+                    notificationId: row.notification_id,
+                    targetGameId: regTarget,
+                    ...lifecycleLogFields(row, lc, this.now(), "dead_registry_temporal_gate"),
+                  },
+                  "OUTBOX_DISPATCH refused by in-memory round registry — target started/crashed",
+                );
+                return "dead" as const;
+              }
             }
 
             // For predictions: HARD temporal contract — a signal for a target

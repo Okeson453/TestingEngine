@@ -34,10 +34,12 @@ import {
   logLatencyBudgetSnapshot,
 } from "@/lib/prediction/live/latency-trace";
 import { syncDbClockOffset, shouldResyncClock } from "@/lib/prediction/live/clock-offset";
+import { noteRoundEnded, noteRoundStarted } from "@/lib/prediction/live/live-round-registry";
 
 const logger = getLogger("game-event-handlers");
 const inFlightEd = new Set<string>();
 const inFlightBg = new Set<string>();
+const inFlightPr = new Set<string>();
 
 // P0 — native WS duplicate-event dedup (idempotency by canonical round ID).
 // inFlightEd only blocks CONCURRENT re-entry; the same crash event arriving
@@ -214,6 +216,10 @@ export async function bgHandler(payload: unknown): Promise<void> {
     0,
     new Date(receivedAt).getTime() - new Date(beganAt).getTime(),
   );
+  // ZERO-RTT registry write — synchronous, before any await. The dispatcher's
+  // pre-send gate consults this so it never relies on the lagging DB writes.
+  // ONLY the real BG (round start) writes startedAt — never pr.
+  noteRoundStarted(gameId, new Date(beganAt).getTime());
 
   try {
     const sql = await getSql();
@@ -309,6 +315,52 @@ export async function bgHandler(payload: unknown): Promise<void> {
 }
 
 /**
+ * SEP 11 FIX: `pr` (prepare — betting opens) handler.
+ *
+ * pr used to be routed into bgHandler, whose unconditional temporal kill
+ * dead-lettered every undelivered prediction targeting the round at
+ * betting-open, ~9-11s before the round actually started, and whose
+ * first-write-wins began_at could never be corrected by the real BG. pr now
+ * ONLY writes an attributable live_event_log row (event_kind 'PR'): no
+ * temporal kill, no began_at write, no registry write.
+ */
+export async function prHandler(payload: unknown): Promise<void> {
+  const gameId = extractLastGameId(payload);
+  if (!gameId) return;
+  if (inFlightPr.has(gameId)) return;
+  inFlightPr.add(gameId);
+
+  const correlationId = randomUUID();
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const beginAt =
+    toIsoString((p.beginTime ?? p.beganAt) as number | string | undefined) ??
+    new Date().toISOString();
+  const receivedAt = new Date().toISOString();
+  const processorLatencyMs = Math.max(
+    0,
+    new Date(receivedAt).getTime() - new Date(beginAt).getTime(),
+  );
+
+  try {
+    const sql = await getSql();
+    await sql`
+      INSERT INTO live_event_log (
+        correlation_id, event_kind, game_id, payload, received_at, processed_at,
+        processor_latency_ms, sla_violated
+      ) VALUES (
+        ${correlationId}::text, 'PR', ${gameId}, ${JSON.stringify({ beginAt })},
+        ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
+      ) ON CONFLICT DO NOTHING
+    `;
+    logger.info({ event: "pr", gameId, correlationId }, "bc pr (betting-open) observed");
+  } catch (error) {
+    logger.warn({ event: "pr", gameId, error: String(error) }, "pr event log failed");
+  } finally {
+    inFlightPr.delete(gameId);
+  }
+}
+
+/**
  * Fix 11: single canonical crash-final normalization.
  *
  * `ed` (round ended) and `st` (settled) are the same semantic event on the
@@ -376,6 +428,13 @@ export async function edHandler(payload: unknown): Promise<void> {
     return;
   }
   inFlightEd.add(gameId);
+  // ZERO-RTT registry write — synchronous, before any await. crash_rounds is
+  // only persisted DETACHED after the N+1 attempt completes (1-3s later); the
+  // dispatcher's pre-send gate consults this registry in the meantime so a
+  // late signal can never deliver into a round that already crashed. Receipt
+  // time is used deliberately: protocol crash timestamps are decode-clock
+  // anyway (native-protocol endTime = Date.now()).
+  noteRoundEnded(gameId);
 
   const correlationId = randomUUID();
   const trace = startTrace(correlationId, gameId);
@@ -567,11 +626,25 @@ export function initializeEventHandlers(): void {
   bcGameSocket.on("ed", edHandler);
 
   nativeBcGameSocket.onEvent((ev) => {
-    if (ev.event === "bg" || ev.event === "pr") {
+    if (ev.event === "bg") {
       void bgHandler({
         gameId: ev.gameId,
         beginTime: ev.beginTime ?? ev.receivedAt,
         beganAt: ev.beginTime ?? ev.receivedAt,
+      });
+    } else if (ev.event === "pr") {
+      // SEP 11 ROOT-CAUSE FIX: `pr` is PREPARE (betting opens, ~9-11s before
+      // the round starts) — a DISTINCT phase per the repo's own normalizer
+      // (realtime/normalizer.ts: pr→"prepare", bg→"begin"). pr used to be
+      // routed into bgHandler, whose unconditional temporal kill dead-lettered
+      // every undelivered prediction targeting the round at betting-open
+      // ("expired_late_signal: BG received") and stamped began_at ~9-11s early
+      // (first-write-wins COALESCE the real bg could never correct). pr now
+      // only writes an attributable PR event log row: no kill, no began_at,
+      // no registry write. The real BG remains the sole round-start authority.
+      void prHandler({
+        gameId: ev.gameId,
+        beginTime: ev.beginTime ?? ev.receivedAt,
       });
     } else if (ev.event === "ed" || ev.event === "st") {
       // Fix 11: ed and st normalize to ONE canonical crash-final event —
