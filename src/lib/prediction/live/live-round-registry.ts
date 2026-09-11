@@ -116,6 +116,14 @@ export function getRoundPhase(gameId: string): RoundPhase | undefined {
   return phase ? { ...phase } : undefined;
 }
 
+/** Zero-RTT target start for forensics when BG already noted this process. */
+export function getRoundStartedAtMs(gameId: string): number | null {
+  const phase = registry.get(gameId);
+  return phase?.startedAt != null && Number.isFinite(phase.startedAt)
+    ? phase.startedAt
+    : null;
+}
+
 /** Test hook — clear all state. */
 export function resetRoundRegistry(): void {
   registry.clear();

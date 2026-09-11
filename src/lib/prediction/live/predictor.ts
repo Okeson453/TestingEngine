@@ -18,6 +18,7 @@ import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
 import { getMedianBettingWindowMs, isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
 import { getEffectiveSkipBelowMs } from "@/lib/prediction/live/gate-cache";
 import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
+import { notifyOutbox } from "@/lib/prediction/live/outbox-wake";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
 import { getSql, getCriticalSql, getPgPool, getLastPoolAcquireMs, type Sql } from "@/lib/db";
@@ -874,7 +875,6 @@ export async function onGameStart(
   // PREDICTION wake (plan §11): the dispatcher's prediction lane runs at once.
   if (outboxEnqueued > 0 && !slaViolated) {
     try {
-      const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
       notifyOutbox("prediction");
     } catch {
       /* soft */
@@ -1504,19 +1504,19 @@ export async function onGameEndPredict(
       slaLagMsActual,
       kind: "prediction",
       recoveryMode,
-      // TIMESTAMP SEMANTICS FIX: immutable per-row timeline — attempt start
-      // (model as-of), measured model-compute cost, model completion. The
-      // remaining instants (persist commit, claim, telegram accept) come
-      // from the existing columns; no back-dated timestamps anywhere.
+      // Immutable stage timeline for PREDICTION_DELIVERY_FORENSICS — every
+      // stage that is known at enqueue time. Later stages (OUTBOX_CLAIMED,
+      // DISPATCH_*, DELIVERY_CONFIRMED) come from outbox columns.
       predictionStartedAt: attemptStartedAt,
       predictionComputeMs,
       predictionGeneratedAt: generatedAt,
       signalReadyAt: generatedAt,
-      // ED RECEIPT ANCHOR (sep 11): true ED(N) worker-receipt instant — the
-      // start of the measured critical path. Persist-commit / outbox-enqueue
-      // instants are the outbox row's created_at (same TX commit); dispatch
-      // start / telegram accept are send_started_at / telegram_accepted_at.
+      predictionCompletedAt: generatedAt,
+      ownershipReservedAt: claim.owned ? new Date(claim.claimedAt).toISOString() : null,
+      ownershipState: claim.owned ? claim.state ?? null : null,
+      owner,
       edReceivedAt: deps.edReceivedAt ?? null,
+      bgTrigger: !!deps.bgTrigger,
     });
 
     // RTT FIX (sep 11 15:11 logs): persist measured ~590ms = acquire + BEGIN
@@ -1604,7 +1604,6 @@ export async function onGameEndPredict(
     // PREDICTION wake (plan §11): lane-aware — dispatcher runs the prediction
     // lane immediately, never queued behind normal work.
     try {
-      const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
       notifyOutbox("prediction");
     } catch { /* soft */ }
 

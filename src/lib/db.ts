@@ -236,6 +236,8 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     idleTimeoutMillis: criticalIdleTimeoutMillis,
     connectionTimeoutMillis: criticalConnTimeout,
     allowExitOnIdle: false,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
   });
   const generalPool = new Pool({
@@ -244,11 +246,62 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     min: generalMin,
     idleTimeoutMillis: generalIdleTimeoutMillis,
     connectionTimeoutMillis: generalConnTimeout,
+    // Match critical: never let node-pg drop idle clients while Neon is still
+    // reachable — mid-stream pool_acquire_ms≈1.1s was TLS+auth after idle exit.
+    allowExitOnIdle: false,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
   });
 
   globalRef.__pgCriticalPool__ = criticalPool;
   globalRef.__pgPool__ = generalPool; // getPgPool / dashboard pin = general
+
+  // PREWARM + KEEPALIVE (sep 11 latency): node-pg min creates sockets, but
+  // Neon still closes idle TCP from the server side. Observed: idleCount≥1
+  // yet pool_acquire_ms≈1059–1159 because the "idle" client was half-open and
+  // connect() rebuilt TLS. Force min clients through SELECT 1 at boot, then
+  // ping both pools every 25s so server-side idle kill never lands on the
+  // prediction/dispatch hot path.
+  void (async () => {
+    const warm = async (pool: import("pg").Pool, label: string, n: number) => {
+      const clients: import("pg").PoolClient[] = [];
+      try {
+        for (let i = 0; i < n; i++) {
+          const c = await pool.connect();
+          await c.query("select 1");
+          clients.push(c);
+        }
+        console.log(`[db] ${label} prewarmed clients=${clients.length}`);
+      } catch (e) {
+        console.warn(`[db] ${label} prewarm failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        for (const c of clients) {
+          try { c.release(); } catch { /* soft */ }
+        }
+      }
+    };
+    await Promise.all([
+      warm(criticalPool, "critical", criticalMin),
+      warm(generalPool, "general", Math.max(1, generalMin)),
+    ]);
+  })();
+
+  const keepAlive = setInterval(() => {
+    for (const [label, pool] of [
+      ["critical", criticalPool],
+      ["general", generalPool],
+    ] as const) {
+      void pool
+        .query("select 1")
+        .catch((e) =>
+          console.warn(
+            `[db] ${label} keepalive failed: ${e instanceof Error ? e.message : String(e)}`,
+          ),
+        );
+    }
+  }, 25_000);
+  keepAlive.unref?.();
 
   const monitor = setInterval(() => {
     for (const [label, pool, max] of [

@@ -26,7 +26,7 @@ import {
 import { getLogger } from "@/lib/observability/logger";
 import { isAuthoritative } from "@/lib/prediction/live/fencing";
 import { isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
-import { getWakeStats } from "@/lib/prediction/live/outbox-wake";
+import { getWakeStats, notifyOutbox, waitForOutboxWake } from "@/lib/prediction/live/outbox-wake";
 
 const logger = getLogger("outbox-dispatcher");
 
@@ -42,7 +42,7 @@ const logger = getLogger("outbox-dispatcher");
 // Recovery/fallback only — wake path is the primary drain trigger. 500ms
 // bounds missed-wake latency without hammering the critical pool (was 2s,
 // which alone could account for a large fraction of 2.5–4s outbox lag).
-export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 500);
+export const TICK_MS = Number(process.env.OUTBOX_TICK_MS ?? 100);
 export const BATCH_SIZE = Number(process.env.OUTBOX_BATCH_SIZE ?? 16);
 /** Prediction lane is strictly single-item: freshness over throughput.
  * There is normally only one actionable N+1 prediction at a time. A new
@@ -218,7 +218,6 @@ export class OutboxDispatcher {
     this.running = false;
     // Nudge the loop so a pending wait resolves immediately and the loop exits.
     try {
-      const { notifyOutbox } = await import("@/lib/prediction/live/outbox-wake");
       notifyOutbox();
     } catch {
       /* wake module optional in tests */
@@ -1554,7 +1553,6 @@ export class OutboxDispatcher {
     normal: boolean;
   } | null> {
     try {
-      const { waitForOutboxWake } = await import("@/lib/prediction/live/outbox-wake");
       return await waitForOutboxWake(TICK_MS);
     } catch {
       // wake module unavailable in some test contexts — plain timer fallback

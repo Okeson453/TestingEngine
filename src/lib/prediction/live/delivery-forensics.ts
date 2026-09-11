@@ -14,6 +14,7 @@
 
 import type { Sql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
+import { getRoundStartedAtMs } from "@/lib/prediction/live/live-round-registry";
 
 const logger = getLogger("delivery-forensics");
 
@@ -330,6 +331,14 @@ export async function recordDeliveredForensics(
 ): Promise<DeliveryForensicsRecord> {
   let targetStartedAt: string | null = null;
   if (args.targetGameId) {
+    // Zero-RTT: same-process BG already noted target start — avoids UNKNOWN
+    // when evidence exists in the registry while DB lag would leave NULL.
+    const memMs = getRoundStartedAtMs(args.targetGameId);
+    if (memMs != null) {
+      targetStartedAt = new Date(memMs).toISOString();
+    }
+  }
+  if (args.targetGameId && !targetStartedAt) {
     try {
       const rows = await sql<{ began_at: string | Date | null }>`
         SELECT began_at FROM live_round_state WHERE game_id = ${args.targetGameId} LIMIT 1
