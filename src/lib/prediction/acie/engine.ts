@@ -503,18 +503,7 @@ export class ACIEEngine {
               : 0.65,
     });
 
-    this.pendingContext = {
-      history: this.crashPoints.slice(-20).map((c) => ({ crashPoint: c })),
-      sequenceState,
-      regime,
-      regimeDuration: this.online.regimeDuration,
-      psiProbability: decisionProbability,
-      psiConfidence: 1 - Math.min(1, psi.modelUncertainty + psi.dataUncertainty),
-      prediction: strategy.isOpportunity,
-    };
-
-    // Model-agreement gate: high ensemble disagreement → skip. Weakly
-    // agreed signals historically underperformed the base rate.
+    // Model-agreement gate BEFORE pendingContext so learning sees the true decision.
     const modelPs = Object.values(this.lastModelProbabilities);
     let disagreement = 0;
     if (modelPs.length >= 2) {
@@ -528,6 +517,24 @@ export class ACIEEngine {
     }
     const maxDisagreement = Number(process.env.ACIE_MAX_DISAGREEMENT ?? 0.06);
     const agreementOk = disagreement <= maxDisagreement;
+
+    if (strategy.isOpportunity && !agreementOk) {
+      strategy.action = 'SKIP';
+      strategy.isOpportunity = false;
+      strategy.reason =
+        `Ensemble disagreement ${disagreement.toFixed(3)} > ${maxDisagreement} — quality gate`;
+      strategy.stake = 0;
+    }
+
+    this.pendingContext = {
+      history: this.crashPoints.slice(-20).map((c) => ({ crashPoint: c })),
+      sequenceState,
+      regime,
+      regimeDuration: this.online.regimeDuration,
+      psiProbability: decisionProbability,
+      psiConfidence: 1 - Math.min(1, psi.modelUncertainty + psi.dataUncertainty),
+      prediction: strategy.isOpportunity,
+    };
 
     let signal: EntrySignal | null = null;
     if (
@@ -552,13 +559,6 @@ export class ACIEEngine {
         psi: { ...psi, estimatedProbability: decisionProbability },
         evidenceReport: { ...evidence, status: evidenceStatus },
       };
-    } else if (strategy.isOpportunity && !agreementOk) {
-      // Force SKIP path for selectivity / logging when models disagree.
-      strategy.action = 'SKIP';
-      strategy.isOpportunity = false;
-      strategy.reason =
-        `Ensemble disagreement ${disagreement.toFixed(3)} > ${maxDisagreement} — quality gate`;
-      strategy.stake = 0;
     }
 
     return {

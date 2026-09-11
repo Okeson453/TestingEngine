@@ -1178,7 +1178,12 @@ export async function onGameEndPredict(
         "N+1_UNAVAILABLE_HISTORY — live history not READY (boot must warm >= MIN_HISTORY before ED)",
       );
     } else {
-      priorRounds = getPriorRoundsSync(MAX_HISTORY, gameId, crashedAt);
+      // FORENSIC FIX: include the just-completed source round N in history for
+      // N+1. Prior call excluded gameId AND applied t < crashedAt, which
+      // dropped Crash N from priorRounds. ACIE masked this via observeRound;
+      // FALLBACK_BASELINE PredictionEngine predicted from N-1 only (stale).
+      // Exclude only the target (not yet observed); no source time cutoff.
+      priorRounds = getPriorRoundsSync(MAX_HISTORY, targetGameId);
     }
   } catch {
     /* soft — priorRounds stays empty */

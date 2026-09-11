@@ -1,8 +1,8 @@
 /**
  * BC.Game native WS → live prediction pipeline.
  *
- * BG(N)  → PRIMARY N+1 prediction trigger (predicts N+1 while round N runs)
- * ED(N)  → validation of N + FALLBACK N+1 prediction (only if BG missed)
+ * ED(N)  → PRIMARY N+1 prediction (completed crash N) + validation of N
+ * BG(N)  → started_at stamp + temporal kill; optional N+1 via BG_PRIMARY_PREDICT=1
  * Poll   → recovery only
  */
 import { randomUUID } from "node:crypto";
@@ -203,20 +203,16 @@ function nextTargetGameId(sourceGameId: string): string {
 }
 
 /**
- * BG(N): reconcile target start + PRIMARY N+1 prediction trigger.
+ * BG(N): reconcile target start + temporal kill of late signals for N.
  *
- * SEP 11 ARCHITECTURE CHANGE (BG-primary / ED-fallback):
- *  1. Reconcile (unchanged): stamp began_at + target_round_started_at on the
- *     pending prediction for N, hard temporal kill of late signals for N.
- *  2. NEW PRIMARY PATH: immediately claim and generate the prediction for
- *     N+1 — while round N is still running. Round N's crash is unknown at
- *     this instant (bgTrigger mode: history/ACIE run through N-1); every
- *     existing gate (edge/selectivity/strategy/temporal/1.30x target) applies
- *     unchanged. Ownership is enforced by the SAME single boundary
- *     (attemptNPlusOnePrediction → claimTarget + pending_predictions unique
- *     constraint): one target round → one prediction owner. ED(N) later sees
- *     the target already claimed/persisted and skips — it is now the
- *     FALLBACK path, not the primary.
+ * Default (ED-primary): does NOT claim or compute N+1. Optional legacy path
+ * when BG_PRIMARY_PREDICT=1: reserve + attemptNPlusOnePrediction for N+1
+ * while round N is still running (history/ACIE through N-1 only).
+ *
+ * Always:
+ *  1. noteRoundStarted (zero-RTT registry)
+ *  2. Stamp began_at / target_round_started_at / live_round_state
+ *  3. Hard temporal kill of undelivered prediction outbox rows targeting N
  */
 // Exported for tests: the BG-arrival signal-kill contract is asserted
 // directly against this handler (see outbox-lifecycle.test.ts).
@@ -915,7 +911,7 @@ export async function edHandler(payload: unknown): Promise<void> {
           endTime: crashedAt,
           multiplier,
           receivedAt: new Date().toISOString(),
-          skipPredict: true, // N+1 owned by BG primary (ED is fallback)
+          skipPredict: true, // N+1 already attempted above on ED primary path
         }).catch((error) => {
           logger.error(
             { event: sourceEvent, gameId, error: String(error), correlationId },
@@ -1001,7 +997,7 @@ export function initializeEventHandlers(): void {
     );
   });
 
-  logger.info({ component: "game-event-handlers" }, "event handlers wired (BG-primary, ED-fallback)");
+  logger.info({ component: "game-event-handlers" }, "event handlers wired (ED-primary N+1, BG temporal + optional BG_PRIMARY_PREDICT)");
 }
 
 /** Called by worker boot — native WS primary; socket.io optional fallback. */
