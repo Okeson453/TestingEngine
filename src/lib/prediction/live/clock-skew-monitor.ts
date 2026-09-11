@@ -116,23 +116,22 @@ export class ClockSkewMonitor {
       measuredAt: new Date(this.now()).toISOString(),
       wallClockSkewMs,
     };
-    await sql`
-      insert into worker_state (key, value) values ('last_bg_to_recv_lag_ms_p95', ${String(snap.p95LagMs ?? "")})
-      on conflict (key) do update set value = excluded.value, updated_at = now()
-    `;
-    await sql`
-      insert into worker_state (key, value) values ('last_bg_to_recv_lag_ms_p50', ${String(snap.p50LagMs ?? "")})
-      on conflict (key) do update set value = excluded.value, updated_at = now()
-    `;
+    // ROUND-TRIP FIX (sep 11 forensic pass): this block used to issue 2-5
+    // SEQUENTIAL worker_state upserts (p95, p50, and — when skew exceeded
+    // the threshold — clock_skew_action/effective_skip_below_ms and
+    // sheath_force_warn). At ~150ms Neon RTT that is ~300-900ms of pure
+    // sequential write latency on the general pool every SKEW_INTERVAL_MS,
+    // the same multi-RTT pattern the BG reconcile CTE fix eliminated.
+    // All rows target the same table with independent keys and no
+    // read-modify-write interdependence → ONE multi-row upsert.
+    const stateRows: Array<{ key: string; value: string }> = [
+      { key: "last_bg_to_recv_lag_ms_p95", value: String(snap.p95LagMs ?? "") },
+      { key: "last_bg_to_recv_lag_ms_p50", value: String(snap.p50LagMs ?? "") },
+    ];
     if (wallClockSkewMs != null) {
-      await sql`
-        insert into worker_state (key, value) values ('wall_clock_skew_ms', ${String(wallClockSkewMs)})
-        on conflict (key) do update set value = excluded.value, updated_at = now()
-      `;
-      try {
-        const { setWallClockSkewMs } = await import("@/lib/prediction/live/gate-cache");
-        setWallClockSkewMs(wallClockSkewMs);
-      } catch { /* soft */ }
+      stateRows.push(
+        { key: "wall_clock_skew_ms", value: String(wallClockSkewMs) },
+      );
       if (Math.abs(wallClockSkewMs) > WALL_CLOCK_SKEW_WARN_MS) {
         logger.error(
           { component: "clock-skew-monitor", wallClockSkewMs, threshold: WALL_CLOCK_SKEW_WARN_MS },
@@ -144,23 +143,43 @@ export class ClockSkewMonitor {
           200,
           Math.max(80, Math.abs(wallClockSkewMs) > 2_000 ? 200 : 120),
         );
-        await sql`
-          insert into worker_state (key, value) values
-            ('clock_skew_action', ${'raise_skip_threshold:' + String(adjusted)}),
-            ('effective_skip_below_ms', ${String(adjusted)})
-          on conflict (key) do update set value = excluded.value, updated_at = now()
-        `;
-        try {
-          const { setEffectiveSkipBelowMs } = await import("@/lib/prediction/live/gate-cache");
-          setEffectiveSkipBelowMs(adjusted);
-        } catch { /* soft */ }
-        // Tighten sheath warn rate temporarily via env-like state
-        await sql`
-          insert into worker_state (key, value)
-          values ('sheath_force_warn', ${Math.abs(wallClockSkewMs) > 5_000 ? '1' : '0'})
-          on conflict (key) do update set value = excluded.value, updated_at = now()
-        `;
+        stateRows.push(
+          { key: "clock_skew_action", value: "raise_skip_threshold:" + String(adjusted) },
+          { key: "effective_skip_below_ms", value: String(adjusted) },
+          { key: "sheath_force_warn", value: Math.abs(wallClockSkewMs) > 5_000 ? "1" : "0" },
+        );
       }
+    }
+    // values ($1::text, $2::text), ($3::text, $4::text), ... — the Sql
+    // wrapper is template-only (arrays would serialize as one JSON param),
+    // so the batched-write pattern uses sql.query with numbered params,
+    // same as reclassifyOnTargetStart (pass 8).
+    const flatParams: string[] = [];
+    const valueRows = stateRows
+      .map((r) => {
+        flatParams.push(r.key, r.value);
+        const n = flatParams.length;
+        return `($${n - 1}::text, $${n}::text)`;
+      })
+      .join(", ");
+    await sql.query(
+      `insert into worker_state (key, value)
+       values ${valueRows}
+       on conflict (key) do update set value = excluded.value, updated_at = now()`,
+      flatParams,
+    );
+    if (wallClockSkewMs != null && Math.abs(wallClockSkewMs) > WALL_CLOCK_SKEW_WARN_MS) {
+      // Restore in-memory gate caches from the corrective action computed
+      // above (was inline in the old per-key write block).
+      try {
+        const { setWallClockSkewMs } = await import("@/lib/prediction/live/gate-cache");
+        setWallClockSkewMs(wallClockSkewMs);
+      } catch { /* soft */ }
+      try {
+        const { setEffectiveSkipBelowMs } = await import("@/lib/prediction/live/gate-cache");
+        const actionRow = stateRows.find((r) => r.key === "effective_skip_below_ms");
+        if (actionRow) setEffectiveSkipBelowMs(Number(actionRow.value));
+      } catch { /* soft */ }
     }
     logger.info(
       { component: "clock-skew-monitor", ...snap },
