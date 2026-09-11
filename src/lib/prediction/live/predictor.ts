@@ -15,7 +15,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
-import { getMedianBettingWindowMs } from "@/lib/prediction/live/live-round-registry";
+import { getMedianBettingWindowMs, isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
 import { getEffectiveSkipBelowMs } from "@/lib/prediction/live/gate-cache";
 import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
@@ -783,6 +783,7 @@ export interface OnGameEndPredictResult {
     | "skipped_stale_source"
     | "skipped_invalid_target"
     | "skipped_insufficient_window"
+    | "skipped_target_started"
     | "skipped_no_edge"
     | "temporally_invalid"
     | "persist_failed";
@@ -867,6 +868,33 @@ export async function onGameEndPredict(
   // time). Enforce the previously-dead window guards here: a prediction with
   // no remaining window is refused AT GENERATION instead of being persisted,
   // enqueued, and delivered into a round that already began.
+  //
+  // RECOVERY GUARD (sep 11 advisor DEF-4): the registry knows synchronously —
+  // written at ED/BG handler entry, before any await — when the target round
+  // has already started or crashed. Recovery paths deliberately FORCE
+  // attempts for targets that are already live ("target live but no pending
+  // prediction — forcing recovery attempt"); a signal for such a target is
+  // late by construction. Refuse here, never persist-then-kill at dispatch.
+  if (isTargetPastBettingWindow(targetGameId)) {
+    completeTarget(targetGameId, owner);
+    logger.warn(
+      {
+        component: "live-predictor",
+        sourceGameId: gameId,
+        targetGameId,
+        recoveryMode: !!deps.recoveryMode,
+      },
+      "skipping prediction: target already started/ended (registry)",
+    );
+    return {
+      predictionId: null,
+      targetGameId,
+      kind: "skipped_target_started",
+      sourceGameId: gameId,
+      sourceCrashAt: crashedAt,
+      outboxEnqueued: 0,
+    };
+  }
   const crashedAtMs = new Date(crashedAt).getTime();
   const bettingWindowMs = getMedianBettingWindowMs();
   const predictedStartMs = (Number.isFinite(crashedAtMs) ? crashedAtMs : Date.now()) + bettingWindowMs;
