@@ -43,6 +43,7 @@ import {
   evaluateSheath,
   recordPredictionOutcome,
 } from "@/lib/core/sheath-mode";
+import { getAdaptiveMinEdge } from "@/lib/prediction/live/adaptive-edge";
 
 const logger = getLogger("live-predictor");
 // SYNTAX_GUARD_20260906: file must parse under node --experimental-strip-types
@@ -124,7 +125,7 @@ const DEFAULT_TARGET: ThresholdTarget = 1.3;
  *  Prior default 0.04 needed ~81% which almost never fired with baseline P≈fair.
  *  NOTE: defaults were briefly 0 which disabled the live "NO BET" path entirely;
  *  restored 0.015 so production can actually skip weak rounds. */
-export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.015);
+export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.02);
 export const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
 export const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
 
@@ -143,7 +144,7 @@ export function shouldSkipSignal(input: {
 }): boolean {
   const targetNum = Number(input.target ?? 1.3);
   const fair = targetNum > 1 ? 1 / targetNum : 0.5;
-  const minEdge = input.minEdge ?? MIN_SIGNAL_EDGE;
+  const minEdge = input.minEdge ?? getAdaptiveMinEdge();
   const minP = input.minProbability ?? MIN_SIGNAL_PROBABILITY;
   const minC = input.minConfidence ?? MIN_SIGNAL_CONFIDENCE;
   const needP = Math.max(minP, fair + minEdge);
@@ -1340,7 +1341,8 @@ export async function onGameEndPredict(
     if (skip) {
       const targetNum = Number(DEFAULT_TARGET);
       const fair = targetNum > 1 ? 1 / targetNum : 0.5;
-      const needP = Math.max(MIN_SIGNAL_PROBABILITY, fair + MIN_SIGNAL_EDGE);
+      const adaptiveEdge = getAdaptiveMinEdge();
+      const needP = Math.max(MIN_SIGNAL_PROBABILITY, fair + adaptiveEdge);
       const strategySkip =
         String(strategyAction ?? "").toUpperCase() === "SKIP" ||
         String(pipelineAction ?? "").toUpperCase() === "SKIP";
@@ -1353,7 +1355,7 @@ export async function onGameEndPredict(
           confidence: c,
           fair,
           needP,
-          minEdge: MIN_SIGNAL_EDGE,
+          minEdge: getAdaptiveMinEdge(),
           strategyAction,
           pipelineAction,
           strategySkip,

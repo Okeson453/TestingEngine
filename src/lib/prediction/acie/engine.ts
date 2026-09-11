@@ -513,9 +513,26 @@ export class ACIEEngine {
       prediction: strategy.isOpportunity,
     };
 
+    // Model-agreement gate: high ensemble disagreement → skip. Weakly
+    // agreed signals historically underperformed the base rate.
+    const modelPs = Object.values(this.lastModelProbabilities);
+    let disagreement = 0;
+    if (modelPs.length >= 2) {
+      const mean = modelPs.reduce((a, b) => a + b, 0) / modelPs.length;
+      let varSum = 0;
+      for (const x of modelPs) {
+        const d = x - mean;
+        varSum += d * d;
+      }
+      disagreement = Math.sqrt(varSum / modelPs.length);
+    }
+    const maxDisagreement = Number(process.env.ACIE_MAX_DISAGREEMENT ?? 0.06);
+    const agreementOk = disagreement <= maxDisagreement;
+
     let signal: EntrySignal | null = null;
     if (
       strategy.isOpportunity &&
+      agreementOk &&
       (strategy.action === 'ENTRY' || strategy.action === 'REDUCED_ENTRY')
     ) {
       signal = {
@@ -528,12 +545,20 @@ export class ACIEEngine {
         stake: strategy.stake,
         reason:
           strategy.reason +
-          (useCalibrated ? ' [calibrated]' : ' [raw]'),
+          (useCalibrated ? ' [calibrated]' : ' [raw]') +
+          ` [disagree=${disagreement.toFixed(3)}]`,
         confidence: strategy.confidence,
         timestamp: new Date().toISOString(),
         psi: { ...psi, estimatedProbability: decisionProbability },
         evidenceReport: { ...evidence, status: evidenceStatus },
       };
+    } else if (strategy.isOpportunity && !agreementOk) {
+      // Force SKIP path for selectivity / logging when models disagree.
+      strategy.action = 'SKIP';
+      strategy.isOpportunity = false;
+      strategy.reason =
+        `Ensemble disagreement ${disagreement.toFixed(3)} > ${maxDisagreement} — quality gate`;
+      strategy.stake = 0;
     }
 
     return {

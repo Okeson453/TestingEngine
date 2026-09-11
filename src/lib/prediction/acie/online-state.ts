@@ -85,7 +85,7 @@ export function createInitialOnlineState(): OnlineAdaptiveState {
   for (const n of MODEL_NAMES) weights[n] = equal;
   return {
     observationCount: 0,
-    ewmaHitRate: 0.65,
+    ewmaHitRate: 0.77, // ≈ fair 1.30× base rate
     ewmaBrier: 0.25,
     ewmaResidual: 0,
     ensembleWeights: weights,
@@ -104,7 +104,7 @@ export function createInitialOnlineState(): OnlineAdaptiveState {
     consecutiveBelow: 0,
     consecutiveAbove: 0,
     sequenceState: null,
-    lastPsiProbability: 0.65,
+    lastPsiProbability: 0.77,
     sinceHeavyValidation: 0,
     lastHeavyValidationAt: 0,
   };
@@ -183,16 +183,18 @@ export function applyOnlineUpdate(
     next.longSquaredErrors.shift();
   }
 
-  // Online ensemble weight update: reward models closer to actual
-  // multiplicative weights update (simple online learning)
+  // Online ensemble weight update: reward models closer to actual.
+  // Stronger multiplicative update (was 0.9/0.1) so recent accuracy
+  // shifts the ensemble within ~30–50 rounds instead of hundreds.
   let weightSum = 0;
   for (const name of MODEL_NAMES) {
     const mp = params.modelProbabilities[name] ?? p;
     const mRes = mp - actual;
     const mSq = mRes * mRes;
-    // Lower squared error → higher weight; soft update
-    const score = Math.exp(-3 * mSq);
-    next.ensembleWeights[name] = (state.ensembleWeights[name] ?? equalWeight()) * (0.9 + 0.1 * score);
+    // Lower squared error → higher weight; faster adaptation
+    const score = Math.exp(-4.5 * mSq);
+    next.ensembleWeights[name] =
+      (state.ensembleWeights[name] ?? equalWeight()) * (0.82 + 0.18 * score);
     weightSum += next.ensembleWeights[name];
   }
   if (weightSum > 0) {

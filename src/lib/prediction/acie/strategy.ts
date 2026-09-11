@@ -20,46 +20,65 @@ import type {
   StrategyPolicyMode,
 } from './types.ts';
 
-/** Classic conservative defaults (lower entry rate). */
+/**
+ * Fair odds for 1.30× cash-out: 1/1.30 ≈ 0.7692.
+ * Any ENTRY threshold BELOW fair is negative EV on average and drags
+ * realized win rate toward (or below) the base rate.
+ *
+ * QUALITY mode (default): require probability ≥ fair + edge so emitted
+ * signals are positive-EV candidates. Volume is secondary to hit rate.
+ */
+const FAIR_130 = 1 / 1.3;
+const QUALITY_EDGE = Number(process.env.ACIE_QUALITY_EDGE ?? 0.025);
+const STRONG_EDGE = Number(process.env.ACIE_STRONG_EDGE ?? 0.045);
+
+/** Quality-first defaults — thresholds at/above fair + edge. */
 export const DEFAULT_STRATEGY_POLICY: StrategyPolicy = {
   mode: 'adaptive',
-  supportedThreshold: 0.62,
-  weakThreshold: 0.66,
-  fallbackThreshold: 0.6,
-  maxCalibrationError: 0.14,
-  highUncertainty: 0.22,
-  consecutiveLossReduceAt: 4,
-  reducedStakeFactor: 0.5,
+  supportedThreshold: FAIR_130 + QUALITY_EDGE, // ~0.794
+  weakThreshold: FAIR_130 + STRONG_EDGE, // ~0.814
+  fallbackThreshold: FAIR_130 + QUALITY_EDGE + 0.01,
+  maxCalibrationError: 0.12,
+  highUncertainty: 0.18,
+  consecutiveLossReduceAt: 3,
+  reducedStakeFactor: 0.45,
   defaultStake: 700,
-  // Disabled hard skip: engine counts stream sub-1.30 streaks, not entry losses
-  consecutiveLossSkipAt: 999,
-  consecutiveLossMaxSkip: 0,
-  lossStreakThresholdEscalation: 0.01,
-};
-
-/**
- * Tuned for ≥500 selective entries/day at 1.30× cash-out.
- */
-export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
-  mode: 'adaptive',
-  supportedThreshold: 0.58,
-  weakThreshold: 0.62,
-  fallbackThreshold: 0.57,
-  maxCalibrationError: 0.16,
-  highUncertainty: 0.25,
-  consecutiveLossReduceAt: 5,
-  reducedStakeFactor: 0.6,
-  defaultStake: 700,
-  // Disabled hard skip — see DEFAULT_STRATEGY_POLICY comment
   consecutiveLossSkipAt: 999,
   consecutiveLossMaxSkip: 0,
   lossStreakThresholdEscalation: 0.015,
 };
 
+/**
+ * High-frequency policy kept for explicit opt-in only.
+ * Still floors at fair odds so volume cannot force negative-EV entries.
+ */
+export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
+  mode: 'adaptive',
+  supportedThreshold: FAIR_130 + 0.01,
+  weakThreshold: FAIR_130 + QUALITY_EDGE,
+  fallbackThreshold: FAIR_130,
+  maxCalibrationError: 0.14,
+  highUncertainty: 0.22,
+  consecutiveLossReduceAt: 4,
+  reducedStakeFactor: 0.55,
+  defaultStake: 700,
+  consecutiveLossSkipAt: 999,
+  consecutiveLossMaxSkip: 0,
+  lossStreakThresholdEscalation: 0.012,
+};
+
+/** Resolve active policy: QUALITY (default) or HF when ACIE_STRATEGY_MODE=hf. */
+function resolveDefaultPolicy(): StrategyPolicy {
+  const mode = String(process.env.ACIE_STRATEGY_MODE ?? "quality").toLowerCase();
+  return mode === "hf" || mode === "high_frequency"
+    ? HIGH_FREQUENCY_STRATEGY_POLICY
+    : DEFAULT_STRATEGY_POLICY;
+}
+
 export class StrategyLayer {
   private readonly policy: StrategyPolicy;
 
-  constructor(policy: StrategyPolicy = HIGH_FREQUENCY_STRATEGY_POLICY) {
+  constructor(policy: StrategyPolicy = resolveDefaultPolicy()) {
     this.policy = policy;
   }
 
@@ -228,15 +247,17 @@ export class StrategyLayer {
     ctx: StrategyDecisionContext
   ): number {
     let t = base;
+    // Quality: raise bar in hard regimes; never lower below fair via regime bonus.
     if (regime === 'deep-low' || regime === 'low-cluster') {
-      t -= 0.025;
+      t += 0.02; // streaks of sub-1.30 are hostile — demand more edge
     } else if (regime === 'volatile') {
-      t += 0.02;
+      t += 0.03;
     } else if (regime === 'high-activity') {
-      t -= 0.01;
+      t += 0.005;
     }
     const lo = ctx.confidenceInterval?.[0];
-    if (typeof lo === 'number' && lo >= 0.55) {
+    // Only ease threshold when lower CI is itself above fair.
+    if (typeof lo === 'number' && lo >= FAIR_130) {
       t -= 0.01;
     }
 
@@ -249,7 +270,9 @@ export class StrategyLayer {
       t += Math.min(extra, 0.05);
     }
 
-    return Math.max(0.52, Math.min(0.75, t));
+    // Floor at fair odds; ceiling allows selective high-confidence entries.
+    // Prior clamp at 0.75 was BELOW fair (~0.769) and forced negative-EV ENTRY.
+    return Math.max(FAIR_130, Math.min(0.92, t));
   }
 
   private reducedStake(_risk: StrategyDecisionContext['riskState']): number {

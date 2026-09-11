@@ -15,6 +15,7 @@
 
 import { getLogger } from "@/lib/observability/logger";
 import { getSql } from "@/lib/db";
+import { recordSignalOutcome } from "@/lib/prediction/live/adaptive-edge";
 
 const logger = getLogger("prediction-feedback");
 
@@ -376,6 +377,14 @@ export async function processResolvedPredictionFeedback(
   }
 
   let incrementalCount: number | null = null;
+
+  // Adaptive selectivity: feed realized signal outcomes into MIN edge.
+  // Only claimed (first) feedback runs update the rolling window.
+  try {
+    recordSignalOutcome(input.result === "WIN");
+  } catch {
+    /* soft */
+  }
 
   // 1. Incremental state (every crash)
   try {
