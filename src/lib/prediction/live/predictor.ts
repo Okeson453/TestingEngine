@@ -22,7 +22,7 @@ import { notifyOutbox } from "@/lib/prediction/live/outbox-wake";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
 import { getSql, getCriticalSql, getPgPool, getLastPoolAcquireMs, type Sql } from "@/lib/db";
-import { runInTransaction, type TxStageTimings } from "@/lib/prediction/live/tx";
+import { runInTransaction, logSlowTxStages, type TxStageTimings } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
 import type { FeaturePath, HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
@@ -760,7 +760,9 @@ export async function onGameStart(
   let outboxEnqueued = 0;
 
   try {
-    await runInTransaction(sql, async (tx) => {
+    await runInTransaction(
+      sql,
+      async (tx) => {
       const ins = await tx<{ prediction_id: string; requested_at: string }>`
         insert into pending_predictions (
           prediction_id, target_multiplier, probability, confidence,
@@ -827,7 +829,9 @@ export async function onGameStart(
           ${Math.max(0, now() - receivedMs)}, ${slaViolated}
         )
       `;
-    });
+    },
+      logSlowTxStages("predictor.onGameStart.persist"),
+    );
   } catch (e) {
     logger.error(
       {

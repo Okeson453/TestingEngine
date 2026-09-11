@@ -17,7 +17,7 @@
  *   attempts >= MAX_ATTEMPTS  --tick-->  DEAD
  */
 import { getCriticalSql, getSql, getCriticalPool, type Sql } from "@/lib/db";
-import { runInTransaction } from "@/lib/prediction/live/tx";
+import { runInTransaction, logSlowTxStages } from "@/lib/prediction/live/tx";
 import {
   sendTelegramMessage,
   sendTelegramMessagePrimaryFirst,
@@ -481,7 +481,9 @@ export class OutboxDispatcher {
           r.attempt_count = (r.attempt_count ?? 0) + 1;
         }
         return rows;
-        });
+        },
+        logSlowTxStages("notification-worker.claim.legacyFallback"),
+        );
       }
     })();
     // claimGateDead no longer used (sweep moved to recoverStale); keep for

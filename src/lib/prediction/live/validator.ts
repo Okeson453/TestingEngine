@@ -18,7 +18,7 @@
 import { randomUUID } from "node:crypto";
 import { getSql, type Sql } from "@/lib/db";
 import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
-import { runInTransaction } from "@/lib/prediction/live/tx";
+import { runInTransaction, logSlowTxStages } from "@/lib/prediction/live/tx";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEndPredict } from "@/lib/prediction/live/predictor";
@@ -384,7 +384,7 @@ export async function onGameEnd(
         )
         on conflict do nothing
       `;
-    });
+    }, logSlowTxStages("validator.onGameEnd.persist"));
   } catch (e) {
     // Fix 9: structured error telemetry — name, message, stack, game,
     // correlation and event context. `String(e)` alone is not enough to

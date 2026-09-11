@@ -48,6 +48,41 @@ export interface TxStageTimings {
 
 export type TxStageReporter = (t: TxStageTimings) => void;
 
+/**
+ * FORENSIC INSTRUMENTATION GAP (closed here): TxStageTimings has always been
+ * computed per-transaction, but `runInTransaction`'s `onStage` parameter was
+ * never supplied by any caller (predictor.ts persist, notification-worker.ts
+ * outbox claim, validator.ts persist) — every one of those transactions
+ * logged, at best, an undifferentiated total via the caller's own ad-hoc
+ * timing, with no way to tell whether a slow transaction was acquire-bound
+ * (cold/contended connection), begin-bound, body-bound (the caller's actual
+ * statement), or commit-bound. That ambiguity is exactly what makes a slow
+ * transaction get reflexively blamed on "pool contention" — it may not be.
+ * `logSlowTxStages` gives every `runInTransaction` caller a one-line opt-in
+ * to get a stage breakdown logged whenever the transaction is slow, without
+ * having to duplicate this logic at each call site.
+ */
+export function logSlowTxStages(label: string, thresholdMs = 300): TxStageReporter {
+  return (t: TxStageTimings) => {
+    if (t.totalMs < thresholdMs) return;
+    // Identify the dominant stage so a slow-transaction log line points
+    // straight at "acquire" (connection/pool), "begin"/"commit" (round-trip
+    // overhead), or "body" (the caller's own statement) instead of forcing
+    // a re-read of raw numbers to figure out which one actually mattered.
+    const stages: Array<[string, number]> = [
+      ["acquire", t.acquireMs],
+      ["begin", t.beginMs],
+      ["body", t.bodyMs],
+      ["commit", t.commitMs],
+    ];
+    const dominant = stages.reduce((a, b) => (b[1] > a[1] ? b : a));
+    console.warn(
+      `[tx] ${label} slow_tx_ms=${t.totalMs} dominant=${dominant[0]} ` +
+        `acquire_ms=${t.acquireMs} begin_ms=${t.beginMs} body_ms=${t.bodyMs} commit_ms=${t.commitMs}`,
+    );
+  };
+}
+
 export async function runInTransaction<T>(
   sql: Sql,
   fn: (tx: Sql) => Promise<T>,
