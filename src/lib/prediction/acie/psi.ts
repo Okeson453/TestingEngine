@@ -237,8 +237,9 @@ export class PredictiveSequenceIntelligence {
     // Mild anti-momentum only (hard skip gate removed from strategy).
     // Keep small penalties so long low streaks don't inflate P.
     let momentum = baseline;
-    if (streakBelow >= 3) {
-      const penalty = Math.min(0.06, (streakBelow - 2) * 0.02);
+    if (streakBelow >= 2) {
+      // Max useful streak signal is 2; do not wait until 3/4/5.
+      const penalty = Math.min(0.06, streakBelow * 0.02);
       momentum = clamp01(baseline - penalty);
     } else if (streakAbove >= 5) {
       momentum = clamp01(baseline - 0.015);
@@ -332,7 +333,7 @@ export class PredictiveSequenceIntelligence {
 
     const nextRoundHitRate = nextRoundHits / matchCount;
     // Mild extra penalty only on longer streaks
-    const streakPenalty = streak >= 4 ? 0.03 : 0;
+    const streakPenalty = streak >= 2 ? 0.025 : 0;
     return clamp01(nextRoundHitRate - streakPenalty);
   }
 

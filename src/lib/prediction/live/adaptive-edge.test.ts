@@ -112,4 +112,56 @@ describe("strategy fair-odds quality", () => {
     );
     assert.equal(d.isOpportunity, true);
   });
+
+  it("skips once consecutive losses reach max streak of 2 (not 3/4/5)", () => {
+    assert.equal(DEFAULT_STRATEGY_POLICY.consecutiveLossSkipAt, 2);
+    assert.equal(DEFAULT_STRATEGY_POLICY.consecutiveLossReduceAt, 2);
+    const layer = new StrategyLayer(DEFAULT_STRATEGY_POLICY);
+    const d = layer.evaluate({
+      target: 1.3,
+      probability: 0.90,
+      confidenceInterval: [0.82, 0.95],
+      calibrationError: 0.03,
+      evidence: "SUPPORTED",
+      regime: "normal",
+      regimeStability: 20,
+      uncertainty: { model: 0.05, data: 0.05, total: 0.08 },
+      riskState: {
+        currentExposure: 0,
+        consecutiveLosses: 2,
+        dailyEntriesUsed: 5,
+        dailyEntriesLimit: 500,
+        balance: 10_000,
+      },
+      baselineProbability: FAIR,
+    });
+    assert.equal(d.action, "SKIP");
+    assert.equal(d.isOpportunity, false);
+  });
+
+  it("still allows ENTRY with only one consecutive loss", () => {
+    const layer = new StrategyLayer(DEFAULT_STRATEGY_POLICY);
+    const d = layer.evaluate({
+      target: 1.3,
+      probability: 0.90,
+      confidenceInterval: [0.82, 0.95],
+      calibrationError: 0.03,
+      evidence: "SUPPORTED",
+      regime: "normal",
+      regimeStability: 20,
+      uncertainty: { model: 0.05, data: 0.05, total: 0.08 },
+      riskState: {
+        currentExposure: 0,
+        consecutiveLosses: 1,
+        dailyEntriesUsed: 5,
+        dailyEntriesLimit: 500,
+        balance: 10_000,
+      },
+      baselineProbability: FAIR,
+    });
+    assert.ok(
+      d.action === "ENTRY" || d.action === "REDUCED_ENTRY",
+      `expected ENTRY at cl=1, got ${d.action}: ${d.reason}`,
+    );
+  });
 });

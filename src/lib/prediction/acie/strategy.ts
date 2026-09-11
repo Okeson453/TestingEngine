@@ -5,11 +5,10 @@
  * without hard-blocking on mild evidence degradation.
  *
  * IMPORTANT — consecutiveLosses semantics:
- *   ACIEEngine currently increments consecutiveLosses on every crash < 1.30×
- *   in the live stream (not on confirmed entry/bet losses). Hard SKIP after
- *   2 stream "losses" caused multi-hour signal blackouts. Hard cooldown is
- *   therefore disabled (skipAt=999) until entry-outcome tracking is wired.
- *   Stake reduction + mild threshold escalation remain.
+ *   ACIEEngine increments consecutiveLosses on every crash < 1.30× in the
+ *   live stream. Max allowed sub-1.30 streak before selective SKIP is **2**
+ *   (no waiting until 3/4/5). After 2 consecutive lows, ENTRY is blocked
+ *   until the streak breaks (a ≥1.30 outcome resets the counter).
  */
 
 import { fractionalKellyStake } from '../stake/kelly-sizer.ts';
@@ -40,12 +39,14 @@ export const DEFAULT_STRATEGY_POLICY: StrategyPolicy = {
   fallbackThreshold: FAIR_130 + QUALITY_EDGE + 0.01,
   maxCalibrationError: 0.12,
   highUncertainty: 0.18,
-  consecutiveLossReduceAt: 3,
+  consecutiveLossReduceAt: 2,
   reducedStakeFactor: 0.45,
   defaultStake: 700,
-  consecutiveLossSkipAt: 999,
-  consecutiveLossMaxSkip: 0,
-  lossStreakThresholdEscalation: 0.015,
+  /** Skip as soon as streak hits 2 — never wait for 3/4/5. */
+  consecutiveLossSkipAt: 2,
+  /** Keep skipping for the duration of the ongoing streak (capped). */
+  consecutiveLossMaxSkip: 8,
+  lossStreakThresholdEscalation: 0.02,
 };
 
 /**
@@ -59,12 +60,12 @@ export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
   fallbackThreshold: FAIR_130,
   maxCalibrationError: 0.14,
   highUncertainty: 0.22,
-  consecutiveLossReduceAt: 4,
+  consecutiveLossReduceAt: 2,
   reducedStakeFactor: 0.55,
   defaultStake: 700,
-  consecutiveLossSkipAt: 999,
-  consecutiveLossMaxSkip: 0,
-  lossStreakThresholdEscalation: 0.012,
+  consecutiveLossSkipAt: 2,
+  consecutiveLossMaxSkip: 6,
+  lossStreakThresholdEscalation: 0.015,
 };
 
 /** Resolve active policy: QUALITY (default) or HF when ACIE_STRATEGY_MODE=hf. */
@@ -87,9 +88,7 @@ export class StrategyLayer {
     const p = this.policy;
     const cl = riskState?.consecutiveLosses ?? 0;
 
-    // Hard consecutive-loss SKIP is intentionally inert (skipAt=999) while
-    // consecutiveLosses tracks stream outcomes rather than entry outcomes.
-    // When true entry-loss tracking is available, lower skipAt again.
+    // Max losing streak = 2: once cl >= 2, SKIP until the streak breaks.
     if (cl >= p.consecutiveLossSkipAt && p.consecutiveLossMaxSkip > 0) {
       const skipRounds = cl - p.consecutiveLossSkipAt + 1;
       if (skipRounds <= p.consecutiveLossMaxSkip) {
