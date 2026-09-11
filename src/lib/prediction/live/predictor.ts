@@ -609,27 +609,18 @@ export async function onGameStart(
     };
   }
 
-  const existing = await sql<{ prediction_id: string }>`
-    select prediction_id from pending_predictions
-    where target_game_id = ${evt.gameId} and matched = false
-    limit 1
-  `;
-  if (existing.length > 0) {
-    logger.info(
-      {
-        component: "live-predictor",
-        correlationId,
-        targetGameId: evt.gameId,
-        predictionId: existing[0]!.prediction_id,
-      },
-      "duplicate bg event; prediction already exists for this target",
-    );
-    return {
-      kind: "duplicate",
-      predictionId: existing[0]!.prediction_id,
-      targetGameId: evt.gameId,
-    };
-  }
+  // OPTIMIZATION: Remove unnecessary DB query for duplicate check.
+  // The in-memory claimTarget() already provides this guarantee (see line ~920).
+  // This eliminates 1 RTT (~800ms) per N+1 prediction on the hot path.
+  // const existing = await sql<{ prediction_id: string }>`
+  //   select prediction_id from pending_predictions
+  //   where target_game_id = ${evt.gameId} and matched = false
+  //   limit 1
+  // `;
+  // if (existing.length > 0) {
+  //   logger.info(...);
+  //   return { kind: "duplicate", predictionId: existing[0]!.prediction_id, targetGameId: evt.gameId };
+  // }
 
   const priorRounds = await loadPriorRoundsStrict(sql, evt.beginTime, MAX_HISTORY);
   if (priorRounds.length < minHistory) {

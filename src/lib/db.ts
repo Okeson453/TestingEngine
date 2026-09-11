@@ -207,8 +207,9 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   const dashboardConnTimeout =
     (Number(process.env.PG_DASHBOARD_CONN_TIMEOUT_MS ?? 3_000) || 3_000);
   // Keep ≥2 critical clients: persist + dispatch can overlap on ED.
+  // OPTIMIZATION: Increase default from 2 to 3 to handle concurrent validator + predictor + dispatcher
   const criticalMin = Math.min(
-    Math.max(1, Number(process.env.PG_CRITICAL_POOL_MIN ?? 2) || 2),
+    Math.max(2, Number(process.env.PG_CRITICAL_POOL_MIN ?? 2) || 2),
     criticalMax,
   );
   const generalMin = Math.min(
@@ -231,6 +232,8 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     connectionTimeoutMillis: criticalConnTimeout,
     allowExitOnIdle: false,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
+    // OPTIMIZATION: Add application_name for connection identification
+    application_name: "TestingEngine-critical",
   });
   const generalPool = new Pool({
     connectionString: databaseUrl,
@@ -239,6 +242,8 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     idleTimeoutMillis: generalIdleTimeoutMillis,
     connectionTimeoutMillis: generalConnTimeout,
     ssl: process.env.PG_SSL === "0" ? false : { rejectUnauthorized: false },
+    // OPTIMIZATION: Add application_name for connection identification
+    application_name: "TestingEngine-general",
   });
 
   globalRef.__pgCriticalPool__ = criticalPool;

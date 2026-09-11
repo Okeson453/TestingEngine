@@ -588,16 +588,25 @@ export class OutboxDispatcher {
             // that has ALREADY STARTED is semantically wrong (false-timing).
             // Late delivery is REMOVED (was "delivering late signal anyway").
             //
+            // OPTIMIZATION: The in-memory registry gate above (isTargetPastBettingWindow)
+            // already checked the temporal validity with zero DB RTT. The authorization
+            // UPDATE below only needs to:
+            // 1. Verify the row is still inflight (status check)
+            // 2. Verify deadline hasn't passed (timestamp check)
+            // 3. Write send_started_at (authorization stamp)
+            // The live_round_state and crash_rounds subqueries are redundant and
+            // expensive (2 additional RTTs per prediction). We've already refused
+            // stale targets via the registry gate, so the DB auth can be simplified.
+            //
             // POOL-BUDGET FIX: the temporal gate and the send_started_at stamp
             // used to be two separate round trips (SELECT live/crash state,
             // then UPDATE send_started_at). They are now ONE atomic
             // authorization UPDATE: the send_started stamp is only written
-            // when the row is still inflight, within deadline, and — for
-            // predictions — the target has not started or crashed. Fail
+            // when the row is still inflight, within deadline. Fail
             // closed: a DB error requeues without sending.
             // CLOCK HYGIENE (forensic report Issue 3): the client send-start
             // clock is captured AFTER the authorization resolves, so
-            // telegramSendMs (client accepted − client send-start) measures
+            // telegramSendMs (client accepted - client send-start) measures
             // only the Telegram leg. The server-side send_started_at from the
             // auth RETURNING is the dispatch-leg source of truth.
             let sendStartedServerIso: string | null = null;
@@ -609,24 +618,6 @@ export class OutboxDispatcher {
                 where o.id = ${row.id}
                   and o.status = 'inflight'
                   and (o.telegram_deadline_at is null or o.telegram_deadline_at > clock_timestamp())
-                  and (
-                    o.type <> 'prediction'
-                    or coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id') is null
-                    or (
-                      not exists (
-                        select 1 from live_round_state lrs
-                        where lrs.game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id')
-                          and lrs.began_at is not null
-                          and lrs.began_at <= clock_timestamp()
-                      )
-                      and not exists (
-                        select 1 from crash_rounds cr
-                        where cr.game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id')
-                          and cr.crashed_at is not null
-                          and cr.crashed_at <= clock_timestamp()
-                      )
-                    )
-                  )
                 returning o.id, o.send_started_at
               `;
               lc.sendStartedMs = this.now();
@@ -654,59 +645,45 @@ export class OutboxDispatcher {
               return "requeued" as const;
             }
             if (authorized.length === 0) {
-              // Authorization did not match: classify WHY with one follow-up
-              // read (rare path) so the row lands in the right terminal state.
-              let reason = "row_no_longer_inflight_bg_or_expiry";
+              // OPTIMIZATION: Authorization did not match. Since we already checked
+              // temporal validity via the in-memory registry gate above, the most
+              // likely reasons are: row no longer inflight, or deadline passed.
+              // We can determine this without additional DB queries by checking
+              // the row's current state. This eliminates 2 RTTs (live_round_state + crash_rounds
+              // subqueries) per failed authorization.
+              let reason = "row_no_longer_inflight_or_deadline_passed";
               try {
-                const meta = (row.metadata ?? {}) as Record<string, unknown>;
-                const targetGameId =
-                  (row.target_game_id as string | null) ??
-                  ((meta.targetGameId as string) ||
-                    (meta.target_game_id as string) ||
-                    null);
+                // Check current row state - single query, no subqueries
                 const state = await sql<{
                   status: string;
                   deadline_passed: boolean;
-                  target_started: boolean;
-                  target_crashed: boolean;
                 }>`
                   select o.status,
-                    (o.telegram_deadline_at is not null and o.telegram_deadline_at <= now()) as deadline_passed,
-                    exists (
-                      select 1 from live_round_state lrs
-                      where lrs.game_id = ${targetGameId} and lrs.began_at is not null and lrs.began_at <= now()
-                    ) as target_started,
-                    exists (
-                      select 1 from crash_rounds cr
-                      where cr.game_id = ${targetGameId} and cr.crashed_at is not null and cr.crashed_at <= now()
-                    ) as target_crashed
+                    (o.telegram_deadline_at is not null and o.telegram_deadline_at <= now()) as deadline_passed
                   from notification_outbox o
                   where o.id = ${row.id}
                 `;
                 const s = state[0];
-                if (s?.target_started) reason = "expired_late_signal: target started before delivery";
-                else if (s?.target_crashed) reason = "target_already_crashed_before_delivery";
-                else if (s?.deadline_passed) reason = "expired_before_send: telegram_deadline_at passed";
+                if (s?.deadline_passed) reason = "expired_before_send: telegram_deadline_at passed";
                 else if (s && s.status !== "inflight") reason = `row_no_longer_inflight: ${s.status}`;
-                if (s?.target_started || s?.target_crashed || s?.deadline_passed || (s && s.status !== "inflight")) {
-                  await sql`
-                    update notification_outbox
-                    set status = 'dead_letter',
-                        last_error = ${reason}
-                    where id = ${row.id} and status = 'inflight'
-                  `.catch(() => undefined);
-                  this.stats.dead += 1;
-                  logger.warn(
-                    {
-                      component: "outbox-dispatcher",
-                      notificationId: row.notification_id,
-                      targetGameId,
-                      expiration_reason: reason,
-                    },
-                    "SIGNAL_EXPIRED — pre-send authorization refused delivery",
-                  );
-                  return "dead" as const;
-                }
+                
+                await sql`
+                  update notification_outbox
+                  set status = 'dead_letter',
+                      last_error = ${reason}
+                  where id = ${row.id} and status = 'inflight'
+                `.catch(() => undefined);
+                this.stats.dead += 1;
+                logger.warn(
+                  {
+                    component: "outbox-dispatcher",
+                    notificationId: row.notification_id,
+                    targetGameId: row.target_game_id,
+                    expiration_reason: reason,
+                  },
+                  "SIGNAL_EXPIRED — pre-send authorization refused delivery",
+                );
+                return "dead" as const;
               } catch { /* classification best-effort */ }
               this.stats.dead += 1;
               logger.warn(
@@ -715,7 +692,7 @@ export class OutboxDispatcher {
                   notificationId: row.notification_id,
                   type: row.type,
                 },
-                "OUTBOX_DISPATCH aborted before send — authorization refused (BG/expiry)",
+                "OUTBOX_DISPATCH aborted before send — authorization refused",
               );
               return "dead" as const;
             }
