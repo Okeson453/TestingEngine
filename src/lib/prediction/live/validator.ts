@@ -176,11 +176,17 @@ export async function onGameEnd(
 
   try {
     await runInTransaction(sql, async (tx) => {
-      // First, anchor the round's crash outcome. The row may not exist
-      // yet (the predictor doesn't pre-insert crash_rounds because the
-      // schema requires multiplier+crashed_at to be NOT NULL — both
-      // arrive on this ed event). Use UPSERT with RETURNING for idempotency
-      // and to avoid a separate SELECT (P2.2: RETURNING clause).
+      // First, anchor the round's crash outcome AND claim the pending
+      // prediction in ONE round trip (pass 12 RTT collapse). These two
+      // statements are independent (different tables, no data dependency)
+      // and the claim's FOR UPDATE lock is held to TX end regardless of
+      // which statement acquired it, so merging them is semantics-neutral.
+      // The anchor row may not exist yet (the predictor doesn't pre-insert
+      // crash_rounds because the schema requires multiplier+crashed_at to
+      // be NOT NULL — both arrive on this ed event). UPSERT with RETURNING
+      // for idempotency (P2.2); the coalesce fallback covers the
+      // already-crashed conflict case (upsert no-op → RETURNING empty →
+      // read the pre-existing row) without a separate round trip.
       {
         const endDate = new Date(evt.endTime);
         const crashedParam = Number.isNaN(endDate.getTime()) ? new Date() : endDate;
@@ -188,50 +194,60 @@ export async function onGameEnd(
         // before BG, began_at stays NULL; the BG handler is the ONLY
         // authoritative source of the real round start (COALESCE backfill).
         const beganParam: Date | null = null;
-        const upserted = await tx<{
+        const anchorAndClaim = await tx<{
           began_at: string | Date | null;
           crashed_at: string | Date | null;
+          prediction_id: string | null;
+          target_multiplier: string | number | null;
+          probability: string | number | null;
+          confidence: string | number | null;
+          regime_name: string | null;
+          correlation_id: string | null;
+          requested_at: string | Date | null;
         }>`
-          insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
-          values (
-            ${evt.gameId}, ${evt.multiplier}, null, null,
-            ${beganParam},
-            ${crashedParam}
-          )
-          on conflict (game_id) do update
-            set crashed_at = excluded.crashed_at,
-                multiplier = excluded.multiplier
-            where crash_rounds.crashed_at is null
-          returning began_at, crashed_at
-        `;
-        state.crashRow = upserted[0] ?? null;
-        // If conflict (row existed with crashed_at already set), RETURNING is empty.
-        // Fall back to a single SELECT only in that case.
-        if (upserted.length === 0) {
-          const fetched = await tx<{
-            began_at: string | Date | null;
-            crashed_at: string | Date | null;
-          }>`
-            select began_at, crashed_at
-            from crash_rounds
-            where game_id = ${evt.gameId}
+          with cr_ins as (
+            insert into crash_rounds (game_id, multiplier, hash, salt, began_at, crashed_at)
+            values (
+              ${evt.gameId}, ${evt.multiplier}, null, null,
+              ${beganParam},
+              ${crashedParam}
+            )
+            on conflict (game_id) do update
+              set crashed_at = excluded.crashed_at,
+                  multiplier = excluded.multiplier
+              where crash_rounds.crashed_at is null
+            returning began_at, crashed_at
+          ),
+          locked as (
+            select prediction_id, target_multiplier, probability, confidence,
+                   regime_name, correlation_id, requested_at
+            from pending_predictions
+            where target_game_id = ${evt.gameId} and matched = false
             limit 1
-          `;
-          state.crashRow = fetched[0] ?? null;
-        }
-      }
-
-      const lockedRows = await tx<PendingRow>`
-        select prediction_id, target_multiplier, probability, confidence,
-               regime_name, correlation_id, requested_at
-        from pending_predictions
-        where target_game_id = ${evt.gameId} and matched = false
-        limit 1
-        for update skip locked
-      `;
-      if (lockedRows.length > 0) {
-        state.pending = lockedRows[0]!;
-      } else {
+            for update skip locked
+          )
+          select
+            coalesce(
+              (select began_at from cr_ins),
+              (select c.began_at from crash_rounds c where c.game_id = ${evt.gameId} limit 1)
+            ) as began_at,
+            coalesce(
+              (select crashed_at from cr_ins),
+              (select c.crashed_at from crash_rounds c where c.game_id = ${evt.gameId} limit 1)
+            ) as crashed_at,
+            l.prediction_id, l.target_multiplier, l.probability, l.confidence,
+            l.regime_name, l.correlation_id, l.requested_at
+          from (select 1) x
+          left join locked l on true
+        `;
+        const anchorRow = anchorAndClaim[0]!;
+        state.crashRow =
+          anchorRow.began_at == null && anchorRow.crashed_at == null
+            ? null
+            : { began_at: anchorRow.began_at, crashed_at: anchorRow.crashed_at };
+        if (anchorRow.prediction_id != null) {
+          state.pending = anchorRow as unknown as PendingRow;
+        } else {
         // Detect: was there a row that was matched already (recovery re-pass)?
         const matchedRows = await tx<{ prediction_id: string }>`
           select prediction_id from prediction_validations
@@ -262,6 +278,7 @@ export async function onGameEnd(
         }
         return;
       }
+      }
 
       if (state.pending == null) return;
 
@@ -269,37 +286,64 @@ export async function onGameEnd(
       const result: "WIN" | "LOSS" = evt.multiplier >= target ? "WIN" : "LOSS";
       const resolvedAt = new Date(now()).toISOString();
 
-      const ins = await tx<{ prediction_id: string }>`
-        insert into prediction_validations (
-          prediction_id, game_id, target_multiplier, predicted_probability,
-          predicted_confidence, actual_multiplier, result, model_version,
-          regime_name, requested_at, resolved_at
-        ) values (
-          ${state.pending!.prediction_id}, ${evt.gameId}, ${target},
-          ${Number(state.pending!.probability)}, ${Number(state.pending!.confidence)},
-          ${evt.multiplier}, ${result}, 'v1',
-          ${state.pending!.regime_name},
-          ${
-            state.pending!.requested_at instanceof Date
-              ? state.pending!.requested_at.toISOString()
-              : String(state.pending!.requested_at)
-          },
-          ${resolvedAt}
-        )
-        on conflict on constraint prediction_validations_prediction_id_key do nothing
-        returning prediction_id
-      `;
-      const alreadyValidated = ins.length === 0;
-
-      if (!alreadyValidated) {
-        await tx`
+      // Pass 12 RTT collapse: validation insert, matched-update and the ED
+      // event-log write in ONE statement. The matched-update is guarded by
+      // the insert's RETURNING (data-modifying CTE RETURNING is visible to
+      // sibling CTEs — same proven pattern as the persist claim), so
+      // already-validated re-processing skips the update exactly as before.
+      // The event-log CTE is unreferenced (still executes exactly once);
+      // its tables are disjoint from the others so ordering is free.
+      const requestedAtIso =
+        state.pending!.requested_at instanceof Date
+          ? state.pending!.requested_at.toISOString()
+          : String(state.pending!.requested_at);
+      const validateOutcome = await tx<{
+        inserted_prediction_id: string | null;
+      }>`
+        with ins as (
+          insert into prediction_validations (
+            prediction_id, game_id, target_multiplier, predicted_probability,
+            predicted_confidence, actual_multiplier, result, model_version,
+            regime_name, requested_at, resolved_at
+          ) values (
+            ${state.pending!.prediction_id}, ${evt.gameId}, ${target},
+            ${Number(state.pending!.probability)}, ${Number(state.pending!.confidence)},
+            ${evt.multiplier}, ${result}, 'v1',
+            ${state.pending!.regime_name},
+            ${requestedAtIso},
+            ${resolvedAt}
+          )
+          on conflict on constraint prediction_validations_prediction_id_key do nothing
+          returning prediction_id
+        ),
+        pp as (
           update pending_predictions
           set matched = true,
               matched_game_id = ${evt.gameId},
               matched_at = ${resolvedAt},
               status = 'MATCHED'
           where prediction_id = ${state.pending!.prediction_id}
-        `;
+            and exists (select 1 from ins)
+          returning 1
+        ),
+        el as (
+          insert into live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) values (
+            ${state.pending!.correlation_id ?? randomUUID()}::text, 'ED', ${evt.gameId},
+            ${JSON.stringify({ endTime: evt.endTime, multiplier: evt.multiplier, result })},
+            ${evt.receivedAt}::timestamptz, now(),
+            ${Math.max(0, now() - new Date(evt.receivedAt).getTime())},
+            false
+          )
+          on conflict do nothing
+        )
+        select (select prediction_id from ins) as inserted_prediction_id
+      `;
+      const alreadyValidated = validateOutcome[0]!.inserted_prediction_id == null;
+
+      if (!alreadyValidated) {
         // ONE outbox row per validation event.
         // sendTelegramMessage() broadcasts to all configured chats — do NOT
         // insert one row per chat (that caused N×M duplicate deliveries).
@@ -371,19 +415,7 @@ export async function onGameEnd(
         `;
       }
 
-      await tx`
-        insert into live_event_log (
-          correlation_id, event_kind, game_id, payload, received_at, processed_at,
-          processor_latency_ms, sla_violated
-        ) values (
-          ${state.pending!.correlation_id ?? randomUUID()}::text, 'ED', ${evt.gameId},
-          ${JSON.stringify({ endTime: evt.endTime, multiplier: evt.multiplier, result })},
-          ${evt.receivedAt}::timestamptz, now(),
-          ${Math.max(0, now() - new Date(evt.receivedAt).getTime())},
-          false
-        )
-        on conflict do nothing
-      `;
+      // (ED live_event_log write moved into the el CTE above — pass 12.)
     }, logSlowTxStages("validator.onGameEnd.persist"));
   } catch (e) {
     // Fix 9: structured error telemetry — name, message, stack, game,
