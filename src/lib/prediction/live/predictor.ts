@@ -1493,10 +1493,12 @@ export async function onGameEndPredict(
       edReceivedAt: deps.edReceivedAt ?? null,
     });
 
-    let txStage: TxStageTimings | null = null;
-    await runInTransaction(
-      sql,
-      async (tx) => {
+    // RTT FIX (sep 11 15:11 logs): persist measured ~590ms = acquire + BEGIN
+    // + stmt + COMMIT. The compound CTE is ONE statement — atomic by
+    // itself in Postgres — so the explicit transaction adds two round
+    // trips of pure overhead to the SIGNAL_READY critical path. Run it
+    // directly: one acquire, one round trip (~200ms expected).
+    const ins = await sql<{ notification_id: string }>`
         // ROUND-TRIP REDUCTION (plan §3): ONE compound statement performs both
         // inserts atomically. The outbox row is inserted SELECTed from the
         // pending_predictions RETURNING — if the prediction loses a duplicate
@@ -1504,7 +1506,6 @@ export async function onGameEndPredict(
         // writes nothing, and we detect the duplicate from 0 returned rows.
         // Same ACID transaction, same critical-pool client, one network round
         // trip instead of two (at ~800ms Neon RTT this halves the in-tx time).
-        const ins = await tx<{ notification_id: string }>`
           with inserted_prediction as (
             insert into pending_predictions (
               prediction_id, target_multiplier, probability, confidence,
@@ -1547,18 +1548,13 @@ export async function onGameEndPredict(
           returning notification_id
         `;
 
-        if (ins.length === 0) {
-          // Duplicate — already persisted by another path (DB is the backstop).
-          // No outbox row was inserted (SELECT FROM an empty CTE writes nothing).
-          pendingWasDuplicate = true;
-          return;
-        }
-        outboxEnqueued = 1;
-      },
-      (t) => {
-        txStage = t;
-      },
-    );
+    if (ins.length === 0) {
+      // Duplicate — already persisted by another path (DB is the backstop).
+      // No outbox row was inserted (SELECT FROM an empty CTE writes nothing).
+      pendingWasDuplicate = true;
+    } else {
+      outboxEnqueued = 1;
+    }
 
     // live_event_log outside TX (not required for correctness / delivery)
     void sql`
@@ -1583,10 +1579,9 @@ export async function onGameEndPredict(
 
     {
       const txMs = Date.now() - txT0;
-      // Per-transaction stage timing (plan §4): acquire/begin/stmt/commit are
-      // measured on THIS transaction via the tx helper's stage reporter —
-      // never derived from a global "last acquisition" variable.
-      const stage = txStage as TxStageTimings | null;
+      // RTT FIX: single-statement persist — no explicit TX, so stage timings
+      // are unavailable; profile falls back to wall-clock deltas below.
+      const stage = null as TxStageTimings | null;
       const profile = {
         component: "live-predictor",
         predictionId,

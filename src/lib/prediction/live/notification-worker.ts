@@ -342,12 +342,18 @@ export class OutboxDispatcher {
     // cleanup lives in recoverStale() on the general/maintenance pool so it
     // never adds DB work to the N+1 critical path. Pre-send atomic temporal
     // authorization + finalization gate remain the safety invariants.
+    // RTT FIX (sep 11): the primary claim is ONE statement (picked CTE +
+    // UPDATE ... FROM) — atomic by itself, so the explicit BEGIN/COMMIT was
+    // two round trips of pure overhead on every dispatch tick (~370ms at
+    // ~185ms Neon RTT). Primary runs direct; the legacy fallback (SELECT
+    // FOR UPDATE + per-row UPDATEs, genuinely multi-statement) keeps a real
+    // transaction.
     const claimLimit =
       lane === "prediction" ? Math.max(1, PREDICTION_BATCH_SIZE) : BATCH_SIZE;
-    const claimed = await runInTransaction(sql, async (tx) => {
+    const claimed = await (async () => {
       try {
         if (lane === "prediction") {
-          return await tx<OutboxRow>`
+          return await sql<OutboxRow>`
             WITH picked AS (
               SELECT id
               FROM notification_outbox
@@ -371,7 +377,7 @@ export class OutboxDispatcher {
                       n.dispatch_claimed_at
           `;
         }
-        return await tx<OutboxRow>`
+        return await sql<OutboxRow>`
           WITH picked AS (
             SELECT id
             FROM notification_outbox
@@ -414,6 +420,8 @@ export class OutboxDispatcher {
         // Legacy fallback (older drivers without UPDATE…FROM): plain SELECT
         // FOR UPDATE + per-row UPDATE. Lane filter is duplicated explicitly —
         // the pinned tx sql builds raw text and cannot compose fragments.
+        // Genuinely multi-statement → runs inside a real transaction.
+        return runInTransaction(sql, async (tx) => {
         const rows =
           lane === "prediction"
             ? await tx<OutboxRow>`
@@ -466,8 +474,9 @@ export class OutboxDispatcher {
           r.attempt_count = (r.attempt_count ?? 0) + 1;
         }
         return rows;
+        });
       }
-    });
+    })();
     // claimGateDead no longer used (sweep moved to recoverStale); keep for
     // type/stats compatibility if any residual path set it.
     dead += claimGateDead;
