@@ -310,12 +310,6 @@ export class LiveSupervisor {
       event_loop_lag_p95: lag.p95,
       event_loop_lag_p99: lag.p99,
     });
-    await sql`
-      INSERT INTO worker_state (key, value, updated_at)
-      VALUES ('worker_heartbeat', ${payload}, now())
-      ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = now()
-    `;
     // Fix 14: worker_status is now DERIVED, not a bare online string.
     this.lastHeartbeatAt = Date.now();
     const health = this.deriveWorkerHealth();
@@ -323,29 +317,62 @@ export class LiveSupervisor {
     health.lifecycle = this.lifecycle;
     health.process = "alive";
     this.lastHealth = health;
+    // HEALTH STATE: the three worker_state rows (heartbeat/status/health)
+    // used to be THREE sequential general-pool upserts every 10s heartbeat —
+    // a standing tax on the pool shared with dispatcher normal-lane claims,
+    // forensics and feedback sweeps. One data-modifying CTE, one round trip.
+    const healthJson = JSON.stringify({
+      ...health,
+      lastEdAt: health.lastEdAt != null ? new Date(health.lastEdAt).toISOString() : null,
+      lastBgAt: health.lastBgAt != null ? new Date(health.lastBgAt).toISOString() : null,
+      lastSignalAt: health.lastSignalAt != null ? new Date(health.lastSignalAt).toISOString() : null,
+      lastHeartbeatAt: new Date(health.lastHeartbeatAt).toISOString(),
+    });
     await sql`
-      INSERT INTO worker_state (key, value, updated_at)
-      VALUES ('worker_status', ${health.online ? 'online' : 'offline'}, now())
-      ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = now()
-    `;
-    await sql`
-      INSERT INTO worker_state (key, value, updated_at)
-      VALUES ('worker_health', ${JSON.stringify({ ...health, lastEdAt: health.lastEdAt != null ? new Date(health.lastEdAt).toISOString() : null, lastBgAt: health.lastBgAt != null ? new Date(health.lastBgAt).toISOString() : null, lastSignalAt: health.lastSignalAt != null ? new Date(health.lastSignalAt).toISOString() : null, lastHeartbeatAt: new Date(health.lastHeartbeatAt).toISOString() })}, now())
-      ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = now()
+      WITH hb AS (
+        INSERT INTO worker_state (key, value, updated_at)
+        VALUES ('worker_heartbeat', ${payload}, now())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+        RETURNING 1
+      ),
+      st AS (
+        INSERT INTO worker_state (key, value, updated_at)
+        VALUES ('worker_status', ${health.online ? 'online' : 'offline'}, now())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+        RETURNING 1
+      ),
+      hlth AS (
+        INSERT INTO worker_state (key, value, updated_at)
+        VALUES ('worker_health', ${healthJson}, now())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+        RETURNING 1
+      )
+      SELECT
+        (SELECT count(*) FROM hb) AS heartbeat_written,
+        (SELECT count(*) FROM st) AS status_written,
+        (SELECT count(*) FROM hlth) AS health_written
     `.catch((e) => {
       logger.debug(
         { component: "live-supervisor", error: String(e) },
-        "worker_health persistence failed (soft)",
+        "worker_state health persistence failed (soft)",
       );
     });
 
-    // P2.11: Persist incremental state on each heartbeat
-    try {
-      await persistIncrementalState(sql);
-    } catch {
-      /* soft */
+    // P2.11: Persist incremental state — every 6th heartbeat (60s), not
+    // every cycle. This is crash-recovery model state (EWMA/Welford/baseline
+    // snapshots); 60s staleness is immaterial for restart fidelity and the
+    // old every-10s cadence put 3 more general-pool writes on the same pool
+    // the dispatcher's normal lane and forensics share (observed general
+    // pool 5/0/1 during realtime windows).
+    if (cycle % 6 === 0) {
+      try {
+        await persistIncrementalState(sql);
+      } catch {
+        /* soft */
+      }
     }
 
     // Phase 14 — sample pool pressure; log if PG_POOL_MAX should rise
@@ -399,14 +426,25 @@ export async function heartbeatWorkerLock(sql: Sql): Promise<boolean> {
 }
 
 // P2.11: Persist Incremental State
-// Save incremental state alongside worker health
+// Save incremental state alongside worker health.
+// ROUND-TRIP FIX (sep 11): this used to be THREE sequential worker_state
+// upserts (incremental_state, baseline_adaptive_state, safe_baseline_state)
+// on every 10s heartbeat — six general-pool round trips per minute of pure
+// telemetry. One data-modifying CTE, one round trip, same upsert semantics
+// per key. Called every 6th heartbeat (60s) by writeWorkerHealth.
 export async function persistIncrementalState(sql: Sql): Promise<void> {
   try {
     const { globalIncrementalState } = await import(
       "@/lib/prediction/state/incremental-state-engine"
     );
+    const { globalBaselineModel } = await import(
+      "@/lib/prediction/models/baseline-model"
+    );
+    const { globalSafeBaseline } = await import(
+      "@/lib/prediction/lifecycle/safe-baseline-controller"
+    );
     const snap = globalIncrementalState.snapshot();
-    const stateJson = JSON.stringify({
+    const incrementalJson = JSON.stringify({
       count: snap.count,
       ewma: snap.ewma,
       ewmaHit13: snap.ewmaHit13,
@@ -414,51 +452,39 @@ export async function persistIncrementalState(sql: Sql): Promise<void> {
       runs: snap.runs,
       timestamp: new Date().toISOString(),
     });
+    const baselineJson = JSON.stringify(globalBaselineModel.exportState());
+    const safeJson = JSON.stringify(globalSafeBaseline.exportState());
     await sql`
-      INSERT INTO worker_state (key, value, updated_at)
-      VALUES ('incremental_state', ${stateJson}, now())
-      ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = now()
+      WITH inc AS (
+        INSERT INTO worker_state (key, value, updated_at)
+        VALUES ('incremental_state', ${incrementalJson}, now())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+        RETURNING 1
+      ),
+      base AS (
+        INSERT INTO worker_state (key, value, updated_at)
+        VALUES ('baseline_adaptive_state', ${baselineJson}, now())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+        RETURNING 1
+      ),
+      safe AS (
+        INSERT INTO worker_state (key, value, updated_at)
+        VALUES ('safe_baseline_state', ${safeJson}, now())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+        RETURNING 1
+      )
+      SELECT
+        (SELECT count(*) FROM inc) AS incremental_written,
+        (SELECT count(*) FROM base) AS baseline_written,
+        (SELECT count(*) FROM safe) AS safe_written
     `;
   } catch (e) {
     logger.debug(
       { component: "live-supervisor", error: String(e) },
       "incremental state persistence failed (soft)",
-    );
-  }
-  // P0: persist baseline adaptive multipliers/outcomes so restarts match prior model
-  try {
-    const { globalBaselineModel } = await import(
-      "@/lib/prediction/models/baseline-model"
-    );
-    const baselineJson = JSON.stringify(globalBaselineModel.exportState());
-    await sql`
-      INSERT INTO worker_state (key, value, updated_at)
-      VALUES ('baseline_adaptive_state', ${baselineJson}, now())
-      ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = now()
-    `;
-  } catch (e) {
-    logger.debug(
-      { component: "live-supervisor", error: String(e) },
-      "baseline adaptive state persistence failed (soft)",
-    );
-  }
-  try {
-    const { globalSafeBaseline } = await import(
-      "@/lib/prediction/lifecycle/safe-baseline-controller"
-    );
-    const safeJson = JSON.stringify(globalSafeBaseline.exportState());
-    await sql`
-      INSERT INTO worker_state (key, value, updated_at)
-      VALUES ('safe_baseline_state', ${safeJson}, now())
-      ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = now()
-    `;
-  } catch (e) {
-    logger.debug(
-      { component: "live-supervisor", error: String(e) },
-      "safe baseline state persistence failed (soft)",
     );
   }
 }

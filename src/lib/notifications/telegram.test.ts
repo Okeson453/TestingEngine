@@ -6,6 +6,7 @@ import {
   getConfiguredChatIds,
   sendTelegramMessage,
   telegramConfigured,
+  _setTelegramTransportForTests,
 } from "./telegram.ts";
 
 function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
@@ -121,10 +122,9 @@ test("sendTelegramMessage: fans out to all configured chats in order", async () 
       TELEGRAM_EXTRA_CHAT_IDS: "-300,-301",
     },
     async () => {
-      const realFetch = globalThis.fetch;
       const urls: string[] = [];
       const bodies: Array<Record<string, unknown>> = [];
-      globalThis.fetch = (async (
+      _setTelegramTransportForTests((async (
         url: unknown,
         init: { body?: string } = {},
       ): Promise<Response> => {
@@ -134,7 +134,7 @@ test("sendTelegramMessage: fans out to all configured chats in order", async () 
           JSON.stringify({ ok: true, result: { message_id: urls.length } }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
-      }) as typeof fetch;
+      }) as typeof fetch);
       try {
         const results = await sendTelegramMessage("hello");
         assert.equal(results.length, 4);
@@ -160,7 +160,7 @@ test("sendTelegramMessage: fans out to all configured chats in order", async () 
         assert.equal(urls.length, 4);
         for (const u of urls) assert.match(u, /api\.telegram\.org\/bot123:abc\/sendMessage/);
       } finally {
-        globalThis.fetch = realFetch;
+        _setTelegramTransportForTests(null);
       }
     },
   );
@@ -170,9 +170,8 @@ test("sendTelegramMessage: never throws on malformed upstream body", async () =>
   await withEnv(
     { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
-      const realFetch = globalThis.fetch;
-      globalThis.fetch = (async () =>
-        new Response("not-json", { status: 200 })) as typeof fetch;
+      _setTelegramTransportForTests((async () =>
+        new Response("not-json", { status: 200 })) as typeof fetch);
       try {
         const results = await sendTelegramMessage("hello");
         assert.equal(results.length, 1);
@@ -181,7 +180,7 @@ test("sendTelegramMessage: never throws on malformed upstream body", async () =>
         assert.equal(results[0]!.error, "malformed_response");
         assert.equal(results[0]!.chatId, "-100123");
       } finally {
-        globalThis.fetch = realFetch;
+        _setTelegramTransportForTests(null);
       }
     },
   );
@@ -191,11 +190,10 @@ test("sendTelegramMessage: returns ok:true per chat on Telegram success envelope
   await withEnv(
     { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
-      const realFetch = globalThis.fetch;
-      globalThis.fetch = (async () =>
+      _setTelegramTransportForTests((async () =>
         new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
           status: 200,
-        })) as typeof fetch;
+        })) as typeof fetch);
       try {
         const results = await sendTelegramMessage("hello");
         assert.equal(results.length, 1);
@@ -203,7 +201,7 @@ test("sendTelegramMessage: returns ok:true per chat on Telegram success envelope
         assert.equal(results[0]!.status, 200);
         assert.equal(results[0]!.chatId, "-100123");
       } finally {
-        globalThis.fetch = realFetch;
+        _setTelegramTransportForTests(null);
       }
     },
   );
@@ -213,12 +211,11 @@ test("sendTelegramMessage: captures Telegram description per chat on 4xx", async
   await withEnv(
     { TELEGRAM_BOT_TOKEN: "bad", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
-      const realFetch = globalThis.fetch;
-      globalThis.fetch = (async () =>
+      _setTelegramTransportForTests((async () =>
         new Response(
           JSON.stringify({ ok: false, description: "chat not found" }),
           { status: 400 },
-        )) as typeof fetch;
+        )) as typeof fetch);
       try {
         const results = await sendTelegramMessage("hello");
         assert.equal(results.length, 1);
@@ -227,7 +224,7 @@ test("sendTelegramMessage: captures Telegram description per chat on 4xx", async
         assert.equal(results[0]!.error, "chat not found");
         assert.equal(results[0]!.chatId, "-100123");
       } finally {
-        globalThis.fetch = realFetch;
+        _setTelegramTransportForTests(null);
       }
     },
   );
@@ -237,15 +234,14 @@ test("sendTelegramMessage: per-chat timeout produces timeout_2000ms", async () =
   await withEnv(
     { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
-      const realFetch = globalThis.fetch;
-      globalThis.fetch = ((_url: unknown, init: RequestInit) =>
+      _setTelegramTransportForTests(((_url: unknown, init: RequestInit) =>
         new Promise<Response>((_resolve, reject) => {
           init.signal?.addEventListener("abort", () => {
             const err = new Error("aborted");
             (err as { name?: string }).name = "AbortError";
             reject(err);
           });
-        })) as typeof fetch;
+        })) as typeof fetch);
       try {
         const results = await sendTelegramMessage("hello");
         assert.equal(results.length, 1);
@@ -253,7 +249,7 @@ test("sendTelegramMessage: per-chat timeout produces timeout_2000ms", async () =
         assert.equal(results[0]!.error, "timeout_2000ms");
         assert.equal(results[0]!.chatId, "-100123");
       } finally {
-        globalThis.fetch = realFetch;
+        _setTelegramTransportForTests(null);
       }
     },
   );
@@ -263,10 +259,9 @@ test("sendTelegramMessage: never throws on per-chat network failure", async () =
   await withEnv(
     { TELEGRAM_BOT_TOKEN: "123:abc", TELEGRAM_CHAT_ID: "-100123", TELEGRAM_GROUP_CHAT_ID: undefined, TELEGRAM_EXTRA_CHAT_IDS: undefined },
     async () => {
-      const realFetch = globalThis.fetch;
-      globalThis.fetch = (async () => {
+      _setTelegramTransportForTests((async () => {
         throw new Error("ECONNREFUSED");
-      }) as typeof fetch;
+      }) as typeof fetch);
       try {
         const results = await sendTelegramMessage("hello");
         assert.equal(results.length, 1);
@@ -274,7 +269,7 @@ test("sendTelegramMessage: never throws on per-chat network failure", async () =
         assert.equal(results[0]!.error, "ECONNREFUSED");
         assert.equal(results[0]!.chatId, "-100123");
       } finally {
-        globalThis.fetch = realFetch;
+        _setTelegramTransportForTests(null);
       }
     },
   );
@@ -289,8 +284,7 @@ test("sendTelegramMessage: per-chat independence — one bad chat does not block
       TELEGRAM_EXTRA_CHAT_IDS: undefined,
     },
     async () => {
-      const realFetch = globalThis.fetch;
-      globalThis.fetch = (async (
+      _setTelegramTransportForTests((async (
         _url: unknown,
         init: { body?: string } = {},
       ): Promise<Response> => {
@@ -305,7 +299,7 @@ test("sendTelegramMessage: per-chat independence — one bad chat does not block
           JSON.stringify({ ok: true, result: { message_id: 1 } }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
-      }) as typeof fetch;
+      }) as typeof fetch);
       try {
         const results = await sendTelegramMessage("hello");
         assert.equal(results.length, 2);
@@ -314,7 +308,7 @@ test("sendTelegramMessage: per-chat independence — one bad chat does not block
         assert.equal(byChat.get("100")!.error, "chat not found");
         assert.equal(byChat.get("-200")!.ok, true);
       } finally {
-        globalThis.fetch = realFetch;
+        _setTelegramTransportForTests(null);
       }
     },
   );

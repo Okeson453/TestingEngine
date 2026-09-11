@@ -26,6 +26,7 @@ import {
 } from "@/lib/prediction/events/game-event-handlers";
 import { getSql } from "@/lib/db";
 import { randomUUID } from "node:crypto";
+import { _setTelegramTransportForTests } from "@/lib/notifications/telegram";
 
 interface LifecycleRow {
   status: string;
@@ -55,13 +56,12 @@ async function withStubbedFetch<T>(
   handler: (url: string, body: string | undefined) => Promise<Response>,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (url: unknown, init: { body?: string } = {}) =>
-    handler(String(url), init.body)) as typeof fetch;
+    _setTelegramTransportForTests((async (url: unknown, init: { body?: string } = {}) =>
+    handler(String(url), init.body)) as typeof fetch);
   try {
     return await fn();
   } finally {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
   }
 }
 

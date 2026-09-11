@@ -117,7 +117,33 @@ export async function evaluateWrUtilsBundleInSandbox(
     console,
     // Dead branch in the verified bundle (wasm is a data: URL) — provided so
     // any surprise fetch is a loud structured failure, never a host request.
-    fetch: () => Promise.reject(new Error("wr_utils sandbox: fetch is not allowed")),
+    // BOOT REJECTION FIX (16:55:46 unhandledRejection class): the stub used
+    // to return a bare Promise.reject. When the bundle calls fetch() and
+    // does not await/chain the result, that rejection has NO handler inside
+    // the VM and escapes the context as a process unhandledRejection during
+    // boot. The rejection is now handled AT THE BOUNDARY THAT CREATED IT:
+    // our own .catch records the violation loudly (structured error log with
+    // the exact message), while the SAME rejected promise is still returned
+    // to the bundle — if the bundle awaits it, it observes the identical
+    // error. Nothing is suppressed or relabeled: the violation is reported
+    // deliberately, with the calling context it previously lacked.
+    fetch: () => {
+      const violation = Promise.reject(
+        new Error("wr_utils sandbox: fetch is not allowed"),
+      );
+      violation.catch((err: Error) => {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            time: new Date().toISOString(),
+            component: "native-sign",
+            msg: "wr_utils sandbox fetch violation (handled at source)",
+            error: { name: err.name, message: err.message },
+          }),
+        );
+      });
+      return violation;
+    },
   };
   sandbox.globalThis = sandbox;
   const context = vm.createContext(sandbox);

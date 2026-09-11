@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import { OutboxDispatcher, MAX_ATTEMPTS } from "@/lib/prediction/live/notification-worker";
 import { getSql } from "@/lib/db";
 import { randomUUID } from "node:crypto";
+import { _setTelegramTransportForTests } from "@/lib/notifications/telegram";
 
 interface OutboxState {
   status: string;
@@ -51,13 +52,12 @@ async function withStubbedFetch<T>(
   handler: (url: string, body: string | undefined) => Promise<Response>,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (url: unknown, init: { body?: string } = {}) =>
-    handler(String(url), init.body)) as typeof fetch;
+    _setTelegramTransportForTests((async (url: unknown, init: { body?: string } = {}) =>
+    handler(String(url), init.body)) as typeof fetch);
   try {
     return await fn();
   } finally {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
   }
 }
 
@@ -395,11 +395,10 @@ test("pool-budget: prediction with target NOT started is delivered (atomic auth 
   setTelegramEnv();
   await cleanPoolBudgetRows();
   const sentUrls: string[] = [];
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (url: unknown) => {
+    _setTelegramTransportForTests((async (url: unknown) => {
     sentUrls.push(String(url));
     return okTelegram();
-  }) as typeof fetch;
+  }) as typeof fetch);
   try {
     const gameId = "[nw-pool-budget] future-round";
     // began_at in the FUTURE: round has not started; signal is valid.
@@ -417,7 +416,7 @@ test("pool-budget: prediction with target NOT started is delivered (atomic auth 
       "Telegram must be contacted exactly once for a valid signal",
     );
   } finally {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
     clearTelegramEnv();
     await cleanPoolBudgetRows();
   }
@@ -427,11 +426,10 @@ test("pool-budget: prediction with target ALREADY started is dead-lettered and n
   setTelegramEnv();
   await cleanPoolBudgetRows();
   const sentUrls: string[] = [];
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (url: unknown) => {
+    _setTelegramTransportForTests((async (url: unknown) => {
     sentUrls.push(String(url));
     return okTelegram();
-  }) as typeof fetch;
+  }) as typeof fetch);
   try {
     const gameId = "[nw-pool-budget] started-round";
     // began_at 5s in the past: BG already arrived; signal is expired.
@@ -449,7 +447,7 @@ test("pool-budget: prediction with target ALREADY started is dead-lettered and n
       "Telegram must NOT be contacted for an expired signal",
     );
   } finally {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
     clearTelegramEnv();
     await cleanPoolBudgetRows();
   }
@@ -458,8 +456,7 @@ test("pool-budget: prediction with target ALREADY started is dead-lettered and n
 test("pool-budget: prediction rows are claimed ahead of a full batch of result rows", async () => {
   setTelegramEnv();
   await cleanPoolBudgetRows();
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async () => okTelegram()) as typeof fetch;
+    _setTelegramTransportForTests((async () => okTelegram()) as typeof fetch);
   try {
     const sql = await getSql();
     // Fill the claim batch (BATCH_SIZE=16) with validation rows queued first…
@@ -505,7 +502,7 @@ test("pool-budget: prediction rows are claimed ahead of a full batch of result r
       "background lane drains its own batch — prediction priority no longer starves result rows",
     );
   } finally {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
     clearTelegramEnv();
     await cleanPoolBudgetRows();
   }
@@ -515,14 +512,13 @@ test("pool-budget: prediction lane executes before background lane within a batc
   setTelegramEnv();
   await cleanPoolBudgetRows();
   const callOrder: string[] = [];
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (url: unknown, init: { body?: string } = {}) => {
+    _setTelegramTransportForTests((async (url: unknown, init: { body?: string } = {}) => {
     const body = init.body ?? "";
     if (body.includes("[nw-lane-pred]")) callOrder.push("prediction");
     else if (body.includes("[nw-lane-val]")) callOrder.push("validation");
     await new Promise((r) => setTimeout(r, 10));
     return okTelegram();
-  }) as typeof fetch;
+  }) as typeof fetch);
   try {
     const sql = await getSql();
     // One prediction + several validation rows. The claim puts the prediction
@@ -559,7 +555,7 @@ test("pool-budget: prediction lane executes before background lane within a batc
       "single prediction row must send exactly once",
     );
   } finally {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
     clearTelegramEnv();
     await cleanPoolBudgetRows();
   }
@@ -602,20 +598,19 @@ async function pollUntil<T>(fn: () => Promise<T>, timeoutMs = 3_000): Promise<T>
 test("fast lane: a prediction committed while a slow validation send is running is delivered without waiting for it", async () => {
   setTelegramEnv();
   await cleanPoolBudgetRows();
-  const realFetch = globalThis.fetch;
-  let releaseValidation: (r: Response) => void = () => undefined;
+    let releaseValidation: (r: Response) => void = () => undefined;
   let validationClaimed = false;
   const validationHeld = new Promise<Response>((res) => {
     releaseValidation = res;
   });
-  globalThis.fetch = (async (_url: unknown, init: { body?: string } = {}) => {
+  _setTelegramTransportForTests((async (_url: unknown, init: { body?: string } = {}) => {
     const body = init.body ?? "";
     if (body.includes("[nw-preempt-val]")) {
       validationClaimed = true;
       return await validationHeld;
     }
     return okTelegram();
-  }) as typeof fetch;
+  }) as typeof fetch);
   const d = new OutboxDispatcher();
   try {
     const sql = await getSql();
@@ -667,7 +662,7 @@ test("fast lane: a prediction committed while a slow validation send is running 
   } finally {
     releaseValidation(okTelegram());
     await d.stop();
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
     clearTelegramEnv();
     await cleanPoolBudgetRows();
   }
@@ -676,15 +671,14 @@ test("fast lane: a prediction committed while a slow validation send is running 
 test("temporal: telegram accepted AFTER target start is dead-lettered as LATE, never delivered", async () => {
   setTelegramEnv();
   await cleanPoolBudgetRows();
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async () => {
+    _setTelegramTransportForTests((async () => {
     // The target starts DURING the Telegram send (after authorization won).
     await seedStartedRound(
       "[nw-pool-budget] late-acceptance-round",
       new Date(),
     );
     return okTelegram();
-  }) as typeof fetch;
+  }) as typeof fetch);
   try {
     // began_at in the FUTURE at claim/auth time — the signal is valid when
     // authorized, then the round starts while Telegram holds the connection.
@@ -711,7 +705,7 @@ test("temporal: telegram accepted AFTER target start is dead-lettered as LATE, n
     }, 2_000);
     assert.equal(outcome, "LATE");
   } finally {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
     clearTelegramEnv();
     await cleanPoolBudgetRows();
   }
@@ -721,11 +715,10 @@ test("min-lead: a prediction with residual budget below DELIVERY_MIN_LEAD_MS is 
   setTelegramEnv();
   await cleanPoolBudgetRows();
   const sentUrls: string[] = [];
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (url: unknown) => {
+    _setTelegramTransportForTests((async (url: unknown) => {
     sentUrls.push(String(url));
     return okTelegram();
-  }) as typeof fetch;
+  }) as typeof fetch);
   try {
     // Deadline 200ms ahead < DELIVERY_MIN_LEAD_MS default (500ms): the send
     // could straddle the validity boundary — refuse BEFORE contacting Telegram.
@@ -743,7 +736,7 @@ test("min-lead: a prediction with residual budget below DELIVERY_MIN_LEAD_MS is 
       "Telegram must NOT be contacted when remaining lead is insufficient",
     );
   } finally {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
     clearTelegramEnv();
     await cleanPoolBudgetRows();
   }

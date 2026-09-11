@@ -54,13 +54,10 @@ const _offFailureHandlers = registerProcessFailureHandlers({
 });
 
 // The live pipeline runs validation, prediction, feedback, outbox and polling
-// concurrently. A pool of 3 repeatedly saturates under normal round traffic.
-// Match src/lib/db.ts's measured default; an explicit operator value still wins.
+// concurrently. Match src/lib/db.ts's measured default (general 7 / critical 3
+// at PG_POOL_MAX=10); an explicit operator value still wins.
 if (!process.env.PG_POOL_MAX) {
-  process.env.PG_POOL_MAX = "8";
-}
-if (!process.env.PG_POOL_MIN) {
-  process.env.PG_POOL_MIN = "1";
+  process.env.PG_POOL_MAX = "10";
 }
 if (!process.env.PG_APP_NAME) {
   process.env.PG_APP_NAME = "testingengine-worker";

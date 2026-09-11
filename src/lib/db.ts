@@ -84,8 +84,8 @@ export function getTaggedPool(sql: Sql): import("pg").Pool | undefined {
 }
 
 function readTotalMax(): number {
-  const raw = Number(process.env.PG_POOL_MAX ?? 8);
-  return Math.max(2, Math.min(Number.isFinite(raw) ? raw : 8, 12));
+  const raw = Number(process.env.PG_POOL_MAX ?? 10);
+  return Math.max(2, Math.min(Number.isFinite(raw) ? raw : 10, 12));
 }
 
 function readCriticalMax(): number {

@@ -26,7 +26,97 @@
  *     independent — a failure to one chat never affects the others.
  */
 
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
+import type { RequestOptions } from "node:https";
+
 const TELEGRAM_API = "https://api.telegram.org";
+
+// CONNECTION REUSE (latency investigation, sep 11): sends are spaced by the
+// round cadence (tens of seconds), far beyond undici's ~4s default
+// keep-alive — the global-fetch connection to api.telegram.org was torn
+// down between rounds, so EVERY prediction/result send re-paid TCP+TLS
+// setup (~300-600ms in production) on the dispatch→ack leg. This transport
+// holds the TLS session open across rounds via a module-level keep-alive
+// agent; a warm send is one HTTPS RTT. Zero new dependencies.
+const telegramKeepAliveAgent = new HttpsAgent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 8,
+  timeout: 60_000,
+});
+
+/** Minimal fetch-shaped response the transport contract returns. */
+interface TransportResponse {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+}
+
+type TelegramTransport = (
+  url: string,
+  init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+  },
+) => Promise<TransportResponse>;
+
+async function keepAliveTransportReal(
+  url: string,
+  init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+  },
+): Promise<TransportResponse> {
+  const parsedUrl = new URL(url);
+  const result = await new Promise<{ status: number; body: string }>(
+    (resolve, reject) => {
+      const reqOptions: RequestOptions = {
+        method: init?.method ?? "POST",
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        agent: telegramKeepAliveAgent,
+        headers: init?.headers ?? {},
+      };
+      const req = httpsRequest(reqOptions, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          }),
+        );
+        res.on("error", reject);
+      });
+      req.on("error", reject);
+      init?.signal?.addEventListener("abort", () => {
+        req.destroy(
+          Object.assign(new Error("The operation was aborted"), {
+            name: "AbortError",
+          }),
+        );
+      });
+      req.end(init?.body ?? "");
+    },
+  );
+  return {
+    ok: result.status >= 200 && result.status < 300,
+    status: result.status,
+    json: async () => JSON.parse(result.body),
+  };
+}
+
+let telegramTransport: TelegramTransport = keepAliveTransportReal;
+
+/** Test seam: swap the transport (null restores the keep-alive default). */
+export function _setTelegramTransportForTests(t: TelegramTransport | null): void {
+  telegramTransport = t ?? keepAliveTransportReal;
+}
+
 // P1.5: Reduced from 5s to 2s. Crash rounds last 3-5s; a 5s timeout
 // can block the entire outbox for a full round window. 2s is still
 // generous for Telegram API (typical RTT: 100-500ms).
@@ -173,7 +263,7 @@ async function sendToChat(
   // Per-destination timing (plan §13): one clock around the whole leg.
   const sendT0 = Date.now();
   try {
-    const response = await fetch(url, {
+    const response = await telegramTransport(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -199,7 +289,7 @@ async function sendToChat(
     return { ok: false, status: response.status, error: description, chatId, durationMs: Date.now() - sendT0 };
   } catch (e: unknown) {
     const name = (e as { name?: string })?.name;
-    if (name === "AbortError") {
+    if (name === "AbortError" || controller.signal.aborted) {
       return { ok: false, status: 0, error: `timeout_${timeoutMs}ms`, chatId, durationMs: Date.now() - sendT0 };
     }
     return { ok: false, status: 0, error: (e as Error)?.message ?? "network_error", chatId, durationMs: Date.now() - sendT0 };

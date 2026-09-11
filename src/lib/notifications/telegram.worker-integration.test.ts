@@ -21,6 +21,7 @@ import {
   formatPredictionMessage,
   formatValidationMessage,
   telegramConfigured,
+  _setTelegramTransportForTests,
 } from "./telegram.ts";
 
 function stubEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
@@ -45,12 +46,12 @@ function withStubbedFetch<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (
+  _setTelegramTransportForTests((async (
     url: unknown,
     init: { body?: string } = {},
-  ): Promise<Response> => handler(String(url), init.body)) as typeof fetch;
+  ): Promise<Response> => handler(String(url), init.body)) as typeof fetch);
   return fn().finally(() => {
-    globalThis.fetch = realFetch;
+    _setTelegramTransportForTests(null);
   });
 }
 
