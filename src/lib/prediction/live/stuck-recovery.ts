@@ -54,22 +54,43 @@ export async function reconcileStuckPredictions(
   result.inspected = stuck.length;
   if (stuck.length === 0) return result;
 
+  // PASS 13 RTT COLLAPSE: the per-row cascade cost 2 lookups + 1 write per
+  // stuck row (3+ RTTs each, up to 150 RTTs per tick at the 50-row cap).
+  // Both lookups are keyed by target_game_id across the same row set, so
+  // they batch into 2 total round trips (ANY(array) over flat params via
+  // sql.query — the tagged template JSON-serializes arrays, so the raw
+  // query path is required for a true Postgres array literal). Per-row
+  // decisions and the status-guarded UPDATEs keep their exact semantics:
+  // crashed > live-state > age-cancel, unchanged. If either batched lookup
+  // fails, skip the pass entirely — rows stay untouched and the next tick
+  // retries, which is what a per-row soft failure did anyway.
+  const targets = stuck.map((row) => row.target_game_id);
+  let crashedRows: { game_id: string }[] = [];
+  let liveRows: { game_id: string; lifecycle: string }[] = [];
+  try {
+    crashedRows = await sql.query<{ game_id: string }>(
+      `SELECT game_id FROM crash_rounds WHERE game_id = ANY($1::text[])`,
+      [targets],
+    );
+    liveRows = await sql.query<{ game_id: string; lifecycle: string }>(
+      `SELECT game_id, lifecycle FROM live_round_state WHERE game_id = ANY($1::text[])`,
+      [targets],
+    );
+  } catch (e) {
+    logger.warn(
+      { error: String(e), stuck: targets.length },
+      "stuck-recovery batched lookup failed — pass skipped, retried next tick",
+    );
+    return result;
+  }
+  const crashedSet = new Set(crashedRows.map((c) => c.game_id));
+  const liveMap = new Map(liveRows.map((l) => [l.game_id, l.lifecycle]));
+
   for (const row of stuck) {
     const target = row.target_game_id;
     try {
       // Has the target already crashed in historical storage?
-      const crashed = await sql<{
-        game_id: string;
-        multiplier: number;
-        crashed_at: string | Date;
-      }>`
-        SELECT game_id, multiplier, crashed_at
-        FROM crash_rounds
-        WHERE game_id = ${target}
-        LIMIT 1
-      `;
-
-      if (crashed.length > 0) {
+      if (crashedSet.has(target)) {
         // Target finished — mark prediction LOST/resolved without inventing outcome
         // if validator already should have run; cancel the stuck PENDING so the
         // unique active-target constraint is released.
@@ -94,13 +115,10 @@ export async function reconcileStuckPredictions(
         continue;
       }
 
-      // Live state: still running?
-      const live = await sql<{ lifecycle: string }>`
-        SELECT lifecycle FROM live_round_state WHERE game_id = ${target} LIMIT 1
-      `.catch(() => [] as { lifecycle: string }[]);
+      // Live state: still running? (batched lookup above)
+      const lc = liveMap.get(target);
 
-      if (live.length > 0) {
-        const lc = live[0]!.lifecycle;
+      if (lc !== undefined) {
         if (lc === "STARTED" || lc === "RUNNING") {
           result.stillLive += 1;
           // Debug, not info: this fires EVERY poll pass (~2s) for every

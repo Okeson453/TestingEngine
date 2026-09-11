@@ -237,6 +237,7 @@ async function claimFeedbackJobDurable(
  */
 async function completeFeedbackJob(
   predictionId: string,
+  targetGameId: string | null,
   ok: boolean,
   err: string | null,
 ): Promise<void> {
@@ -249,6 +250,13 @@ async function completeFeedbackJob(
     // invariant re-flagged the row every pass and the sweep could never heal
     // it (claim saw the COMPLETED job and skipped). One data-modifying CTE =
     // both writes commit or neither does.
+    //
+    // PASS 13: the live_round_state lifecycle advance (markFeedbackApplied)
+    // folded in as a third CTE — it was a separate round trip per stuck
+    // feedback row. Same unconditional call as before (fires even when the
+    // job returns to PENDING), same never-regress lifecycle CASE, and the
+    // source/correlation_id columns keep their prior values via the
+    // ON CONFLICT path (the row exists by the time feedback runs).
     const rows = await sql<{ marker_set: number }>`
       WITH j AS (
         UPDATE feedback_jobs
@@ -266,6 +274,22 @@ async function completeFeedbackJob(
           AND feedback_applied_at IS NULL
           AND ${ok}
         RETURNING 1
+      ),
+      lrs AS (
+        INSERT INTO live_round_state (
+          game_id, lifecycle, source, correlation_id, updated_at
+        ) SELECT
+          ${targetGameId ?? null}, 'FEEDBACK_APPLIED', 'unknown', null, now()
+        WHERE ${targetGameId ?? null}::text IS NOT NULL
+        ON CONFLICT (game_id) DO UPDATE SET
+          lifecycle = CASE
+            WHEN live_round_state.lifecycle = 'FAILED' THEN 'FAILED'
+            WHEN live_round_state.lifecycle = 'RECONCILED'
+              AND 'FEEDBACK_APPLIED' NOT IN ('FAILED') THEN 'RECONCILED'
+            ELSE 'FEEDBACK_APPLIED'
+          END,
+          correlation_id = COALESCE(live_round_state.correlation_id, EXCLUDED.correlation_id),
+          updated_at = now()
       )
       SELECT
         (SELECT count(*) FROM j) AS job_updated,
@@ -498,6 +522,7 @@ export async function processResolvedPredictionFeedback(
   // sweep re-drives it.
   await completeFeedbackJob(
     input.predictionId,
+    input.targetGameId ?? null,
     learningStatus !== "FAILED",
     learningStatus === "FAILED" ? "all learning components failed" : null,
   );
@@ -509,14 +534,8 @@ export async function processResolvedPredictionFeedback(
   }
 
   // Phase 11 — advance round state machine
-  try {
-    const { markFeedbackApplied } = await import(
-      "@/lib/prediction/live/live-round-state"
-    );
-    await markFeedbackApplied(input.targetGameId);
-  } catch {
-    /* soft */
-  }
+  // (PASS 13: folded into completeFeedbackJob's lrs CTE above — one RTT
+  // instead of two per stuck-feedback row.)
 
   // Phase 18 — feedback latency observed by caller; count complete here
   try {

@@ -1304,6 +1304,18 @@ export class OutboxDispatcher {
     // it now runs only on the maintenance/general pool so it cannot add
     // latency to the N+1 critical path. Pre-send authorization remains the
     // final gate for any row that reaches dispatch.
+    //
+    // PASS 13 BOUNDING: the started/crashed subqueries had no lower bound,
+    // so they matched every round that EVER started — the match set grows
+    // forever (live_round_state has no retention) and the UPDATE got
+    // slower every week of uptime. Bounded to a 10-minute lookback, which
+    // is semantics-preserving BY CONSTRUCTION: the age sweep above in this
+    // same function dead-letters every row with created_at < now() - 2min
+    // first, so this sweep only ever sees rows younger than 2 minutes,
+    // and a prediction created <2 min ago targets a round that starts
+    // within one round duration (~30s) of creation — a 10-minute horizon
+    // is a 20x margin over any legitimate match. Older targets were only
+    // reachable by rows that the age sweep already removed.
     try {
       await sql`
         update notification_outbox
@@ -1315,9 +1327,11 @@ export class OutboxDispatcher {
           and coalesce(target_game_id, metadata->>'targetGameId', metadata->>'target_game_id') in (
             select game_id from live_round_state
             where began_at is not null and began_at <= clock_timestamp()
+              and began_at > clock_timestamp() - interval '10 minutes'
             union
             select game_id from crash_rounds
             where crashed_at is not null and crashed_at <= clock_timestamp()
+              and crashed_at > clock_timestamp() - interval '10 minutes'
           )
       `;
     } catch { /* soft */ }

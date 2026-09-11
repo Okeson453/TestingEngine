@@ -434,9 +434,15 @@ export class PollWorker {
         }
 
         // Validation for newly inserted rounds — bounded parallelism
+        // (PASS 13: default raised 1 -> 2. Each onGameEnd is now 3 RTTs
+        // post-3000e75; at 50 recovered rounds concurrency 1 serialized
+        // 150 sequential RTTs on the general pool per WAF-recovery fetch.
+        // 2 halves the wall time; the cap stays 2 so the general pool
+        // (max 6 in prod under PG_POOL_MAX=10) keeps headroom for the
+        // dispatcher's normal lane. Env-overridable as before.)
         const VALIDATE_CONCURRENCY = Math.max(
           1,
-          Math.min(2, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 1) || 1),
+          Math.min(2, Number(process.env.POLL_VALIDATE_CONCURRENCY ?? 2) || 2),
         );
         {
           const valT0 = performance.now();
