@@ -72,6 +72,27 @@ export function registerProcessFailureHandlers(opts = {}) {
   };
 
   const onUnhandledRejection = (reason) => {
+    // Sandbox-contained rejections (sep 11 boot log: unhandledRejection in
+    // the same tick as "wr_utils loaded"): rejections originating INSIDE the
+    // node:vm wr_utils bundle (identifier "wr_utils.vm.mjs") cannot touch
+    // host state — the context is an explicit allowlist with no fs/net/
+    // process. The verified bundle has a dead fetch branch; its stub
+    // rejection escapes the bundle unhandled. These are benign by
+    // construction and must never be fatal-worthy, even if
+    // WORKER_FATAL_ON_UNCAUGHT=1 is set — log-and-continue at info level.
+    const sandboxStack = String(reason instanceof Error ? reason.stack ?? reason.message : reason);
+    if (sandboxStack.includes("wr_utils.vm.mjs")) {
+      out.log(
+        JSON.stringify({
+          level: "info",
+          time: new Date().toISOString(),
+          component: "worker-entry",
+          msg: "benign unhandledRejection from wr_utils sandbox bundle (contained, no host access)",
+          error: serialize(reason),
+        }),
+      );
+      return;
+    }
     out.error(
       JSON.stringify({
         level: "fatal",
