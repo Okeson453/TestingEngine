@@ -909,6 +909,8 @@ export interface OnGameEndPredictResult {
   kind:
     | "predicted"
     | "duplicate"
+    | "duplicate_no_bet"
+    | `blocked_by_bg:${string}`
     | "too_late"
     | "skipped_late"
     | "insufficient_history"
@@ -993,7 +995,7 @@ export async function onGameEndPredict(
   const t1 = performance.now(); // target claimed
 
   if (!claim.owned) {
-    const blockedKind =
+    const blockedKind: OnGameEndPredictResult["kind"] =
       claim.reason === "bg_reserved" ||
       claim.reason === "bg_running" ||
       claim.reason === "bg_owned" ||
