@@ -307,30 +307,47 @@ async function loadSignUtilsOnce(): Promise<SignUtils> {
 }
 
 const WR_UTILS_CACHE_KEY = "wr_utils_bundle_cache";
+/** Process-local cache so boot/hot path never re-reads the multi-hundred-KB
+ *  worker_state blob (prod measured SELECT ~573ms). */
+let memWrUtilsBundleCache: { body: string; url: string; at: number } | null = null;
 
 /** Persist the last-good bundle body so boots survive bc.game flakiness. */
 async function persistWrUtilsBundleCache(body: string, url: string): Promise<void> {
-  const { getSql } = await import("@/lib/db");
-  const sql = await getSql();
-  await sql`
-    insert into worker_state (key, value, updated_at)
-    values (${WR_UTILS_CACHE_KEY}, ${JSON.stringify({ body, url, at: Date.now() })}, now())
-    on conflict (key) do update
-      set value = excluded.value, updated_at = now()
-  `;
+  memWrUtilsBundleCache = { body, url, at: Date.now() };
+  // Fire-and-forget: never block sign path or boot on a large worker_state write.
+  void (async () => {
+    try {
+      const { getSql } = await import("@/lib/db");
+      const sql = await getSql();
+      await sql`
+        insert into worker_state (key, value, updated_at)
+        values (${WR_UTILS_CACHE_KEY}, ${JSON.stringify({ body, url, at: Date.now() })}, now())
+        on conflict (key) do update
+          set value = excluded.value, updated_at = now()
+      `;
+    } catch {
+      /* soft — memory cache remains authoritative for this process */
+    }
+  })();
 }
 
 async function loadCachedWrUtilsBundle(): Promise<{ body: string; url: string; at: number } | null> {
-  const { getSql } = await import("@/lib/db");
-  const sql = await getSql();
-  const rows = await sql<{ value: string | null }>`
-    select value from worker_state where key = ${WR_UTILS_CACHE_KEY} limit 1
-  `;
-  const raw = rows[0]?.value;
-  if (!raw) return null;
-  const parsed = JSON.parse(raw) as { body?: string; url?: string; at?: number };
-  if (!parsed.body || !parsed.url || !parsed.at) return null;
-  return { body: parsed.body, url: parsed.url, at: parsed.at };
+  if (memWrUtilsBundleCache?.body) return memWrUtilsBundleCache;
+  try {
+    const { getSql } = await import("@/lib/db");
+    const sql = await getSql();
+    const rows = await sql<{ value: string | null }>`
+      select value from worker_state where key = ${WR_UTILS_CACHE_KEY} limit 1
+    `;
+    const raw = rows[0]?.value;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { body?: string; url?: string; at?: number };
+    if (!parsed.body || !parsed.url || !parsed.at) return null;
+    memWrUtilsBundleCache = { body: parsed.body, url: parsed.url, at: parsed.at };
+    return memWrUtilsBundleCache;
+  } catch {
+    return null;
+  }
 }
 
 /**

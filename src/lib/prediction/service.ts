@@ -804,8 +804,12 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
     }>(
       `select owner_id, expires_at, heartbeat_at from worker_locks where lock_key = 'prediction_worker' limit 1`,
     );
+    // Exclude large blob keys (wr_utils bundle can be hundreds of KB and was
+    // measured at ~573ms full-table reads). Dashboard only needs scalar status.
     const stateRows = await query<{ key: string; value: string }>(
-      `select key, value from worker_state`,
+      `select key, value from worker_state
+       where key not in ('wr_utils_bundle_cache')
+         and coalesce(length(value), 0) < 4096`,
     );
     const state = new Map(stateRows.map((r) => [r.key, r.value]));
     const lock = lockRows[0];

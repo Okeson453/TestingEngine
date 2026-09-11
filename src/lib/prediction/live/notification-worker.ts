@@ -16,7 +16,7 @@
  *   INFLIGHT stuck > STALE_MS  --tick-->  PENDING (recovered)
  *   attempts >= MAX_ATTEMPTS  --tick-->  DEAD
  */
-import { getCriticalSql, getSql, type Sql } from "@/lib/db";
+import { getCriticalSql, getSql, getCriticalPool, type Sql } from "@/lib/db";
 import { runInTransaction } from "@/lib/prediction/live/tx";
 import {
   sendTelegramMessage,
@@ -415,7 +415,15 @@ export class OutboxDispatcher {
                     n.telegram_deadline_at, n.priority, n.target_game_id,
                     n.dispatch_claimed_at
         `;
-      } catch {
+      } catch (claimErr) {
+        // Only fall back for genuine SQL-shape rejection. Pool timeouts /
+        // connection errors must NOT cascade into a multi-statement TX that
+        // multiplies RTTs on the already-failing critical path (was a hidden
+        // amplifier of the ~1.17s SIGNAL_READY→DISPATCH lag).
+        const msg = claimErr instanceof Error ? claimErr.message : String(claimErr);
+        const isShapeError =
+          /syntax|UPDATE…FROM|UPDATE \.\.\. FROM|does not exist|42883|42601/i.test(msg);
+        if (!isShapeError) throw claimErr;
         // Legacy fallback (older drivers without UPDATE…FROM): plain SELECT
         // FOR UPDATE + per-row UPDATE. Lane filter is duplicated explicitly —
         // the pinned tx sql builds raw text and cannot compose fragments.
@@ -1480,7 +1488,9 @@ export class OutboxDispatcher {
       prediction: true,
       normal: true,
     };
+    let loopTick = 0;
     while (this.running) {
+      loopTick += 1;
       // Fencing gate (fix plan Phase 1): a worker that lost authority must not
       // dispatch. Covers the window between lock loss and cascade teardown.
       if (!isAuthoritative()) {
@@ -1492,33 +1502,27 @@ export class OutboxDispatcher {
         break;
       }
       try {
-        // PREDICTION LANE: always checked first. A prediction wake resolves
-        // immediately and this claim runs before any validation/result work.
-        // CO-DELIVERY FIX 2: recoverStale was awaited INLINE before this
-        // claim every 10th tick, adding its full general-pool round trips
-        // (~1s on slow rounds) to the N+1 dispatch path — dispatch landed
-        // 1.6-2.2s after enqueue, the WIN/LOSS became claimable meanwhile,
-        // and slow-round predictions missed target-start (LATE refusals).
-        // Recovery now runs AFTER the prediction claim; it is maintenance,
-        // one tick of extra staleness is immaterial (STALE_INFLIGHT_MS 30s).
-        await this.processLane("prediction");
-        // P2.4: Throttle recoverStale to every 10 ticks (250ms at 25ms tick)
-        // instead of every tick. Stale recovery is non-critical and the DB
-        // UPDATE it runs was consuming ~5-10ms on every tick.
-        // PLAN §8: recoverStale now runs on the GENERAL pool (maintenance),
-        // never on the prediction-critical pool.
-        if (this.stats.tickCount % 10 === 0) {
-          // DETACHED (sep 11 advisor D12): recovery is maintenance — awaiting
-          // it inline delayed the loop's return to the wake wait, so a
-          // prediction wake latching during a slow sweep waited for the full
-          // general-pool round trips. Nothing downstream needs it synchronously.
+        // PREDICTION LANE — wake-driven (sep 11 latency):
+        // Previously processLane("prediction") ran on EVERY timer tick
+        // (TICK_MS=100 → ~10 critical-pool acquires/sec of empty claims).
+        // Those empty claims caused intermittent cold Neon acquires
+        // (~1.0–1.2s) that then sat on the critical path of a real
+        // SIGNAL_READY→OUTBOX_DISPATCH wake. Now:
+        //   • prediction wake → claim immediately (primary path)
+        //   • recovery every 20 ticks (~2s) → catch missed wakes / crashes
+        //   • pure normal / timer ticks do NOT touch the critical pool
+        const runPrediction =
+          wake == null ||
+          wake.prediction ||
+          loopTick % 20 === 0;
+        if (runPrediction) {
+          await this.processLane("prediction");
+        }
+        // Maintenance: general pool only, never ahead of prediction claim.
+        if (loopTick % 10 === 0) {
           void this.recoverStale().catch(() => undefined);
         }
-        // DURABLE FORENSIC RECONCILIATION (remediation §5-§7): throttled
-        // sweep that repairs stored delivery_outcome from the authoritative
-        // raw timestamps. Detached — forensic repair never occupies the
-        // scheduling path. Every 30 ticks (~60s at a 2s fallback tick).
-        if (this.stats.tickCount % 30 === 0) {
+        if (loopTick % 30 === 0) {
           void this.reconcileForensics();
         }
         // NORMAL LANE: only when woken for normal work or on timer recovery

@@ -404,6 +404,32 @@ export async function withPinnedClient<T>(
   }
 }
 
+/** Pin a critical-pool client for multi-statement prediction dispatch (claim + auth + finalize)
+ * so one acquire covers the whole SIGNAL_READY→Telegram leg instead of 3× cold connects. */
+export async function withCriticalPinnedClient<T>(
+  fn: (client: import("pg").PoolClient) => Promise<T>,
+): Promise<T> {
+  await getSql(); // ensure pools
+  const pool = getCriticalPool();
+  if (!pool) {
+    // PGLite / tests: fall through to general pin
+    return withPinnedClient(fn);
+  }
+  const t0 = Date.now();
+  const client = await pool.connect();
+  globalRef.__lastPoolAcquireMs__ = Date.now() - t0;
+  if (globalRef.__lastPoolAcquireMs__ > 100) {
+    console.warn(
+      `[db] critical pin acquire_ms=${globalRef.__lastPoolAcquireMs__} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
+    );
+  }
+  try {
+    return await fn(client);
+  } finally {
+    client.release();
+  }
+}
+
 /** Dashboard-only: fail fast if general pool is busy (do not block 30s). */
 export async function withDashboardClient<T>(
   fn: (client: import("pg").PoolClient) => Promise<T>,

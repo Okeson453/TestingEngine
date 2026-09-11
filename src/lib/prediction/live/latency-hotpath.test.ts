@@ -88,3 +88,14 @@ describe("TICK_MS recovery default", () => {
     assert.ok(TICK_MS <= 100, `TICK_MS=${TICK_MS} should be recovery-fast`);
   });
 });
+
+describe("outbox wake coalescing under burst", () => {
+  it("multiple notifyOutbox collapse to one latched prediction wake", async () => {
+    notifyOutbox("prediction");
+    notifyOutbox("prediction");
+    notifyOutbox("normal");
+    const kinds = await waitForOutboxWake(50);
+    assert.equal(kinds.prediction, true);
+    assert.equal(kinds.normal, true);
+  });
+});
