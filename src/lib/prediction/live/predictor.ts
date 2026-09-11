@@ -929,7 +929,11 @@ export async function onGameEndPredict(
     };
   }
 
-  const generatedAt = new Date().toISOString();
+  // TIMESTAMP SEMANTICS FIX (sep 11 investigation §21/§7): this instant is
+  // the ATTEMPT START (model as-of time + requested_at), NOT generation.
+  // The model runs AFTER it; generated_at is captured post-compute so
+  // prediction_compute_ms is a measured fact, not an inferred one.
+  const attemptStartedAt = new Date().toISOString();
   const recoveryMode = deps.recoveryMode === true;
 
   // ── P0: Update in-memory history buffer (ZERO DB) ──
@@ -1055,7 +1059,7 @@ export async function onGameEndPredict(
   }
 
   // ── P0: Prediction computation only (ZERO DB, ZERO Telegram, ZERO outbox) ──
-  const timestamp = generatedAt;
+  const timestamp = attemptStartedAt;
   const predictT0 = performance.now();
   let signal: ReturnType<NonNullable<PredictorDeps["predictFn"]>>;
   try {
@@ -1103,6 +1107,13 @@ export async function onGameEndPredict(
   }
   const predictElapsed = performance.now() - predictT0;
   const t3 = performance.now(); // prediction completed
+
+  // TIMESTAMP SEMANTICS FIX: generated_at = model COMPLETION instant. The
+  // full timeline lives in outbox metadata: predictionStartedAt (attempt
+  // start / model as-of) → prediction_generated_at (here) → persist →
+  // outbox → dispatch → telegram_accepted. No derived back-dating.
+  const generatedAt = new Date().toISOString();
+  const predictionComputeMs = Math.round(predictElapsed);
 
   if (predictElapsed > PREDICT_TIMEOUT_MS) {
     logger.warn(
@@ -1285,7 +1296,7 @@ export async function onGameEndPredict(
       // WIN/LOSS message later reports, so the pair is verifiable.
       `Game ID: ${targetGameId} (bet NOW — round starting)`,
       `Prediction ID: ${predictionId}`,
-      `Generated: ${timestamp}`,
+      `Generated: ${generatedAt}`,
       recoveryMode ? "Source: poll recovery" : "Source: live ED",
     ].join("\n");
     // Shorter live deadline keeps temporal contract tight; recovery keeps more budget.
@@ -1324,6 +1335,13 @@ export async function onGameEndPredict(
       slaLagMsActual,
       kind: "prediction",
       recoveryMode,
+      // TIMESTAMP SEMANTICS FIX: immutable per-row timeline — attempt start
+      // (model as-of), measured model-compute cost, model completion. The
+      // remaining instants (persist commit, claim, telegram accept) come
+      // from the existing columns; no back-dated timestamps anywhere.
+      predictionStartedAt: attemptStartedAt,
+      predictionComputeMs,
+      predictionGeneratedAt: generatedAt,
     });
 
     let txStage: TxStageTimings | null = null;
@@ -1352,7 +1370,7 @@ export async function onGameEndPredict(
               ${signal.confidence}, ${signal.regimeId},
               ${signal.regimeId ? 0.5 : null},
               ${signal.reasoning}, ${JSON.stringify(signal.featureSummary)},
-              ${signal.modelVersion}, ${timestamp}, ${timestamp},
+              ${signal.modelVersion}, ${attemptStartedAt}, ${generatedAt},
               ${targetGameId}, ${gameId},
               ${correlationId},
               ${String((signal.featureSummary as Record<string, unknown> | undefined)?.acie_instance_id ?? "") || null},
