@@ -1,200 +1,216 @@
 # TestingEngine
 
-BcTracker — autonomous prediction engine for BC.Game Crash multiplier rounds.
+**BcTracker** — autonomous live prediction engine for [BC.Game](https://bc.game) Crash rounds (1.30× threshold intelligence).
 
-## Overview
+A long-lived **Railway worker** ingests live crash events, generates N+1 predictions, validates outcomes, and delivers Telegram signals. A **Vercel dashboard** is read-only against the same PostgreSQL database.
 
-CrashWave records BC.Game Crash multipliers in sequence — live history, stats,
-and streaks. Tracking only. The prediction engine runs as an **autonomous
-background worker** that polls BC.Game history, detects new rounds, generates
-predictions, validates WIN/LOSS outcomes, and persists results to the database
-— independent of any browser, dashboard, or Vercel invocation.
+---
 
 ## Architecture
 
-Two deployments of the same repository, talking to the same PostgreSQL:
-
 ```
-   ┌────────────────────┐         ┌────────────────────┐
-   │  Railway (worker)  │ writes  │                    │  reads  ┌────────────────────┐
-   │  npm run worker    │ ──────► │   PostgreSQL       │ ◄────── │  Vercel (dashboard)│
-   │  long-lived, 24/7  │         │   (Neon / Railway) │         │  read-only SSR     │
-   │  polls BC.Game 1.5s │         │                    │         │  TanStack Start    │
-   └────────────────────┘         └────────────────────┘         └────────────────────┘
+  BC.Game native WS / Socket.IO          REST poll (recovery)
+           │                                      │
+           ▼                                      ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │              Railway worker  (npm run worker)            │
+  │  ED(N) → observe → predict N+1 → outbox → Telegram      │
+  │  BG(N) → started_at + temporal kill of late signals     │
+  │  Poll  → recovery when socket path misses a round       │
+  │  Feedback → adaptive edge / ACIE online weights         │
+  └───────────────────────────┬─────────────────────────────┘
+                              │ writes
+                              ▼
+                     PostgreSQL (Neon / Railway)
+                              │ reads
+                              ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │         Vercel dashboard  (TanStack Start SSR)           │
+  │         Read-only: rounds, predictions, worker health    │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-### Worker (autonomous background process)
+### Production prediction path (ED-primary)
 
-The worker (`scripts/worker.mjs`) runs as a long-lived Node.js process on
-Railway (see `railway.toml` / `Procfile`):
+| Stage | What happens |
+|-------|----------------|
+| **ED(N)** | Crash N ends → observe on ACIE → claim target N+1 → in-memory history (includes N) → evaluate → edge/quality gates → durable `pending_predictions` + `notification_outbox` → `notifyOutbox` |
+| **Delivery** | Dispatcher claims pending outbox (immediate by default) → pre-send temporal auth → Telegram |
+| **BG(N+1)** | Stamps round start; **dead-letters** any undelivered prediction still targeting the started round |
+| **Validation** | When N resolves, WIN/LOSS + feedback update online state / adaptive edge |
+| **Poll** | Safety net only if the live path missed ownership or events |
 
-- Polls BC.Game history every `POLL_WORKER_MS` (default **1.5 s**)
-- Detects new rounds by comparing `game_id` against the DB primary key
-- Generates predictions using the existing `PredictionEngine`
-- Validates WIN/LOSS outcomes, deterministically 1:1:1 with the round
-- Persists all results to PostgreSQL (Neon / Railway Postgres)
-- Runs **24/7** — does **not** require a browser, dashboard, or Vercel
-  invocation. The dashboard may be closed; the worker keeps going.
+Optional legacy: set `BG_PRIMARY_PREDICT=1` to also attempt N+1 at BG(N) (without crash N). **Default is off** — generation uses the completed round result.
+
+### Design invariants
+
+- **One target → one prediction owner** (in-memory claim + DB unique on unmatched `pending_predictions.target_game_id`)
+- **No outcome leakage**: features/history never include the target round’s crash
+- **Temporal contract**: signal must be generated and delivered **before** the target round starts
+- **Quality over volume**: ENTRY only when model P beats fair odds (1/1.30 ≈ 76.9%) + configurable edge
+- **Worker authority fencing**: only the lease holder mutates live state
+
+---
+
+## Quick start
+
+### Requirements
+
+- Node.js **≥ 22.6**
+- PostgreSQL for production (`DATABASE_URL`)
+- Optional: Telegram bot for signal delivery
+
+### Local development
 
 ```bash
-npm run dev          # Local dev (in-process PGLite, worker runs in the Vite dev server)
-npm run worker       # Standalone persistent worker (requires DATABASE_URL=Postgres)
+npm install
+npm run dev          # Vite + in-process PGLite; worker runs inside the dev server
 ```
 
-The Vercel dashboard is **read-only**. It never polls BC.Game, never generates
-predictions, never validates — it just reads `worker_state` /
-`prediction_validations` / `crash_rounds` and renders them.  No React timer,
-no `refreshDashboard` cycle, no client-side execution is required for the
-worker to keep operating.
+### Standalone worker (production shape)
 
-### Database
-
-- **Production**: PostgreSQL via Neon or Railway Postgres (`DATABASE_URL`).
-  Both deployments MUST use the same database.
-- **Dev/Preview**: PGLite (in-process WASM Postgres).
-
-Migrations live in `migrations/` and are auto-applied on first query
-(`src/lib/db.ts` for PGLite, `scripts/migrate.mjs` for `DATABASE_URL`).
-
-### Migrations (in apply order)
-
-| File                            | Purpose                                                  |
-|---------------------------------|----------------------------------------------------------|
-| `0002_crash_rounds.sql`         | `crash_rounds` table                                     |
-| `0003_crash_daily.sql`          | `crash_daily` aggregate table                            |
-| `0004_crash_optimize.sql`       | `sum_multipliers`, `purge_old_crash_rounds` (raw only)   |
-| `0005_prediction_validation.sql`| `pending_predictions`, `prediction_validations`,         |
-|                                 | `validation_config`                                      |
-| `0006_worker_infra.sql`         | `worker_locks`, `worker_state`                           |
-| `0007_prediction_correlation.sql` | **NEW** — `pending_predictions.target_game_id`,        |
-|                                 | `UNIQUE(prediction_validations.game_id)` for the        |
-|                                 | durable 1:1:1 invariant                                 |
-
-### Dashboard
-
-Live at `http://localhost:8080/predictions` (dev) or `https://<vercel-app>`:
-
-- Current prediction status (read from `worker_state`)
-- Daily progress (target vs. resolved count)
-- WIN/LOSS stats and streaks
-- Historical validation records
-- Worker health (Running/Offline, last sync) — read from `worker_locks` +
-  `worker_state`
-- Daily target configuration (operator-adjustable, range 20–500; **operating
-  target only**, never a database retention limit)
-
-The worker is the **sole owner** of:
-
-- BC.Game polling
-- New-round detection
-- Prediction generation
-- Prediction-to-round correlation
-- WIN/LOSS validation
-- Persistent state writes (`crash_rounds`, `pending_predictions`,
-  `prediction_validations`, `worker_state`)
-
-The dashboard **must never** do any of those — it only reads.
-
-## Prediction ↔ round ↔ validation invariant
-
-```
-exactly 1 prediction  ↔  exactly 1 target game_id  ↔  exactly 1 validation
+```bash
+export DATABASE_URL=postgres://...
+npm run worker       # migrations + live boot (socket, poll, outbox dispatcher)
 ```
 
-Enforced at three layers:
+### Common scripts
 
-1. **At generation** (`generateAndQueuePrediction`): model input is
-   `crash_rounds` with `crashed_at <= now()` (the existing `MAX_HISTORY = 100`
-   cap is preserved).  The target round's own multiplier is never fed in.
-2. **At correlation** (`validateAgainstNewRounds`): oldest-pending ↔
-   oldest-new-round, durable via `pending_predictions.target_game_id`.
-   Cycles that discover N rounds in one poll resolve N predictions (capped by
-   the number of unmatched pendings).
-3. **At persistence** (Postgres): `UNIQUE(prediction_validations.prediction_id)`
-   + `UNIQUE(prediction_validations.game_id)` +
-   partial unique index on `pending_predictions(target_game_id) WHERE matched = false`.
-   A re-run after a crash leaves already-resolved rows untouched
-   (`ON CONFLICT DO NOTHING`).
+| Script | Purpose |
+|--------|---------|
+| `npm run dev` | Dashboard + local worker (PGLite if no `DATABASE_URL`) |
+| `npm run worker` | Production autonomous worker |
+| `npm run build` | Vite build + `db:migrate` |
+| `npm run db:migrate` | Apply SQL migrations |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run test` | Unit + live-path tests |
+| `npm run lint` | ESLint |
+| `npm run diagnose` | Engine diagnostic script |
 
-### Error-state contract
+---
 
-- A failed BC.Game / DB cycle leaves `worker_state.last_error` populated and
-  `worker_state.last_sync_ok = 0`. It does **not** clear a previous error.
-- A fully successful cycle writes `last_sync_at = now`,
-  `last_sync_ok = 1`, and clears `last_error` to the empty string.
-- A cycle that errored at any step (fetch / insert / validate / generate)
-  is recorded as failed even if a later step happened to succeed on an empty
-  result set. This prevents a partial cycle from being reported as "ok".
+## Deployments
 
-## Server Functions
+| Surface | Role | Notes |
+|---------|------|--------|
+| **Railway** | Worker 24/7 | `Procfile` / `railway.toml` → `npm run worker` |
+| **Vercel** | Read-only dashboard | Same `DATABASE_URL`; never polls BC.Game or generates predictions |
 
-Server functions are defined in `src/lib/p.ts` and called from client
-components via `useMutation` / `useQuery`.
+See [DEPLOY.md](./DEPLOY.md), [EDGE_SETUP.md](./EDGE_SETUP.md), and [TELEGRAM.md](./TELEGRAM.md).
 
-### Important: Server Function ID Base64 Encoding
+Both deployments **must** share the same Postgres instance.
 
-TanStack Start encodes server function IDs as base64 of
-`{"file":"<path>","export":"<name>"}`. The base64 string becomes part of the
-URL path (`/_serverFn/<base64id>`).
+---
 
-**Known issue**: If the file path is long enough that the base64 encoding
-produces `/` characters, the server's URL parsing (`split('/')[0]`) truncates
-the ID, causing "Invalid server function ID" 500 errors for all
-browser-side calls.
+## Prediction engine (ACIE)
 
-**Solution**: Keep server function file paths short enough to avoid `/` in the
-base64 encoding. The functions must live in `src/lib/p.ts` (or a similarly
-short path), not `src/lib/prediction/api.ts`.
+**ACIE** (Adaptive Crash Intelligence Engine) is the authoritative live scorer when history is warm (≥ 5 observed rounds):
 
-### Calling Convention
+- Multi-model PSI ensemble + online weight updates  
+- Optional Platt calibration when it improves rolling Brier  
+- Strategy layer: ENTRY / REDUCED_ENTRY / SKIP  
+- Live selectivity: `MIN_SIGNAL_EDGE` + **adaptive edge** from realized signal outcomes  
+- Ensemble **disagreement gate** (`ACIE_MAX_DISAGREEMENT`)
 
-POST server functions require a `{ data: { ... } }` wrapper:
+Fallback: `PredictionEngine` + feature engines when ACIE is unavailable (explicit `FALLBACK_BASELINE` provenance).
 
-```typescript
-// CORRECT
+Default strategy mode is **quality** (thresholds ≥ fair + edge). High-frequency mode:
+
+```bash
+ACIE_STRATEGY_MODE=hf
+```
+
+---
+
+## Key environment variables
+
+### Required (production worker)
+
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | Postgres connection string |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_IDS` | Signal delivery (see TELEGRAM.md) |
+
+### Prediction & delivery
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MIN_SIGNAL_EDGE` | `0.02` | Min P − fair before emit; further adapted online |
+| `PREDICTION_RESULT_HOLD_MS` | `0` | Outbox hold before claimable (0 = immediate) |
+| `BG_PRIMARY_PREDICT` | off | `1` = also predict at BG without crash N |
+| `ACIE_STRATEGY_MODE` | `quality` | `quality` \| `hf` |
+| `ACIE_QUALITY_EDGE` | `0.025` | Strategy threshold above fair |
+| `ACIE_MAX_DISAGREEMENT` | `0.06` | Skip when ensemble disagreement exceeds this |
+| `TELEGRAM_DEADLINE_MS` | `5000` | Soft send budget for live signals |
+| `USE_NATIVE_BC_WS` | on | Native BC.Game WS primary (`0` to disable) |
+| `USE_ADVANCED_PIPELINE` | off | Extra meta/calibration pipeline on fallback path |
+
+### Infrastructure
+
+| Variable | Purpose |
+|----------|---------|
+| `POLL_WORKER_MS` | REST recovery poll interval |
+| `PG_*` / pool sizing | Neon connection tuning (see `src/lib/db.ts`) |
+| Socket / edge agent vars | WAF bypass via browser edge — see EDGE_SETUP.md |
+
+---
+
+## Repository layout
+
+```
+scripts/worker.mjs          # Process entry → live boot
+src/lib/prediction/
+  live/                     # Boot, predictor, validator, outbox, poll, feedback
+  events/game-event-handlers.ts
+  acie/                     # Shared ACIE engine, PSI, strategy, online state
+  models/ features/ …       # Fallback PredictionEngine stack
+migrations/                 # Ordered SQL (outbox, feedback, fencing, indexes)
+docs/                       # Deep-dive investigations
+FORENSIC_PREDICTION_ENGINE_REPORT.md
+```
+
+---
+
+## Correctness contracts
+
+1. **Correlation** — exactly one unmatched pending prediction per `target_game_id`  
+2. **Temporal** — `generated_at` before target start; dispatcher refuses late sends; BG kills stale outbox rows  
+3. **History** — N+1 history includes completed source N; never includes the target’s crash  
+4. **Idempotency** — ED dedup by game id; feedback claimed once per `prediction_id`  
+5. **Authority** — non-authoritative workers drop mutation roles after fence loss  
+
+---
+
+## Ops & diagnostics
+
+| Symptom | Where to look |
+|---------|----------------|
+| Late / missing Telegram | Outbox status, pre-send temporal reasons, `ed_to_signal_ms` logs |
+| No predictions | History READY?, quality skips (`skipped_no_edge`), sheath halt, fencing |
+| Worker offline / pool | Neon `max_client_conn`, critical vs general pool logs |
+| Socket WAF | `socket_status`, browser edge agent (EDGE_SETUP.md) |
+
+Useful docs:
+
+- [FORENSIC_PREDICTION_ENGINE_REPORT.md](./FORENSIC_PREDICTION_ENGINE_REPORT.md) — path audit & fixed defects  
+- [LATENCY_OUTBOX_PREDICTION_DIAGNOSIS.md](./LATENCY_OUTBOX_PREDICTION_DIAGNOSIS.md)  
+- [TELEGRAM.md](./TELEGRAM.md)  
+- [DATABASE_AUDIT_REPORT.md](./DATABASE_AUDIT_REPORT.md)  
+
+---
+
+## Dashboard / server functions
+
+SSR UI uses TanStack Start. Server functions live in short paths such as `src/lib/p.ts` so base64 function IDs do not embed `/` (see historical path-length constraint).
+
+POST calls use a `{ data: { ... } }` wrapper:
+
+```ts
 predictionSetDailyTarget({ data: { target: 50 } })
-
-// INCORRECT
-predictionSetDailyTarget({ target: 50 })
 ```
 
-## Production environment
+---
 
-| Variable                   | Default  | Used by                    | Purpose                                       |
-|----------------------------|----------|----------------------------|-----------------------------------------------|
-| `DATABASE_URL`             | —        | Vercel **+** Railway       | Postgres connection string                    |
-| `POLL_WORKER_MS`       | `1500`  | Railway worker only        | BC.Game poll interval (ms)                    |
-| `PREDICTION_LOCK_TTL_SEC`  | `60`     | Railway worker only        | Distributed lock TTL (s)                      |
-| `PREDICTION_FETCH_PAGES`   | `2`      | Railway worker only        | Pages of BC.Game history per poll             |
-| `PG_DATA_PATH`             | `./data/crashwave` | Dev only         | PGLite on-disk dir (never set in production) |
+## License / status
 
-See `.env.example` for the full annotated list.
-
-## Deployment
-
-### Railway (worker)
-
-1. New Railway project from this repository.
-2. Add a PostgreSQL database (or use Neon / external Postgres — set
-   `DATABASE_URL` in the Railway service's env vars).
-3. Set `DATABASE_URL`, `POLL_WORKER_MS=1500`,
-   `PREDICTION_LOCK_TTL_SEC=60`, `PREDICTION_FETCH_PAGES=2`.
-4. `railway.toml` auto-detects the build (`npm install`) and start command
-   (`npm run worker`).
-
-### Vercel (dashboard)
-
-1. New Vercel project from this repository.
-2. Set `DATABASE_URL` to the same Postgres as Railway.
-3. No cron / no worker needed — the worker runs on Railway.
-4. `npm run build && npm run db:migrate` applies migrations on each deploy.
-
-## Development
-
-```bash
-npm run dev           # Start dev server on port 8080 (PGLite + in-process worker)
-npm run typecheck     # TypeScript type checking
-npm run test          # Run tests
-npm run lint          # Lint code
-npm run worker        # Standalone worker (requires DATABASE_URL=Postgres)
-```
+Private application workspace. Node ≥ 22.6. Production worker is the source of truth for predictions; the dashboard only observes.
