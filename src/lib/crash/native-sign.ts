@@ -229,6 +229,10 @@ async function loadSignUtilsOnce(): Promise<SignUtils> {
       if (getSourceTextModule() !== null) {
         const utils = await evaluateWrUtilsBundleInSandbox(body);
         cachedUtils = utils;
+        // SEP 11 FIX: persist the last-good bundle so a flaky bc.game boot
+        // (7 failed fetch attempts, 00:12 deploy log) can fall back to the
+        // DB cache instead of delaying sign readiness ~19s. Fire-and-forget.
+        void persistWrUtilsBundleCache(body, url).catch(() => undefined);
         logger.info({ url, attempt, sandboxed: true }, "wr_utils loaded");
         return cachedUtils;
       }
@@ -276,7 +280,57 @@ async function loadSignUtilsOnce(): Promise<SignUtils> {
       if (attempt < 3) await sleep(400 * attempt);
     }
   }
+
+  // SEP 11 FIX (wr_utils load): all fresh attempts failed. Before throwing,
+  // fall back to the last-good bundle persisted in worker_state — bc.game
+  // fetches from Railway were flaky at boot (7 failed attempts, ~19s of
+  // sign-readiness delay, 00:12 deploy log) and the bundle rotates rarely.
+  // Fresh fetch is always preferred; this cache only rescues a failing boot.
+  const cached = await loadCachedWrUtilsBundle().catch(() => null);
+  if (cached) {
+    try {
+      const utils = await evaluateWrUtilsBundleInSandbox(cached.body);
+      cachedUtils = utils;
+      logger.warn(
+        { cachedAt: new Date(cached.at).toISOString(), source: cached.url },
+        "wr_utils loaded from worker_state cache (fresh fetch chain failed)",
+      );
+      return utils;
+    } catch (e) {
+      logger.warn(
+        { error: e instanceof Error ? e.message : String(e) },
+        "wr_utils DB-cache fallback failed — stale or rotated bundle",
+      );
+    }
+  }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+const WR_UTILS_CACHE_KEY = "wr_utils_bundle_cache";
+
+/** Persist the last-good bundle body so boots survive bc.game flakiness. */
+async function persistWrUtilsBundleCache(body: string, url: string): Promise<void> {
+  const { getSql } = await import("@/lib/db");
+  const sql = await getSql();
+  await sql`
+    insert into worker_state (key, value, updated_at)
+    values (${WR_UTILS_CACHE_KEY}, ${JSON.stringify({ body, url, at: Date.now() })}, now())
+    on conflict (key) do update
+      set value = excluded.value, updated_at = now()
+  `;
+}
+
+async function loadCachedWrUtilsBundle(): Promise<{ body: string; url: string; at: number } | null> {
+  const { getSql } = await import("@/lib/db");
+  const sql = await getSql();
+  const rows = await sql<{ value: string | null }>`
+    select value from worker_state where key = ${WR_UTILS_CACHE_KEY} limit 1
+  `;
+  const raw = rows[0]?.value;
+  if (!raw) return null;
+  const parsed = JSON.parse(raw) as { body?: string; url?: string; at?: number };
+  if (!parsed.body || !parsed.url || !parsed.at) return null;
+  return { body: parsed.body, url: parsed.url, at: parsed.at };
 }
 
 /**
