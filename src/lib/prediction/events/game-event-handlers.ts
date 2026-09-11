@@ -312,57 +312,45 @@ RT INTO live_event_log (
 
     logger.info(
       { event: "bg", gameId, correlationId },
-    // PROACTIVE PREDICTION (Fix #1): Trigger prediction for N+2 when BG(N+1) arrives
-    // This gives the entire duration of round N+1 to generate and deliver the N+2 prediction
+    // PROACTIVE PREDICTION: Trigger prediction for N+2 when BG(N+1) arrives
     const nextTarget = nextTargetGameId(gameId);
     const predCorrelationId = randomUUID();
-
+    
     try {
       const checkSql = await getSql();
-      const existing = await checkSql<{ prediction_id: string }>`
-        SELECT prediction_id FROM pending_predictions
-        WHERE target_game_id = ${nextTarget} AND matched = false
-        LIMIT 1
-      `;
-
+      const existing = await checkSql<{ prediction_id: string }>(
+        `SELECT prediction_id FROM pending_predictions WHERE target_game_id = ${nextTarget} AND matched = false LIMIT 1`
+      );
+      
       if (existing.length === 0) {
-        // No pending prediction for N+2 yet, trigger it
+        const prevGameId = String(BigInt(gameId) - 1n);
+        const prevRow = await checkSql<{ multiplier: string | number }>(
+          `SELECT multiplier FROM crash_rounds WHERE game_id = ${prevGameId} LIMIT 1`
+        );
+        const sourceMultiplier = prevRow.length > 0 ? Number(prevRow[0].multiplier) : 1.0;
+        
         void (async () => {
           try {
             const result = await attemptNPlusOnePrediction({
               sourceRoundId: gameId,
               sourceCrashAt: beganAt,
-              sourceMultiplier: 1.0,
+              sourceMultiplier: sourceMultiplier,
               source: "BG",
               correlationId: predCorrelationId,
             });
             logger.info(
-              {
-                event: "bg",
-                gameId,
-                targetGameId: result.targetGameId,
-                attempted: result.attempted,
-                correlationId: predCorrelationId,
-              },
-              result.attempted
-                ? "BG-triggered N+2 prediction"
-                : "BG-triggered N+2 prediction skipped",
+              { event: "bg", gameId, targetGameId: result.targetGameId, attempted: result.attempted, correlationId: predCorrelationId },
+              result.attempted ? "BG-triggered N+2 prediction" : "BG-triggered N+2 prediction skipped"
             );
           } catch (err) {
-            logger.error(
-              { event: "bg", gameId, error: String(err), correlationId: predCorrelationId },
-              "BG-triggered N+2 prediction failed",
-            );
+            logger.error({ event: "bg", gameId, error: String(err), correlationId: predCorrelationId }, "BG-triggered N+2 prediction failed");
           }
         })();
       }
     } catch (e) {
-      logger.debug(
-        { event: "bg", gameId, error: String(e), correlationId },
-        "BG N+2 prediction check failed (soft)",
-      );
+      logger.debug({ event: "bg", gameId, error: String(e), correlationId }, "BG N+2 prediction check failed (soft)");
     }
-
+    
     logger.info(
       { event: "bg", gameId, correlationId },
       "bg reconcile complete",
