@@ -1505,26 +1505,17 @@ export async function onGameEndPredict(
     // produces a signal that is dead-lettered past its round start, never
     // delivered into a crashed round.
     const DELIVERY_SAFETY_MS = Number(process.env.DELIVERY_SAFETY_MS ?? 500);
-    // PASS 16 — RESULT-TRIGGERED DELIVERY (user-approved 2026-09-11): the
-    // signal HOLDS in the outbox until round N's RESULT lands (the ED(N)
-    // validator release CTE sets next_attempt_at = now()), so the Telegram
-    // message arrives when the previous outcome is known and the target
-    // round's betting window opens ~4s later — instead of a full round
-    // early while round N is still on screen (user-visible as "the round I
-    // should bet on already started"). The hold is DB-clock based
-    // (now() + interval in the INSERT below). If ED(N) never arrives, the
-    // row stays held until the bg(target) temporal kill dead-letters it —
-    // a signal that missed its result trigger has no honest delivery
-    // moment. Backstops unchanged: bg(target) kill + dispatcher pre-send
-    // auth remain the final gates.
+    // IMMEDIATE DELIVERY (2026-09-11): N+1 signal is claimable as soon as
+    // the outbox row is durable. Generation is triggered by the completed
+    // round (ED primary) so the model sees crash N; delivery must not wait
+    // for a second event. A non-zero PREDICTION_RESULT_HOLD_MS remains
+    // available as an emergency brake only — default 0.
+    // Backstops unchanged: bg(target) temporal kill + dispatcher pre-send
+    // auth remain the final gates against late delivery into a started round.
     const resultHoldMs = Math.max(
       0,
-      Number(process.env.PREDICTION_RESULT_HOLD_MS ?? 30_000),
+      Number(process.env.PREDICTION_RESULT_HOLD_MS ?? 0),
     );
-    // The deadline must outlive the hold or a slow round (long run time)
-    // dead-letters the row before its release ever fires. The binding
-    // semantic constraint is unchanged: never deliver into the target
-    // round (remaining − safety clamp below).
     const deadlineAt = new Date(Math.min(
       authoritativeNowMs() + resultHoldMs + deadlineMs,
       authoritativeNowMs() + remainingBeforeTargetMs - DELIVERY_SAFETY_MS,
@@ -1548,9 +1539,8 @@ export async function onGameEndPredict(
       slaLagMsActual,
       kind: "prediction",
       recoveryMode,
-      // PASS 16: result-triggered delivery — the row is held until ED(N)
-      // (validator release CTE). Provenance for forensics + ops.
-      deliverySchedule: "ed_result_release",
+      // Immediate-on-persist delivery (hold only if PREDICTION_RESULT_HOLD_MS > 0).
+      deliverySchedule: resultHoldMs > 0 ? "ed_result_release" : "immediate_on_persist",
       resultHoldMs,
       // Immutable stage timeline for PREDICTION_DELIVERY_FORENSICS — every
       // stage that is known at enqueue time. Later stages (OUTBOX_CLAIMED,

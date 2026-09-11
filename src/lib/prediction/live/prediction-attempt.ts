@@ -5,8 +5,8 @@
  * function so target ownership, temporal gating and result logging behave
  * identically regardless of who calls:
  *
- *   BG(N)      → attemptNPlusOnePrediction({ source: "BG" })   [PRIMARY — fires while round N runs]
- *   ED(N)      → attemptNPlusOnePrediction({ source: "ED" })   [FALLBACK — only if BG(N) failed/missing]
+ *   ED(N)      → attemptNPlusOnePrediction({ source: "ED" })   [PRIMARY — crash N → N+1, immediate delivery]
+ *   BG(N)      → attemptNPlusOnePrediction({ source: "BG" })   [OPTIONAL — BG_PRIMARY_PREDICT=1]
  *   Poll(N)    → attemptNPlusOnePrediction({ source: "RECOVERY" })
  *
  * Layers of duplicate defence (in order):

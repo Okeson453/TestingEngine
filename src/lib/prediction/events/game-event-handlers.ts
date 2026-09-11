@@ -244,14 +244,18 @@ export async function bgHandler(payload: unknown): Promise<void> {
   // ONLY the real BG (round start) writes startedAt — never pr.
   noteRoundStarted(gameId, new Date(beganAt).getTime());
 
-  // P0 OWNERSHIP: reserve N+1 for BG PRIMARY immediately — BEFORE any await.
-  // Production race (16:13:21): BG received → reconcile await (~190ms) → ED
-  // arrived and first-claim-won. Reservation is synchronous Map write; ED
-  // claimTarget then sees RESERVED_BG / BG_RUNNING and reports blockedByBg.
+  // ED-PRIMARY (2026-09-11): N+1 is generated on ED(N) with the completed
+  // crash result, then delivered immediately. BG no longer reserves/claims
+  // N+1 by default — that blocked ED from computing with crash N and left
+  // held signals arriving after the target round started.
+  // Opt-in legacy: BG_PRIMARY_PREDICT=1 restores pre-reserve + BG compute.
   const targetGameIdForBg = nextTargetGameId(gameId);
   const bgReserveAt = Date.now();
   let bgReserved = false;
-  if (isAuthoritative() && /^\d+$/.test(gameId)) {
+  const bgPrimaryPredict =
+    process.env.BG_PRIMARY_PREDICT === "1" ||
+    process.env.BG_PRIMARY_PREDICT === "true";
+  if (bgPrimaryPredict && isAuthoritative() && /^\d+$/.test(gameId)) {
     const reserve = reserveTargetForBg(targetGameIdForBg, gameId);
     bgReserved = reserve.owned;
     logger.info(
@@ -267,7 +271,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
         correlationId,
       },
       reserve.owned
-        ? "BG→N+1 ownership RESERVED (primary path — before reconcile)"
+        ? "BG→N+1 ownership RESERVED (legacy BG_PRIMARY_PREDICT)"
         : `BG→N+1 reserve skipped reason=${reserve.reason}`,
     );
   }
@@ -299,7 +303,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
     // receipt and "reconcile complete" — the reconcile TX (pool acquire +
     // 5 statements), NOT the model, owns that cost. bg_receipt_to_reconcile
     // and bg_to_prediction_total below make the split visible per round.
-    if (isAuthoritative() && /^\d+$/.test(gameId)) {
+    if (bgPrimaryPredict && isAuthoritative() && /^\d+$/.test(gameId)) {
       void (async () => {
         const bgCorrelationId = `${correlationId}:bg-n1`;
         const bgTrace = startTrace(bgCorrelationId, gameId);
@@ -669,10 +673,12 @@ export function normalizeCrashEnd(
 }
 
 /**
- * ED(N): FALLBACK N+1 prediction (BG(N) is the primary trigger).
- * attemptNPlusOnePrediction is the sole ownership boundary: if BG(N) already
- * claimed/persisted target N+1, this attempt returns duplicate and skips —
- * ED only computes when the BG primary path failed or produced nothing.
+ * ED(N): PRIMARY N+1 prediction trigger (completed-round result path).
+ * Crash N is observed, then N+1 is predicted and enqueued for immediate
+ * delivery so the signal is ready before BG(N+1). attemptNPlusOnePrediction
+ * remains the sole ownership boundary (dedup vs poll recovery / optional
+ * legacy BG_PRIMARY_PREDICT). BG still stamps start + temporal-kills late
+ * signals for the started target.
  */
 export async function edHandler(payload: unknown): Promise<void> {
   // Fencing gate (fix plan Phase 1): a worker that lost authority must not
