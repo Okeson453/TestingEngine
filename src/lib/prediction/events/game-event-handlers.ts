@@ -24,6 +24,10 @@ import { isAuthoritative } from "@/lib/prediction/live/fencing";
 import {
   completeTarget,
   releaseTarget,
+  reserveTargetForBg,
+  markBgRunning,
+  isBgBlocking,
+  peekClaim,
 } from "@/lib/prediction/live/target-coordinator";
 import {
   startTrace,
@@ -239,6 +243,34 @@ export async function bgHandler(payload: unknown): Promise<void> {
   // pre-send gate consults this so it never relies on the lagging DB writes.
   // ONLY the real BG (round start) writes startedAt — never pr.
   noteRoundStarted(gameId, new Date(beganAt).getTime());
+
+  // P0 OWNERSHIP: reserve N+1 for BG PRIMARY immediately — BEFORE any await.
+  // Production race (16:13:21): BG received → reconcile await (~190ms) → ED
+  // arrived and first-claim-won. Reservation is synchronous Map write; ED
+  // claimTarget then sees RESERVED_BG / BG_RUNNING and reports blockedByBg.
+  const targetGameIdForBg = nextTargetGameId(gameId);
+  const bgReserveAt = Date.now();
+  let bgReserved = false;
+  if (isAuthoritative() && /^\d+$/.test(gameId)) {
+    const reserve = reserveTargetForBg(targetGameIdForBg, gameId);
+    bgReserved = reserve.owned;
+    logger.info(
+      {
+        component: "game-event-handlers",
+        event: "bg",
+        gameId,
+        targetGameId: targetGameIdForBg,
+        ownership: reserve.owned ? "RESERVED_BG" : reserve.reason,
+        owner: reserve.owned ? `bg:${gameId}` : reserve.owner,
+        state: reserve.owned ? reserve.state : reserve.state,
+        bg_receipt_to_reserve_ms: Math.max(0, bgReserveAt - new Date(receivedAt).getTime()),
+        correlationId,
+      },
+      reserve.owned
+        ? "BG→N+1 ownership RESERVED (primary path — before reconcile)"
+        : `BG→N+1 reserve skipped reason=${reserve.reason}`,
+    );
+  }
 
   try {
     const sql = await getSql();

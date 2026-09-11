@@ -979,10 +979,11 @@ export async function onGameEndPredict(
     };
   }
 
-  // ── P0: In-memory target claim (ZERO DB) ──
-  // ONE target round → ONE prediction owner. BG (primary), ED (fallback) and
-  // poll (recovery) all contend here first; the DB unique constraint on
-  // pending_predictions(target_game_id) is the durability backstop.
+  // ── P0: Priority-ordered target claim (ZERO DB hot path) ──
+  // Priority: BG > ED > RECOVERY. BG reserves at receipt (before reconcile);
+  // claimTarget here promotes RESERVED_BG → BG_RUNNING or blocks ED when BG
+  // already owns. pending_predictions unique constraint remains the durability
+  // backstop for multi-process safety.
   const owner = deps.recoveryMode
     ? `poll:${gameId}`
     : deps.bgTrigger
@@ -992,10 +993,35 @@ export async function onGameEndPredict(
   const t1 = performance.now(); // target claimed
 
   if (!claim.owned) {
+    const blockedKind =
+      claim.reason === "bg_reserved" ||
+      claim.reason === "bg_running" ||
+      claim.reason === "bg_owned" ||
+      claim.blockedByBg
+        ? `blocked_by_bg:${claim.reason}`
+        : claim.reason === "no_bet_terminal"
+          ? "duplicate_no_bet"
+          : "duplicate";
+    logger.info(
+      {
+        component: "live-predictor",
+        sourceGameId: gameId,
+        targetGameId,
+        owner,
+        claimReason: claim.reason,
+        claimOwner: claim.owner,
+        claimState: claim.state,
+        blockedByBg: !!claim.blockedByBg,
+        noBet: !!claim.noBet,
+      },
+      claim.blockedByBg
+        ? `N+1 ownership blocked by BG (${claim.reason})`
+        : `N+1 ownership not acquired (${claim.reason})`,
+    );
     return {
       predictionId: null,
       targetGameId,
-      kind: "duplicate",
+      kind: blockedKind,
       sourceGameId: gameId,
       sourceCrashAt: crashedAt,
     };

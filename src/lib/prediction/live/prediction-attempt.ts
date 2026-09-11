@@ -158,13 +158,24 @@ export async function attemptNPlusOnePrediction(
       attempted,
     );
     if (!attempted) {
-      // Fire-and-forget durable evidence for post-mortem (batch 3 P0).
-      persistLastRejectionFireAndForget(
-        source,
-        sourceRoundId,
-        result?.targetGameId ?? null,
-        result?.kind ?? null,
-      );
+      // Rate-limited forensic telemetry: skip hot-path worker_state writes for
+      // normal terminal outcomes (NO_BET / duplicate / BG-blocked). Those must
+      // not contend with ownership or critical DB ops. Persist only genuine
+      // failures / unexpected soft kinds.
+      const kind = result?.kind ?? null;
+      const skipWorkerState =
+        kind === "skipped_no_edge" ||
+        kind === "duplicate" ||
+        kind === "duplicate_no_bet" ||
+        (typeof kind === "string" && kind.startsWith("blocked_by_bg"));
+      if (!skipWorkerState) {
+        persistLastRejectionFireAndForget(
+          source,
+          sourceRoundId,
+          result?.targetGameId ?? null,
+          kind,
+        );
+      }
     }
 
     logger.info(
