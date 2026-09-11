@@ -457,7 +457,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
             completeTarget(targetGameId, `bg:${gameId}`);
             logger.info(
               profile,
-              "BG→N+1 SIGNAL_READY (primary path — durable outbox enqueued)",
+              `BG→N+1 SIGNAL_READY (primary path — durable outbox enqueued) [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`,
             );
           } else {
             // P0 state semantics (sep 11): skipped_no_edge is an EVALUATED,
@@ -471,10 +471,10 @@ export async function bgHandler(payload: unknown): Promise<void> {
             logger.info(
               { ...profile, terminal_no_bet: result.kind === "skipped_no_edge" },
               result.kind === "duplicate"
-                ? "BG→N+1 already claimed/persisted by another trigger"
+                ? `BG→N+1 already claimed/persisted by another trigger [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`
                 : result.kind === "skipped_no_edge"
-                  ? "BG→N+1 evaluated NO_BET (terminal — ED will not recompute)"
-                  : `BG→N+1 soft result kind=${result.kind} — target recoverable by ED fallback`,
+                  ? `BG→N+1 evaluated NO_BET (terminal — ED will not recompute) [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`
+                  : `BG→N+1 soft result kind=${result.kind} — target recoverable by ED fallback [reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]`,
             );
           }
         } catch (err) {

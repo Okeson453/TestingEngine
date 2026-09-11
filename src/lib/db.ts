@@ -9,6 +9,10 @@
  */
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import {
+  maxLoopLagBetween,
+  startEventLoopLagSampler,
+} from "@/lib/observability/event-loop-lag";
 
 export type DbSource = "neon" | "pglite";
 
@@ -170,10 +174,19 @@ function makeRun(
     }
     try {
       const q0 = Date.now();
+      const q0Perf = performance.now();
       const res = await client.query(text, params);
       const queryMs = Date.now() - q0;
       if (queryMs > 500) {
-        console.warn(`[db] ${label} slow_query_ms=${queryMs} text=${text.slice(0, 80)}`);
+        // FORENSIC ATTRIBUTION (sep 11 19:05-19:12 logs): queryMs alone
+        // cannot distinguish a Neon/network RTT spike from an event-loop
+        // stall — both inflate every query without touching pool acquires
+        // (the window's signature: SELECT 1 at 595ms, zero acquire warns).
+        // loop_lag_ms = max event-loop lag sampled during this query's
+        // wall-clock window. loop_lag ≈ queryMs ⇒ application-side stall;
+        // loop_lag ≈ 0 ⇒ network/Neon execution.
+        const loopLag = Math.round(maxLoopLagBetween(q0Perf, performance.now()));
+        console.warn(`[db] ${label} slow_query_ms=${queryMs} loop_lag_ms=${loopLag} text=${text.slice(0, 80)}`);
       }
       return res.rows as T[];
     } catch (err) {
@@ -331,6 +344,10 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
 
   criticalPool.on("error", (err) => console.error("[db] critical pool error:", err.message));
   generalPool.on("error", (err) => console.error("[db] general pool error:", err.message));
+
+  // Forensic attribution (sep 11 19:05-19:12): slow-query lines carry
+  // loop_lag_ms, which requires the sampler to be running.
+  startEventLoopLagSampler();
 
   return {
     critical: toSql(makeRun(criticalPool, "critical"), criticalPool),

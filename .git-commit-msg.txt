@@ -1,0 +1,65 @@
+forensic: attribute slow queries (loop lag vs network), stop poll spam, inline BG latency into messages
+
+Root-cause investigation of the 19:05-19:12 window (uniform 570-1001ms
+slow queries in BOTH pools — critical SELECT 1 = 595ms, general
+worker_state / live_round_state / worker_locks / outbox dead-letter =
+570-624ms, critical outbox claim = 1001ms — with ZERO pool_acquire_ms
+warnings all window; BG reconcile 927-1420ms in some rounds and a
+1.0-1.2s skip-to-not-persisted gap in others, never both):
+
+FINDING 1 — NOT pool contention. Zero acquire warns (100ms threshold)
+while queries ran 3-6x slow. Pool acquire is exonerated by the logs.
+
+FINDING 2 — NOT lock contention or plan pathology. SELECT 1 has no
+locks, no scans, no contention; it took 595ms on the critical pool.
+The outbox claim (WITH picked ... FOR UPDATE SKIP LOCKED) is exactly
+matched by migration 0041's partial index. The BG reconcile CTE is a
+single round trip on disjoint tables (pass 8 audit).
+
+FINDING 3 — the BG slow phase MOVES between rounds: reconcile TX slow
+in some rounds (19:07:28 = 883ms, 19:08:22 = 1420ms, 19:11:48 = 927ms),
+the memory-only skip-to-not-persisted gap slow in others (19:07:01 =
+1222ms, 19:07:44 = 1034ms, 19:08:51 = 1118ms) — every operation in that
+gap is synchronous (completeTarget, recordAttempt, logger.info). A
+delay in a no-DB phase cannot be a database wait. Total BG-event-to-
+NO_BET cost is ~1.0-1.4s in slow rounds and ~0ms in fast ones: one
+~1.2s stall per affected round, landing wherever the event loop happens
+to be when it hits.
+
+DIAGNOSIS: two candidates remain — (a) event-loop stall on the Railway
+instance, (b) Neon network/compute RTT spike. queryMs (client.query
+wall time) inflates under BOTH without touching pool acquires, and a
+loop stall also explains the no-DB phase delay. The 19:05-19:12 log
+cannot separate them. Shipped instrumentation that will:
+
+CHANGES
+1. src/lib/observability/event-loop-lag.ts (new): 50ms unref'd sampler,
+   bounded ring (~6.4s), maxLoopLagBetween(from, to), standalone
+   event_loop_lag_ms warn at >= 400ms. No dependencies.
+2. src/lib/db.ts makeRun: slow-query lines now read
+   slow_query_ms=X loop_lag_ms=Y — loop_lag ~= queryMs means
+   application-side stall; loop_lag ~= 0 means Neon/network. One line,
+   definitive attribution on the next slow window.
+3. game-event-handlers.ts: BG latency profile inlined into message text
+   (reconcile=Xms prediction=Yms total=Zms for SIGNAL_READY, NO_BET,
+   duplicate, and soft results). Railway raw logs show pino message
+   text ONLY — profile fields were invisible in production.
+4. poll-worker.ts: the source-round-too-old skip bypassed the 30s
+   logSkipOncePerInterval limiter and fired every 1-1.5s for minutes
+   during WS stalls (50+ identical INFO lines per window). Now
+   rate-limited, and consecutive too-old ticks apply the same linear
+   capped backoff as failures (base + 250ms*n, max 2s) — re-fetching
+   every 500ms cannot refresh an aging backlog. Counter resets the
+   moment a round passes the age check.
+
+NOT CHANGED (audited, no defect found): outbox claim query + 0041
+index (correct, SKIP LOCKED, matched sort order); dead-letter sweep
+ownership and cadence; heartbeat; BG-primary ownership state machine;
+MIN_SIGNAL_EDGE; prediction semantics; terminal NO_BET; pool sizes.
+
+TESTS: latency-attribution.test.ts (12) — sampler window math with a
+deterministic 120ms loop block, idempotent start, passive reads;
+source contracts for the loop_lag annotation, poll rate-limit + reset
++ capped backoff, inlined BG profile, unchanged 500ms base cadence.
+Full sweep 148 pass / 76 fail (all pre-existing PGLite suites;
+baseline unchanged). tsc clean, frozen-lockfile clean.

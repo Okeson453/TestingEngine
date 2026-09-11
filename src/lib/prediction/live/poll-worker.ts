@@ -200,6 +200,15 @@ export class PollWorker {
   private _lastPersistedGapMs: number | null = null;
   /** Consecutive failed ticks — drives exponential backoff to avoid pool thrash. */
   private consecutiveFailures = 0;
+
+  /**
+   * Consecutive ticks whose newest round was too old to predict from
+   * (sep 11 19:05-19:12): drives a mild linear fetch backoff during WS
+   * stalls — re-fetching every 500ms cannot refresh an aging backlog.
+   * Capped at 2s like the failure backoff so recovery stays inside one
+   * inter-round gap.
+   */
+  private consecutiveSourceTooOld = 0;
   private lastError: string | null = null;
   /** Guard: at most one BC.Game request in flight. */
   private fetchInFlight = false;
@@ -568,17 +577,24 @@ export class PollWorker {
       }
     } catch { /* soft */ }
     if (Number.isFinite(sourceAgeMs) && sourceAgeMs > maxSourceAgeMs) {
-      logger.info(
+      // RATE-LIMIT (sep 11 19:06/19:11 logs): during WS stalls this fired
+      // every ~1-1.5s for MINUTES (50+ identical INFO lines per window) —
+      // the same skip, zero new information, through the hot path of a
+      // 500ms tick loop. Route through the 30s-per-key limiter.
+      this.consecutiveSourceTooOld += 1;
+      logSkipOncePerInterval(
+        "source_too_old",
         {
-          component: "poll-worker",
           sourceGameId: newest.gameId,
           sourceAgeMs: Math.round(sourceAgeMs),
           maxSourceAgeMs,
+          consecutiveSourceTooOld: this.consecutiveSourceTooOld,
         },
         "skip poll prediction: source round too old for reliable N+1",
       );
       return false;
     }
+    this.consecutiveSourceTooOld = 0;
 
     // Browser-edge is fresher than poll — defer N+1 to avoid duplicate/cascade
     try {
@@ -885,6 +901,15 @@ export class PollWorker {
         `poll backoff ${backoff}ms after ${this.consecutiveFailures} failures`,
       );
       return backoff;
+    }
+    // Source-stall backoff (sep 11 19:05-19:12): during WS stalls the
+    // newest round ages past the prediction ceiling and every tick re-fetched
+    // the same stale page at full 500ms cadence. Linear + capped at 2s —
+    // still well inside the recovery SLA, halves the REST/parse/DB load
+    // during exactly the windows where the DB layer is already stressed.
+    if (this.consecutiveSourceTooOld > 2) {
+      const n = Math.min(this.consecutiveSourceTooOld, 8);
+      return Math.min(2_000, Math.round(base + n * 250));
     }
     try {
       // Fix 7: cadence driven by WS stream health.
