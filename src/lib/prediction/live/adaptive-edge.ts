@@ -13,10 +13,10 @@ const TARGET_HIT =
   Number(process.env.SIGNAL_TARGET_HIT_RATE ?? FAIR_130 + 0.05); // ~0.819
 
 /** Base edge from env / predictor MIN_SIGNAL_EDGE default. */
-const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.02);
+const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.03);
 
 const MAX_EDGE = Number(process.env.SIGNAL_MAX_EDGE ?? 0.08);
-const MIN_EDGE_FLOOR = Number(process.env.SIGNAL_MIN_EDGE_FLOOR ?? 0.01);
+const MIN_EDGE_FLOOR = Number(process.env.SIGNAL_MIN_EDGE_FLOOR ?? 0.02);
 
 const WINDOW = Math.max(20, Number(process.env.SIGNAL_EDGE_WINDOW ?? 40));
 

@@ -121,14 +121,15 @@ export function observeCrashForACIE(
 /** Prediction-related constants. */
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
 /** Require model P to beat fair odds (1/target) by this margin before emitting.
- *  Default 0.015 (~78.4% for 1.3x): filters pure base-rate spam without
- *  silencing the engine for hours. Set MIN_SIGNAL_EDGE=0 to emit every round.
- *  Prior default 0.04 needed ~81% which almost never fired with baseline P≈fair.
- *  NOTE: defaults were briefly 0 which disabled the live "NO BET" path entirely;
- *  restored 0.015 so production can actually skip weak rounds. */
-export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.02);
+ *  Selective default: fair + 0.03 ≈ 79.9% for 1.30× — quality over volume.
+ *  Set MIN_SIGNAL_EDGE=0 only for diagnostics (emits near every evaluable round). */
+export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.03);
 export const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
 export const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
+/** When false (default), REDUCED_ENTRY is treated like SKIP for delivery. */
+export const ALLOW_REDUCED_ENTRY =
+  process.env.ALLOW_REDUCED_ENTRY === "1" ||
+  process.env.ALLOW_REDUCED_ENTRY === "true";
 
 /** Pure selectivity decision used by onGameEndPredict (and unit tests).
  *  Returns true when this evaluation must NOT become a delivered signal. */
@@ -163,8 +164,14 @@ export function shouldSkipSignal(input: {
     (Number.isFinite(minEdge) && minEdge > 0 && p < needP) ||
     (minP > 0 && p < minP) ||
     (minC > 0 && c < minC);
+  const reducedBlocked =
+    !ALLOW_REDUCED_ENTRY &&
+    (strategyAction === "REDUCED_ENTRY" || pipelineAction === "REDUCED_ENTRY");
   const strategySkip =
-    strategyAction === "SKIP" || pipelineAction === "SKIP" || reasoningSaysSkip;
+    strategyAction === "SKIP" ||
+    pipelineAction === "SKIP" ||
+    reducedBlocked ||
+    reasoningSaysSkip;
   return noEdge || strategySkip;
 }
 const MIN_HISTORY = 20;

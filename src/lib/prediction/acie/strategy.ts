@@ -35,7 +35,7 @@ const STRONG_EDGE = Number(process.env.ACIE_STRONG_EDGE ?? 0.045);
 /** Quality-first defaults — thresholds at/above fair + edge. */
 export const DEFAULT_STRATEGY_POLICY: StrategyPolicy = {
   mode: 'adaptive',
-  supportedThreshold: FAIR_130 + QUALITY_EDGE, // ~0.794
+  supportedThreshold: FAIR_130 + QUALITY_EDGE, // ~0.804
   weakThreshold: FAIR_130 + STRONG_EDGE, // ~0.814
   fallbackThreshold: FAIR_130 + QUALITY_EDGE + 0.01,
   maxCalibrationError: 0.12,
@@ -147,7 +147,13 @@ export class StrategyLayer {
     const limit = riskState.dailyEntriesLimit ?? 500;
     if (limit > 0 && used / limit > 0.85) {
       threshold += 0.03;
-    } else if (limit > 0 && used / limit < 0.25 && used < limit * 0.25) {
+    } else if (
+      !this.selectiveOnly &&
+      limit > 0 &&
+      used / limit < 0.25 &&
+      used < limit * 0.25
+    ) {
+      // HF only: never lower the bar in selective quality mode.
       threshold -= 0.015;
     }
 
@@ -172,6 +178,11 @@ export class StrategyLayer {
 
     // Stake reduction only (no hard blackout) when past reduceAt
     if (cl >= p.consecutiveLossReduceAt) {
+      if (this.selectiveOnly) {
+        return this.skip(
+          `${cl} consecutive sub-1.30 outcomes — selective mode requires full ENTRY only.`,
+        );
+      }
       return {
         action: 'REDUCED_ENTRY',
         stake: this.reducedStake(riskState),

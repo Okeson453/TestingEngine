@@ -41,7 +41,7 @@ describe("adaptive edge", () => {
     for (let i = 0; i < 20; i++) recordSignalOutcome(true);
     const e = getAdaptiveMinEdge();
     // Should not go above base when overperforming
-    assert.ok(e <= Number(process.env.MIN_SIGNAL_EDGE ?? 0.02) + 0.001);
+    assert.ok(e <= Number(process.env.MIN_SIGNAL_EDGE ?? 0.03) + 0.001);
   });
 });
 
