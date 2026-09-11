@@ -223,13 +223,6 @@ export async function bgHandler(payload: unknown): Promise<void> {
 
   try {
     const sql = await getSql();
-    // Backfill began_at when known from BG (authoritative round start).
-    await sql`
-      UPDATE crash_rounds
-      SET began_at = COALESCE(began_at, ${new Date(beganAt)})
-      WHERE game_id = ${gameId}
-    `.catch(() => undefined);
-
     // POOL-BUDGET FIX: BG used to launch SIX concurrent general-pool
     // operations via Promise.all — with general max=5 that self-induced
     // waiting=2/3 pool pressure on every round start. The essential BG
@@ -237,8 +230,17 @@ export async function bgHandler(payload: unknown): Promise<void> {
     // stamp + temporal kill + event log); analytics run detached after.
     // Retried once — if both attempts fail, the dispatcher's atomic
     // pre-send authorization still refuses late signals at send time.
+    // AUDIT 2026-09-11: the began_at backfill UPDATE was a SEPARATE round
+    // trip before this TX — folded in as the first statement (one less
+    // general-pool round trip per round start, same COALESCE semantics).
     const runBgTx = () =>
       runInTransaction(sql, async (tx) => {
+        // Backfill began_at when known from BG (authoritative round start).
+        await tx`
+          UPDATE crash_rounds
+          SET began_at = COALESCE(began_at, ${new Date(beganAt)})
+          WHERE game_id = ${gameId}
+        `;
         // P0 correlation: stamp target_round_started_at on the pending prediction for N
         await tx`
           UPDATE pending_predictions

@@ -564,9 +564,26 @@ class LiveBoot {
       try { void this.dispatcher?.stop(); } catch { /* */ }
       try { void this.pollWorker?.stop(); } catch { /* */ }
       try { void this.clockMonitor?.stop(); } catch { /* */ }
+      try {
+        void import("./retention").then(({ stopRetentionSweep }) => stopRetentionSweep());
+      } catch { /* */ }
     });
 
     await dispatcher.start();
+    // Retention sweep (audit 2026-09-11): live_event_log is append-only
+    // observability with no cleanup — batched bounded DELETE on the general
+    // pool, 6h cadence, unref'd timer. Prediction/result history is never
+    // touched. Gated behind worker authority implicitly: this code only runs
+    // on the worker that holds the lease (see lease gate above).
+    try {
+      const { startRetentionSweep } = await import("./retention");
+      startRetentionSweep();
+    } catch (e) {
+      logger.warn(
+        { component: "live-boot", error: String(e) },
+        "retention sweep failed to start (soft) — observability table will grow",
+      );
+    }
     if (deps.startSubscriber) {
       try {
         await deps.startSubscriber();
@@ -608,6 +625,10 @@ class LiveBoot {
     setWorkerAuthority(null);
     // Fix 6: supervisor stops ALL timers (heartbeat, invariants, warmer, probe)
     await getLiveSupervisor().stop();
+    try {
+      const { stopRetentionSweep } = await import("./retention");
+      stopRetentionSweep();
+    } catch { /* soft */ }
     if (this.dispatcher) {
       try { await this.dispatcher.stop(); } catch { /* best effort */ }
     }
