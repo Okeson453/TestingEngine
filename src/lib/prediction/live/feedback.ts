@@ -152,7 +152,13 @@ export function analyzeFailure(
  * Fallback chain for pre-0026 databases: claim via feedback_applied_at on
  * prediction_validations, then in-memory.
  */
-async function claimFeedbackJobDurable(predictionId: string): Promise<boolean> {
+type ClaimFeedbackResult =
+  | { owned: true }
+  | { owned: false; outcome: "complete" | "pending_elsewhere" };
+
+async function claimFeedbackJobDurable(
+  predictionId: string,
+): Promise<ClaimFeedbackResult> {
   try {
     const sql = await getSql();
     const claimed = await sql<{ id: number }>`
@@ -168,18 +174,34 @@ async function claimFeedbackJobDurable(predictionId: string): Promise<boolean> {
         )
       RETURNING id
     `;
-    if (claimed.length > 0) return true;
-    // No claimable row: either the job is COMPLETED (done — skip) or it does
-    // not exist yet (legacy row / direct call). Enqueue+claim atomically;
-    // a UNIQUE(prediction_id) job that already exists in a terminal state
-    // makes this a no-op.
+    if (claimed.length > 0) return { owned: true };
+    // No claimable row: the job is either COMPLETED (done — but VERIFY the
+    // SLA marker actually landed; sep 11 found completed jobs with a NULL
+    // feedback_applied_at, which re-flagged the invariant forever), fresh
+    // PROCESSING elsewhere (do NOT poison the in-memory set — the owner may
+    // crash before completing and the sweep must re-drive after the stale
+    // window), or absent (legacy row — enqueue+claim atomically).
+    const job = await sql<{ status: string }>`
+      SELECT status FROM feedback_jobs WHERE prediction_id = ${predictionId}
+    `;
+    if (job[0]?.status === "COMPLETED") {
+      // Repair a lost marker (completed job, missing feedback_applied_at).
+      await sql`
+        UPDATE prediction_validations
+        SET feedback_applied_at = now()
+        WHERE prediction_id = ${predictionId} AND feedback_applied_at IS NULL
+      `;
+      return { owned: false, outcome: "complete" };
+    }
     const inserted = await sql<{ id: number }>`
       INSERT INTO feedback_jobs (prediction_id, status, claimed_at, attempt_count)
       VALUES (${predictionId}, 'PROCESSING', now(), 1)
       ON CONFLICT (prediction_id) DO NOTHING
       RETURNING id
     `;
-    return inserted.length > 0;
+    if (inserted.length > 0) return { owned: true };
+    // Lost an insert race or fresh PROCESSING elsewhere.
+    return { owned: false, outcome: "pending_elsewhere" };
   } catch (e) {
     // feedback_jobs may not exist yet (pre-migration). Fall back to the
     // feedback_applied_at claim, then in-memory.
@@ -196,9 +218,13 @@ async function claimFeedbackJobDurable(predictionId: string): Promise<boolean> {
           AND feedback_applied_at IS NULL
         RETURNING prediction_id
       `;
-      return claimed.length > 0;
+      return claimed.length > 0
+        ? { owned: true }
+        : { owned: false, outcome: "complete" };
     } catch {
-      return !processedIds.has(predictionId);
+      return processedIds.has(predictionId)
+        ? { owned: false, outcome: "complete" }
+        : { owned: true };
     }
   }
 }
@@ -216,21 +242,36 @@ async function completeFeedbackJob(
 ): Promise<void> {
   try {
     const sql = await getSql();
-    await sql`
-      UPDATE feedback_jobs
-      SET status = ${ok ? "COMPLETED" : "PENDING"},
-          completed_at = ${ok ? new Date().toISOString() : null}::timestamptz,
-          last_error = ${err},
-          updated_at = now()
-      WHERE prediction_id = ${predictionId}
-    `;
-    if (ok) {
-      await sql`
+    // SEP 11 FIX (feedback SLA loop): this was two statements — job terminal
+    // state first, marker second, marker failure soft-caught. A failure (or
+    // crash) between them left the job COMPLETED while
+    // prediction_validations.feedback_applied_at stayed NULL forever: the
+    // invariant re-flagged the row every pass and the sweep could never heal
+    // it (claim saw the COMPLETED job and skipped). One data-modifying CTE =
+    // both writes commit or neither does.
+    const rows = await sql<{ marker_set: number }>`
+      WITH j AS (
+        UPDATE feedback_jobs
+        SET status = ${ok ? "COMPLETED" : "PENDING"},
+            completed_at = ${ok ? new Date().toISOString() : null}::timestamptz,
+            last_error = ${err},
+            updated_at = now()
+        WHERE prediction_id = ${predictionId}
+        RETURNING 1
+      ),
+      v AS (
         UPDATE prediction_validations
         SET feedback_applied_at = now()
-        WHERE prediction_id = ${predictionId} AND feedback_applied_at IS NULL
-      `;
-    }
+        WHERE prediction_id = ${predictionId}
+          AND feedback_applied_at IS NULL
+          AND ${ok}
+        RETURNING 1
+      )
+      SELECT
+        (SELECT count(*) FROM j) AS job_updated,
+        (SELECT count(*) FROM v) AS marker_set
+    `;
+    void rows;
   } catch (e) {
     // Soft: pre-migration fallback keeps feedback_applied_at as claim==complete.
     logger.warn(
@@ -280,13 +321,26 @@ export async function processResolvedPredictionFeedback(
   }
 
   // Durable job claim (fix plan Phase 5): PENDING/stale-PROCESSING → PROCESSING.
-  const owned = await claimFeedbackJobDurable(input.predictionId);
-  if (!owned) {
-    processedIds.add(input.predictionId);
-    logger.debug(
-      { predictionId: input.predictionId },
-      "feedback already processed — idempotent skip (durable)",
-    );
+  const claim = await claimFeedbackJobDurable(input.predictionId);
+  if (!claim.owned) {
+    if (claim.outcome === "complete") {
+      // Job done elsewhere (marker verified/repaired by the claim) — safe to
+      // memoize: the SLA marker is now guaranteed present.
+      processedIds.add(input.predictionId);
+      logger.debug(
+        { predictionId: input.predictionId },
+        "feedback already processed — idempotent skip (durable)",
+      );
+    } else {
+      // SEP 11 FIX: fresh PROCESSING owned by another call/process. Do NOT
+      // add to processedIds — if the owner crashes before completing, the
+      // sweep must be able to re-drive this row after the stale-claim
+      // window. Poisoning the set here is what made stuck rows permanent.
+      logger.debug(
+        { predictionId: input.predictionId },
+        "feedback claimed elsewhere — re-drivable after stale window",
+      );
+    }
     return {
       predictionId: input.predictionId,
       targetGameId: input.targetGameId,
