@@ -213,8 +213,11 @@ export async function reEnqueuePrediction(input: z.infer<typeof ReEnqueueInput>)
   if (enqueued > 0) {
     // Wake the dispatcher immediately — operator re-enqueues should not wait
     // for the fallback tick (delivery latency belongs to the wake path).
+    // SEP 11 FIX: must wake the PREDICTION lane — this endpoint inserts
+    // type='prediction' rows, but notifyOutbox() defaults to "normal", so
+    // the wake latched the wrong lane and the row stalled for up to TICK_MS.
     void import("@/lib/prediction/live/outbox-wake")
-      .then(({ notifyOutbox }) => notifyOutbox())
+      .then(({ notifyOutbox }) => notifyOutbox("prediction"))
       .catch(() => undefined);
   }
   return { ok: true, enqueued };
