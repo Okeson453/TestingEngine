@@ -88,10 +88,12 @@ describe("target ownership priority BG > ED > RECOVERY", () => {
     const a = reserveTargetForBg(target, "7000");
     const b = reserveTargetForBg(target, "7000");
     assert.equal(a.owned, true);
-    assert.equal(b.owned, true); // same owner idempotent
+    assert.equal(b.owned, true); // same owner idempotent — same ownership, no second claim
     const other = reserveTargetForBg(target, "6999");
-    // different source game still BG source — treated as BG
-    assert.equal(other.owned, true);
+    // different source = different owner: a second primary must NOT own —
+    // single authoritative prediction per target (exactly-once).
+    assert.equal(other.owned, false);
+    assert.ok(other.blockedByBg);
   });
 
   it("duplicate ED → second is blocked", () => {
@@ -128,7 +130,7 @@ describe("target ownership priority BG > ED > RECOVERY", () => {
     const target = "1201";
     reserveTargetForBg(target, "1200");
     claimTarget(target, "bg:1200");
-    completeTarget(target, "bg:1200", { decision: "PREDICTED" });
+    completeTarget(target, "bg:1200", { decision: "SIGNAL" });
     const ed = claimTarget(target, "ed:1200");
     assert.equal(ed.owned, false);
   });

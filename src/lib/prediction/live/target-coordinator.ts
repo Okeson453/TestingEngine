@@ -143,8 +143,19 @@ function reservePrimary(
         blockedByBg: isPrimarySource(existing.source),
       };
     }
-    // Same owner or any primary already holding — do not double-reserve.
-    if (existing.owner === owner || isPrimarySource(existing.source)) {
+    // PASS 8 FIX (e0d2d5b regression): same-owner re-entry (a duplicate
+    // PR/BG frame for the SAME source round) is IDEMPOTENT — owned:true,
+    // ownership unchanged, never a second claim. e0d2d5b folded this into
+    // the double-reserve reject below, so duplicate frames of the owning
+    // event returned owned:false. The DB backstop (bare ON CONFLICT DO
+    // NOTHING) absorbs any recompute — exactly-once is preserved.
+    if (existing.owner === owner) {
+      return { owned: true, claimedAt: existing.claimedAt, state: existing.state };
+    }
+    // A DIFFERENT primary (PR/BG) already holds the target — do not
+    // double-reserve. Single authoritative prediction per target: a second
+    // primary source confirms/reconciles, never owns.
+    if (isPrimarySource(existing.source)) {
       return {
         owned: false,
         reason:

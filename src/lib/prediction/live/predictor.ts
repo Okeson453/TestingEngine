@@ -2061,6 +2061,10 @@ export async function onGameEndPredict(
     // left INSIDE the template literal above (48006b3), so the slash-slash
     // text shipped to Postgres as SQL and every persist failed with a
     // syntax error. Comments live OUTSIDE the template literal. Always.
+    try {
+      const { mark } = await import("@/lib/prediction/live/latency-trace");
+      if (trace) mark(trace, "persist_started");
+    } catch { /* soft */ }
     const ins = await sql<{ notification_id: string }>`
           with inserted_prediction as (
             insert into pending_predictions (
@@ -2239,6 +2243,17 @@ export async function onGameEndPredict(
     }
   } catch (e) {
     const stage = (e as { stage?: string }).stage ?? "persistence";
+    const pgCode = (e as { code?: string }).code ?? null;
+    const errName = e instanceof Error ? e.name : "Error";
+    const errMsg = e instanceof Error ? e.message : String(e);
+    // PASS 8 (17:39Z window): Railway strips ALL JSON context fields —
+    // failureReason/errorName lived only in JSON, so raw prod logs showed
+    // the generic message with ZERO underlying exception. Every failure
+    // detail is now INLINE in the message string: stage, SQLSTATE, error
+    // identity, elapsed, full ID chain. Single-statement atomic CTE: no
+    // explicit transaction exists, nothing to roll back (statement-level
+    // atomicity — either both inserts landed or neither did).
+    const elapsedMs = Date.now() - persistT0;
     logger.error(
       {
         component: "live-predictor",
@@ -2247,13 +2262,12 @@ export async function onGameEndPredict(
         sourceRoundId: gameId,
         correlationId,
         predictionId,
-        failureReason: String(e),
-        errorName: e instanceof Error ? e.name : "Error",
-        errorMessage: e instanceof Error ? e.message : String(e),
+        failureReason: errMsg,
+        sqlstate: pgCode,
+        errorName: errName,
+        errorMessage: errMsg,
       },
-      stage === "outbox_enqueue"
-        ? "outbox enqueue failed — not returning predicted without Telegram handoff"
-        : "durable prediction persistence failed — not returning predicted without handoff",
+      `durable prediction persistence FAILED target=${targetGameId} prediction=${predictionId} correlation=${correlationId} [stage=${stage}] [err=${errName}: ${errMsg}] [sqlstate=${pgCode ?? "n/a"}] [elapsed_ms=${elapsedMs}] [pool_wait_ms=${poolWaitMs}] [atomic_cte=no explicit tx, nothing to roll back]`,
     );
     predictionLifecycleCounters.persistenceFailures += 1;
     try { releaseTarget(targetGameId, owner); } catch { /* soft */ }

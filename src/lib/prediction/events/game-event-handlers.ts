@@ -639,7 +639,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
  * PR (prepare — betting opens) — PRIMARY N+1 prediction trigger.
  *
  * Directive 2026-09-12: promote pr to authoritative N+1 trigger so the
- * signal is generated ~7s before BG (upstream betting window), not after
+ * signal is generated ~7s before BG (upstream BC.Game betting window), not after
  * round start. Does NOT write began_at or noteRoundStarted — BG remains
  * the sole round-start authority for temporal kill / registry. Does NOT
  * run temporal kill (that would dead-letter signals ~7s early).
