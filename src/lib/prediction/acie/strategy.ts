@@ -78,9 +78,15 @@ function resolveDefaultPolicy(): StrategyPolicy {
 
 export class StrategyLayer {
   private readonly policy: StrategyPolicy;
+  /** Pass-18 hotfix: this field was REFERENCED (this.selectiveOnly) but never
+   *  declared — undefined made the HF-only threshold discount apply in quality
+   *  mode too, silently lowering the bar the quality gates raised. Quality
+   *  (selective) policy = anything that is not the explicit HF policy. */
+  private readonly selectiveOnly: boolean;
 
   constructor(policy: StrategyPolicy = resolveDefaultPolicy()) {
     this.policy = policy;
+    this.selectiveOnly = policy !== HIGH_FREQUENCY_STRATEGY_POLICY;
   }
 
   evaluate(ctx: StrategyDecisionContext): StrategyDecision {

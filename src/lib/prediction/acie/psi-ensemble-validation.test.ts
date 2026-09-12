@@ -72,6 +72,8 @@ function toSol(cps: number[], tpl: TemporalPatternLearner): SOLRecord[] {
       actualResult: cps[i]! >= TARGET,
       residual: FAIR - (cps[i]! >= TARGET ? 1 : 0),
       squaredError: (FAIR - (cps[i]! >= TARGET ? 1 : 0)) ** 2,
+      probabilityResidual: FAIR - (cps[i]! >= TARGET ? 1 : 0),
+      binnedProbability: FAIR,
       logLoss: 0.5,
     } as SOLRecord);
   }

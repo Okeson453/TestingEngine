@@ -174,6 +174,61 @@ export function shouldSkipSignal(input: {
     reasoningSaysSkip;
   return noEdge || strategySkip;
 }
+
+/** Pass 18: machine-readable veto reason for every NO_BET. The prompt
+ *  directive asks exactly this: WHICH gate suppressed the round. Priority
+ *  order = hardest gate first (hard floors before soft edge, explicit
+ *  vetoes last because they compound with anything). */
+export type SkipVetoReason =
+  | "probability_below_min"
+  | "confidence_below_min"
+  | "edge_below_threshold"
+  | "reduced_entry_blocked"
+  | "strategy_veto"
+  | "pipeline_veto"
+  | "reasoning_skip";
+
+export function shouldSkipReason(input: {
+  probability: number;
+  confidence: number;
+  target?: number;
+  strategyAction?: string | null;
+  pipelineAction?: string | null;
+  reasoning?: string[] | string | null;
+  minEdge?: number;
+  minProbability?: number;
+  minConfidence?: number;
+}): { skip: boolean; reason: SkipVetoReason | null } {
+  const targetNum = Number(input.target ?? 1.3);
+  const fair = targetNum > 1 ? 1 / targetNum : 0.5;
+  const minEdge = input.minEdge ?? MIN_SIGNAL_EDGE;
+  const minP = input.minProbability ?? MIN_SIGNAL_PROBABILITY;
+  const minC = input.minConfidence ?? MIN_SIGNAL_CONFIDENCE;
+  const needP = Math.max(minP, fair + minEdge);
+  const p = input.probability;
+  const c = input.confidence;
+  const strategyAction = String(input.strategyAction ?? "").toUpperCase();
+  const pipelineAction = String(input.pipelineAction ?? "").toUpperCase();
+  const reasoningJoined = Array.isArray(input.reasoning)
+    ? input.reasoning.join(" ")
+    : String(input.reasoning ?? "");
+  const reasoningSaysSkip =
+    /\baction=SKIP\b/i.test(reasoningJoined) ||
+    /\bpipeline_action=SKIP\b/i.test(reasoningJoined);
+  const reducedBlocked =
+    !ALLOW_REDUCED_ENTRY &&
+    (strategyAction === "REDUCED_ENTRY" || pipelineAction === "REDUCED_ENTRY");
+
+  if (minP > 0 && p < minP) return { skip: true, reason: "probability_below_min" };
+  if (minC > 0 && c < minC) return { skip: true, reason: "confidence_below_min" };
+  if (Number.isFinite(minEdge) && minEdge > 0 && p < needP)
+    return { skip: true, reason: "edge_below_threshold" };
+  if (reducedBlocked) return { skip: true, reason: "reduced_entry_blocked" };
+  if (strategyAction === "SKIP") return { skip: true, reason: "strategy_veto" };
+  if (pipelineAction === "SKIP") return { skip: true, reason: "pipeline_veto" };
+  if (reasoningSaysSkip) return { skip: true, reason: "reasoning_skip" };
+  return { skip: false, reason: null };
+}
 const MIN_HISTORY = 20;
 /** Reduced 100->50: halves history query cost on the hot ED path while
  *  remaining well above MIN_HISTORY for model stability. */
@@ -1365,7 +1420,7 @@ export async function onGameEndPredict(
     const c = signal.confidence;
     const strategyAction = String(fs.strategy_action ?? "") || null;
     const pipelineAction = String(fs.pipeline_action ?? "") || null;
-    const skip = shouldSkipSignal({
+    const skipCheck = shouldSkipReason({
       probability: p,
       confidence: c,
       target: Number(DEFAULT_TARGET),
@@ -1373,6 +1428,8 @@ export async function onGameEndPredict(
       pipelineAction,
       reasoning: signal.reasoning,
     });
+    const skip = skipCheck.skip;
+    const vetoReason = skipCheck.reason;
     if (skip) {
       const targetNum = Number(DEFAULT_TARGET);
       const fair = targetNum > 1 ? 1 / targetNum : 0.5;
@@ -1394,11 +1451,12 @@ export async function onGameEndPredict(
           strategyAction,
           pipelineAction,
           strategySkip,
+          vetoReason,
           recoveryMode,
         },
         strategySkip
-          ? "skip signal — strategy/pipeline veto (NO BET this round)"
-          : "skip signal — no edge vs fair odds (not every round should fire)",
+          ? `skip signal — strategy/pipeline veto (NO BET this round) [veto=${vetoReason}]`
+          : `skip signal — no edge vs fair odds (not every round should fire) [veto=${vetoReason}]`,
       );
       // P0 (sep 11 state semantics): an EVALUATED skip — no edge vs fair
       // odds, or strategy/pipeline veto — is a TERMINAL NO_BET decision for
