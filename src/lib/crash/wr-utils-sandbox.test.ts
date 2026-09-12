@@ -68,3 +68,54 @@ test("sandbox reports a throwing bundle as a structured failure", async (t) => {
     /rotated bundle exploded/,
   );
 });
+
+// ——— Directive 17:27Z: rotating-variant browser-global union ———
+// bc.game serves DIFFERENT BYTES under the SAME wr_utils-*.js filename per
+// fetch (verified live, 6 samples: 43631-44176B). The variants differ in an
+// anti-bot preamble that touches a varying subset of browser globals:
+//   document (property probe + addEventListener('visibilitychange')),
+//   requestAnimationFrame, URL, setTimeout, location. The prod errors
+//   "ReferenceError: document is not defined" / "requestAnimationFrame is
+//   not defined" were two variants of the SAME failure class: the sandbox
+//   allowlist lagged the variant union. The sandbox stub set must cover the
+//   UNION so any served variant evaluates — that is the determinism fix.
+
+test("sandbox source stubs the full observed variant union", async () => {
+  // Runtime-independent source assertion: runs even where the vm sandbox
+  // itself cannot (bun), keeping the contract visible in every runner.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const src = readFileSync(
+    fileURLToPath(new URL("./native-sign.ts", import.meta.url)),
+    "utf8",
+  );
+  for (const stub of [
+    "document:", "addEventListener: () => {}", "removeEventListener: () => {}",
+    "requestAnimationFrame: () => 0", "cancelAnimationFrame: () => {}",
+    "location:", "navigator:", "URL,", "setTimeout: () => 0",
+    "module.require is not allowed",
+  ]) {
+    assert.ok(src.includes(stub), `sandbox allowlist must contain ${stub}`);
+  }
+});
+
+test("a bundle double mimicking the anti-bot preamble evaluates in the sandbox", async (t) => {
+  if (!sandboxAvailable) return t.skip("node:vm.SourceTextModule unavailable in this runtime");
+  // Mimics the live preamble shape: document property probe inside new URL,
+  // visibilitychange listener, rAF callback, setTimeout — then the real
+  // wasm-bindgen contract. All preamble globals must come from the sandbox
+  // allowlist, and host globals must STILL be invisible (leak check intact).
+  const body = `
+    document.addEventListener('visibilitychange', () => {}, { once: true });
+    new URL(document.location.href);
+    requestAnimationFrame(() => 0);
+    const timer = setTimeout(() => {}, 0);
+    if (typeof process !== 'undefined' || typeof require !== 'undefined') {
+      throw new Error('host globals leaked into sandbox');
+    }
+    export default Promise.resolve({ t1: () => 'ok', t2: () => 't2' });
+  `;
+  const utils = await evaluateWrUtilsBundleInSandbox(body);
+  assert.equal(utils.t1("ua"), "ok");
+  assert.equal(utils.t2("src", "ua"), "t2");
+});

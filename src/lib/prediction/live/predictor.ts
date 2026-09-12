@@ -251,6 +251,43 @@ export const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ??
  *  governed by the full gate chain (edge vs fair+minEdge, strategy, risk,
  *  temporal). 0.7692 remains the mathematical break-even for 1.30×. */
 export const PREDICTION_FLOOR = Number(process.env.PREDICTION_FLOOR ?? 0.65);
+
+/**
+ * Directive 17:27Z: five-state prediction taxonomy. Classification is a pure
+ * function of the prediction probability — coverage (persistence) is fully
+ * separated from betting eligibility. PERSISTED tiers (p >= PREDICTION_FLOOR)
+ * are durable decision-audit rows, band-backtestable; only NO_BET (below
+ * floor) is excluded from band statistics by construction.
+ *
+ *   PREDICTION_65_PLUS  65-69.99%   — recorded, weakest evidence tier
+ *   WATCH               70-74.99%   — recorded, below break-even
+ *   BREAK_EVEN_ZONE     75-76.91%   — recorded, at/just under break-even
+ *   BET_CANDIDATE       76.92%-needP — ABOVE mathematical break-even, below
+ *                          the runtime edge gate (NOT automatically a bet)
+ *   BET_ELIGIBLE        p >= needP  — passed the edge gate; other gates
+ *                          (strategy/risk/temporal) may still veto
+ *
+ * 76.92% (= 1/1.30) remains the mathematical break-even under the 1.30x
+ * payout convention. No tier below BET_ELIGIBLE is a betting signal, and
+ * BET_ELIGIBLE itself still runs the full gate chain.
+ */
+export type PredictionTier =
+  | "PREDICTION_65_PLUS"
+  | "WATCH"
+  | "BREAK_EVEN_ZONE"
+  | "BET_CANDIDATE"
+  | "BET_ELIGIBLE"
+  | "NO_BET";
+
+export function classifyPredictionTier(p: number, needP: number): PredictionTier {
+  if (!(p >= PREDICTION_FLOOR)) return "NO_BET";
+  const breakEven = 1 / DEFAULT_TARGET; // 0.7692… at 1.30x
+  if (p >= needP) return "BET_ELIGIBLE";
+  if (p >= breakEven) return "BET_CANDIDATE";
+  if (p >= 0.75) return "BREAK_EVEN_ZONE";
+  if (p >= 0.70) return "WATCH";
+  return "PREDICTION_65_PLUS";
+}
 /** When false (default), REDUCED_ENTRY is treated like SKIP for delivery. */
 export const ALLOW_REDUCED_ENTRY =
   process.env.ALLOW_REDUCED_ENTRY === "1" ||
@@ -1684,10 +1721,16 @@ export async function onGameEndPredict(
     });
     const skip = skipCheck.skip;
     const vetoReason = skipCheck.reason;
-    // Tier separation: a prediction at/above the 65% floor is RECORDED
-    // (durable audit row, band-backtestable) but is NOT a betting signal.
-    // BET eligibility is unchanged (full gate chain below).
-    const tier: "WATCH" | "NO_BET" = p >= PREDICTION_FLOOR ? "WATCH" : "NO_BET";
+    // Tier separation (directive 17:27Z): five-state taxonomy, pure function
+    // of the probability. p >= PREDICTION_FLOOR is RECORDED (durable audit
+    // row, band-backtestable) but is NOT a betting signal. BET eligibility
+    // is unchanged (full gate chain below); 0.7692 stays mathematical
+    // break-even; BET_CANDIDATE (76.92%-needP) is explicitly NOT a bet.
+    const needPForTier = Math.max(
+      MIN_SIGNAL_PROBABILITY,
+      1 / Number(DEFAULT_TARGET) + getAdaptiveMinEdge(),
+    );
+    const tier: PredictionTier = classifyPredictionTier(p, needPForTier);
     // Funnel telemetry (directive 2026-09-12): per-gate marginal counts +
     // terminal veto reason. In-memory only — zero DB, zero hot-path latency.
     // Classification: cooldown/pacing/drawdown strategy vetoes are RISK;
@@ -1707,7 +1750,7 @@ export async function onGameEndPredict(
         temporal: !slaViolated,
       });
       if (skip) recordNoBet(vetoReason ?? "unknown");
-      if (tier === "WATCH") recordWatch();
+      if (p >= PREDICTION_FLOOR) recordWatch(); // coverage counter: ALL recorded rounds
     }
     if (skip) {
       const targetNum = Number(DEFAULT_TARGET);
@@ -1745,8 +1788,8 @@ export async function onGameEndPredict(
           recoveryMode,
         },
         strategySkip
-          ? `skip signal — strategy/pipeline veto (NO BET this round) [veto=${vetoReason}] [tier=${p >= PREDICTION_FLOOR ? "WATCH" : "NO_BET"}] ${edgeDiag}`
-          : `skip signal — no edge vs fair odds (not every round should fire) [veto=${vetoReason}] [tier=${p >= PREDICTION_FLOOR ? "WATCH" : "NO_BET"}] ${edgeDiag}`,
+          ? `skip signal — strategy/pipeline veto (NO BET this round) [veto=${vetoReason}] [tier=${tier}] ${edgeDiag}`
+          : `skip signal — no edge vs fair odds (not every round should fire) [veto=${vetoReason}] [tier=${tier}] ${edgeDiag}`,
       );
       // Pass 19: durable decision audit — NO_BET decisions are otherwise
       // invisible to walk-forward evaluation (emitted signals persist

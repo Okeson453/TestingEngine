@@ -110,6 +110,50 @@ export async function evaluateWrUtilsBundleInSandbox(
     window: {},
     global: {},
     self: {},
+    // SEP 12 (17:10Z directive; prod errors "ReferenceError: document is not
+    // defined" / "ReferenceError: requestAnimationFrame is not defined"):
+    // bc.game serves ROTATING VARIANTS of wr_utils-DPR8KNaj.js (same filename,
+    // different bytes per fetch — verified live 6 samples: 43631-44176B) whose
+    // anti-bot preambles touch a varying subset of browser globals. The stub
+    // set below is the UNION across sampled variants, so ANY variant evaluates
+    // — that is what makes fresh loading deterministic. Inert, host-free
+    // stubs only: the sandbox still exposes NO Node globals (fs/net/process).
+    // Same posture as installDomPolyfill() on the legacy path, scoped to this
+    // context. The worker_state cache stays purely as boot-flakiness insurance.
+    document: {
+      location: {
+        href: "https://bc.game/game/crash",
+        toString() {
+          return "https://bc.game/game/crash";
+        },
+      },
+      // Variant preamble: document.addEventListener('visibilitychange', …)
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    },
+    location: {
+      href: "https://bc.game/game/crash",
+      toString() {
+        return "https://bc.game/game/crash";
+      },
+    },
+    navigator: { userAgent: UA, language: "en-US", languages: ["en-US"] },
+    requestAnimationFrame: () => 0,
+    cancelAnimationFrame: () => {},
+    // Anti-bot preamble: new URL(document[decoded]) — parser only, no I/O.
+    URL,
+    // Timer variants: no-op stubs — deterministic, and no VM-created timer
+    // can hold the worker's event loop open.
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    // wasm-bindgen glue: typeof TextDecoder>"u" ? module.require("util") :
+    // TextDecoder — TextDecoder is always stubbed, so this is a dead branch;
+    // if a rotated bundle ever reaches it, fail LOUD, not with a TypeError.
+    module: {
+      require: () => {
+        throw new Error("wr_utils sandbox: module.require is not allowed");
+      },
+    },
     WebAssembly,
     TextEncoder,
     TextDecoder,
