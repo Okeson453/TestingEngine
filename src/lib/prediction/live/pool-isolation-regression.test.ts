@@ -89,10 +89,17 @@ describe("pool sizing (sep 11 pass)", () => {
 });
 
 describe("realtime vs background pool isolation (source contract)", () => {
-  it("BG reconcile CTE runs on the critical pool", () => {
+  it("BG temporal kill runs on the critical pool (lifecycle leg on general)", () => {
     expect(handlersSrc).toContain("await getCriticalSql()");
-    // The reconcile comment anchors the critical-pool acquire to the BG CTE.
-    expect(handlersSrc).toMatch(/PRIORITY-ISOLATION FIX[\s\S]*?const sql = await getCriticalSql\(\)/);
+    // PASS 5 split: the temporal kill (safety/temporal gate) anchors the
+    // critical-pool acquire; the lifecycle bookkeeping moved to the general
+    // pool so it can never contest a critical slot.
+    expect(handlersSrc).toMatch(
+      /Leg 1: temporal kill[\s\S]*?const killSql = await getCriticalSql\(\)/,
+    );
+    expect(handlersSrc).toMatch(
+      /Leg 2: lifecycle bookkeeping \(general pool, detached\)[\s\S]*?const generalSql = await getSql\(\)/,
+    );
   });
 
   it("forensic reclassify stays on the general pool", () => {

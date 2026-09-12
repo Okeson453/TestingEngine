@@ -1858,14 +1858,14 @@ export async function onGameEndPredict(
             ${outboxMetadata}::jsonb, 'pending', 100,
             0, now() + (${resultHoldMs} * interval '1 millisecond'), ${deadlineAt}::timestamptz, ${targetGameId}
           from inserted_prediction
-          -- EXACTLY-ONCE PER TARGET (sep 12 pass 4, migration 0045): at most
-          -- one UNDELIVERED prediction notification per target may exist. If
-          -- an older undelivered row for this target is still pending/inflight
-          -- (pre-restart survivor, retry race), THIS insert writes nothing and
-          -- the caller reads it as kind=duplicate — the older row delivers,
-          -- never both. The temporal kill clears expired rows for a started
-          -- target, so legitimate successor predictions are unaffected.
-          on conflict (type, target_game_id) where status in ('pending', 'inflight') do nothing
+          -- EXACTLY-ONCE (sep 12 pass 5, migrations 0045 + 0046): at most one
+          -- UNDELIVERED prediction per target (0045) and one per prediction
+          -- (0046) may exist. Bare ON CONFLICT DO NOTHING absorbs a violation
+          -- of either: a racing second persist reads 0 rows = kind=duplicate —
+          -- the existing row delivers, never both. The temporal kill clears
+          -- expired rows for a started target, so legitimate successor
+          -- predictions are unaffected.
+          on conflict do nothing
           returning notification_id
         `;
 
@@ -1944,6 +1944,13 @@ export async function onGameEndPredict(
         ed_received_at: deps.edReceivedAt ?? null,
       };
       if (txMs + poolWaitMs > 300) {
+        // P5 plain-text line: Railway strips JSON fields — keep the slow-
+        // handoff decision data INLINE so the next 1.5s-class window is
+        // attributable from raw logs (pinned-vs-fallback is the discriminator
+        // between lane rebuild and pool/network issues).
+        console.warn(
+          `[persist] slow durable handoff target=${targetGameId} prediction=${predictionId} correlation=${correlationId} persist_ms=${profile.prediction_persistence_ms} pool_wait_ms=${poolWaitMs} outboxEnqueued=${outboxEnqueued}`,
+        );
         logger.info(profile, "PERSIST_PROFILE");
       } else {
         logger.debug(profile, "PERSIST_PROFILE");

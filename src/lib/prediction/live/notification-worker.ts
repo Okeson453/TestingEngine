@@ -939,7 +939,7 @@ export class OutboxDispatcher {
               // line with every identity inline makes the next window
               // decidable by inspection, no log-order inference.
               console.log(
-                `[outbox] delivered notification=${row.notification_id} prediction=${(row.metadata as Record<string, unknown> | null)?.predictionId ?? "n/a"} correlation=${(row.metadata as Record<string, unknown> | null)?.correlationId ?? "n/a"} target=${row.target_game_id ?? "n/a"} source=${(row.metadata as Record<string, unknown> | null)?.sourceGameId ?? "n/a"} attempt=${row.attempt_count} claim_to_send_ms=${lc.sendStartedMs != null ? Math.max(0, Math.round(lc.sendStartedMs - lc.claimClientMs)) : "n/a"} send_to_accept_ms=${lc.telegramAcceptedMs != null && lc.sendStartedMs != null ? Math.round(lc.telegramAcceptedMs - lc.sendStartedMs) : "n/a"}`,
+                `[outbox] delivered type=${row.type} notification=${row.notification_id} prediction=${(row.metadata as Record<string, unknown> | null)?.predictionId ?? "n/a"} correlation=${(row.metadata as Record<string, unknown> | null)?.correlationId ?? "n/a"} target=${row.target_game_id ?? (row.metadata as Record<string, unknown> | null)?.gameId ?? "n/a"} source=${(row.metadata as Record<string, unknown> | null)?.sourceGameId ?? "n/a"} attempt=${row.attempt_count} claim_to_send_ms=${lc.sendStartedMs != null ? Math.max(0, Math.round(lc.sendStartedMs - lc.claimClientMs)) : "n/a"} send_to_accept_ms=${lc.telegramAcceptedMs != null && lc.sendStartedMs != null ? Math.round(lc.telegramAcceptedMs - lc.sendStartedMs) : "n/a"}`,
               );
               logger.info(
                 {

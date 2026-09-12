@@ -43,12 +43,6 @@ import { noteRoundEnded, noteRoundStarted } from "@/lib/prediction/live/live-rou
 
 const logger = getLogger("game-event-handlers");
 
-/** Affected-row counts returned by the single-CTE BG reconcile statement. */
-interface BgReconcileCounts {
-  crash_backfilled: number;
-  targets_stamped: number;
-  signals_killed: number;
-}
 const inFlightEd = new Set<string>();
 const inFlightBg = new Set<string>();
 const inFlightPr = new Set<string>();
@@ -400,49 +394,81 @@ export async function bgHandler(payload: unknown): Promise<void> {
     }
 
 
-    // PRIORITY-ISOLATION FIX (sep 11 18:20 logs): this CTE is REALTIME-
-    // CRITICAL (began_at stamp + live_round_state + temporal kill) and the
-    // BG→N+1 prediction attempt only fires AFTER it resolves — yet it ran
-    // on the GENERAL pool, queueing behind every background sweep. Measured
-    // general acquires of ~1.0-1.16s with total=7 therefore landed directly
-    // on the BG→prediction critical path (the 1.5-1.8s skipped_no_edge
-    // result lag = this acquire + 1 CTE RTT + attempt). Run it on the
-    // critical pool: one acquire, one round trip, isolated from sweeps.
-    // Forensics reclassify below stays on the general pool (telemetry).
-    const sql = await getCriticalSql();
-    // POOL-BUDGET FIX: BG used to launch SIX concurrent general-pool
-    // operations via Promise.all — with general max=5 that self-induced
-    // waiting=2/3 pool pressure on every round start. The essential BG
-    // lifecycle is now ONE transaction (round start + prediction target
-    // stamp + temporal kill + event log); analytics run detached after.
-    // Retried once — if both attempts fail, the dispatcher's atomic
-    // pre-send authorization still refuses late signals at send time.
-    // AUDIT 2026-09-11: the began_at backfill UPDATE was a SEPARATE round
-    // trip before this TX — folded in as the first statement (one less
-    // general-pool round trip per round start, same COALESCE semantics).
-    // ROUND-TRIP FIX (sep 11 logs, post-5a6ac90): production still measured
-    // 1.1-1.4s between "bc bg event" and "bg reconcile complete" with NO
-    // pool pressure — the TX was FIVE sequential Neon round trips (~200ms
-    // RTT each). All five writes target disjoint tables with no
-    // read-modify-write interdependence, so they collapse into ONE
-    // data-modifying CTE (single round trip) whose SELECT returns
-    // per-table affected-row counts for the reconcile log.
-    // RTT FIX 2 (sep 11 14:45 logs): reconcile measured 300-700ms = BEGIN +
-    // statement + COMMIT (3 RTT). A single statement is already atomic in
-    // Postgres — the explicit transaction added two round trips of pure
-    // overhead. Run the CTE directly: one pool acquire, ONE round trip.
+    // PASS 5 (sep 12, 11:23Z window): the 189-208ms reconcile measurements
+    // were CRITICAL-POOL ACQUIRE WAIT, not query time — this handler's CTE
+    // shared the critical pool (max 4, 2 permanently checked out by the
+    // pinned persist/dispatch lanes) with validation TXs and fallback runs.
+    // Split by criticality:
+    //   - TEMPORAL KILL (ob): safety/temporal gate — stays on the critical
+    //     pool, awaited, concurrent with the attempt. It dead-letters every
+    //     undelivered prediction targeting the round that just started; the
+    //     dispatcher's claim-time auth is the independent backstop.
+    //   - LIFECYCLE (cr/pp/lrs): began_at backfill, target stamp,
+    //     live_round_state upsert — idempotent bookkeeping, required for
+    //     correctness but NOT for the handoff or the kill. Moves to the
+    //     GENERAL pool, detached, so it can never contest a critical slot.
+    // Acquire-vs-query timing is logged per leg so the next slow window is
+    // attributable by construction (directive: no unmeasured attribution).
     const beganParam = new Date(beganAt);
-    const runBgTx = async (): Promise<BgReconcileCounts> => {
-        const rows = await sql`
+
+    // ── Leg 1: temporal kill (critical pool, awaited) ──
+    const killAcquireT0 = Date.now();
+    const killSql = await getCriticalSql();
+    const killAcquireMs = Date.now() - killAcquireT0;
+    const killQueryT0 = Date.now();
+    let signalsKilled = 0;
+    try {
+      const killRows = await killSql`
+        UPDATE notification_outbox
+        SET status = 'dead_letter',
+            last_error = 'expired_late_signal: target round started (BG received)'
+        WHERE type = 'prediction'
+          AND status IN ('pending', 'inflight')
+          AND target_game_id = ${gameId}
+        RETURNING 1
+      `;
+      signalsKilled = killRows.length;
+    } catch (killErr1) {
+      logger.warn(
+        { event: "bg", gameId, error: String(killErr1), attempt: 1 },
+        `BG temporal kill failed — retrying once: ${String(killErr1).slice(0, 300)}`,
+      );
+      try {
+        const killRows = await killSql`
+          UPDATE notification_outbox
+          SET status = 'dead_letter',
+              last_error = 'expired_late_signal: target round started (BG received)'
+          WHERE type = 'prediction'
+            AND status IN ('pending', 'inflight')
+            AND target_game_id = ${gameId}
+          RETURNING 1
+        `;
+        signalsKilled = killRows.length;
+      } catch (killErr2) {
+        logger.error(
+          { event: "bg", gameId, error: String(killErr2), attempt: 2 },
+          `BG temporal kill FAILED after retry — dispatcher claim-time auth is the backstop: ${String(killErr2).slice(0, 300)}`,
+        );
+      }
+    }
+    reconcileMs = Date.now() - reconcileT0;
+    const killQueryMs = Date.now() - killQueryT0;
+
+    // ── Leg 2: lifecycle bookkeeping (general pool, detached) ──
+    void (async () => {
+      try {
+        const lifecycleT0 = Date.now();
+        const generalSql = await getSql();
+        const lifecycleAcquireMs = Date.now() - lifecycleT0;
+        const lifecycleQueryT0 = Date.now();
+        const rows = await generalSql`
           WITH cr AS (
-            -- Backfill began_at when known from BG (authoritative round start).
             UPDATE crash_rounds
             SET began_at = COALESCE(began_at, ${beganParam})
             WHERE game_id = ${gameId}
             RETURNING 1
           ),
           pp AS (
-            -- P0 correlation: stamp target_round_started_at on the pending prediction for N
             UPDATE pending_predictions
             SET target_round_started_at = COALESCE(target_round_started_at, ${beganParam})
             WHERE target_game_id = ${gameId}
@@ -450,7 +476,6 @@ export async function bgHandler(payload: unknown): Promise<void> {
             RETURNING 1
           ),
           lrs AS (
-            -- markLiveRoundStarted, inlined (idempotent lifecycle upsert)
             INSERT INTO live_round_state (
               game_id, lifecycle, began_at, source, correlation_id, updated_at
             ) VALUES (
@@ -470,51 +495,32 @@ export async function bgHandler(payload: unknown): Promise<void> {
               END,
               correlation_id = COALESCE(live_round_state.correlation_id, EXCLUDED.correlation_id),
               updated_at = now()
-          ),
-          ob AS (
-            -- Hard temporal contract (report #13): BG(N) arriving means round N
-            -- has STARTED — every undelivered prediction signal targeting N is
-            -- now EXPIRED. Atomic kill beats waiting for the dispatcher tick.
-            -- MUST-BLOCK on critical pool: prevents late signal delivery.
-            UPDATE notification_outbox
-            SET status = 'dead_letter',
-                last_error = 'expired_late_signal: target round started (BG received)'
-            WHERE type = 'prediction'
-              AND status IN ('pending', 'inflight')
-              AND target_game_id = ${gameId}
-            RETURNING 1
           )
-          -- HOT-PATH REDUCTION: live_event_log is telemetry/audit only.
-          -- Deferred to general pool after critical CTE (see below).
           SELECT
             (SELECT count(*) FROM cr) AS crash_backfilled,
-            (SELECT count(*) FROM pp) AS targets_stamped,
-            (SELECT count(*) FROM ob) AS signals_killed
+            (SELECT count(*) FROM pp) AS targets_stamped
         `;
-        return {
-          crash_backfilled: Number(rows[0]?.crash_backfilled ?? 0),
-          targets_stamped: Number(rows[0]?.targets_stamped ?? 0),
-          signals_killed: Number(rows[0]?.signals_killed ?? 0),
-        };
-    };
-    let bgCounts: BgReconcileCounts | null = null;
-    try {
-      bgCounts = await runBgTx();
-    } catch (txErr1) {
-      logger.warn(
-        { event: "bg", gameId, error: String(txErr1), attempt: 1 },
-        `BG transaction failed — retrying once: ${String(txErr1).slice(0, 300)}`,
-      );
-      try {
-        await runBgTx();
-      } catch (txErr2) {
-        logger.error(
-          { event: "bg", gameId, error: String(txErr2), attempt: 2 },
-          `BG transaction FAILED after retry — temporal kill may not have run: ${String(txErr2).slice(0, 300)}`,
+        const lifecycleQueryMs = Date.now() - lifecycleQueryT0;
+        logger.info(
+          {
+            event: "bg",
+            gameId,
+            correlationId,
+            leg: "lifecycle",
+            crash_backfilled: Number(rows[0]?.crash_backfilled ?? 0),
+            targets_stamped: Number(rows[0]?.targets_stamped ?? 0),
+            lifecycleAcquireMs,
+            lifecycleQueryMs,
+          },
+          "bg lifecycle reconciled (general pool — post-critical-path)",
+        );
+      } catch (lifecycleErr) {
+        logger.warn(
+          { event: "bg", gameId, error: String(lifecycleErr) },
+          "bg lifecycle reconcile failed (idempotent — next BG event or poll recovery restamps)",
         );
       }
-    }
-    reconcileMs = Date.now() - reconcileT0;
+    })();
 
     // CAN-BE-DEFERRED: live_event_log audit row — not required for ownership,
     // temporal kill, prediction correctness, or crash recovery. Runs on the
@@ -570,17 +576,19 @@ export async function bgHandler(payload: unknown): Promise<void> {
         event: "bg",
         gameId,
         correlationId,
-        // Event receipt → reconcile TX committed. Production measured
+        // Event receipt → temporal kill committed. Production measured
         // ~1.24s here (pool contention) vs ~2ms of model time — this
         // field is the per-round proof of where the cost sits.
         bg_receipt_to_reconcile_ms: Math.max(0, Date.now() - new Date(receivedAt).getTime()),
-        // Per-table affected-row counts from the single-CTE reconcile:
+        // PASS 5: acquire-vs-query split for the kill leg — if this is slow
+        // again, these two fields decide contention vs network with no
+        // inference.
+        kill_acquire_ms: killAcquireMs,
+        kill_query_ms: killQueryMs,
         // signals_killed>0 is the proof the temporal kill actually ran.
-        crash_backfilled: bgCounts?.crash_backfilled ?? null,
-        targets_stamped: bgCounts?.targets_stamped ?? null,
-        signals_killed: bgCounts?.signals_killed ?? null,
+        signals_killed: signalsKilled,
       },
-      "bg reconcile complete — N+1 trigger in flight (launched concurrently, pass 15)",
+      "bg reconcile complete — kill committed; lifecycle leg detached (general pool)",
     );
   } catch (error) {
     logger.error({ event: "bg", gameId, error: String(error) }, "bg observability failed");

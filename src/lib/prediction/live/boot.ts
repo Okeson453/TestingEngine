@@ -406,10 +406,18 @@ class LiveBoot {
         }
       }
 
-      // P2.11: Restore incremental state after schema validation
-      await withBootStage("incremental-state-restore", () => restoreIncrementalState(sql));
-      await withBootStage("baseline-adaptive-restore", () => restoreBaselineAdaptiveState(sql));
-      await withBootStage("safe-baseline-restore", () => restoreSafeBaselineState(sql));
+      // P2.11: Restore incremental state after schema validation.
+      // PASS 5 (11:23Z window): these three restores are independent state
+      // domains (incremental model, adaptive baseline, safe baseline) — they
+      // ran sequentially, serializing three Neon round trips (+2 RTT of boot
+      // wall time, the 489ms ACIE-restore class). Run them CONCURRENTLY;
+      // each keeps its own stage attribution, and boot proceeds only when
+      // all three land.
+      await Promise.all([
+        withBootStage("incremental-state-restore", () => restoreIncrementalState(sql)),
+        withBootStage("baseline-adaptive-restore", () => restoreBaselineAdaptiveState(sql)),
+        withBootStage("safe-baseline-restore", () => restoreSafeBaselineState(sql)),
+      ]);
 
       // Pre-warm the PredictionEngine so the first live prediction avoids
       // constructor + module-resolution cost on the hot path.

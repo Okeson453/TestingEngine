@@ -24,6 +24,10 @@ const MIGRATION = readFileSync(
   join(__dirname, "../../../../migrations/0045_outbox_exactly_once_per_target.sql"),
   "utf8",
 );
+const MIGRATION_0046 = readFileSync(
+  join(__dirname, "../../../../migrations/0046_outbox_one_notification_per_prediction.sql"),
+  "utf8",
+);
 const predictorSrc = readFileSync(join(__dirname, "predictor.ts"), "utf8");
 
 test("migration 0045: partial unique index on (type, target_game_id) where undelivered", () => {
@@ -36,10 +40,27 @@ test("migration 0045: partial unique index on (type, target_game_id) where undel
   assert.match(MIGRATION, /superseded_duplicate/i);
 });
 
+test("migration 0046: one undelivered notification per prediction (signal + result)", () => {
+  assert.match(
+    MIGRATION_0046,
+    /notification_outbox_prediction_signal_uidx/i,
+  );
+  assert.match(
+    MIGRATION_0046,
+    /notification_outbox_validation_uidx/i,
+  );
+  // Both indexes key on the predictionId inside metadata.
+  assert.match(MIGRATION_0046, /\(metadata->>'predictionId'\)/);
+});
+
+test("persist CTE absorbs outbox conflicts as duplicate (bare ON CONFLICT covers 0045+0046)", () => {
+  assert.match(predictorSrc, /on conflict do nothing\s*\n\s*returning notification_id/);
+});
+
 test("persist CTE tolerates an undelivered-row conflict instead of throwing", () => {
   assert.match(
     predictorSrc,
-    /on conflict \(type, target_game_id\) where status in \('pending', 'inflight'\) do nothing/,
+    /on conflict do nothing\s*returning notification_id/,
   );
 });
 
@@ -68,7 +89,7 @@ test("behavioral: second pending outbox insert for the same target conflicts, no
         (notification_id, type, content, metadata, status, priority, target_game_id)
       values
         (${randomUUID()}::uuid, 'prediction', 't', '{}', 'pending', 100, ${target})
-      on conflict (type, target_game_id) where status in ('pending', 'inflight') do nothing
+      on conflict do nothing
       returning notification_id
     `;
     assert.equal(ins.length, 0);
@@ -89,6 +110,47 @@ test("behavioral: second pending outbox insert for the same target conflicts, no
       where type = 'prediction' and target_game_id = ${target} and status = 'pending'
     `;
     assert.equal(Number(rows2[0]?.n ?? 0), 1);
+    // 0046: a second SIGNAL row for the SAME predictionId (new notification
+    // id, even under a different target) cannot become deliverable either.
+    const pid = randomUUID();
+    const byPrediction = (nid: string) => sql`
+      insert into notification_outbox
+        (notification_id, type, content, metadata, status, priority, target_game_id)
+      values
+        (${nid}::uuid, 'prediction', 't', ${JSON.stringify({ predictionId: pid })}::jsonb, 'pending', 100, ${"t-" + pid})
+      on conflict do nothing
+      returning notification_id
+    `;
+    try {
+      const first = await byPrediction(randomUUID());
+      assert.equal(first.length, 1);
+      const dup = await byPrediction(randomUUID());
+      assert.equal(dup.length, 0, "second signal row for the same predictionId is absorbed");
+      // Validation (WIN/LOSS) for the same prediction remains allowed — it is
+      // a distinct logical notification, not a duplicate signal.
+      const val = await sql`
+        insert into notification_outbox
+          (notification_id, type, content, metadata, status, priority)
+        values
+          (${randomUUID()}::uuid, 'validation', 't', ${JSON.stringify({ predictionId: pid })}::jsonb, 'pending', 2)
+        on conflict do nothing
+        returning notification_id
+      `;
+      assert.equal(val.length, 1);
+      const valDup = await sql`
+        insert into notification_outbox
+          (notification_id, type, content, metadata, status, priority)
+        values
+          (${randomUUID()}::uuid, 'validation', 't', ${JSON.stringify({ predictionId: pid })}::jsonb, 'pending', 2)
+        on conflict do nothing
+        returning notification_id
+      `;
+      assert.equal(valDup.length, 0, "second validation row for the same predictionId is absorbed");
+    } finally {
+      await sql`
+        delete from notification_outbox where metadata->>'predictionId' = ${pid}
+      `.catch(() => undefined);
+    }
   } finally {
     await sql`
       delete from notification_outbox where type = 'prediction' and target_game_id = ${target}

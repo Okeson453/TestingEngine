@@ -47,7 +47,9 @@ describe("outbox TOCTOU temporal contract (source)", () => {
   it("BG temporal kill retries and logs error instead of silent swallow only", () => {
     // POOL-BUDGET FIX: the kill now lives inside the BG transaction; the
     // retry-with-log contract is at transaction granularity.
-    expect(handlers).toContain("BG transaction failed — retrying once");
-    expect(handlers).toContain("BG transaction FAILED after retry");
+    // PASS 5: the kill is its own awaited statement (critical leg); the
+    // retry-with-log contract is unchanged, renamed to match.
+    expect(handlers).toContain("BG temporal kill failed — retrying once");
+    expect(handlers).toContain("BG temporal kill FAILED after retry");
   });
 });

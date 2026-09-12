@@ -146,9 +146,21 @@ async function ensurePinnedClient(lane: PinnedLaneState): Promise<import("pg").P
 function makePinnedRun(lane: PinnedLaneState): Run {
   const fallbackRun = lane.pool ? makeRun(lane.pool, `${lane.label}-fallback`) : null;
   return async <T>(text: string, params: unknown[]): Promise<T[]> => {
-    const client = await ensurePinnedClient(lane);
+    // PASS 5 (11:23Z window): NEVER await a pinned-client BUILD on the hot
+    // path. The old code returned lane.building, so a query arriving while
+    // the lane was rebuilding paid the full TLS+auth (~1.07s at Neon RTT)
+    // inside the BG durable handoff — the ~1,543ms first-round handoff
+    // class. If the client is not IMMEDIATELY ready, run the statement on
+    // the warm pooled fallback right now and let the rebuild finish in the
+    // background for subsequent rounds.
+    const client = lane.client && !lane.dead ? lane.client : null;
     if (!client) {
       if (!fallbackRun) throw new Error(`${lane.label}: no pinned client and no fallback pool`);
+      const why = lane.dead ? "discarded" : "building/never-built";
+      void ensurePinnedClient(lane); // rebuild/readiness for the NEXT round
+      console.warn(
+        `[db] ${lane.label} not ready (${why}) — fallback pool run for this query`,
+      );
       return fallbackRun<T>(text, params);
     }
     try {
@@ -163,6 +175,9 @@ function makePinnedRun(lane: PinnedLaneState): Run {
         discardPinnedClient(lane, err instanceof Error ? err.message : String(err));
         void ensurePinnedClient(lane); // rebuild in background for the next round
         if (!fallbackRun) throw err;
+        console.warn(
+          `[db] ${lane.label} connection-class error — fallback pool run (rebuilding in background)`,
+        );
         return fallbackRun<T>(text, params);
       }
       throw err;
@@ -582,6 +597,14 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     }
   }, 5_000);
   monitor.unref?.();
+
+  // PASS 5 (11:23Z window): kick both pinned-lane builds EAGERLY at pool
+  // init — the first BG event can otherwise reach getPinnedLaneSql before
+  // any prewarm stage ran, and (pre-pass-5) its handoff would await the
+  // full TLS+auth build. Combined with the makePinnedRun fast fallback,
+  // a first-round handoff can no longer pay connection setup.
+  void getPredictionPersistSql().catch(() => undefined);
+  void getDispatchCriticalSql().catch(() => undefined);
 
   criticalPool.on("error", (err) => console.error("[db] critical pool error:", err.message));
   generalPool.on("error", (err) => console.error("[db] general pool error:", err.message));
