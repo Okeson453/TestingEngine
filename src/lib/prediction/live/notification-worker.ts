@@ -959,6 +959,16 @@ export class OutboxDispatcher {
                 },
                 "OUTBOX_DISPATCH correlated",
               );
+              // Funnel telemetry: count only prediction-signal deliveries in
+              // signals_dispatched (validation/result rows are separate).
+              if (row.type === "prediction") {
+                try {
+                  const { recordSignalDispatched } = await import(
+                    "@/lib/prediction/live/funnel-metrics"
+                  );
+                  recordSignalDispatched();
+                } catch { /* telemetry must never throw */ }
+              }
               // Forensics: classify ON_TIME/LATE/UNKNOWN vs target start if known.
               // POOL-BUDGET FIX: forensics is analytics, never a delivery gate.
               // It used to be awaited on the dispatcher's CRITICAL sql — an

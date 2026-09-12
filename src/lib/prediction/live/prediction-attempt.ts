@@ -144,10 +144,17 @@ export interface AttemptNPlusOneResult {
   kind: string | null;
 }
 
+import {
+  recordCandidateRound,
+  recordEligibleRound,
+  recordSignalCreated,
+} from "@/lib/prediction/live/funnel-metrics";
+
 export async function attemptNPlusOnePrediction(
   input: AttemptNPlusOneInput,
 ): Promise<AttemptNPlusOneResult> {
   const { sourceRoundId, sourceCrashAt, sourceMultiplier, source } = input;
+  recordCandidateRound();
   const trace = input.trace ?? null;
   const recoveryMode = source === "RECOVERY";
   // BG-PRIMARY (sep 11 architecture change): source === "BG" means round N
@@ -179,6 +186,7 @@ export async function attemptNPlusOnePrediction(
       result?.kind ?? null,
       attempted,
     );
+    if (attempted) recordSignalCreated();
     if (!attempted) {
       // Rate-limited forensic telemetry: skip hot-path worker_state writes for
       // normal terminal outcomes (NO_BET / duplicate / BG-blocked). Those must

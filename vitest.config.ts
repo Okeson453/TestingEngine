@@ -24,6 +24,7 @@ export default defineConfig({
       "src/lib/prediction/live/outbox-toctou-race.test.ts",
       "src/lib/prediction/live/live-round-registry.test.ts",
       "src/lib/prediction/live/feedback.test.ts",
+      "src/lib/prediction/live/funnel-metrics.test.ts",
       "src/lib/prediction/live/delivery-forensics.test.ts",
       "src/lib/prediction/live/delivery-correlation.test.ts",
       "src/lib/prediction/models/baseline-calibration.test.ts",

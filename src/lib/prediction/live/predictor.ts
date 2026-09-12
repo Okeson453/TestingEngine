@@ -19,6 +19,14 @@ import { getMedianBettingWindowMs, getRoundStartedAtMs, isTargetPastBettingWindo
 import { getEffectiveSkipBelowMs } from "@/lib/prediction/live/gate-cache";
 import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
 import { notifyOutbox } from "@/lib/prediction/live/outbox-wake";
+import {
+  recordPredictionGenerated,
+  recordCalibratedPrediction,
+  recordGateResults,
+  recordNoBet,
+  recordSignalPersisted,
+  recordEligibleRound,
+} from "@/lib/prediction/live/funnel-metrics";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
 import { getSql, getPredictionPersistSql, getPgPool, getLastPoolAcquireMs, type Sql } from "@/lib/db";
@@ -597,6 +605,10 @@ const defaultPredictFn = (
           ...(typeof provenance === "object" ? provenance : {}),
           acieAuthoritative: true,
           strategy_action: strategyAction,
+          // Funnel telemetry: distinguishes a risk-gate veto (loss cooldown,
+          // pacing) from a quality-gate veto (evidence/calibration) in the
+          // daily no_bet_by_reason breakdown.
+          strategy_reason: String(evaluation.strategy?.reason ?? "") || null,
           // Regime must be on featureSummary — edgeDiagText / decision-audit
           // read fs.regime; regimeId alone left production logs as regime=n/a.
           regime: String(evaluation.regime ?? "unknown"),
@@ -1205,6 +1217,8 @@ export async function onGameEndPredict(
     trace.marks.target_claimed = t1;
   }
 
+  if (claim.owned) recordEligibleRound();
+
   if (!claim.owned) {
     const blockedKind: OnGameEndPredictResult["kind"] =
       claim.reason === "bg_reserved" ||
@@ -1544,6 +1558,26 @@ export async function onGameEndPredict(
     });
     const skip = skipCheck.skip;
     const vetoReason = skipCheck.reason;
+    // Funnel telemetry (directive 2026-09-12): per-gate marginal counts +
+    // terminal veto reason. In-memory only — zero DB, zero hot-path latency.
+    // Classification: cooldown/pacing/drawdown strategy vetoes are RISK;
+    // evidence/calibration/uncertainty strategy vetoes are QUALITY.
+    {
+      const strategyReason = String(fs.strategy_reason ?? "");
+      const isRiskVeto = /consecutive losses|pacing|drawdown/i.test(strategyReason);
+      recordPredictionGenerated();
+      if (fs.used_calibrated === true) recordCalibratedPrediction();
+      recordGateResults({
+        edge: vetoReason !== "edge_below_threshold" && vetoReason !== "probability_below_min",
+        confidence: vetoReason !== "confidence_below_min",
+        quality:
+          vetoReason !== "reduced_entry_blocked" &&
+          !(vetoReason === "strategy_veto" && !isRiskVeto),
+        risk: !(vetoReason === "strategy_veto" && isRiskVeto),
+        temporal: !slaViolated,
+      });
+      if (skip) recordNoBet(vetoReason ?? "unknown");
+    }
     if (skip) {
       const targetNum = Number(DEFAULT_TARGET);
       const fair = targetNum > 1 ? 1 / targetNum : 0.5;
@@ -1991,6 +2025,7 @@ export async function onGameEndPredict(
         : `durable prediction handoff complete — duplicate pending (no new outbox row; existing undelivered row for this target delivers) target=${targetGameId} prediction=${predictionId} correlation=${correlationId}`,
     );
     predictionLifecycleCounters.predictionsPersisted += 1;
+    if (outboxEnqueued > 0) recordSignalPersisted();
 
     if (pendingWasDuplicate) {
       try { completeTarget(targetGameId, owner); } catch { /* soft */ }
