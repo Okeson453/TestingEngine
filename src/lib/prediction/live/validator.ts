@@ -618,6 +618,17 @@ export async function onGameEnd(
   if (!evt.skipStateUpdate) {
     try {
       globalIncrementalState.update(evt.multiplier);
+      // FINAL_REPORT-2 #1: gap feature needs round-start times (zero-RTT
+      // registry, BG-authoritative). No-op when BG never arrived.
+      try {
+        const { getRoundStartedAtMs } = await import(
+          "@/lib/prediction/live/live-round-registry"
+        );
+        const beganMs = getRoundStartedAtMs(evt.gameId);
+        if (beganMs != null) globalIncrementalState.recordBeganAt(beganMs);
+      } catch {
+        /* soft */
+      }
     } catch {
       /* soft */
     }

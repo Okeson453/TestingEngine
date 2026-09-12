@@ -39,7 +39,7 @@ import {
   logLatencyBudgetSnapshot,
 } from "@/lib/prediction/live/latency-trace";
 import { syncDbClockOffset, shouldResyncClock } from "@/lib/prediction/live/clock-offset";
-import { noteRoundEnded, noteRoundStarted } from "@/lib/prediction/live/live-round-registry";
+import { noteRoundEnded, noteRoundStarted, getRoundStartedAtMs } from "@/lib/prediction/live/live-round-registry";
 
 const logger = getLogger("game-event-handlers");
 
@@ -762,6 +762,10 @@ export async function edHandler(payload: unknown): Promise<void> {
     // --- P0 REALTIME path (no await on DB before signal) ---
     try {
       globalIncrementalState.update(multiplier);
+      // FINAL_REPORT-2 #1: gap feature needs round-start times. BG events
+      // stamp the registry synchronously at bgHandler entry (authoritative).
+      const beganMs = getRoundStartedAtMs(gameId);
+      if (beganMs != null) globalIncrementalState.recordBeganAt(beganMs);
     } catch {
       /* soft */
     }

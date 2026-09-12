@@ -15,7 +15,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
-import { getMedianBettingWindowMs, isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
+import { getMedianBettingWindowMs, getRoundStartedAtMs, isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
 import { getEffectiveSkipBelowMs } from "@/lib/prediction/live/gate-cache";
 import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/live/target-coordinator";
 import { notifyOutbox } from "@/lib/prediction/live/outbox-wake";
@@ -69,15 +69,28 @@ export function observeCrashForACIE(
   gameId: string,
   multiplier: number,
   crashedAt: string,
+  beganAt?: string | null,
 ): void {
   const prev = getLastAcieObservation();
   if (prev.gameId === String(gameId) && prev.observationCount > 0) return;
+  // FINAL_REPORT-2 #2: round-start time feeds the gap feature family.
+  // Callers without it fall back to the zero-RTT BG-authoritative registry.
+  let beganAtResolved = beganAt ?? null;
+  if (!beganAtResolved) {
+    try {
+      const startedMs = getRoundStartedAtMs(gameId);
+      if (startedMs != null) beganAtResolved = new Date(startedMs).toISOString();
+    } catch {
+      /* soft — gap features degrade to zero */
+    }
+  }
   try {
     const acie = getSharedACIEEngine();
     const learnResult = acie.observeRound({
       roundId: gameId,
       crashPoint: multiplier,
       timestamp: crashedAt,
+      beganAt: beganAtResolved ?? undefined,
     });
     const obsCount =
       learnResult?.online?.observationCount ?? acie.historySize();

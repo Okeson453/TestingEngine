@@ -9,7 +9,10 @@ export interface FeatureMeta {
   missingValuePolicy: 'zero' | 'carry' | 'skip';
 }
 
-export const FEATURE_VERSION_V2 = 'fv-2.0.0';
+/** fv-2.1.0: added the gap family (gap_s, log_lag_1) — FINAL_REPORT-2 #1.
+ * Additive keys; version bump so assertFeatureVersionMatch rejects stale
+ * signals scored in the pre-gap feature space. */
+export const FEATURE_VERSION_V2 = 'fv-2.1.0';
 
 
 export const CURRENT_FEATURE_VERSION = FEATURE_VERSION_V2;
