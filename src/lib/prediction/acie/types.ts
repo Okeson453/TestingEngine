@@ -230,6 +230,11 @@ export interface ACIERoundInput {
   roundId: string;
   crashPoint: number;
   timestamp?: string;
+  /** Round-start time (began_at). FINAL_REPORT-2 #2: required for the gap
+   * feature family — the only Bonferroni-surviving signal. Optional so
+   * legacy callers without round-start data stay type-safe; gap features
+   * degrade to zero when absent. */
+  beganAt?: string;
 }
 
 /** Pass 19: per-decision model contributions + calibration provenance.

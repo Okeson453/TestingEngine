@@ -85,6 +85,11 @@ export interface IncrementalEngineSnapshot {
   shortCount: number;
   updatedAt: number;
   featureVersion: string;
+  /** Realized gap (seconds) between the last two consecutive round-start
+   * timestamps. 0 until beganAt observations flow (missingValuePolicy zero). */
+  lastGapS: number;
+  /** Number of valid gap observations seen (beganAt pairs). */
+  gapCount: number;
 }
 
 export const LAG_CAP = 512;
@@ -143,6 +148,10 @@ export class IncrementalStateEngine {
   private shortSum = 0;
   private shortSumSq = 0;
   private shortHits13 = 0;
+  /** Gap tracking (FINAL_REPORT-2): last two round-start timestamps. */
+  private lastBeganAtMs: number | null = null;
+  private lastGapS = 0;
+  private gapCount = 0;
   private updatedAt = 0;
 
   seed(crashPoints: number[]): void {
@@ -150,6 +159,33 @@ export class IncrementalStateEngine {
     for (const cp of crashPoints) {
       this.update(cp);
     }
+  }
+
+  /**
+   * Gap observation (FINAL_REPORT-2 #1/#2): record the round-start timestamp
+   * for the round currently being observed. Called with began_at when the
+   * caller has it (live: BG-authoritative registry; offline: startedAt).
+   * The realized gap = beganAt(N) − beganAt(N−1); per the report the signal
+   * content is round_duration(prev) + betting_window, both carried by this
+   * difference.
+   */
+  recordBeganAt(beganAtMs: number): void {
+    if (!Number.isFinite(beganAtMs) || beganAtMs <= 0) return;
+    if (this.lastBeganAtMs !== null && beganAtMs > this.lastBeganAtMs) {
+      const gapS = (beganAtMs - this.lastBeganAtMs) / 1000;
+      // Sanity window: gaps beyond 10 minutes are restarts/clock jumps,
+      // not signal. Report gaps run ~10-60s.
+      if (gapS > 0 && gapS <= 600) {
+        this.lastGapS = gapS;
+        this.gapCount += 1;
+      }
+    }
+    this.lastBeganAtMs = beganAtMs;
+  }
+
+  /** Gap state probe for the regime detector (#4) and diagnostics. */
+  getGapState(): { lastGapS: number; gapCount: number; lastBeganAtMs: number | null } {
+    return { lastGapS: this.lastGapS, gapCount: this.gapCount, lastBeganAtMs: this.lastBeganAtMs };
   }
 
   reset(): void {
@@ -172,6 +208,9 @@ export class IncrementalStateEngine {
     this.shortSumSq = 0;
     this.shortHits13 = 0;
     this.updatedAt = 0;
+    this.lastBeganAtMs = null;
+    this.lastGapS = 0;
+    this.gapCount = 0;
   }
 
   /** O(1) update on every crash */
@@ -294,6 +333,8 @@ export class IncrementalStateEngine {
       shortCount: this.shortLen,
       updatedAt: this.updatedAt,
       featureVersion: this.featureVersion,
+      lastGapS: this.lastGapS,
+      gapCount: this.gapCount,
     };
   }
 

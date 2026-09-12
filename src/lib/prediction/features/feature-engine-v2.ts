@@ -19,6 +19,7 @@ import { computeSpectralFeatures } from './spectral-features.ts';
 import { computeEntropyFeatures } from './entropy-features.ts';
 import { computeTimeFeatures } from './time-features.ts';
 import { computeCrossTargetFeatures } from './cross-target-features.ts';
+import { computeGapFeatures } from './gap-features.ts';
 import { computeFeatures as computeLegacy } from './calculators.ts';
 import { getLogger } from '../../observability/logger.ts';
 
@@ -76,6 +77,10 @@ export class FeatureEngineV2 {
       ...runFamily('entropy', () => computeEntropyFeatures(this.engine)),
       ...runFamily('time', () => computeTimeFeatures(new Date(timestamp))),
       ...runFamily('cross_target', () => computeCrossTargetFeatures(this.engine)),
+      // FINAL_REPORT-2 #1: gap family — only Bonferroni-surviving feature.
+      // Regime-dependent (dead since Sept 10); consumed by the gap-conditional
+      // candidate model when the regime detector says the signal is active.
+      ...runFamily('gap', () => computeGapFeatures(this.engine)),
     };
     for (const k of Object.keys(values)) {
       if (!Number.isFinite(values[k])) values[k] = 0;
@@ -102,6 +107,15 @@ export class FeatureEngineV2 {
   ): FeatureVector {
     const local = new IncrementalStateEngine();
     local.seed(priorRounds.map((r) => r.crashPoint));
+    // FINAL_REPORT-2 #1: gap family needs round-start times. HistoricalRound
+    // already carries startedAt (crash_rounds.began_at); feed it in round
+    // order so the realized-gap chain rebuilds identically to live.
+    for (const r of priorRounds) {
+      if (r.startedAt) {
+        const ms = new Date(r.startedAt).getTime();
+        if (Number.isFinite(ms)) local.recordBeganAt(ms);
+      }
+    }
     const tmp = new FeatureEngineV2(local);
     return tmp.snapshotFromState(targetRoundId, timestamp);
   }

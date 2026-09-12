@@ -27,6 +27,7 @@ export default defineConfig({
       "src/lib/prediction/live/delivery-forensics.test.ts",
       "src/lib/prediction/live/delivery-correlation.test.ts",
       "src/lib/prediction/models/baseline-calibration.test.ts",
+      "src/lib/prediction/features/gap-features.test.ts",
       "src/lib/prediction/state/*.test.ts",
     ],
   },
