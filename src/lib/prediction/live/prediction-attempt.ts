@@ -208,19 +208,29 @@ export async function attemptNPlusOnePrediction(
       }
     }
 
+    // Directive 2026-09-12: "not persisted" previously meant "no betting
+    // signal in pending_predictions/outbox". That was misread as "prediction
+    // discarded entirely" and blocked band backtests. For skipped_no_edge the
+    // decision audit (prediction_decisions) IS scheduled with the taxonomy
+    // tier — only the BETTING signal is withheld. Log text must make that
+    // distinction explicit (Railway strips structured fields).
+    const kind = result?.kind ?? null;
+    const msg = attempted
+      ? "N+1 SIGNAL_READY (durable outbox enqueued)"
+      : kind === "skipped_no_edge"
+        ? `N+1 NO_BET terminal (kind=skipped_no_edge) — decision audit scheduled; betting signal withheld`
+        : `N+1 prediction not persisted (kind=${kind ?? "null"})`;
     logger.info(
       {
         source,
         sourceGameId: sourceRoundId,
         targetGameId: result?.targetGameId ?? null,
         predictionId: result?.predictionId ?? null,
-        kind: result?.kind ?? null,
+        kind,
         outboxEnqueued: result?.outboxEnqueued ?? 0,
         recoveryMode,
       },
-      attempted
-        ? "N+1 SIGNAL_READY (durable outbox enqueued)"
-        : `N+1 prediction not persisted (kind=${result?.kind ?? "null"})`,
+      msg,
     );
 
     return {

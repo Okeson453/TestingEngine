@@ -640,7 +640,15 @@ export async function prHandler(payload: unknown): Promise<void> {
         ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
       ) ON CONFLICT DO NOTHING
     `;
-    logger.info({ event: "pr", gameId, correlationId }, "bc pr (betting-open) observed");
+    // Upstream proof (directive 2026-09-12): BC.Game emits pr (prepare /
+    // betting-open) ~7s before bg (begin). That gap is measured at native
+    // WS frame arrival (pr_to_bg_ms) with frame_to_event_ms ~0.03-0.13ms —
+    // there is NO application setTimeout/queue between the two frames.
+    // Operators must not treat pr_to_bg_ms~7060 as a TestingEngine bug.
+    logger.info(
+      { event: "pr", gameId, correlationId },
+      "bc pr (betting-open) observed — expect bg ~7s later (upstream BC.Game betting window, not app delay)",
+    );
   } catch (error) {
     logger.warn({ event: "pr", gameId, error: String(error) }, "pr event log failed");
   } finally {
