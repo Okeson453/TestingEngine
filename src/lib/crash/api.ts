@@ -7,6 +7,7 @@ import {
   toIso,
   type RoundRow,
 } from "./ingest";
+import { generateExportChunks } from "./export";
 import {
   HISTORY_LIMIT,
   STATS_LIMIT,
@@ -281,4 +282,94 @@ export const exportCrashCsv = createServerFn({ method: "POST" })
     }
 
     return { csv, filename: `crash-rounds-${now}.csv` };
+  });
+
+/* ── Full-history export (all crash_rounds, streaming) ─────────────────── */
+
+type ExportBatchRow = {
+  id: number | string;
+  game_id: string;
+  multiplier: string | number;
+  hash: string | null;
+  salt: string | null;
+  began_at: string | Date | null;
+  crashed_at: string | Date;
+  ingested_at: string | Date | null;
+};
+
+/**
+ * Export EVERY stored crash_rounds row as CSV or JSON. The handler runs
+ * batched keyset reads (id > last ORDER BY id LIMIT 2000) on the GENERAL
+ * pool — one short index-scan query per batch, one client at a time — and
+ * streams the result to the browser as a raw Response, so the dataset is
+ * never materialized as one query or one giant server-side string, and no
+ * critical/pinned hot-path resource is touched.
+ */
+export const exportAllRounds = createServerFn({ method: "POST" })
+  .validator((data: unknown) => {
+    const d = data as { format?: string } | undefined;
+    return { format: d?.format === "json" ? ("json" as const) : ("csv" as const) };
+  })
+  .handler(async ({ data }): Promise<Response> => {
+    const format = data.format;
+    const sql = await getSql();
+    const generatedAt = new Date().toISOString();
+    const stamp = generatedAt.slice(0, 19).replace(/[:T]/g, "-");
+    const filename = `crash-rounds-full-${stamp}.${format}`;
+    const contentType =
+      format === "csv" ? "text/csv; charset=utf-8" : "application/json; charset=utf-8";
+
+    // Count first: cheap PK aggregate, and it both validates the export
+    // (mismatch aborts mid-stream) and feeds the client's success state via
+    // the X-Export-Count header.
+    const countRows = await sql<{ n: number }>`
+      select count(*)::int as n from crash_rounds
+    `;
+    const count = Number(countRows[0]?.n ?? 0);
+
+    const fetchBatch = async (
+      afterId: number,
+      limit: number,
+    ): Promise<ExportBatchRow[]> => {
+      // GENERAL pool, keyset pagination: each call holds a client only for
+      // the duration of one bounded index-scan query.
+      const rows = await sql<ExportBatchRow>`
+        select id, game_id, multiplier::text as multiplier, hash, salt,
+               began_at, crashed_at, ingested_at
+        from crash_rounds
+        where id > ${afterId}
+        order by id asc
+        limit ${limit}
+      `;
+      return rows;
+    };
+
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          for await (const chunk of generateExportChunks({
+            format,
+            count,
+            generatedAt,
+            fetchBatch,
+          })) {
+            controller.enqueue(encoder.encode(chunk));
+          }
+          controller.close();
+        } catch (err) {
+          controller.error(err);
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "content-type": contentType,
+        "content-disposition": `attachment; filename="${filename}"`,
+        "x-export-count": String(count),
+        // Cache-control: export must always be fresh.
+        "cache-control": "no-store",
+      },
+    });
   });

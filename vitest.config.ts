@@ -12,6 +12,7 @@ export default defineConfig({
   },
   test: {
     include: [
+      "src/lib/crash/export.test.ts",
       "src/lib/prediction/calibration/calibration-honesty.test.ts",
       "src/lib/prediction/lifecycle/*.test.ts",
       "src/lib/prediction/live/durable-handoff-ordering.test.ts",

@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowUpRight,
@@ -11,7 +12,11 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
-import { refreshDashboard, exportCrashCsv } from "@/lib/crash/api";
+import {
+  refreshDashboard,
+  exportCrashCsv,
+  exportAllRounds,
+} from "@/lib/crash/api";
 import { bandForMultiplier } from "@/lib/crash/stats";
 import {
   HIGH_THRESHOLD,
@@ -173,7 +178,82 @@ function FeedBanner({ data }: { data: DashboardPayload }) {
   );
 }
 
+type FullExportFormat = "csv" | "json";
+type ExportStatus =
+  | { state: "idle" }
+  | { state: "loading"; format: FullExportFormat }
+  | { state: "success"; format: FullExportFormat; count: number; filename: string }
+  | { state: "error"; format: FullExportFormat; message: string };
+
+/**
+ * Stream the full-history export Response to a browser download. Reads the
+ * body in chunks (the server streams batch-by-batch) and saves the assembled
+ * blob — the raw count comes from the X-Export-Count header.
+ */
+async function downloadFullExport(
+  format: FullExportFormat,
+): Promise<{ count: number; filename: string }> {
+  const response = await exportAllRounds({ data: { format } });
+  if (!(response instanceof Response)) {
+    throw new Error("Export endpoint returned an unexpected payload");
+  }
+  if (!response.ok) {
+    throw new Error(`Export failed with status ${response.status}`);
+  }
+  const count = Number(response.headers.get("x-export-count") ?? 0);
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="([^"]+)"/.exec(disposition);
+  const filename = match?.[1] ?? `crash-rounds-full.${format}`;
+
+  const blob = response.body
+    ? await new Response(response.body).blob()
+    : new Blob([await response.text()]);
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  return { count, filename };
+}
+
 export function CrashDashboard({ initial }: { initial: DashboardPayload }) {
+  const [exportStatus, setExportStatus] = useState<ExportStatus>({ state: "idle" });
+  const exportStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (exportStatusTimer.current) clearTimeout(exportStatusTimer.current);
+    },
+    [],
+  );
+
+  const runFullExport = (format: FullExportFormat) => {
+    if (exportStatus.state === "loading") return;
+    setExportStatus({ state: "loading", format });
+    downloadFullExport(format)
+      .then(({ count, filename }) => {
+        setExportStatus({ state: "success", format, count, filename });
+      })
+      .catch((err: unknown) => {
+        setExportStatus({
+          state: "error",
+          format,
+          message: err instanceof Error ? err.message : "Export failed",
+        });
+      })
+      .finally(() => {
+        exportStatusTimer.current = setTimeout(
+          () => setExportStatus({ state: "idle" }),
+          6_000,
+        );
+      });
+  };
+
   const query = useQuery({
     queryKey: ["crash-dashboard"],
     queryFn: () => refreshDashboard(),
@@ -256,6 +336,48 @@ export function CrashDashboard({ initial }: { initial: DashboardPayload }) {
             </Button>
           </div>
         </header>
+
+        {/* Full-history export: authoritative crash_rounds table, streamed in
+            batches — not the 60-round chart window. Loading / success /
+            failure states inline below the toolbar. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            type="button"
+            disabled={exportStatus.state === "loading"}
+            onClick={() => runFullExport("csv")}
+          >
+            <Download className="size-3.5" />
+            {exportStatus.state === "loading" && exportStatus.format === "csv"
+              ? "Preparing CSV…"
+              : "Download All Rounds (CSV)"}
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            type="button"
+            disabled={exportStatus.state === "loading"}
+            onClick={() => runFullExport("json")}
+          >
+            <Download className="size-3.5" />
+            {exportStatus.state === "loading" && exportStatus.format === "json"
+              ? "Preparing JSON…"
+              : "Download All Rounds (JSON)"}
+          </Button>
+          {exportStatus.state === "success" && (
+            <span className="text-xs text-emerald-500" role="status">
+              Exported {exportStatus.count.toLocaleString("en-US")} rounds →{" "}
+              {exportStatus.filename}
+            </span>
+          )}
+          {exportStatus.state === "error" && (
+            <span className="text-xs text-red-500" role="alert">
+              {exportStatus.format.toUpperCase()} export failed:{" "}
+              {exportStatus.message}
+            </span>
+          )}
+        </div>
 
         <Card className="overflow-hidden rounded-xl p-5 md:p-6">
           <div className="flex flex-col gap-6 md:flex-row md:items-end md:justify-between">
