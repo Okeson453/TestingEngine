@@ -158,22 +158,38 @@ export function snapshotLatencyBudget(): Record<string, unknown> {
     delivery_ms: {
       p50: percentile(deliverySamples, 50),
       p95: percentile(deliverySamples, 95),
+      p99: percentile(deliverySamples, 99),
       n: deliverySamples.length,
     },
     lastSignalAt: lastSignalAt != null ? new Date(lastSignalAt).toISOString() : null,
     stages: Object.fromEntries(
       Object.entries(stageSamples).map(([k, arr]) => [
         k,
-        { p50: percentile(arr, 50), p95: percentile(arr, 95), n: arr.length },
+        { p50: percentile(arr, 50), p95: percentile(arr, 95), p99: percentile(arr, 99), n: arr.length },
       ]),
     ),
   };
 }
 
 export function logLatencyBudgetSnapshot(): void {
+  const snap = snapshotLatencyBudget();
   logger.info(
-    { component: "latency-trace", ...snapshotLatencyBudget() },
+    { component: "latency-trace", ...snap },
     "ED→signal latency budget snapshot",
+  );
+  // Plain-text mirror — Railway raw logs strip ALL JSON context fields, so the
+  // percentile budget is only greppable if it is IN the message string.
+  const es = snap.ed_to_signal_ms as { p50: number; p95: number; p99: number; max: number };
+  const dl = snap.delivery_ms as { p50: number; p95: number; p99: number; n: number };
+  const stages = snap.stages as Record<string, { p50: number; p95: number; p99: number; n: number }>;
+  const stageTxt = Object.entries(stages)
+    .filter(([, v]) => v.n > 0)
+    .map(([k, v]) => `${k}=${v.p50.toFixed(1)}/${v.p95.toFixed(1)}/${v.p99.toFixed(1)}ms`)
+    .join(" ");
+  console.log(
+    `[latency-budget] samples=${String(snap.n)} ed_to_signal p50/p95/p99=${es.p50.toFixed(1)}/${es.p95.toFixed(1)}/${es.p99.toFixed(1)}ms max=${es.max.toFixed(1)}` +
+      ` delivery p50/p95/p99=${dl.p50.toFixed(1)}/${dl.p95.toFixed(1)}/${dl.p99.toFixed(1)}ms n=${dl.n}` +
+      (stageTxt ? ` | ${stageTxt}` : ""),
   );
 }
 

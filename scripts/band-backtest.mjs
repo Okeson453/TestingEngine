@@ -6,7 +6,7 @@
  * joined against realized outcomes (crash_rounds.multiplier) and prints the
  * empirical performance of EVERY probability band:
  *
- *   65-69.99 | 70-74.99 | 75-76.91 | 76.92-77.99 | 78-79.99 | 80-84.99 | 85+
+ *   65-69.99 | 70-74.99 | 75-76.91 | 76.92-79.99 | 80-84.99 | 85+
  *
  * Per band: sample count, empirical win rate, loss rate, EV at 1.30x,
  * realized edge (win rate - break-even 0.7692), calibration error
@@ -30,8 +30,7 @@ const BANDS = [
   ["65-69.99", 0.65, 0.70],
   ["70-74.99", 0.70, 0.75],
   ["75-76.91", 0.75, BREAK_EVEN],
-  ["76.92-77.99", BREAK_EVEN, 0.78],
-  ["78-79.99", 0.78, 0.80],
+  ["76.92-79.99", BREAK_EVEN, 0.80],
   ["80-84.99", 0.80, 0.85],
   ["85+", 0.85, 1.01],
 ];
