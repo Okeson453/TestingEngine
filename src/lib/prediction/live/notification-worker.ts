@@ -65,10 +65,17 @@ export const MAX_ATTEMPTS = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5);
  * Prediction lane uses PREDICTION_PARALLELISM = 1 (see below).
  */
 export const BATCH_PARALLELISM = Number(process.env.OUTBOX_BATCH_PARALLELISM ?? 2);
-/** Prediction lane concurrency is hard-capped at 1 so a newly arriving N+1
- * signal is never blocked behind an in-flight prediction send. */
+/** Prediction lane concurrency: 2 as of sep 12 pass 4. The observed 1,051ms
+ * SIGNAL_READY→delivery (10:55Z prod window) was a fresh BG signal queued
+ * behind a legitimate pre-restart survivor row while parallelism was 1 —
+ * a scheduling delay, not a network or DB delay. Correctness does not
+ * depend on serial sends: each row's claim is a CAS (status pending→inflight),
+ * and the per-row pre-send temporal authorization independently refuses any
+ * signal whose target round has started. Two predictions for DIFFERENT
+ * targets may therefore overlap their Telegram legs; two rows for the SAME
+ * target cannot coexist (migration 0045 partial unique). */
 export const PREDICTION_PARALLELISM = Number(
-  process.env.OUTBOX_PREDICTION_PARALLELISM ?? 1,
+  process.env.OUTBOX_PREDICTION_PARALLELISM ?? 2,
 );
 /**
  * MINIMUM REMAINING LEAD SAFETY GATE (remediation plan §6): before a
@@ -548,11 +555,13 @@ export class OutboxDispatcher {
     const claimClientMs = this.now();
     const claimMs = Math.max(0, claimClientMs - claimT0);
 
-    // Parallel dispatch: prediction lane is strictly single-item (P0).
-    // Freshness > throughput for N+1. Normal lane retains BATCH_PARALLELISM.
+    // Parallel dispatch: prediction lane overlaps two sends. A fresh N+1
+    // signal must not queue behind a stale survivor row's Telegram leg
+    // (the observed 1,051ms SIGNAL_READY→delivery), and per-row CAS claim +
+    // pre-send temporal auth keep correctness under concurrency.
     const parallelism =
       lane === "prediction"
-        ? Math.max(1, Math.min(PREDICTION_PARALLELISM, 1))
+        ? Math.max(1, Math.min(PREDICTION_PARALLELISM, 2))
         : Math.max(1, BATCH_PARALLELISM);
     const laneChunks: OutboxRow[][] = [];
     for (let i = 0; i < claimed.length; i += parallelism) {
@@ -922,6 +931,15 @@ export class OutboxDispatcher {
                       : null,
                 },
                 "OUTBOX_DISPATCH delivered",
+              );
+              // P5 (sep 12 pass 4): Railway's raw log view strips JSON fields
+              // — the 10:55Z "duplicate delivery" report was UNDECIDABLE from
+              // raw logs because notification/prediction/correlation IDs and
+              // the claim timing lived only in stripped fields. One plain
+              // line with every identity inline makes the next window
+              // decidable by inspection, no log-order inference.
+              console.log(
+                `[outbox] delivered notification=${row.notification_id} prediction=${(row.metadata as Record<string, unknown> | null)?.predictionId ?? "n/a"} correlation=${(row.metadata as Record<string, unknown> | null)?.correlationId ?? "n/a"} target=${row.target_game_id ?? "n/a"} source=${(row.metadata as Record<string, unknown> | null)?.sourceGameId ?? "n/a"} attempt=${row.attempt_count} claim_to_send_ms=${lc.sendStartedMs != null ? Math.max(0, Math.round(lc.sendStartedMs - lc.claimClientMs)) : "n/a"} send_to_accept_ms=${lc.telegramAcceptedMs != null && lc.sendStartedMs != null ? Math.round(lc.telegramAcceptedMs - lc.sendStartedMs) : "n/a"}`,
               );
               logger.info(
                 {

@@ -1858,6 +1858,14 @@ export async function onGameEndPredict(
             ${outboxMetadata}::jsonb, 'pending', 100,
             0, now() + (${resultHoldMs} * interval '1 millisecond'), ${deadlineAt}::timestamptz, ${targetGameId}
           from inserted_prediction
+          -- EXACTLY-ONCE PER TARGET (sep 12 pass 4, migration 0045): at most
+          -- one UNDELIVERED prediction notification per target may exist. If
+          -- an older undelivered row for this target is still pending/inflight
+          -- (pre-restart survivor, retry race), THIS insert writes nothing and
+          -- the caller reads it as kind=duplicate — the older row delivers,
+          -- never both. The temporal kill clears expired rows for a started
+          -- target, so legitimate successor predictions are unaffected.
+          on conflict (type, target_game_id) where status in ('pending', 'inflight') do nothing
           returning notification_id
         `;
 
@@ -1959,8 +1967,8 @@ export async function onGameEndPredict(
         persistenceMs: Number((performance.now() - t4).toFixed(2)),
       },
       outboxEnqueued > 0
-        ? "durable prediction handoff complete — outbox pending before return"
-        : "durable prediction handoff complete — duplicate pending (outbox may already exist)",
+        ? `durable prediction handoff complete — outbox pending before return target=${targetGameId} prediction=${predictionId} correlation=${correlationId}`
+        : `durable prediction handoff complete — duplicate pending (no new outbox row; existing undelivered row for this target delivers) target=${targetGameId} prediction=${predictionId} correlation=${correlationId}`,
     );
     predictionLifecycleCounters.predictionsPersisted += 1;
 

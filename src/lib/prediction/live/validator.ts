@@ -674,8 +674,18 @@ export async function onGameEnd(
   // P0.3: Make feedback processing non-blocking via setImmediate.
   // Feedback is for learning (incremental state, calibration, model performance),
   // not correctness. The N+1 prediction can proceed without waiting for it.
+  // P4 (sep 12 pass 4): setImmediate still fired INSIDE the delivery window —
+  // the 10:55Z logs show feedback + model-performance + forensics bursting
+  // onto the general pool within 600ms of the round landing, forcing two NEW
+  // Neon connections (acquire 1077/1083ms — during-window data proves
+  // connection creation, not contention: maxWaiting=0). The learning writes
+  // are minutes-insensitive: defer past the delivery window entirely.
   const pendingSnapshot = state.pending; // capture for async closure
-  setImmediate(() => {
+  const feedbackDeferMs = Math.max(
+    0,
+    Number(process.env.FEEDBACK_DEFER_MS ?? 4_000),
+  );
+  const feedbackTimer = setTimeout(() => {
     if (!pendingSnapshot) return;
     // P0 (identity + temporal validity): resolve the EXACT registered
     // prediction for this target round and observe rolling metrics.
@@ -756,7 +766,8 @@ export async function onGameEnd(
         );
       });
     })();
-  });
+  }, feedbackDeferMs);
+  feedbackTimer.unref?.();
 
   // N+1 already scheduled at function entry (parallel with validation).
   // Keep a safety schedule only if entry was skipped (should not happen here).

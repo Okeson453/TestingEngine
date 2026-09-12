@@ -149,9 +149,18 @@ async function ensureMigrations() {
   }
 }
 
+// P2 (sep 12 pass 4): THIS is where the ~1.5s boot event-loop stall lives.
+// These three dynamic imports compile the entire TypeScript app graph under
+// --experimental-strip-types — synchronous CPU, boot-window only (the WS
+// pipeline starts later; no BG event can be processed yet). Measure and name
+// it so the stall is attributed by construction, not inferred.
+const appImportT0 = Date.now();
 const liveBoot = await import("@/lib/prediction/live/boot");
 const events = await import("@/lib/prediction/events/game-event-handlers");
 const db = await import("@/lib/db");
+console.log(
+  `[worker] app module graph import ms=${Date.now() - appImportT0} (strip-types compile — the boot event_loop_lag class)`,
+);
 endPgPoolLazy = db.endPgPool;
 const edgeHttp = await import("@/lib/prediction/live/edge-http");
 

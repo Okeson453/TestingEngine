@@ -265,8 +265,8 @@ export async function bgHandler(payload: unknown): Promise<void> {
         correlationId,
       },
       reserve.owned
-        ? "BG→N+1 ownership RESERVED (BG-primary — single authoritative path)"
-        : `BG→N+1 reserve skipped reason=${reserve.reason}`,
+        ? `BG→N+1 ownership RESERVED (BG-primary — single authoritative path) target=${targetGameIdForBg} correlation=${correlationId}`
+        : `BG→N+1 reserve skipped reason=${reserve.reason} target=${targetGameIdForBg} correlation=${correlationId}`,
     );
   }
 
@@ -547,7 +547,10 @@ export async function bgHandler(payload: unknown): Promise<void> {
       })
       .catch(() => undefined);
 
-    setImmediate(() => {
+    // P4 (sep 12 pass 4): forensics reclassify is analytics — defer it out of
+    // the round-start window where the reconcile CTE, BG persist and dispatcher
+    // claim all run. setImmediate still collided with that burst in prod.
+    const reclassifyTimer = setTimeout(() => {
       void (async () => {
         const { reclassifyOnTargetStart } = await import(
           "@/lib/prediction/live/delivery-forensics"
@@ -559,7 +562,8 @@ export async function bgHandler(payload: unknown): Promise<void> {
       })().catch(() => {
         /* soft */
       });
-    });
+    }, Math.max(0, Number(process.env.FORENSICS_DEFER_MS ?? 2_500)));
+    reclassifyTimer.unref?.();
 
     logger.info(
       {
