@@ -19,6 +19,7 @@ import { OutboxDispatcher } from "./notification-worker";
 import { PollWorker } from "./poll-worker";
 import { ClockSkewMonitor } from "./clock-skew-monitor";
 import { getLogger } from "@/lib/observability/logger";
+import { maxLoopLagBetween } from "@/lib/observability/event-loop-lag";
 import { getSql, type Sql } from "@/lib/db";
 import { loadAcieStateFromDb } from "@/lib/prediction/acie/state-persistence";
 import { getSharedPredictionEngine } from "@/lib/prediction/live/predictor";
@@ -27,6 +28,43 @@ import { WORKER_ID, LiveSupervisor, persistIncrementalState, restoreBaselineAdap
 import { setWorkerAuthority, onAuthorityLost } from "@/lib/prediction/live/fencing";
 
 const logger = getLogger("live-boot");
+
+/**
+ * P2 BOOT-STAGE ATTRIBUTION (sep 12 10:40Z directive).
+ *
+ * The 10:40Z boot showed two event-loop stalls (1679ms, 419ms) that the
+ * directive requires attributed to an EXACT operation, not to Neon. Both
+ * happened during boot (the WS pipeline only starts after "live prediction
+ * pipeline started" / "ws open", minutes of wall-clock later), and mid-stream
+ * loop lag in the same window stayed ≤12ms — so the suspects are boot-time
+ * synchronous work: strip-types TS compilation of dynamically imported
+ * module graphs, JSON.parse of restored state, and PredictionEngine
+ * construction.
+ *
+ * withBootStage wraps each boot stage and, when the stage is slow OR the
+ * event loop stalled inside its window, emits ONE line naming the stage,
+ * its wall duration, and the max loop lag measured DURING the stage window.
+ * Next prod boot, the 1679/419 class lands on a named stage by construction.
+ */
+const BOOT_STAGE_WARN_MS = Number(process.env.BOOT_STAGE_WARN_MS ?? 250) || 250;
+
+async function withBootStage<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const t0 = performance.now();
+  try {
+    return await fn();
+  } finally {
+    const t1 = performance.now();
+    const ms = Math.round(t1 - t0);
+    const lag = Math.round(maxLoopLagBetween(t0, t1));
+    if (ms >= BOOT_STAGE_WARN_MS || lag >= BOOT_STAGE_WARN_MS) {
+      // Inline values: Railway raw logs show message text only.
+      logger.warn(
+        { component: "live-boot", stage: name, ms, loopLagMs: lag },
+        `[boot] stage=${name} ms=${ms} loop_lag_ms=${lag}`,
+      );
+    }
+  }
+}
 
 /**
  * Pre-warm the PredictionEngine singleton at boot so the first real
@@ -264,7 +302,7 @@ class LiveBoot {
     // Railway will otherwise restart-loop while Neon is waking.
     let seed: SeedResult;
     try {
-      seed = await seeder();
+      seed = await withBootStage("cold-start-seeder", () => seeder());
     } catch (e) {
       logger.error(
         { component: "live-boot", error: String(e) },
@@ -308,7 +346,7 @@ class LiveBoot {
     // has a chance to populate the table list; run before dispatcher /
     // poll so a missing migration fails the boot fast.
     try {
-      await validateSchema(sql);
+      await withBootStage("schema-validation", () => validateSchema(sql));
       logger.info(
         { component: "live-boot" },
         "schema validation passed; all required tables present",
@@ -316,6 +354,7 @@ class LiveBoot {
       // §5.1 Restore ACIE online state into the AUTHORITATIVE shared singleton.
       // P0: one process-wide ACIEEngine for observe + evaluate + emission.
       try {
+        await withBootStage("acie-state-restore", async () => {
         const { getSharedACIEEngine, getSharedACIEInstanceId } = await import(
           "@/lib/prediction/acie/shared-engine"
         );
@@ -345,6 +384,7 @@ class LiveBoot {
             `ACIE shared singleton starting cold — restore reason: ${result.reason}`,
           );
         }
+        });
       } catch (e) {
         logger.warn(
           {
@@ -367,14 +407,14 @@ class LiveBoot {
       }
 
       // P2.11: Restore incremental state after schema validation
-      await restoreIncrementalState(sql);
-      await restoreBaselineAdaptiveState(sql);
-      await restoreSafeBaselineState(sql);
+      await withBootStage("incremental-state-restore", () => restoreIncrementalState(sql));
+      await withBootStage("baseline-adaptive-restore", () => restoreBaselineAdaptiveState(sql));
+      await withBootStage("safe-baseline-restore", () => restoreSafeBaselineState(sql));
 
       // Pre-warm the PredictionEngine so the first live prediction avoids
       // constructor + module-resolution cost on the hot path.
-      prewarmPredictionEngine();
-      await prewarmHotModules();
+      await withBootStage("prediction-engine-prewarm", async () => prewarmPredictionEngine());
+      await withBootStage("hot-module-prewarm", () => prewarmHotModules());
 
       // Latency fix: collapse any historically inflated residual floor so the
       // first live ED is not systematically skipped_late → poll recovery.
@@ -422,7 +462,7 @@ class LiveBoot {
           liveHistorySize,
           MIN_HISTORY_FOR_PREDICTION,
         } = await import("@/lib/prediction/live/live-history-buffer");
-        await warmLiveHistoryBuffer(sql, 200);
+        await withBootStage("history-warm", () => warmLiveHistoryBuffer(sql, 200));
         if (!isHistoryReadyForPrediction()) {
           logger.error(
             {
@@ -456,10 +496,12 @@ class LiveBoot {
           setWallClockSkewMs,
           setEffectiveSkipBelowMs,
         } = await import("@/lib/prediction/live/gate-cache");
-        const rows = await sql<{ key: string; value: string }>`
-          SELECT key, value FROM worker_state
-          WHERE key IN ('effective_skip_below_ms', 'median_inter_round_gap_ms', 'wall_clock_skew_ms')
-        `.catch(() => [] as { key: string; value: string }[]);
+        const rows = await withBootStage<{ key: string; value: string }[]>("gate-cache-warm", () =>
+          sql<{ key: string; value: string }>`
+            SELECT key, value FROM worker_state
+            WHERE key IN ('effective_skip_below_ms', 'median_inter_round_gap_ms', 'wall_clock_skew_ms')
+          `.catch(() => [] as { key: string; value: string }[]),
+        );
         for (const row of rows) {
           const n = Number(row.value);
           if (!Number.isFinite(n)) continue;
@@ -532,7 +574,7 @@ class LiveBoot {
     const signReadyTimeoutMs = Number(process.env.SIGN_READY_TIMEOUT_MS ?? 30_000);
     try {
       const { ensureSignReady } = await import("@/lib/crash/native-sign");
-      await ensureSignReady(signReadyTimeoutMs);
+      await withBootStage("sign-ready", () => ensureSignReady(signReadyTimeoutMs));
     } catch (e) {
       if (process.env.NODE_ENV === "production") {
         logger.error(
@@ -570,7 +612,7 @@ class LiveBoot {
       } catch { /* */ }
     });
 
-    await dispatcher.start();
+    await withBootStage("dispatcher-start", () => dispatcher.start());
     // Retention sweep (audit 2026-09-11): live_event_log is append-only
     // observability with no cleanup — batched bounded DELETE on the general
     // pool, 6h cadence, unref'd timer. Prediction/result history is never

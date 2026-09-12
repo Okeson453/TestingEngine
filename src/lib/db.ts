@@ -323,9 +323,23 @@ function makeRun(
   return async <T>(text: string, params: unknown[]) => {
     const t0 = Date.now();
     const t0Perf = performance.now();
+    // P3 FORENSIC (sep 12 10:40Z directive): the >100ms acquire warn prints
+    // waiting=/idle= AFTER the acquire completes — this waiter already left
+    // the queue, so "waiting=0" can never describe the window it waited in
+    // (the 10:42:29 acquire: 1073ms, idle=4, waiting=0 at completion). Sample
+    // the pool DURING the wait so the warn carries the observed extrema.
+    let maxWaiting = pool.waitingCount;
+    let maxIdle = pool.idleCount;
+    let maxTotal = pool.totalCount;
+    const poolSampler = setInterval(() => {
+      if (pool.waitingCount > maxWaiting) maxWaiting = pool.waitingCount;
+      if (pool.idleCount > maxIdle) maxIdle = pool.idleCount;
+      if (pool.totalCount > maxTotal) maxTotal = pool.totalCount;
+    }, 25);
+    poolSampler.unref?.();
     let client: import("pg").PoolClient;
     try {
-      client = await pool.connect();
+      client = await pool.connect().finally(() => clearInterval(poolSampler));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const transient =
@@ -358,10 +372,12 @@ function makeRun(
       // idle clients exist is indistinguishable — from acquireMs alone —
       // from an event-loop stall that starved the connect() continuation.
       // Report the max loop lag inside the acquire window so the 1093ms
-      // class of outlier is attributable in the log itself.
+      // class of outlier is attributable in the log itself. maxWaiting /
+      // maxIdle / maxTotal are sampled DURING the wait (the trailing
+      // waiting=/idle= snapshot is post-completion and cannot show waiters).
       const loopLag = Math.round(maxLoopLagBetween(t0Perf, performance.now()));
       console.warn(
-        `[db] ${label} pool_acquire_ms=${acquireMs} loop_lag_ms=${loopLag} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
+        `[db] ${label} pool_acquire_ms=${acquireMs} loop_lag_ms=${loopLag} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} | during: maxTotal=${maxTotal} maxIdle=${maxIdle} maxWaiting=${maxWaiting}`,
       );
     }
     try {

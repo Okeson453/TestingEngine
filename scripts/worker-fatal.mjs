@@ -80,8 +80,29 @@ export function registerProcessFailureHandlers(opts = {}) {
     // rejection escapes the bundle unhandled. These are benign by
     // construction and must never be fatal-worthy, even if
     // WORKER_FATAL_ON_UNCAUGHT=1 is set — log-and-continue at info level.
-    const sandboxStack = String(reason instanceof Error ? reason.stack ?? reason.message : reason);
-    if (sandboxStack.includes("wr_utils.vm.mjs")) {
+    //
+    // P2 (sep 12 10:40Z directive): two reasons slip past a bare stack
+    // match. (a) The stub rejection is CREATED host-side in native-sign.ts
+    // ("wr_utils sandbox: fetch is not allowed") — its stack names
+    // native-sign.ts, never "wr_utils.vm.mjs". (b) A rejection created
+    // INSIDE the VM realm fails `reason instanceof Error` on the host
+    // (different realm prototype), so only its .message/.stack PROPERTIES
+    // are readable. Match both surfaces on the wr_utils sandbox markers.
+    const reasonMessage =
+      reason instanceof Error
+        ? reason.message ?? ""
+        : typeof reason?.message === "string"
+          ? reason.message
+          : String(reason ?? "");
+    const reasonStack =
+      String(
+        (reason instanceof Error ? reason.stack : reason?.stack) ?? reasonMessage,
+      ) + `\n${reasonMessage}`;
+    if (
+      reasonStack.includes("wr_utils.vm.mjs") ||
+      /wr_utils sandbox/.test(reasonStack) ||
+      /wr_utils sandbox/.test(reasonMessage)
+    ) {
       out.log(
         JSON.stringify({
           level: "info",

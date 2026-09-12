@@ -340,21 +340,31 @@ let memWrUtilsBundleCache: { body: string; url: string; at: number } | null = nu
 /** Persist the last-good bundle body so boots survive bc.game flakiness. */
 async function persistWrUtilsBundleCache(body: string, url: string): Promise<void> {
   memWrUtilsBundleCache = { body, url, at: Date.now() };
-  // Fire-and-forget: never block sign path or boot on a large worker_state write.
-  void (async () => {
-    try {
-      const { getSql } = await import("@/lib/db");
-      const sql = await getSql();
-      await sql`
-        insert into worker_state (key, value, updated_at)
-        values (${WR_UTILS_CACHE_KEY}, ${JSON.stringify({ body, url, at: Date.now() })}, now())
-        on conflict (key) do update
-          set value = excluded.value, updated_at = now()
-      `;
-    } catch {
-      /* soft — memory cache remains authoritative for this process */
-    }
-  })();
+  // P3 (sep 12 10:40Z directive): the bundle body is multi-hundred-KB; the
+  // worker_state upsert held a general-pool client for ~578ms inside the
+  // boot window (prod: slow_query_ms=578 loop_lag_ms=1 — payload transfer
+  // over the Neon link, not CPU). The in-memory cache is authoritative for
+  // this process, and the durable copy only matters for a FUTURE boot's
+  // fetch-failure fallback — so defer the write until boot and the first
+  // prediction rounds are long over. unref'd: an early process exit merely
+  // skips the cache write (the next successful fetch re-persists it).
+  const timer = setTimeout(() => {
+    void (async () => {
+      try {
+        const { getSql } = await import("@/lib/db");
+        const sql = await getSql();
+        await sql`
+          insert into worker_state (key, value, updated_at)
+          values (${WR_UTILS_CACHE_KEY}, ${JSON.stringify({ body, url, at: Date.now() })}, now())
+          on conflict (key) do update
+            set value = excluded.value, updated_at = now()
+        `;
+      } catch {
+        /* soft — memory cache remains authoritative for this process */
+      }
+    })();
+  }, 60_000);
+  timer.unref?.();
 }
 
 async function loadCachedWrUtilsBundle(): Promise<{ body: string; url: string; at: number } | null> {
