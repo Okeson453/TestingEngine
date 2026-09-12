@@ -43,6 +43,18 @@ describe("adaptive edge", () => {
     // Should not go above base when overperforming
     assert.ok(e <= Number(process.env.MIN_SIGNAL_EDGE ?? 0.03) + 0.001);
   });
+
+  it("does not permanently lock at MAX after a mediocre window (recovery)", () => {
+    for (let i = 0; i < 20; i++) recordSignalOutcome(false);
+    const high = getAdaptiveMinEdge();
+    assert.ok(high >= Number(process.env.MIN_SIGNAL_EDGE ?? 0.03), `expected elevated edge, got ${high}`);
+    for (let i = 0; i < 30; i++) recordSignalOutcome(true);
+    const recovered = getAdaptiveMinEdge();
+    assert.ok(
+      recovered < high - 0.005,
+      `expected recovery below ${high}, got ${recovered}`,
+    );
+  });
 });
 
 describe("strategy fair-odds quality", () => {
