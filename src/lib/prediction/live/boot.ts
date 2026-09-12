@@ -3,16 +3,18 @@
  *
  * Spec: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §7.7
  *
- * Wires, in order:
- *   1. `ColdStartSeeder.runColdStartSeeder` — backfill crash_rounds if empty
- *   2. `OutboxDispatcher.start()` — drain queued Telegram notifications
- *   3. `LiveEventSubscriber` (via `events/game-event-handlers.startEventDrivenPipeline`)
- *      — subscribe to BC.Game's Socket.IO `bg`/`ed` events
- *   4. `PollWorker.start()` — REST safety net
- *   5. `ClockSkewMonitor.start()` — periodic skew measurement
+ * LIVE-FIRST order (directive 2026-09-12):
+ *   1. Minimal DB connectivity + schema validation
+ *   2. Shared ACIE singleton (cold construct — no DB)
+ *   3. Worker lease / fencing epoch (authority)
+ *   4. Sign readiness (WS dependency)
+ *   5. OutboxDispatcher + native WS subscriber (PR/BG/ED live path)
+ *   6. PollWorker + ClockSkewMonitor
+ *   7. BACKGROUND (never blocks live events): cold-start seeder,
+ *      ACIE/incremental/baseline restores, history warm, gate cache, prewarm
  *
- * The boot is a single process. All four logical roles are independent
- * timers, so a failure in one does not take down the others.
+ * Heavy restoration must not delay PR→N+1. History re-warm timer remains
+ * the safety net if the buffer is not READY on the first events.
  */
 import { runColdStartSeeder, type SeedResult } from "./cold-start-seeder";
 import { OutboxDispatcher } from "./notification-worker";
@@ -274,6 +276,154 @@ export interface BootDeps {
   startSubscriber?: () => Promise<void>;
 }
 
+
+/**
+ * Non-critical boot work — scheduled AFTER the live pipeline is up.
+ * Failures are soft; the history re-warm timer and cold ACIE paths cover gaps.
+ */
+async function runBackgroundHydration(
+  sql: Sql,
+  seeder: () => Promise<SeedResult>,
+): Promise<void> {
+  // Yield once so the first PR/BG handlers can interleave before CPU-heavy work.
+  await new Promise<void>((r) => setImmediate(r));
+
+  try {
+    await withBootStage("cold-start-seeder", () => seeder());
+  } catch (e) {
+    logger.warn(
+      { component: "live-boot", error: String(e) },
+      "background cold-start seeder failed (soft)",
+    );
+  }
+
+  try {
+    await withBootStage("acie-state-restore", async () => {
+      const { getSharedACIEEngine, getSharedACIEInstanceId } = await import(
+        "@/lib/prediction/acie/shared-engine"
+      );
+      const eng = getSharedACIEEngine();
+      const result = await loadAcieStateFromDb(eng);
+      (globalThis as { __acieEngine__?: typeof eng }).__acieEngine__ = eng;
+      if (result.restored) {
+        logger.info(
+          {
+            component: "live-boot",
+            reason: result.reason,
+            observationCount: result.observationCount,
+            crashPoints: result.crashPoints,
+            acieInstanceId: getSharedACIEInstanceId(),
+          },
+          "ACIE online state restored into shared singleton (warm, background)",
+        );
+      } else {
+        logger.warn(
+          {
+            component: "live-boot",
+            reason: result.reason,
+            error: result.error ?? null,
+            acieInstanceId: getSharedACIEInstanceId(),
+          },
+          `ACIE remaining cold in background — restore reason: ${result.reason}`,
+        );
+      }
+    });
+  } catch (e) {
+    logger.warn(
+      { component: "live-boot", error: String(e) },
+      "background ACIE restore failed (soft)",
+    );
+  }
+
+  try {
+    await Promise.all([
+      withBootStage("incremental-state-restore", () => restoreIncrementalState(sql)),
+      withBootStage("baseline-adaptive-restore", () => restoreBaselineAdaptiveState(sql)),
+      withBootStage("safe-baseline-restore", () => restoreSafeBaselineState(sql)),
+    ]);
+  } catch (e) {
+    logger.warn(
+      { component: "live-boot", error: String(e) },
+      "background state restores failed (soft)",
+    );
+  }
+
+  try {
+    await withBootStage("acie-tail-hydrate", async () => {
+      const { hydrateAcieTailFromCrashRounds } = await import(
+        "@/lib/prediction/live/predictor"
+      );
+      const hydrated = await hydrateAcieTailFromCrashRounds(sql);
+      if (hydrated > 0) {
+        logger.info(
+          { component: "live-boot", hydrated_rounds: hydrated },
+          "ACIE tail hydrated from crash_rounds (background)",
+        );
+      }
+    });
+  } catch (e) {
+    logger.warn(
+      { component: "live-boot", error: String(e) },
+      "background ACIE tail hydrate failed (soft)",
+    );
+  }
+
+  try {
+    await withBootStage("prediction-engine-prewarm", async () => prewarmPredictionEngine());
+    await withBootStage("hot-module-prewarm", () => prewarmHotModules());
+  } catch (e) {
+    logger.warn(
+      { component: "live-boot", error: String(e) },
+      "background prewarm failed (soft)",
+    );
+  }
+
+  try {
+    const { warmLiveHistoryBuffer } = await import("./live-history-buffer");
+    await withBootStage("history-warm", () => warmLiveHistoryBuffer(sql, 200));
+    logger.info(
+      { component: "live-boot" },
+      "Live history buffer warmed and READY for N+1 prediction (background)",
+    );
+  } catch (e) {
+    logger.warn(
+      { component: "live-boot", error: String(e) },
+      "background history warm failed (soft) — rewarm timer will retry",
+    );
+  }
+
+  try {
+    const {
+      setMedianInterRoundGapMs,
+      setWallClockSkewMs,
+      setEffectiveSkipBelowMs,
+    } = await import("@/lib/prediction/live/gate-cache");
+    const rows = await withBootStage<{ key: string; value: string }[]>("gate-cache-warm", () =>
+      sql<{ key: string; value: string }>`
+        SELECT key, value FROM worker_state
+        WHERE key IN ('effective_skip_below_ms', 'median_inter_round_gap_ms', 'wall_clock_skew_ms')
+      `.catch(() => [] as { key: string; value: string }[]),
+    );
+    for (const row of rows) {
+      const n = Number(row.value);
+      if (!Number.isFinite(n)) continue;
+      if (row.key === "median_inter_round_gap_ms") setMedianInterRoundGapMs(n);
+      if (row.key === "wall_clock_skew_ms") setWallClockSkewMs(n);
+      if (row.key === "effective_skip_below_ms") {
+        setEffectiveSkipBelowMs(Math.min(200, Math.max(80, n)));
+      }
+    }
+    logger.info({ component: "live-boot", keys: rows.length }, "gate cache warmed (background)");
+  } catch (e) {
+    logger.warn(
+      { component: "live-boot", error: String(e) },
+      "background gate cache warm failed (soft)",
+    );
+  }
+
+  logger.info({ component: "live-boot" }, "background hydration complete");
+}
+
 class LiveBoot {
   private dispatcher: OutboxDispatcher | null = null;
   private pollWorker: PollWorker | null = null;
@@ -286,7 +436,7 @@ class LiveBoot {
     if (this.started) {
       return this.lastResult!;
     }
-    // Do NOT set started=true until all components initialize (P0 startup state machine)
+    // Do NOT set started=true until live path is up (P0 startup state machine)
     const bootStartedAt = new Date().toISOString();
 
     try {
@@ -298,28 +448,8 @@ class LiveBoot {
     this.pollWorker = pollWorker;
     this.clockMonitor = clockMonitor;
 
-    // Cold-start must not crash the worker process on a transient DB timeout.
-    // Railway will otherwise restart-loop while Neon is waking.
-    let seed: SeedResult;
-    try {
-      seed = await withBootStage("cold-start-seeder", () => seeder());
-    } catch (e) {
-      logger.error(
-        { component: "live-boot", error: String(e) },
-        "cold-start seeder threw; continuing with empty seed result",
-      );
-      seed = {
-        alreadySeeded: false,
-        initialCount: 0,
-        finalCount: 0,
-        insertedTotal: 0,
-        pagesFetched: 0,
-        elapsedMs: 0,
-        timedOut: true,
-      };
-    }
-
-    let sql;
+    // ── 1. Minimal DB connectivity (no cold-start seeder on critical path) ──
+    let sql: Sql | undefined;
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       try {
         sql = await getSql();
@@ -328,230 +458,22 @@ class LiveBoot {
       } catch (e) {
         logger.warn(
           { component: "live-boot", attempt, error: String(e) },
-          "DB not ready after cold-start; retrying",
+          "DB not ready; retrying",
         );
-        await new Promise((r) => setTimeout(r, Math.min(2000 * attempt, 8000)));
+        await new Promise((r) => setTimeout(r, Math.min(500 * attempt, 3000)));
       }
     }
     if (!sql) {
-      throw new Error("Database unreachable after cold-start retries — aborting boot");
+      throw new Error("Database unreachable after connectivity retries — aborting boot");
     }
 
-    logger.info(
-      { component: "live-boot", seed, bootStartedAt },
-      "cold-start seeder complete; starting dispatcher / subscriber / poll / monitor",
-    );
-
-    // Spec §3.10 — schema validation. Run after the seeder so the seeder
-    // has a chance to populate the table list; run before dispatcher /
-    // poll so a missing migration fails the boot fast.
+    // ── 2. Schema validation (fail fast) ──
     try {
       await withBootStage("schema-validation", () => validateSchema(sql));
       logger.info(
         { component: "live-boot" },
         "schema validation passed; all required tables present",
       );
-      // §5.1 Restore ACIE online state into the AUTHORITATIVE shared singleton.
-      // P0: one process-wide ACIEEngine for observe + evaluate + emission.
-      try {
-        await withBootStage("acie-state-restore", async () => {
-        const { getSharedACIEEngine, getSharedACIEInstanceId } = await import(
-          "@/lib/prediction/acie/shared-engine"
-        );
-        const eng = getSharedACIEEngine();
-        const result = await loadAcieStateFromDb(eng);
-        // Keep globalThis bridge for any residual callers during rollout.
-        (globalThis as { __acieEngine__?: typeof eng }).__acieEngine__ = eng;
-        if (result.restored) {
-          logger.info(
-            {
-              component: "live-boot",
-              reason: result.reason,
-              observationCount: result.observationCount,
-              crashPoints: result.crashPoints,
-              acieInstanceId: getSharedACIEInstanceId(),
-            },
-            "ACIE online state restored into shared singleton (warm)",
-          );
-        } else {
-          logger.warn(
-            {
-              component: "live-boot",
-              reason: result.reason,
-              error: result.error ?? null,
-              acieInstanceId: getSharedACIEInstanceId(),
-            },
-            `ACIE shared singleton starting cold — restore reason: ${result.reason}`,
-          );
-        }
-        });
-      } catch (e) {
-        logger.warn(
-          {
-            component: "live-boot",
-            reason: "db_error",
-            error: String(e),
-            stack: e instanceof Error ? e.stack : undefined,
-          },
-          "ACIE state restore threw — ensuring shared singleton exists cold",
-        );
-        try {
-          const { getSharedACIEEngine } = await import(
-            "@/lib/prediction/acie/shared-engine"
-          );
-          const cold = getSharedACIEEngine();
-          (globalThis as { __acieEngine__?: typeof cold }).__acieEngine__ = cold;
-        } catch {
-          /* ACIE optional */
-        }
-      }
-
-      // P2.11: Restore incremental state after schema validation.
-      // PASS 5 (11:23Z window): these three restores are independent state
-      // domains (incremental model, adaptive baseline, safe baseline) — they
-      // ran sequentially, serializing three Neon round trips (+2 RTT of boot
-      // wall time, the 489ms ACIE-restore class). Run them CONCURRENTLY;
-      // each keeps its own stage attribution, and boot proceeds only when
-      // all three land.
-      await Promise.all([
-        withBootStage("incremental-state-restore", () => restoreIncrementalState(sql)),
-        withBootStage("baseline-adaptive-restore", () => restoreBaselineAdaptiveState(sql)),
-        withBootStage("safe-baseline-restore", () => restoreSafeBaselineState(sql)),
-      ]);
-
-      // COLD-START (9603950, 15:46:56): crashes that landed while this worker
-      // had no wired handlers (deploy / lease wait) exist in crash_rounds but
-      // were never observed into THIS process's ACIE engine — the first BG
-      // prediction rejected STALE_REJECTED and fell to ED. Observe the missed
-      // tail (rows newer than the snapshot's lastSourceGameId) here, before
-      // any handler is wired. Boot-window only, 1 general-pool query.
-      try {
-        await withBootStage("acie-tail-hydrate", async () => {
-          const { hydrateAcieTailFromCrashRounds } = await import(
-            "@/lib/prediction/live/predictor"
-          );
-          const hydrated = await hydrateAcieTailFromCrashRounds(sql);
-          if (hydrated > 0) {
-            logger.info(
-              { component: "live-boot", hydrated_rounds: hydrated },
-              "ACIE tail hydrated from crash_rounds (missed crash observations)",
-            );
-          }
-        });
-      } catch (e) {
-        logger.warn(
-          { component: "live-boot", error: String(e) },
-          "ACIE tail hydration failed (soft) — stale-guard retry covers the first round",
-        );
-      }
-
-      // Pre-warm the PredictionEngine so the first live prediction avoids
-      // constructor + module-resolution cost on the hot path.
-      await withBootStage("prediction-engine-prewarm", async () => prewarmPredictionEngine());
-      await withBootStage("hot-module-prewarm", () => prewarmHotModules());
-
-      // Latency fix: collapse any historically inflated residual floor so the
-      // first live ED is not systematically skipped_late → poll recovery.
-      try {
-        await sql`
-          INSERT INTO worker_state (key, value, updated_at)
-          VALUES ('effective_skip_below_ms', '120', now())
-          ON CONFLICT (key) DO UPDATE
-            SET value = '120', updated_at = now()
-            WHERE worker_state.value::numeric > 200
-        `;
-        const { setEffectiveSkipBelowMs } = await import("@/lib/prediction/live/gate-cache");
-        setEffectiveSkipBelowMs(120);
-        logger.info({ component: "live-boot" }, "reset effective_skip_below_ms ceiling");
-        try {
-          const { clearSheathSamples } = await import("@/lib/core/sheath-mode");
-          clearSheathSamples();
-          logger.info({ component: "live-boot" }, "cleared sheath late-rate window");
-        } catch { /* soft */ }
-        try {
-          const { globalProductionController } = await import(
-            "@/lib/prediction/lifecycle/production-controller"
-          );
-          globalProductionController.manualRecoverDivergence();
-          logger.info({ component: "live-boot" }, "divergence sheath recovered to level 0");
-        } catch { /* soft */ }
-        try {
-          const { globalLiveDivergence } = await import(
-            "@/lib/prediction/validation/live-divergence-monitor"
-          );
-          globalLiveDivergence.manualRecover(true);
-        } catch { /* soft */ }
-      } catch {
-        /* soft */
-      }
-
-      // Warm the live rolling history buffer so the first ED predict hits
-      // memory. P0: history is a hard prerequisite — without READY buffer
-      // the predictor returns N+1_UNAVAILABLE_HISTORY (no silent SQL fallback).
-      try {
-        const {
-          warmLiveHistoryBuffer,
-          isHistoryReadyForPrediction,
-          isLiveHistoryWarmed,
-          liveHistorySize,
-          MIN_HISTORY_FOR_PREDICTION,
-        } = await import("@/lib/prediction/live/live-history-buffer");
-        await withBootStage("history-warm", () => warmLiveHistoryBuffer(sql, 200));
-        if (!isHistoryReadyForPrediction()) {
-          logger.error(
-            {
-              component: "live-boot",
-              warmed: isLiveHistoryWarmed(),
-              size: liveHistorySize(),
-              minRequired: MIN_HISTORY_FOR_PREDICTION,
-            },
-            "P0 health fault: live history NOT READY — N+1 predictions blocked until buffer recovers",
-          );
-        } else {
-          logger.info(
-            {
-              component: "live-boot",
-              size: liveHistorySize(),
-            },
-            "live history buffer READY (hot path memory-only, no history SQL)",
-          );
-        }
-      } catch (e) {
-        logger.error(
-          { component: "live-boot", error: String(e) },
-          "P0 health fault: live history warm failed — N+1 predictions blocked (no SQL fallback)",
-        );
-      }
-
-      // Warm gate-cache so first predict skips worker_state SQL (another 700–1000ms).
-      try {
-        const {
-          setMedianInterRoundGapMs,
-          setWallClockSkewMs,
-          setEffectiveSkipBelowMs,
-        } = await import("@/lib/prediction/live/gate-cache");
-        const rows = await withBootStage<{ key: string; value: string }[]>("gate-cache-warm", () =>
-          sql<{ key: string; value: string }>`
-            SELECT key, value FROM worker_state
-            WHERE key IN ('effective_skip_below_ms', 'median_inter_round_gap_ms', 'wall_clock_skew_ms')
-          `.catch(() => [] as { key: string; value: string }[]),
-        );
-        for (const row of rows) {
-          const n = Number(row.value);
-          if (!Number.isFinite(n)) continue;
-          if (row.key === "median_inter_round_gap_ms") setMedianInterRoundGapMs(n);
-          if (row.key === "wall_clock_skew_ms") setWallClockSkewMs(n);
-          if (row.key === "effective_skip_below_ms") {
-            setEffectiveSkipBelowMs(Math.min(200, Math.max(80, n)));
-          }
-        }
-        logger.info({ component: "live-boot", keys: rows.length }, "gate cache warmed");
-      } catch (e) {
-        logger.warn(
-          { component: "live-boot", error: String(e) },
-          "gate cache warm failed — first predict may query worker_state",
-        );
-      }
     } catch (e) {
       logger.error(
         { component: "live-boot", error: String(e) },
@@ -560,11 +482,25 @@ class LiveBoot {
       throw e;
     }
 
-    // P0 (fix plan Phase 1): lease + fencing epoch = authority. Takeover must
-    // PROVE the previous lease expired — no unconditional DELETE. During a
-    // rolling deploy the old worker heartbeats until drained; we retry until
-    // its lease proves expired (≤ 2×TTL after its last heartbeat) or it
-    // releases on SIGTERM. Bounded by WORKER_LEASE_WAIT_MS.
+    // ── 3. Cold ACIE singleton (no DB) so first PR can evaluate ──
+    try {
+      const { getSharedACIEEngine } = await import(
+        "@/lib/prediction/acie/shared-engine"
+      );
+      const cold = getSharedACIEEngine();
+      (globalThis as { __acieEngine__?: typeof cold }).__acieEngine__ = cold;
+      logger.info({ component: "live-boot" }, "Shared ACIEEngine constructed (cold; restore in background)");
+    } catch (e) {
+      logger.warn(
+        { component: "live-boot", error: String(e) },
+        "ACIE cold construct failed (soft)",
+      );
+    }
+
+    // ── 4. Worker lease EARLY (authority before live mutations) ──
+    // Rolling deploy: previous container keeps lease until heartbeat stale.
+    // Retry every 500ms (was 2s) so takeover after SIGTERM is faster without
+    // weakening fencing — still requires prove-expired, no unconditional steal.
     const leaseWaitDeadline = Date.now() + Number(process.env.WORKER_LEASE_WAIT_MS ?? 45_000);
     let lock: { ok: boolean; epoch: number | null } = { ok: false, epoch: null };
     let leaseAttempts = 0;
@@ -582,7 +518,7 @@ class LiveBoot {
           "WORKER_LEASE_WAITING: another worker holds an unexpired lease — retrying until it proves expired",
         );
       }
-      await new Promise((r) => setTimeout(r, 2_000));
+      await new Promise((r) => setTimeout(r, Number(process.env.WORKER_LEASE_RETRY_MS ?? 500)));
     }
     if (!lock.ok) {
       logger.error(
@@ -595,16 +531,11 @@ class LiveBoot {
     }
     setWorkerAuthority(lock.epoch);
     logger.info(
-      { component: "live-boot", workerId: WORKER_ID, workerEpoch: lock.epoch },
+      { component: "live-boot", workerId: WORKER_ID, workerEpoch: lock.epoch, leaseAttempts },
       "distributed worker lease acquired (fencing epoch active)",
     );
 
-    // Second-opinion report #1: signing is a HARD readiness dependency. The
-    // wr_utils bundle + self-test must land BEFORE the WS / pipeline starts —
-    // an unsignable worker connects nothing and produces nothing while still
-    // advertising ready. Production treats exhaustion as fatal (runtime
-    // restarts); dev warns and continues so local work isn't blocked by
-    // bc.game reachability.
+    // ── 5. Sign readiness (WS dependency) ──
     const signReadyTimeoutMs = Number(process.env.SIGN_READY_TIMEOUT_MS ?? 30_000);
     try {
       const { ensureSignReady } = await import("@/lib/crash/native-sign");
@@ -622,17 +553,10 @@ class LiveBoot {
         "sign readiness failed (dev) — starting pipeline degraded",
       );
     }
-    // Fix 6: supervisor owns ALL control-loop timers — lock heartbeat +
-    // worker health (10s), invariant monitor (30s, exactly ONE timer — fix 1),
-    // connection warmer (3s), event-loop probe (2s).
+
+    // ── 6. Supervisor + authority-loss cascade ──
     const supervisor = getLiveSupervisor();
     supervisor.start();
-
-    // Fix plan Phase 2: lock loss must cancel EVERY mutation-capable
-    // component, not just supervisor timers. The supervisor calls
-    // markAuthorityLost(); this cascade stops the dispatcher, poll worker and
-    // clock monitor immediately. The ed/dispatch/poll gates consult
-    // isAuthoritative() for the window before teardown completes.
     onAuthorityLost(() => {
       logger.error(
         { component: "live-boot", workerId: WORKER_ID },
@@ -646,24 +570,20 @@ class LiveBoot {
       } catch { /* */ }
     });
 
+    // ── 7. LIVE PATH: dispatcher + WS subscriber + poll + clock ──
     await withBootStage("dispatcher-start", () => dispatcher.start());
-    // Retention sweep (audit 2026-09-11): live_event_log is append-only
-    // observability with no cleanup — batched bounded DELETE on the general
-    // pool, 6h cadence, unref'd timer. Prediction/result history is never
-    // touched. Gated behind worker authority implicitly: this code only runs
-    // on the worker that holds the lease (see lease gate above).
     try {
       const { startRetentionSweep } = await import("./retention");
       startRetentionSweep();
     } catch (e) {
       logger.warn(
         { component: "live-boot", error: String(e) },
-        "retention sweep failed to start (soft) — observability table will grow",
+        "retention sweep failed to start (soft)",
       );
     }
     if (deps.startSubscriber) {
       try {
-        await deps.startSubscriber();
+        await withBootStage("subscriber-start", () => deps.startSubscriber!());
       } catch (e) {
         logger.warn(
           { component: "live-boot", error: String(e) },
@@ -674,9 +594,7 @@ class LiveBoot {
     await pollWorker.start();
     await clockMonitor.start();
 
-    // Resilience: if the in-memory history buffer drops below READY (cold
-    // boot race, partial warm, long WS gap), re-warm from crash_rounds on a
-    // slow cadence without touching the prediction hot path.
+    // History re-warm safety net (covers first events before background warm)
     if (!this.historyRewarmTimer) {
       this.historyRewarmTimer = setInterval(() => {
         void (async () => {
@@ -686,8 +604,8 @@ class LiveBoot {
               warmLiveHistoryBuffer,
             } = await import("./live-history-buffer");
             if (isHistoryReadyForPrediction()) return;
-            const sql = await getSql();
-            await warmLiveHistoryBuffer(sql, 200, true);
+            const s = await getSql();
+            await warmLiveHistoryBuffer(s, 200, true);
             logger.info(
               { component: "live-boot" },
               "history buffer re-warm completed (was not READY)",
@@ -699,12 +617,39 @@ class LiveBoot {
             );
           }
         })();
-      }, Number(process.env.HISTORY_REWARM_MS ?? 60_000) || 60_000);
+      }, Number(process.env.HISTORY_REWARM_MS ?? 15_000) || 15_000);
       this.historyRewarmTimer.unref?.();
     }
 
+    // Live path is up — accept events. Heavy hydration must not block PR/BG.
     this.started = true;
-    this.lastResult = { seed, bootStartedAt };
+    const emptySeed: SeedResult = {
+      alreadySeeded: false,
+      initialCount: 0,
+      finalCount: 0,
+      insertedTotal: 0,
+      pagesFetched: 0,
+      elapsedMs: 0,
+      timedOut: false,
+    };
+    this.lastResult = { seed: emptySeed, bootStartedAt };
+    logger.info(
+      {
+        component: "live-boot",
+        bootStartedAt,
+        liveReadyMs: Date.now() - new Date(bootStartedAt).getTime(),
+      },
+      "LIVE PATH READY — background hydration starting (does not block PR/BG/N+1)",
+    );
+
+    // ── 8. BACKGROUND hydration (fire-and-forget) ──
+    void runBackgroundHydration(sql, seeder).catch((e) => {
+      logger.warn(
+        { component: "live-boot", error: String(e) },
+        "background hydration chain failed (soft)",
+      );
+    });
+
     return this.lastResult;
     } catch (err) {
       // Cleanup partial init so retry can rebuild cleanly
