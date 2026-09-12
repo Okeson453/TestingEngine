@@ -590,6 +590,11 @@ export async function bgHandler(payload: unknown): Promise<void> {
       },
       "bg reconcile complete — kill committed; lifecycle leg detached (general pool)",
     );
+    // Railway strips JSON fields — the acquire-vs-query split must be in the
+    // MESSAGE to be readable from raw logs (that split is the P1 evidence).
+    console.log(
+      `[bg] kill leg: acquire_ms=${killAcquireMs} query_ms=${killQueryMs} killed=${signalsKilled} (acquire≈RTT-floor when 0-wait; acquire≫query ⇒ pool contention)`,
+    );
   } catch (error) {
     logger.error({ event: "bg", gameId, error: String(error) }, "bg observability failed");
   } finally {
