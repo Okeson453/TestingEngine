@@ -232,6 +232,26 @@ export interface ACIERoundInput {
   timestamp?: string;
 }
 
+/** Pass 19: per-decision model contributions + calibration provenance.
+ *  Populated on the full evaluation path so the live predictor can log the
+ *  EXACT runtime edge inputs (which model said what, was Platt applied)
+ *  on every BG decision, signal or NO_BET. Optional: the seed/warmup
+ *  emptyEvaluation omits it. */
+export interface ACIEEvaluationDiagnostics {
+  /** Per-model probability estimates (the ensemble members' votes). */
+  modelProbabilities: Record<string, number>;
+  /** Population std-dev of the model estimates (the disagreement gate input). */
+  ensembleDisagreement: number;
+  /** Whether the disagreement gate passed (ACIE_MAX_DISAGREEMENT). */
+  agreementOk: boolean;
+  /** Raw (uncalibrated) psi ensemble probability. */
+  rawProbability: number;
+  /** Platt-calibrated probability, or null when the calibrator is unfitted. */
+  calibratedProbability: number | null;
+  /** Whether the decision probability came from the Platt calibrator. */
+  usedCalibrated: boolean;
+}
+
 export interface ACIEEvaluationResult {
   psi: PSIOutput;
   evidence: EvidenceReport;
@@ -239,4 +259,5 @@ export interface ACIEEvaluationResult {
   signal: EntrySignal | null;
   sequenceState: SequenceState;
   regime: RegimeLabel;
+  diagnostics?: ACIEEvaluationDiagnostics;
 }

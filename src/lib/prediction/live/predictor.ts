@@ -45,6 +45,7 @@ import {
   recordPredictionOutcome,
 } from "@/lib/core/sheath-mode";
 import { getAdaptiveMinEdge } from "@/lib/prediction/live/adaptive-edge";
+import { recordNoBetDecision } from "@/lib/prediction/live/decision-audit";
 
 const logger = getLogger("live-predictor");
 // SYNTAX_GUARD_20260906: file must parse under node --experimental-strip-types
@@ -201,7 +202,13 @@ export function shouldSkipReason(input: {
 }): { skip: boolean; reason: SkipVetoReason | null } {
   const targetNum = Number(input.target ?? 1.3);
   const fair = targetNum > 1 ? 1 / targetNum : 0.5;
-  const minEdge = input.minEdge ?? MIN_SIGNAL_EDGE;
+  // PASS 19 FIX: default to the ADAPTIVE edge, matching shouldSkipSignal.
+  // Pass 18's delegation accidentally defaulted to the static
+  // MIN_SIGNAL_EDGE constant, silently switching the live gate off the
+  // adaptive selectivity semantics (recordSignalOutcome feedback loop) —
+  // the log's needP and the gate could disagree. Both gates now share
+  // getAdaptiveMinEdge() unless a caller pins minEdge explicitly.
+  const minEdge = input.minEdge ?? getAdaptiveMinEdge();
   const minP = input.minProbability ?? MIN_SIGNAL_PROBABILITY;
   const minC = input.minConfidence ?? MIN_SIGNAL_CONFIDENCE;
   const needP = Math.max(minP, fair + minEdge);
@@ -228,6 +235,61 @@ export function shouldSkipReason(input: {
   if (pipelineAction === "SKIP") return { skip: true, reason: "pipeline_veto" };
   if (reasoningSaysSkip) return { skip: true, reason: "reasoning_skip" };
   return { skip: false, reason: null };
+}
+
+/** Pass 19: ONE-LINE runtime edge diagnostic, inlined into the log MESSAGE
+ *  (Railway raw logs show pino message text only — context fields are
+ *  stripped). Carries the exact numbers the directive asks for on EVERY
+ *  BG decision: runtime edge, threshold, probability, confidence, model
+ *  contributions, calibration provenance. Read from featureSummary when
+ *  the caller only holds the signal shape (the ACIE evaluation's
+ *  diagnostics are folded into featureSummary at generation time). */
+export function edgeDiagText(input: {
+  probability: number;
+  confidence: number;
+  target?: number;
+  minEdge?: number;
+  minProbability?: number;
+  vetoReason?: SkipVetoReason | null;
+  featureSummary?: Record<string, unknown> | null;
+}): string {
+  const targetNum = Number(input.target ?? 1.3);
+  const fair = targetNum > 1 ? 1 / targetNum : 0.5;
+  const minEdge = input.minEdge ?? getAdaptiveMinEdge();
+  const needP = Math.max(
+    input.minProbability ?? MIN_SIGNAL_PROBABILITY,
+    fair + minEdge,
+  );
+  const edge = input.probability - fair;
+  const fs = input.featureSummary ?? {};
+  const models = fs.model_probabilities as Record<string, number> | undefined;
+  const modelsText =
+    models && Object.keys(models).length > 0
+      ? Object.entries(models)
+          .map(([k, v]) => `${k}:${Number(v).toFixed(3)}`)
+          .join(",")
+      : "n/a";
+  const disagree = fs.ensemble_disagreement;
+  const calText =
+    fs.used_calibrated === true
+      ? "platt"
+      : fs.used_calibrated === false
+        ? "raw"
+        : "unknown";
+  const parts = [
+    `edge=${edge >= 0 ? "+" : ""}${edge.toFixed(4)}`,
+    `p=${input.probability.toFixed(4)}`,
+    `fair=${fair.toFixed(4)}`,
+    `needP=${needP.toFixed(4)}`,
+    `minEdge=${minEdge.toFixed(4)}`,
+    `c=${input.confidence.toFixed(3)}`,
+    ...(input.vetoReason ? [`veto=${input.vetoReason}`] : []),
+    `cal=${calText}`,
+    ...(typeof disagree === "number" ? [`disagree=${disagree.toFixed(3)}`] : []),
+    `regime=${String(fs.regime ?? "n/a")}`,
+    `models=[${modelsText}]`,
+  ];
+  return parts.join(" ");
 }
 const MIN_HISTORY = 20;
 /** Reduced 100->50: halves history query cost on the hot ED path while
@@ -509,6 +571,13 @@ const defaultPredictFn = (
           ...(typeof provenance === "object" ? provenance : {}),
           acieAuthoritative: true,
           strategy_action: strategyAction,
+          // Pass 19: per-decision model contributions + calibration
+          // provenance, consumed by edgeDiagText at the decision log
+          // sites and persisted with the signal's feature summary.
+          model_probabilities: evaluation.diagnostics?.modelProbabilities ?? null,
+          ensemble_disagreement: evaluation.diagnostics?.ensembleDisagreement ?? null,
+          raw_probability: evaluation.diagnostics?.rawProbability ?? null,
+          used_calibrated: evaluation.diagnostics?.usedCalibrated ?? null,
           ...(liveSafeMode ? { safe_baseline: 1 } : {}),
         },
         modelVersion: "acie-v3",
@@ -1438,6 +1507,17 @@ export async function onGameEndPredict(
       const strategySkip =
         String(strategyAction ?? "").toUpperCase() === "SKIP" ||
         String(pipelineAction ?? "").toUpperCase() === "SKIP";
+      // Pass 19: exact runtime edge numbers INLINED in the message text
+      // (Railway strips pino fields). Every NO_BET now carries the full
+      // decision input: edge, threshold, probability, confidence, model
+      // contributions, calibration provenance.
+      const edgeDiag = edgeDiagText({
+        probability: p,
+        confidence: c,
+        target: targetNum,
+        featureSummary: fs,
+        vetoReason,
+      });
       logger.info(
         {
           component: "live-predictor",
@@ -1455,9 +1535,37 @@ export async function onGameEndPredict(
           recoveryMode,
         },
         strategySkip
-          ? `skip signal — strategy/pipeline veto (NO BET this round) [veto=${vetoReason}]`
-          : `skip signal — no edge vs fair odds (not every round should fire) [veto=${vetoReason}]`,
+          ? `skip signal — strategy/pipeline veto (NO BET this round) [veto=${vetoReason}] ${edgeDiag}`
+          : `skip signal — no edge vs fair odds (not every round should fire) [veto=${vetoReason}] ${edgeDiag}`,
       );
+      // Pass 19: durable decision audit — NO_BET decisions are otherwise
+      // invisible to walk-forward evaluation (emitted signals persist
+      // full provenance in pending_predictions, rejected ones persist
+      // nothing). Detached, general pool, never awaits on the BG path;
+      // the getSql call lives in decision-audit.ts to preserve the
+      // Zero-DB hot-path invariant (zero-db-regression.test.ts).
+      recordNoBetDecision({
+        gameId: targetGameId,
+        sourceGameId: gameId ?? null,
+        targetMultiplier: targetNum,
+        probability: p,
+        confidence: c,
+        fairProbability: fair,
+        minEdge: getAdaptiveMinEdge(),
+        needProbability: needP,
+        edge: p - fair,
+        vetoReason,
+        mode: String(fs.mode ?? "") || null,
+        regime: String(fs.regime ?? "") || null,
+        modelProbabilities:
+          typeof fs.model_probabilities === "object" && fs.model_probabilities != null
+            ? (fs.model_probabilities as Record<string, number>)
+            : null,
+        ensembleDisagreement:
+          typeof fs.ensemble_disagreement === "number" ? fs.ensemble_disagreement : null,
+        usedCalibrated:
+          typeof fs.used_calibrated === "boolean" ? fs.used_calibrated : null,
+      });
       // P0 (sep 11 state semantics): an EVALUATED skip — no edge vs fair
       // odds, or strategy/pipeline veto — is a TERMINAL NO_BET decision for
       // this target, not a failure. Complete the claim (not release) so the
@@ -1501,7 +1609,14 @@ export async function onGameEndPredict(
       sourceAgeMs: Math.max(0, Date.now() - new Date(crashedAt).getTime()),
       signalReady: true,
     },
-    "PREDICTION_SIGNAL_READY — model computation finished; awaiting durable outbox handoff",
+    `PREDICTION_SIGNAL_READY — model computation finished; awaiting durable outbox handoff ${edgeDiagText(
+      {
+        probability: signal.probability,
+        confidence: signal.confidence,
+        target: Number(DEFAULT_TARGET),
+        featureSummary: signal.featureSummary as Record<string, unknown>,
+      },
+    )}`,
   );
   predictionLifecycleCounters.predictionsReady += 1;
 

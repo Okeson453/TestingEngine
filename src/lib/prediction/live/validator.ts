@@ -298,26 +298,16 @@ export async function onGameEnd(
         if (anchorRow.prediction_id != null) {
           state.pending = anchorRow as unknown as PendingRow;
         } else {
-        // Detect: was there a row that was matched already (recovery re-pass)?
-        const matchedRows = await tx<{ prediction_id: string }>`
-          select prediction_id from prediction_validations
-          where game_id = ${evt.gameId}
-          limit 1
-        `;
-        if (matchedRows.length > 0) {
-          // Already validated — telemetry deferred (was a full Neon RTT
-          // inside the critical TX; ~200ms BEGIN-scale cost on every re-ED).
-        } else if (!state.crashRow || state.crashRow.began_at == null) {
-          // No crash_rounds.began_at → the bg event was missed entirely.
-          // Mark as orphaned for the poll-worker to clean up later.
-          await tx`
-            update crash_rounds
-            set crashed_at = coalesce(crashed_at, ${evt.endTime}::timestamptz)
-            where game_id = ${evt.gameId}
-          `;
+          // No pending row targets this round (terminal NO_BET makes this
+          // the COMMON ED path). PASS 19: both follow-up awaits from HEAD
+          // are gone. (1) The matched-detect SELECT only decided whether
+          // to run the orphan UPDATE; (2) the orphan UPDATE wrote
+          // coalesce(crashed_at, ts) into a NOT NULL column — a
+          // dead-tuple no-op plus a full Neon RTT. The orphaned/
+          // bg_arrived_late classification below is derived from
+          // crashRow.began_at and never depended on either.
+          return;
         }
-        return;
-      }
       }
 
       if (state.pending == null) return;
@@ -333,6 +323,9 @@ export async function onGameEnd(
       // already-validated re-processing skips the update exactly as before.
       // The event-log CTE is unreferenced (still executes exactly once);
       // its tables are disjoint from the others so ordering is free.
+      // Pass 19: local copies — the reworked else-if flow above leaves
+      // state.pending nullable from tsc's perspective, and property-chain
+      // instanceof narrowing is unreliable here; a const narrows cleanly.
       const requestedAtIso =
         state.pending!.requested_at instanceof Date
           ? state.pending!.requested_at.toISOString()

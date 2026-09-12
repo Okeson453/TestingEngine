@@ -568,6 +568,15 @@ export class ACIEEngine {
       signal,
       sequenceState,
       regime,
+      // Pass 19: expose the exact decision inputs for per-round edge logging.
+      diagnostics: {
+        modelProbabilities: { ...this.lastModelProbabilities },
+        ensembleDisagreement: Number(disagreement.toFixed(4)),
+        agreementOk,
+        rawProbability: rawP,
+        calibratedProbability: this.platt.fitted ? clampedCal : null,
+        usedCalibrated: useCalibrated,
+      },
     };
   }
 
