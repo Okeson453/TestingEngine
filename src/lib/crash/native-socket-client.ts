@@ -92,6 +92,9 @@ export class NativeBcGameSocket {
   /** Monotonic stamp of the last raw frame arrival (directive 16:52Z
    *  instrumentation). Synchronous parse chain ⇒ no interleaving. */
   private frameArrivedMono: number | null = null;
+  /** Monotonic stamp of the last pr (betting-open) frame arrival — lets the
+   *  bg log quantify the game-side pr→bg wire gap per round. */
+  private lastPrArrivedMono: number | null = null;
   private lastError: string | null = null;
   private lastEventAt: number | null = null;
   private lastEdAt: number | null = null;
@@ -357,6 +360,14 @@ export class NativeBcGameSocket {
     if (packet.event === "pr" || packet.event === "bg") {
       if (gameId) this.currentGameId = gameId;
     }
+    // SEP 12 directive: record when the last betting-open (pr) FRAME arrived
+    // so the bg event can quantify the pr→bg WIRE gap. frame_to_event_ms
+    // already proves our dispatch adds ~0.05-0.15ms; pr_to_bg_ms measures
+    // the game's own betting-open→round-start interval upstream of this
+    // socket — the ~6.9s is between two separate wire events, not in-app.
+    if (packet.event === "pr") {
+      this.lastPrArrivedMono = this.frameArrivedMono;
+    }
     if (!gameId) return;
     if (packet.event === "ed" || packet.event === "bg") {
       // SEP 11: name the event kind in the msg itself — Railway's collector
@@ -366,6 +377,13 @@ export class NativeBcGameSocket {
       const frameDelta =
         this.frameArrivedMono != null
           ? (performance.now() - this.frameArrivedMono).toFixed(2)
+          : null;
+      const prToBgMs =
+        packet.event === "bg" &&
+        this.lastPrArrivedMono != null &&
+        this.frameArrivedMono != null &&
+        this.frameArrivedMono - this.lastPrArrivedMono < 120_000
+          ? (this.frameArrivedMono - this.lastPrArrivedMono).toFixed(0)
           : null;
       logger.info(
         {
@@ -380,7 +398,9 @@ export class NativeBcGameSocket {
         // proves the native WS path has zero buffering between raw frame
         // receipt and BG/ED handler dispatch (the ~7s pr→bg gap is the
         // game's own betting-open window, upstream of this socket).
-        `bc ${packet.event} event from native WS frame_to_event_ms=${frameDelta ?? "n/a"}`,
+        // pr_to_bg_ms: wire gap between the pr (betting-open) frame and this
+        // bg frame — pure game-side round lifecycle, quantified per round.
+        `bc ${packet.event} event from native WS frame_to_event_ms=${frameDelta ?? "n/a"}${prToBgMs ? ` pr_to_bg_ms=${prToBgMs}` : ""}`,
       );
     }
 

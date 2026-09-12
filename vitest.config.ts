@@ -13,6 +13,8 @@ export default defineConfig({
   test: {
     include: [
       "src/lib/crash/export.test.ts",
+      "src/lib/crash/bundle-cache-codec.test.ts",
+      "src/lib/crash/native-dispatch-synchrony.test.ts",
       "src/lib/prediction/calibration/calibration-honesty.test.ts",
       "src/lib/prediction/lifecycle/*.test.ts",
       "src/lib/prediction/live/durable-handoff-ordering.test.ts",

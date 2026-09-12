@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import vm from "node:vm";
+import { gzipSync, gunzipSync } from "node:zlib";
 import { getLogger } from "@/lib/observability/logger";
 
 const logger = getLogger("bc-sign");
@@ -327,9 +328,11 @@ async function loadSignUtilsOnce(): Promise<SignUtils> {
       }
     } catch (e) {
       lastErr = e;
+      // Inline error — Railway strips JSON context fields, so the failure
+      // reason must be in the message string to be diagnosable from raw logs.
       logger.warn(
         { attempt, error: e instanceof Error ? e.message : String(e) },
-        "wr_utils load attempt failed",
+        `wr_utils load attempt failed attempt=${attempt} error=${e instanceof Error ? e.message : String(e)}`,
       );
       if (attempt < 3) {
         // Cache landed while we were failing? Use it now — no fail-wait-retry.
@@ -379,9 +382,13 @@ async function persistWrUtilsBundleCache(body: string, url: string): Promise<voi
       try {
         const { getSql } = await import("@/lib/db");
         const sql = await getSql();
+        // SEP 12 (17:10Z directive): the plain-text body made BOTH the upsert
+        // and every future cache read ~0.5s Neon transfers (multi-hundred-KB).
+        // gzip+base64 cuts the payload ~4-5x; v2 format. loadCachedWrUtilsBundle
+        // still reads the v1 plain format for backward compatibility.
         await sql`
           insert into worker_state (key, value, updated_at)
-          values (${WR_UTILS_CACHE_KEY}, ${JSON.stringify({ body, url, at: Date.now() })}, now())
+          values (${WR_UTILS_CACHE_KEY}, ${encodeBundleCache(body, url, Date.now())}, now())
           on conflict (key) do update
             set value = excluded.value, updated_at = now()
         `;
@@ -391,6 +398,37 @@ async function persistWrUtilsBundleCache(body: string, url: string): Promise<voi
     })();
   }, 60_000);
   timer.unref?.();
+}
+
+/**
+ * SEP 12 (17:10Z directive): worker_state reads/writes of the wr_utils bundle
+ * were repeatedly ~0.5s — pure multi-hundred-KB payload transfer over the
+ * Neon link. v2 format gzip+base64 encodes the body (~4-5x smaller);
+ * decodeBundleCache still accepts the v1 plain format for a no-migration
+ * rollback. Exported pure (no DB) for tests.
+ */
+export function encodeBundleCache(body: string, url: string, at: number): string {
+  return JSON.stringify({ v: 2, bodyGz: gzipSync(body, { level: 6 }).toString("base64"), url, at });
+}
+
+export function decodeBundleCache(
+  raw: string,
+): { body: string; url: string; at: number } | null {
+  try {
+    const parsed = JSON.parse(raw) as { body?: string; bodyGz?: string; url?: string; at?: number };
+    if (!parsed.url || !parsed.at) return null;
+    let body: string | undefined;
+    if (parsed.bodyGz) {
+      // v2: gzip+base64 — ~4-5x smaller Neon transfer than the v1 plain body.
+      body = gunzipSync(Buffer.from(parsed.bodyGz, "base64")).toString("utf8");
+    } else {
+      body = parsed.body; // v1 legacy plain format
+    }
+    if (!body) return null;
+    return { body, url: parsed.url, at: parsed.at };
+  } catch {
+    return null; // corrupt payload — treat as no cache
+  }
 }
 
 async function loadCachedWrUtilsBundle(): Promise<{ body: string; url: string; at: number } | null> {
@@ -403,9 +441,9 @@ async function loadCachedWrUtilsBundle(): Promise<{ body: string; url: string; a
     `;
     const raw = rows[0]?.value;
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as { body?: string; url?: string; at?: number };
-    if (!parsed.body || !parsed.url || !parsed.at) return null;
-    memWrUtilsBundleCache = { body: parsed.body, url: parsed.url, at: parsed.at };
+    const decoded = decodeBundleCache(raw);
+    if (!decoded) return null;
+    memWrUtilsBundleCache = decoded;
     return memWrUtilsBundleCache;
   } catch {
     return null;
