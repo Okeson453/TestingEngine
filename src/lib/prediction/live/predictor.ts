@@ -299,7 +299,7 @@ export function edgeDiagText(input: {
     ...(typeof fs.ewma_hit_rate === "number"
       ? [`ewma=${fs.ewma_hit_rate.toFixed(4)}`]
       : []),
-    `regime=${String(fs.regime ?? "n/a")}`,
+    `regime=${String(fs.regime ?? fs.regimeId ?? fs.regime_name ?? "n/a")}`,
     `models=[${modelsText}]`,
   ];
   return parts.join(" ");
@@ -584,6 +584,9 @@ const defaultPredictFn = (
           ...(typeof provenance === "object" ? provenance : {}),
           acieAuthoritative: true,
           strategy_action: strategyAction,
+          // Regime must be on featureSummary — edgeDiagText / decision-audit
+          // read fs.regime; regimeId alone left production logs as regime=n/a.
+          regime: String(evaluation.regime ?? "unknown"),
           // Pass 19: per-decision model contributions + calibration
           // provenance, consumed by edgeDiagText at the decision log
           // sites and persisted with the signal's feature summary.
@@ -707,6 +710,11 @@ const defaultPredictFn = (
       prediction_mode: executionMode,
       execution_path: "PredictionEngine.predict",
       acieAuthoritative: false,
+      regime: String(
+        (signal.featureSummary as Record<string, unknown> | undefined)?.regime ??
+          signal.regimeId ??
+          "unknown",
+      ),
     },
     modelVersion,
     featurePath: signal.featurePath,
@@ -1576,7 +1584,7 @@ export async function onGameEndPredict(
         edge: p - fair,
         vetoReason,
         mode: String(fs.mode ?? "") || null,
-        regime: String(fs.regime ?? "") || null,
+        regime: String(fs.regime ?? fs.regimeId ?? fs.regime_name ?? "") || null,
         modelProbabilities:
           typeof fs.model_probabilities === "object" && fs.model_probabilities != null
             ? (fs.model_probabilities as Record<string, number>)
