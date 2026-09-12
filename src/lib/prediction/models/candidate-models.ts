@@ -4,6 +4,7 @@
  */
 
 import type { IncrementalStateEngine } from '../state/incremental-state-engine.ts';
+import { scoreGapConditional } from './gap-conditional-model.ts';
 
 export interface CandidateEstimate {
   modelName: string;
@@ -85,5 +86,8 @@ export function scoreCandidates(engine: IncrementalStateEngine): CandidateEstima
     markovChainModel(engine),
     spectralModel(engine),
     entropyModel(engine),
+    // FINAL_REPORT-2 #3: gap-conditional candidate — ensemble flag
+    // (randomness-gate driven) decides whether it carries weight.
+    scoreGapConditional(engine),
   ];
 }

@@ -183,3 +183,32 @@ function std(xs: number[]): number {
   const v = xs.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, xs.length - 1);
   return Math.sqrt(v);
 }
+
+/** Shared live instance — the pipeline candidate scorer and the (future, #4)
+ * regime-test wiring must agree on regime/standardization state. */
+export const globalGapConditionalModel = new GapConditionalModel();
+
+/** Candidate-model adapter (prediction-pipeline scoreCandidates shape).
+ * Scores from the incremental engine's gap state each round; ensemble flag
+ * + randomness gate decide whether the score carries weight. */
+export function scoreGapConditional(engine: {
+  snapshot(): { lastGapS: number; gapCount: number; lastCrash: number | null };
+}): { modelName: 'GapConditionalModel'; probability: number } {
+  const snap = engine.snapshot();
+  const fv = fvFromGapState(snap.lastGapS, snap.lastCrash ?? 0);
+  const out = globalGapConditionalModel.predict(fv, 1.3, null);
+  return { modelName: 'GapConditionalModel', probability: out.probability };
+}
+
+function fvFromGapState(gapS: number, lastCrash: number): FeatureVector {
+  return {
+    roundId: 'pipeline',
+    timestamp: new Date().toISOString(),
+    featureVersion: CURRENT_FEATURE_VERSION,
+    values: {
+      gap_s: gapS,
+      log_lag_1: lastCrash >= 1 ? Math.log(lastCrash) : 0,
+    },
+    meta: { sampleSize: 0, dataQualityScore: 1, missingFeatureCount: 0 },
+  };
+}

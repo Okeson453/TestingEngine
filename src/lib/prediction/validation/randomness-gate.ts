@@ -349,6 +349,7 @@ export function applyRandomnessGateToFlags(report: RandomnessGateReport): {
   enableMarkov: boolean;
   enableSpectral: boolean;
   enableEntropy: boolean;
+  enableGapConditional: boolean;
 } {
   const on = report.allowSequenceModels;
   return {
@@ -356,5 +357,9 @@ export function applyRandomnessGateToFlags(report: RandomnessGateReport): {
     enableMarkov: on,
     enableSpectral: on,
     enableEntropy: on,
+    // FINAL_REPORT-2 #3: gap-conditional candidate follows the same sequence
+    // gate by default. #7 policy: if a tailored gate is decided, split this
+    // off from `on` with its own evidence threshold.
+    enableGapConditional: on,
   };
 }

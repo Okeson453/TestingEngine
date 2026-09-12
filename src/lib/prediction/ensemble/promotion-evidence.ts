@@ -14,6 +14,7 @@ const DEFAULT_OFF: EnsembleFlags = {
   enableSpectral: false,
   enableEntropy: false,
   enableStreak: false,
+  enableGapConditional: false,
 };
 
 export async function loadApprovedEnsembleFlags(
@@ -32,6 +33,7 @@ export async function loadApprovedEnsembleFlags(
       if (n.includes('spectral')) flags.enableSpectral = true;
       if (n.includes('entropy')) flags.enableEntropy = true;
       if (n.includes('streak')) flags.enableStreak = true;
+      if (n.includes('gap')) flags.enableGapConditional = true;
     }
     logger.info(
       { component: 'PromotionEvidence', flags, approved: r.rows.length },

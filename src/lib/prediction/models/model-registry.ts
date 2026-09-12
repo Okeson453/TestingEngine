@@ -1,6 +1,6 @@
 import type { PredictiveModel } from './baseline-model.ts';
 import { globalBaselineModel } from './baseline-model.ts';
-import { GapConditionalModel } from './gap-conditional-model.ts';
+import { globalGapConditionalModel } from './gap-conditional-model.ts';
 import type { ModelIdentity } from '../types.ts';
 import { getLogger } from '../../observability/logger.ts';
 
@@ -16,9 +16,11 @@ export class ModelRegistry {
     // Use adaptive singleton so observeOutcome learning is shared
     this.register(globalBaselineModel);
     // FINAL_REPORT-2 #3: gap-conditional candidate (Model A/B port).
-    // Candidate only — promotion runs through model-gate/walk-forward
-    // protocol; regime switch is driven by the gap-regime test (#4).
-    this.register(new GapConditionalModel());
+    // Shared singleton — the pipeline scorer and this registry must agree
+    // on regime/standardization state. Candidate only — promotion runs
+    // through model-gate/walk-forward protocol; ensemble flag is
+    // randomness-gate driven.
+    this.register(globalGapConditionalModel);
     this.defaultKey = this.keyOf(globalBaselineModel.identity);
   }
   private keyOf(id: ModelIdentity): string { return `${id.name}@${id.version}`; }

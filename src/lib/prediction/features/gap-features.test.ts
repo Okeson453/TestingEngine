@@ -9,11 +9,16 @@ import { FeatureEngineV2 } from "./feature-engine-v2.ts";
 import { FEATURE_VERSION_V2 } from "./feature-meta.ts";
 import {
   GapConditionalModel,
+  globalGapConditionalModel,
+  scoreGapConditional,
   MODEL_A,
   MODEL_B,
   NEUTRAL_Z,
 } from "../models/gap-conditional-model.ts";
 import { ModelRegistry } from "../models/model-registry.ts";
+import { scoreCandidates } from "../models/candidate-models.ts";
+import { EnsembleOrchestrator, DEFAULT_ENSEMBLE_FLAGS } from "../ensemble/ensemble-orchestrator.ts";
+import { applyRandomnessGateToFlags } from "../validation/randomness-gate.ts";
 import type { HistoricalRound, FeatureVector, ThresholdTarget } from "../types.ts";
 
 const T: ThresholdTarget = 1.3;
@@ -186,5 +191,58 @@ describe("GapConditionalModel", () => {
     const z = m.getStandardization();
     expect(z.gapMeanS).toBeGreaterThan(0);
     expect(z.gapStdS).toBeGreaterThan(0);
+  });
+});
+
+describe("live pipeline wiring", () => {
+  it("scoreCandidates emits the GapConditionalModel score (Model A by default)", () => {
+    const eng = new IncrementalStateEngine();
+    eng.update(2.0);
+    const est = scoreCandidates(eng).find((c) => c.modelName === "GapConditionalModel");
+    expect(est).toBeDefined();
+    const expected = 1 / (1 + Math.exp(-(MODEL_A.intercept + MODEL_A.logLag1 * Math.log(2.0))));
+    expect(est!.probability).toBeCloseTo(expected, 10);
+  });
+
+  it("scoreGapConditional reads the engine gap state", () => {
+    const eng = new IncrementalStateEngine();
+    eng.update(1.5);
+    eng.recordBeganAt(1_000_000);
+    eng.update(2.0);
+    eng.recordBeganAt(1_020_000);
+    const est = scoreGapConditional(eng);
+    expect(est.modelName).toBe("GapConditionalModel");
+    expect(est.probability).toBeGreaterThan(0.01);
+    expect(est.probability).toBeLessThan(0.99);
+  });
+
+  it("ensemble holds the gap candidate at weight 0 while the flag is off (default)", () => {
+    const o = new EnsembleOrchestrator();
+    expect(DEFAULT_ENSEMBLE_FLAGS.enableGapConditional).toBe(false);
+    const result = o.combine([
+      { modelName: "FrequencyModel", modelVersion: "1", probability: 0.75, confidence: 1, weight: 0.2 },
+      { modelName: "GapConditionalModel", modelVersion: "1", probability: 0.9, confidence: 1, weight: 0 },
+    ]);
+    expect(result.weights["GapConditionalModel"]).toBe(0);
+    // Zero-weight member must not drag the blend toward its probability.
+    expect(result.probability).toBeCloseTo(0.75, 10);
+    expect(result.scores.find((s) => s.modelName === "GapConditionalModel")).toBeDefined();
+  });
+
+  it("the randomness gate maps allowSequenceModels onto the gap flag", () => {
+    const off = applyRandomnessGateToFlags({
+      allowSequenceModels: false,
+    } as never);
+    expect(off.enableGapConditional).toBe(false);
+    const on = applyRandomnessGateToFlags({ allowSequenceModels: true } as never);
+    expect(on.enableGapConditional).toBe(true);
+  });
+
+  it("registry and pipeline share the same model instance", () => {
+    globalGapConditionalModel.setGapSignalActive(true);
+    const reg = new ModelRegistry().get("gap-conditional") as GapConditionalModel;
+    expect(reg.isGapSignalActive()).toBe(true);
+    globalGapConditionalModel.setGapSignalActive(false);
+    expect(reg.isGapSignalActive()).toBe(false);
   });
 });

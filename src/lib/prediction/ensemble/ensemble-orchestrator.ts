@@ -32,6 +32,10 @@ export interface EnsembleFlags {
   enableSpectral: boolean;
   enableEntropy: boolean;
   enableStreak: boolean;
+  /** FINAL_REPORT-2 #3: gap-conditional candidate. Default off — enabled only
+   * via the randomness gate (prewarm) once the #4 regime test exists and the
+   * #7 gate-policy decision is made. */
+  enableGapConditional: boolean;
 }
 
 export const DEFAULT_ENSEMBLE_FLAGS: EnsembleFlags = {
@@ -40,6 +44,7 @@ export const DEFAULT_ENSEMBLE_FLAGS: EnsembleFlags = {
   enableSpectral: false,
   enableEntropy: false,
   enableStreak: false,
+  enableGapConditional: false,
 };
 
 const BASE_WEIGHTS: Record<string, number> = {
@@ -54,6 +59,7 @@ const BASE_WEIGHTS: Record<string, number> = {
   MarkovChainModel: 0,
   SpectralModel: 0,
   EntropyModel: 0,
+  GapConditionalModel: 0,
 };
 
 export class EnsembleOrchestrator {
@@ -93,7 +99,8 @@ export class EnsembleOrchestrator {
         (s.modelName === 'StreakAwareModel' && !this.flags.enableStreak) ||
         (s.modelName === 'MarkovChainModel' && !this.flags.enableMarkov) ||
         (s.modelName === 'SpectralModel' && !this.flags.enableSpectral) ||
-        (s.modelName === 'EntropyModel' && !this.flags.enableEntropy)
+        (s.modelName === 'EntropyModel' && !this.flags.enableEntropy) ||
+        (s.modelName === 'GapConditionalModel' && !this.flags.enableGapConditional)
       ) {
         return { ...s, weight: 0 };
       }
@@ -115,7 +122,8 @@ export class EnsembleOrchestrator {
         (filtered[i].modelName.startsWith('Auto') ||
           filtered[i].modelName.startsWith('Markov') ||
           filtered[i].modelName.startsWith('Spectral') ||
-          filtered[i].modelName.startsWith('Entropy'))
+          filtered[i].modelName.startsWith('Entropy') ||
+          filtered[i].modelName.startsWith('GapConditional'))
           ? 0
           : weights[i];
       weightMap[filtered[i].modelName] = finalW;
