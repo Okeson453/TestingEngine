@@ -546,13 +546,14 @@ interface PredictorDeps {
    */
   edReceivedAt?: string;
   /**
-   * BG-PRIMARY trigger (sep 11 architecture change): the source round N has
-   * STARTED (BG(N) received) — it has NOT crashed yet. Round N's multiplier
-   * is unknown and must NOT be appended to history or observed on ACIE;
-   * features/history run through N-1 only. Target is still sourceRoundId+1
-   * and ALL gates apply unchanged.
+   * Primary-tier trigger (PR betting-open or BG round-start): source round N
+   * has NOT crashed yet. Multiplier is unknown — must NOT append to history
+   * or observe on ACIE; features/history run through N-1 only. Target is
+   * still sourceRoundId+1 and ALL gates apply unchanged.
    */
   bgTrigger?: boolean;
+  /** Distinguishes PR vs BG ownership prefix (pr: vs bg:). Default bg. */
+  primarySource?: "PR" | "BG";
   predictFn?: (
     priorRounds: HistoricalRound[],
     targetRoundId: string,
@@ -1344,14 +1345,15 @@ export async function onGameEndPredict(
   }
 
   // ── P0: Priority-ordered target claim (ZERO DB hot path) ──
-  // Priority: BG > ED > RECOVERY. BG reserves at receipt (before reconcile);
-  // claimTarget here promotes RESERVED_BG → BG_RUNNING or blocks ED when BG
-  // already owns. pending_predictions unique constraint remains the durability
-  // backstop for multi-process safety.
+  // Priority: PR/BG (primary) > ED > RECOVERY. Primary reserves at PR or BG
+  // receipt; claimTarget promotes RESERVED_* → *_RUNNING or blocks ED when
+  // primary already owns. pending_predictions unique constraint remains the
+  // durability backstop for multi-process safety.
+  const primaryPrefix = deps.primarySource === "PR" ? "pr" : "bg";
   const owner = deps.recoveryMode
     ? `poll:${gameId}`
     : deps.bgTrigger
-      ? `bg:${gameId}`
+      ? `${primaryPrefix}:${gameId}`
       : `ed:${gameId}`;
   const claim = claimTarget(targetGameId, owner);
   const t1 = performance.now(); // target claimed
@@ -1370,6 +1372,9 @@ export async function onGameEndPredict(
       claim.reason === "bg_reserved" ||
       claim.reason === "bg_running" ||
       claim.reason === "bg_owned" ||
+      claim.reason === "pr_reserved" ||
+      claim.reason === "pr_running" ||
+      claim.reason === "pr_owned" ||
       claim.blockedByBg
         ? `blocked_by_bg:${claim.reason}`
         : claim.reason === "no_bet_terminal"
@@ -1999,7 +2004,13 @@ export async function onGameEndPredict(
     const outboxNotificationId = randomUUID();
     // EXPLICIT PROVENANCE (sep 11 item 8): trigger identity + full timeline
     // on every prediction, proving N+1 was generated ahead of its round.
-    const triggerEvent = deps.bgTrigger ? "BG" : recoveryMode ? "POLL" : "ED";
+    const triggerEvent = deps.bgTrigger
+      ? deps.primarySource === "PR"
+        ? "PR"
+        : "BG"
+      : recoveryMode
+        ? "POLL"
+        : "ED";
     const outboxMetadata = JSON.stringify({
       predictionId,
       correlationId,

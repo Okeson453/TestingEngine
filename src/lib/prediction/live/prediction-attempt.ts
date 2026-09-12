@@ -22,20 +22,19 @@ import type { Trace } from "@/lib/prediction/live/latency-trace";
 
 const logger = getLogger("prediction-attempt");
 
-export type PredictionSource = "ED" | "RECOVERY" | "BG";
+export type PredictionSource = "ED" | "RECOVERY" | "BG" | "PR";
 
 /**
- * SINGLE SOURCE OF TRUTH for BG-primary N+1 prediction (this change:
- * previously duplicated as an inline env evaluation in both
- * game-event-handlers.ts bgHandler and validator.ts onGameEnd — two places
- * that could silently disagree about who owns N+1 generation).
+ * SINGLE SOURCE OF TRUTH for primary-tier N+1 prediction.
  *
- * BG-primary is the ONE authoritative implementation: BG(N) received (round
- * N started) reserves and generates the N+1 prediction; ED(N) is fallback
- * only (it never races BG for a target BG owns). Opting out restores the
- * legacy ED-primary behaviour via ED_PRIMARY_PREDICT=1/true or
- * BG_PRIMARY_PREDICT=0/false — both legacy names are honoured for
- * deploy-env continuity.
+ * Directive 2026-09-12 PR-primary:
+ *   PR(N) PRIMARY  — betting-open reserves + generates N+1 (~7s before BG)
+ *   BG(N) CONFIRM  — reconciliation; generates N+1 only if PR missed
+ *   ED(N) FALLBACK — never races a primary-owned target
+ *
+ * Opt out of primary tier (PR+BG) via ED_PRIMARY_PREDICT=1/true or
+ * BG_PRIMARY_PREDICT=0/false. PR_PRIMARY_PREDICT=0 disables PR trigger only
+ * (BG remains primary within the tier).
  */
 export function bgPrimaryEnabled(): boolean {
   return !(
@@ -43,6 +42,15 @@ export function bgPrimaryEnabled(): boolean {
     process.env.ED_PRIMARY_PREDICT === "true" ||
     process.env.BG_PRIMARY_PREDICT === "0" ||
     process.env.BG_PRIMARY_PREDICT === "false"
+  );
+}
+
+/** PR trigger is on when primary tier is enabled and PR is not opted out. */
+export function prPrimaryEnabled(): boolean {
+  if (!bgPrimaryEnabled()) return false;
+  return !(
+    process.env.PR_PRIMARY_PREDICT === "0" ||
+    process.env.PR_PRIMARY_PREDICT === "false"
   );
 }
 
@@ -157,10 +165,10 @@ export async function attemptNPlusOnePrediction(
   recordCandidateRound();
   const trace = input.trace ?? null;
   const recoveryMode = source === "RECOVERY";
-  // BG-PRIMARY (sep 11 architecture change): source === "BG" means round N
-  // has STARTED (BG(N) received) and we are predicting N+1 while it runs.
-  // Round N's crash is UNKNOWN — the predictor must not observe or append it.
-  const bgTrigger = source === "BG";
+  // Primary-tier (PR or BG): round N has not crashed yet. PR = betting-open
+  // (~7s before start); BG = round start. Predictor must not observe or
+  // append N's crash (unknown at this point). Same ACIE isolation as BG.
+  const bgTrigger = source === "BG" || source === "PR";
 
   if (trace) trace.marks.prediction_started = performance.now();
 
@@ -170,7 +178,13 @@ export async function attemptNPlusOnePrediction(
       sourceCrashAt,
       bgTrigger ? Number.NaN : (sourceMultiplier as number),
       input.correlationId ?? crypto.randomUUID(),
-      { recoveryMode, trace, edReceivedAt: input.edReceivedAt, bgTrigger },
+      {
+        recoveryMode,
+        trace,
+        edReceivedAt: input.edReceivedAt,
+        bgTrigger,
+        primarySource: source === "PR" ? "PR" : source === "BG" ? "BG" : undefined,
+      },
     );
     if (trace) trace.marks.prediction_completed = performance.now();
 
@@ -266,7 +280,7 @@ export async function attemptNPlusOnePrediction(
           (err as { targetRoundId?: string }).targetRoundId ??
           (err as { context?: { targetRoundId?: string } }).context?.targetRoundId ??
           null,
-        predictionType: `N+1:${source === "ED" ? "live" : source === "BG" ? "bg-primary" : "recovery"}`,
+        predictionType: `N+1:${source === "ED" ? "live" : source === "PR" ? "pr-primary" : source === "BG" ? "bg-confirm" : "recovery"}`,
         predictionResult: (err as { predictionResult?: unknown }).predictionResult ?? null,
         stage,
         featureStage,

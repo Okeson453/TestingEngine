@@ -1,9 +1,12 @@
 /**
  * BC.Game native WS → live prediction pipeline.
  *
- * BG(N)  → PRIMARY N+1 prediction (reserve + in-memory evaluate + outbox)
- * ED(N)  → FALLBACK N+1 only if BG did not own target; validation of N
- * Opt out of BG-primary with ED_PRIMARY_PREDICT=1 or BG_PRIMARY_PREDICT=0
+ * Directive 2026-09-12 PR-primary:
+ *   PR(N)  → PRIMARY N+1 prediction at betting-open (~7s before BG)
+ *   BG(N)  → CONFIRM/reconcile (began_at, temporal kill); N+1 only if PR missed
+ *   ED(N)  → FALLBACK N+1 only if primary did not own target; validation of N
+ * Opt out of primary tier: ED_PRIMARY_PREDICT=1 or BG_PRIMARY_PREDICT=0
+ * Opt out of PR trigger only: PR_PRIMARY_PREDICT=0 (BG remains primary)
  * Poll   → recovery only
  */
 import { randomUUID } from "node:crypto";
@@ -14,8 +17,15 @@ import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtim
 import { getSql, getCriticalSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
-import { attemptNPlusOnePrediction, bgPrimaryEnabled } from "@/lib/prediction/live/prediction-attempt";
-import { isBgOwnedOrTerminal } from "@/lib/prediction/live/target-coordinator";
+import {
+  attemptNPlusOnePrediction,
+  bgPrimaryEnabled,
+  prPrimaryEnabled,
+} from "@/lib/prediction/live/prediction-attempt";
+import {
+  isBgOwnedOrTerminal,
+  isPrimaryOwnedOrTerminal,
+} from "@/lib/prediction/live/target-coordinator";
 import { observeCrashForACIE } from "@/lib/prediction/live/predictor";
 import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
 import {
@@ -27,7 +37,9 @@ import {
   completeTarget,
   releaseTarget,
   reserveTargetForBg,
+  reserveTargetForPr,
   markBgRunning,
+  markPrRunning,
   isBgBlocking,
   peekClaim,
 } from "@/lib/prediction/live/target-coordinator";
@@ -291,7 +303,28 @@ export async function bgHandler(payload: unknown): Promise<void> {
     // receipt and "reconcile complete" — the reconcile TX (pool acquire +
     // 5 statements), NOT the model, owns that cost. bg_receipt_to_reconcile
     // and bg_to_prediction_total below make the split visible per round.
-    if (bgPrimaryPredict && isAuthoritative() && /^\d+$/.test(gameId)) {
+    // PR-primary: if PR already reserved/completed N+1, BG is confirmation
+    // only (reconcile + temporal kill below). Attempt N+1 only when PR missed.
+    const primaryAlreadyOwns =
+      isPrimaryOwnedOrTerminal(targetGameIdForBg) && !bgReserved;
+    if (primaryAlreadyOwns) {
+      logger.info(
+        {
+          component: "game-event-handlers",
+          event: "bg",
+          gameId,
+          targetGameId: targetGameIdForBg,
+          correlationId,
+        },
+        `BG confirmation only — N+1 already owned by primary (PR); reconcile continues target=${targetGameIdForBg}`,
+      );
+    }
+    if (
+      bgPrimaryPredict &&
+      isAuthoritative() &&
+      /^\d+$/.test(gameId) &&
+      !primaryAlreadyOwns
+    ) {
       void (async () => {
         const bgCorrelationId = `${correlationId}:bg-n1`;
         const bgTrace = startTrace(bgCorrelationId, gameId);
@@ -603,14 +636,16 @@ export async function bgHandler(payload: unknown): Promise<void> {
 }
 
 /**
- * SEP 11 FIX: `pr` (prepare — betting opens) handler.
+ * PR (prepare — betting opens) — PRIMARY N+1 prediction trigger.
  *
- * pr used to be routed into bgHandler, whose unconditional temporal kill
- * dead-lettered every undelivered prediction targeting the round at
- * betting-open, ~9-11s before the round actually started, and whose
- * first-write-wins began_at could never be corrected by the real BG. pr now
- * ONLY writes an attributable live_event_log row (event_kind 'PR'): no
- * temporal kill, no began_at write, no registry write.
+ * Directive 2026-09-12: promote pr to authoritative N+1 trigger so the
+ * signal is generated ~7s before BG (upstream betting window), not after
+ * round start. Does NOT write began_at or noteRoundStarted — BG remains
+ * the sole round-start authority for temporal kill / registry. Does NOT
+ * run temporal kill (that would dead-letter signals ~7s early).
+ *
+ * Ownership: reserveTargetForPr → attemptNPlusOnePrediction(source=PR).
+ * BG later becomes confirmation; ED remains fallback only.
  */
 export async function prHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
@@ -629,28 +664,101 @@ export async function prHandler(payload: unknown): Promise<void> {
     new Date(receivedAt).getTime() - new Date(beginAt).getTime(),
   );
 
-  try {
-    const sql = await getSql();
-    await sql`
-      INSERT INTO live_event_log (
-        correlation_id, event_kind, game_id, payload, received_at, processed_at,
-        processor_latency_ms, sla_violated
-      ) VALUES (
-        ${correlationId}::text, 'PR', ${gameId}, ${JSON.stringify({ beginAt })},
-        ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
-      ) ON CONFLICT DO NOTHING
-    `;
-    // Upstream proof (directive 2026-09-12): BC.Game emits pr (prepare /
-    // betting-open) ~7s before bg (begin). That gap is measured at native
-    // WS frame arrival (pr_to_bg_ms) with frame_to_event_ms ~0.03-0.13ms —
-    // there is NO application setTimeout/queue between the two frames.
-    // Operators must not treat pr_to_bg_ms~7060 as a TestingEngine bug.
+  const targetGameId = nextTargetGameId(gameId);
+  const prPrimary = prPrimaryEnabled();
+  const prReserveAt = Date.now();
+  let prReserved = false;
+
+  if (prPrimary && isAuthoritative() && /^\d+$/.test(gameId)) {
+    const reserve = reserveTargetForPr(targetGameId, gameId);
+    prReserved = reserve.owned;
     logger.info(
-      { event: "pr", gameId, correlationId },
-      "bc pr (betting-open) observed — expect bg ~7s later (upstream BC.Game betting window, not app delay)",
+      {
+        component: "game-event-handlers",
+        event: "pr",
+        gameId,
+        targetGameId,
+        ownership: reserve.owned ? "RESERVED_PR" : reserve.reason,
+        owner: reserve.owned ? `pr:${gameId}` : reserve.owner,
+        state: reserve.state,
+        correlationId,
+      },
+      reserve.owned
+        ? `PR→N+1 ownership RESERVED (PR-primary) target=${targetGameId} correlation=${correlationId}`
+        : `PR→N+1 reserve skipped reason=${reserve.reason} target=${targetGameId} correlation=${correlationId}`,
     );
-  } catch (error) {
-    logger.warn({ event: "pr", gameId, error: String(error) }, "pr event log failed");
+  }
+
+  try {
+    // Observability only — general pool, must not block primary path.
+    void (async () => {
+      try {
+        const sql = await getSql();
+        await sql`
+          INSERT INTO live_event_log (
+            correlation_id, event_kind, game_id, payload, received_at, processed_at,
+            processor_latency_ms, sla_violated
+          ) VALUES (
+            ${correlationId}::text, 'PR', ${gameId}, ${JSON.stringify({ beginAt })},
+            ${receivedAt}::timestamptz, now(), ${processorLatencyMs}, false
+          ) ON CONFLICT DO NOTHING
+        `;
+      } catch (error) {
+        logger.warn({ event: "pr", gameId, error: String(error) }, "pr event log failed");
+      }
+    })();
+
+    logger.info(
+      { event: "pr", gameId, correlationId, targetGameId, prReserved },
+      "bc pr (betting-open) observed — PR-primary N+1 trigger; expect bg ~7s later (upstream window)",
+    );
+
+    // PRIMARY N+1: fire concurrently with the detached log write.
+    if (prPrimary && isAuthoritative() && /^\d+$/.test(gameId)) {
+      void (async () => {
+        const prCorrelationId = `${correlationId}:pr-n1`;
+        const prTrace = startTrace(prCorrelationId, gameId);
+        const attemptT0 = Date.now();
+        try {
+          prTrace.marks.ownership_reserved = prReserveAt;
+          prTrace.marks.ws_received = new Date(receivedAt).getTime();
+          if (prReserved) {
+            markPrRunning(targetGameId, `pr:${gameId}`);
+          }
+          const result = await attemptNPlusOnePrediction({
+            sourceRoundId: gameId,
+            sourceCrashAt: beginAt,
+            source: "PR",
+            correlationId: prCorrelationId,
+            trace: prTrace,
+          });
+          const predictionMs = Date.now() - attemptT0;
+          logger.info(
+            {
+              component: "game-event-handlers",
+              event: "pr",
+              gameId,
+              targetGameId: result.targetGameId ?? targetGameId,
+              kind: result.kind,
+              predictionId: result.predictionId,
+              attempted: result.attempted,
+              prediction_ms: predictionMs,
+              pr_receipt_to_prediction_ms: Math.max(
+                0,
+                Date.now() - new Date(receivedAt).getTime(),
+              ),
+              correlationId: prCorrelationId,
+            },
+            `PR→N+1 attempt done kind=${result.kind ?? "null"} prediction_ms=${predictionMs} target=${result.targetGameId ?? targetGameId}`,
+          );
+        } catch (err) {
+          logger.error(
+            { event: "pr", gameId, error: String(err) },
+            `PR→N+1 attempt failed: ${String(err).slice(0, 300)}`,
+          );
+        }
+      })();
+    }
   } finally {
     inFlightPr.delete(gameId);
   }
@@ -1001,15 +1109,9 @@ export function initializeEventHandlers(): void {
         beganAt: ev.beginTime ?? ev.receivedAt,
       });
     } else if (ev.event === "pr") {
-      // SEP 11 ROOT-CAUSE FIX: `pr` is PREPARE (betting opens, ~9-11s before
-      // the round starts) — a DISTINCT phase per the repo's own normalizer
-      // (realtime/normalizer.ts: pr→"prepare", bg→"begin"). pr used to be
-      // routed into bgHandler, whose unconditional temporal kill dead-lettered
-      // every undelivered prediction targeting the round at betting-open
-      // ("expired_late_signal: BG received") and stamped began_at ~9-11s early
-      // (first-write-wins COALESCE the real bg could never correct). pr now
-      // only writes an attributable PR event log row: no kill, no began_at,
-      // no registry write. The real BG remains the sole round-start authority.
+      // PR-primary: betting-open triggers N+1 prediction (~7s before BG).
+      // prHandler does NOT write began_at / registry / temporal kill —
+      // BG remains sole round-start authority for those.
       void prHandler({
         gameId: ev.gameId,
         beginTime: ev.beginTime ?? ev.receivedAt,

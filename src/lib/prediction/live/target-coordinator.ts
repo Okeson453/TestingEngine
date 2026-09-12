@@ -1,13 +1,15 @@
 /**
  * Priority-ordered ownership for target game N+1 prediction.
  *
- * Architecture (source of truth):
- *   BG(N) PRIMARY  → reserve/claim N+1 immediately on BG receipt
- *   ED(N) FALLBACK → only when BG is genuinely absent / failed / recoverable
+ * Architecture (source of truth) — directive 2026-09-12 PR-primary:
+ *   PR(N) PRIMARY  → reserve/claim N+1 at betting-open (~7s before BG)
+ *   BG(N) CONFIRM  → reconciliation only when PR already owns; primary
+ *                    trigger only if PR missed (fallback within primary tier)
+ *   ED(N) FALLBACK → only when primary (PR/BG) is absent / failed / recoverable
  *   Poll RECOVERY  → last resort only
  *
- * Priority: BG > ED > RECOVERY
- * First-arrival does NOT win when a higher-priority source is active.
+ * Priority: PR = BG (primary tier) > ED > RECOVERY
+ * First primary arrival wins; ED never steals primary ownership.
  * NO_BET is terminal and never released for recomputation.
  *
  * Layers:
@@ -20,6 +22,8 @@
  */
 
 export type OwnershipState =
+  | "RESERVED_PR"
+  | "PR_RUNNING"
   | "RESERVED_BG"
   | "BG_RUNNING"
   | "SIGNAL_READY"
@@ -39,18 +43,25 @@ export type ClaimResult =
         | "bg_reserved"
         | "bg_running"
         | "bg_owned"
+        | "pr_reserved"
+        | "pr_running"
+        | "pr_owned"
         | "priority_blocked"
         | "no_bet_terminal";
       owner?: string;
       state?: OwnershipState;
       /** True when the completed claim was an EVALUATED NO_BET decision. */
       noBet?: boolean;
+      /** True when blocked by primary-tier owner (PR or BG). */
       blockedByBg?: boolean;
     };
 
+type PrimarySource = "PR" | "BG";
+type EntrySource = PrimarySource | "ED" | "RECOVERY";
+
 type Entry = {
   owner: string;
-  source: "BG" | "ED" | "RECOVERY";
+  source: EntrySource;
   claimedAt: number;
   state: OwnershipState;
   completed: boolean;
@@ -60,16 +71,23 @@ type Entry = {
 const claims = new Map<string, Entry>();
 const MAX_ENTRIES = 500;
 
-const SOURCE_PRIORITY: Record<"BG" | "ED" | "RECOVERY", number> = {
+/** PR and BG share the primary tier (priority 3). ED=2, RECOVERY=1. */
+const SOURCE_PRIORITY: Record<EntrySource, number> = {
+  PR: 3,
   BG: 3,
   ED: 2,
   RECOVERY: 1,
 };
 
-function parseSource(owner: string): "BG" | "ED" | "RECOVERY" {
+function parseSource(owner: string): EntrySource {
+  if (owner.startsWith("pr:")) return "PR";
   if (owner.startsWith("bg:")) return "BG";
   if (owner.startsWith("poll:") || owner.startsWith("recovery:")) return "RECOVERY";
   return "ED";
+}
+
+function isPrimarySource(source: EntrySource): source is PrimarySource {
+  return source === "PR" || source === "BG";
 }
 
 function prune(): void {
@@ -85,18 +103,35 @@ function prune(): void {
 }
 
 /**
+ * Immediate PR reservation for target N+1. Call at PR (betting-open) receipt
+ * BEFORE any await. Primary path — fires ~7s before BG.
+ */
+export function reserveTargetForPr(
+  targetGameId: string,
+  sourceGameId: string,
+): ClaimResult {
+  return reservePrimary(targetGameId, `pr:${sourceGameId}`, "PR", "RESERVED_PR");
+}
+
+/**
  * Immediate BG reservation for target N+1. Call at BG receipt BEFORE any
- * await (reconcile, prediction). Prevents ED from claiming while BG is in
- * the reconciliation window.
+ * await. Used when PR missed; no-op (duplicate) when PR already reserved.
  */
 export function reserveTargetForBg(
   targetGameId: string,
   sourceGameId: string,
 ): ClaimResult {
-  prune();
-  const owner = `bg:${sourceGameId}`;
-  const existing = claims.get(targetGameId);
+  return reservePrimary(targetGameId, `bg:${sourceGameId}`, "BG", "RESERVED_BG");
+}
 
+function reservePrimary(
+  targetGameId: string,
+  owner: string,
+  source: PrimarySource,
+  reservedState: "RESERVED_PR" | "RESERVED_BG",
+): ClaimResult {
+  prune();
+  const existing = claims.get(targetGameId);
   if (existing) {
     if (existing.completed) {
       return {
@@ -105,65 +140,78 @@ export function reserveTargetForBg(
         owner: existing.owner,
         state: existing.state,
         noBet: existing.noBet,
-        blockedByBg: existing.source === "BG",
+        blockedByBg: isPrimarySource(existing.source),
       };
     }
-    if (existing.owner === owner || existing.source === "BG") {
-      // Same BG or already reserved by BG — keep ownership, promote to RUNNING if reserved
-      if (existing.state === "RESERVED_BG") {
-        existing.state = "BG_RUNNING";
-      }
-      return { owned: true, claimedAt: existing.claimedAt, state: existing.state };
+    // Same owner or any primary already holding — do not double-reserve.
+    if (existing.owner === owner || isPrimarySource(existing.source)) {
+      return {
+        owned: false,
+        reason:
+          existing.state === "RESERVED_PR" || existing.state === "RESERVED_BG"
+            ? existing.source === "PR"
+              ? "pr_reserved"
+              : "bg_reserved"
+            : existing.source === "PR"
+              ? "pr_owned"
+              : "bg_owned",
+        owner: existing.owner,
+        state: existing.state,
+        blockedByBg: true,
+      };
     }
-    // Lower priority (ED/RECOVERY) holds incomplete claim — BG takes over
-    if (SOURCE_PRIORITY.BG > SOURCE_PRIORITY[existing.source]) {
+    // Primary may take over incomplete lower-priority claim.
+    if (SOURCE_PRIORITY[source] > SOURCE_PRIORITY[existing.source]) {
       const claimedAt = Date.now();
       claims.set(targetGameId, {
         owner,
-        source: "BG",
+        source,
         claimedAt,
-        state: "RESERVED_BG",
+        state: reservedState,
         completed: false,
       });
-      return { owned: true, claimedAt, state: "RESERVED_BG" };
+      return { owned: true, claimedAt, state: reservedState };
     }
     return {
       owned: false,
-      reason: "duplicate",
+      reason: "priority_blocked",
       owner: existing.owner,
       state: existing.state,
+      blockedByBg: isPrimarySource(existing.source),
     };
   }
-
   const claimedAt = Date.now();
   claims.set(targetGameId, {
     owner,
-    source: "BG",
+    source,
     claimedAt,
-    state: "RESERVED_BG",
+    state: reservedState,
     completed: false,
   });
-  return { owned: true, claimedAt, state: "RESERVED_BG" };
+  return { owned: true, claimedAt, state: reservedState };
 }
 
-/**
- * Promote RESERVED_BG → BG_RUNNING when prediction compute starts.
- */
+
 export function markBgRunning(targetGameId: string, owner: string): void {
   const e = claims.get(targetGameId);
   if (!e || e.owner !== owner) return;
   if (e.state === "RESERVED_BG") e.state = "BG_RUNNING";
 }
 
-/**
- * Unified claim used by predictor / attempt path.
- * Respects priority: BG can claim over incomplete ED/RECOVERY;
- * ED/RECOVERY cannot steal from active BG reservation/running.
- */
-/** Read-only view of target ownership (no mutation). */
+export function markPrRunning(targetGameId: string, owner: string): void {
+  const e = claims.get(targetGameId);
+  if (!e || e.owner !== owner) return;
+  if (e.state === "RESERVED_PR") e.state = "PR_RUNNING";
+}
+
 export function peekTargetClaim(
   targetGameId: string,
-): { source: "BG" | "ED" | "RECOVERY"; state: OwnershipState; completed: boolean; noBet?: boolean } | null {
+): {
+  source: EntrySource;
+  state: OwnershipState;
+  completed: boolean;
+  noBet?: boolean;
+} | null {
   const e = claims.get(targetGameId);
   if (!e) return null;
   return {
@@ -174,12 +222,16 @@ export function peekTargetClaim(
   };
 }
 
-/** True when BG already reserved/owns or target is terminal (ED must not race). */
+/** True when primary (PR or BG) already reserved/owns or target is terminal. */
 export function isBgOwnedOrTerminal(targetGameId: string): boolean {
+  return isPrimaryOwnedOrTerminal(targetGameId);
+}
+
+export function isPrimaryOwnedOrTerminal(targetGameId: string): boolean {
   const e = claims.get(targetGameId);
   if (!e) return false;
   if (e.completed) return true;
-  return e.source === "BG";
+  return isPrimarySource(e.source);
 }
 
 export function claimTarget(targetGameId: string, owner: string): ClaimResult {
@@ -195,33 +247,44 @@ export function claimTarget(targetGameId: string, owner: string): ClaimResult {
         owner: existing.owner,
         state: existing.state,
         noBet: existing.noBet,
-        blockedByBg: existing.source === "BG",
+        blockedByBg: isPrimarySource(existing.source),
       };
     }
 
-    // Same owner re-entry (idempotent)
+    // Same owner re-entry (idempotent) — promote RESERVED_* → *_RUNNING
     if (existing.owner === owner) {
       if (existing.state === "RESERVED_BG" && source === "BG") {
         existing.state = "BG_RUNNING";
       }
+      if (existing.state === "RESERVED_PR" && source === "PR") {
+        existing.state = "PR_RUNNING";
+      }
       return { owned: true, claimedAt: existing.claimedAt, state: existing.state };
     }
 
-    // Active BG reservation/running blocks ED and RECOVERY
+    // Active primary reservation/running blocks ED and RECOVERY
     if (
-      existing.source === "BG" &&
+      isPrimarySource(existing.source) &&
       (existing.state === "RESERVED_BG" ||
         existing.state === "BG_RUNNING" ||
+        existing.state === "RESERVED_PR" ||
+        existing.state === "PR_RUNNING" ||
         existing.state === "SIGNAL_READY")
     ) {
       return {
         owned: false,
         reason:
-          existing.state === "RESERVED_BG"
-            ? "bg_reserved"
-            : existing.state === "BG_RUNNING"
-              ? "bg_running"
-              : "bg_owned",
+          existing.state === "RESERVED_PR"
+            ? "pr_reserved"
+            : existing.state === "PR_RUNNING"
+              ? "pr_running"
+              : existing.state === "RESERVED_BG"
+                ? "bg_reserved"
+                : existing.state === "BG_RUNNING"
+                  ? "bg_running"
+                  : existing.source === "PR"
+                    ? "pr_owned"
+                    : "bg_owned",
         owner: existing.owner,
         state: existing.state,
         blockedByBg: true,
@@ -232,11 +295,13 @@ export function claimTarget(targetGameId: string, owner: string): ClaimResult {
     if (SOURCE_PRIORITY[source] > SOURCE_PRIORITY[existing.source]) {
       const claimedAt = Date.now();
       const state: OwnershipState =
-        source === "BG"
-          ? "BG_RUNNING"
-          : source === "ED"
-            ? "ED_RUNNING"
-            : "RECOVERY_RUNNING";
+        source === "PR"
+          ? "PR_RUNNING"
+          : source === "BG"
+            ? "BG_RUNNING"
+            : source === "ED"
+              ? "ED_RUNNING"
+              : "RECOVERY_RUNNING";
       claims.set(targetGameId, {
         owner,
         source,
@@ -252,17 +317,19 @@ export function claimTarget(targetGameId: string, owner: string): ClaimResult {
       reason: "priority_blocked",
       owner: existing.owner,
       state: existing.state,
-      blockedByBg: existing.source === "BG",
+      blockedByBg: isPrimarySource(existing.source),
     };
   }
 
   const claimedAt = Date.now();
   const state: OwnershipState =
-    source === "BG"
-      ? "BG_RUNNING"
-      : source === "ED"
-        ? "ED_RUNNING"
-        : "RECOVERY_RUNNING";
+    source === "PR"
+      ? "PR_RUNNING"
+      : source === "BG"
+        ? "BG_RUNNING"
+        : source === "ED"
+          ? "ED_RUNNING"
+          : "RECOVERY_RUNNING";
   claims.set(targetGameId, {
     owner,
     source,
@@ -275,8 +342,8 @@ export function claimTarget(targetGameId: string, owner: string): ClaimResult {
 
 export function completeTarget(
   targetGameId: string,
-  owner?: string,
-  opts?: { decision?: "PREDICTED" | "NO_BET" },
+  owner: string,
+  opts?: { decision?: "NO_BET" | "SIGNAL" },
 ): void {
   const e = claims.get(targetGameId);
   if (!e) return;
@@ -292,18 +359,16 @@ export function completeTarget(
 
 /**
  * Release only recoverable failures. NO_BET / SIGNAL_READY stay closed.
- * Marks BG_FAILED_RECOVERABLE when a BG owner releases without completing.
+ * Marks recoverable when a primary owner releases without completing.
  */
 export function releaseTarget(targetGameId: string, owner?: string): void {
   const e = claims.get(targetGameId);
   if (!e) return;
   if (owner && e.owner !== owner) return;
-  if (e.completed) return; // never reopen terminal states
-  if (e.source === "BG") {
-    // Leave a recoverable marker briefly so ED can observe and take over
+  if (e.completed) return;
+  if (isPrimarySource(e.source)) {
     e.state = "BG_FAILED_RECOVERABLE";
     e.completed = false;
-    // Delete so ED/RECOVERY can claim immediately
     claims.delete(targetGameId);
     return;
   }
@@ -314,12 +379,10 @@ export function hasCompletedTarget(targetGameId: string): boolean {
   return claims.get(targetGameId)?.completed === true;
 }
 
-/** True when any owner currently holds (or completed) a claim for target. */
 export function hasActiveOrCompletedClaim(targetGameId: string): boolean {
   return claims.has(targetGameId);
 }
 
-/** Peek claim without mutating — for poll recovery gates and ED eligibility. */
 export function peekClaim(
   targetGameId: string,
 ): {
@@ -327,7 +390,7 @@ export function peekClaim(
   completed: boolean;
   claimedAt: number;
   state?: OwnershipState;
-  source?: "BG" | "ED" | "RECOVERY";
+  source?: EntrySource;
   noBet?: boolean;
 } | null {
   const e = claims.get(targetGameId);
@@ -343,8 +406,8 @@ export function peekClaim(
 }
 
 /**
- * ED/Poll eligibility: true only when BG has not reserved/run/completed,
- * or BG explicitly failed recoverably (no entry).
+ * ED/Poll eligibility: true only when primary has not reserved/run/completed,
+ * or primary explicitly failed recoverably (no entry).
  */
 export function isBgBlocking(targetGameId: string): {
   blocked: boolean;
@@ -354,11 +417,13 @@ export function isBgBlocking(targetGameId: string): {
 } {
   const e = claims.get(targetGameId);
   if (!e) return { blocked: false };
-  if (e.source !== "BG") return { blocked: false };
+  if (!isPrimarySource(e.source)) return { blocked: false };
   if (e.state === "BG_FAILED_RECOVERABLE") return { blocked: false };
   if (
     e.state === "RESERVED_BG" ||
     e.state === "BG_RUNNING" ||
+    e.state === "RESERVED_PR" ||
+    e.state === "PR_RUNNING" ||
     e.state === "SIGNAL_READY" ||
     e.state === "NO_BET" ||
     e.completed
