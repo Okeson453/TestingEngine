@@ -44,7 +44,7 @@ import {
   evaluateSheath,
   recordPredictionOutcome,
 } from "@/lib/core/sheath-mode";
-import { getAdaptiveMinEdge } from "@/lib/prediction/live/adaptive-edge";
+import { getAdaptiveMinEdge, getAdaptiveEdgeStats } from "@/lib/prediction/live/adaptive-edge";
 import { recordNoBetDecision } from "@/lib/prediction/live/decision-audit";
 
 const logger = getLogger("live-predictor");
@@ -276,16 +276,29 @@ export function edgeDiagText(input: {
       : fs.used_calibrated === false
         ? "raw"
         : "unknown";
+  // Pass 20: WHY is minEdge what it is? adaptive-edge stats separate the
+  // env base + adaptation from an adaptation ratchet: edgeN < WINDOW
+  // minimum (12) means the edge is pure BASE_EDGE (env or 0.03); edgeN
+  // >= 12 with edgeHit below target means the controller ratcheted it up
+  // because emitted signals underperform. needP=0.8492 (edge 0.08) is
+  // either BASE_EDGE=0.08 from env or the 0.03+0.05 adaptation ceiling —
+  // these two fields tell which.
+  const stats = getAdaptiveEdgeStats();
   const parts = [
     `edge=${edge >= 0 ? "+" : ""}${edge.toFixed(4)}`,
     `p=${input.probability.toFixed(4)}`,
     `fair=${fair.toFixed(4)}`,
     `needP=${needP.toFixed(4)}`,
     `minEdge=${minEdge.toFixed(4)}`,
+    `edgeN=${stats.n}`,
+    `edgeHit=${stats.hitRate == null ? "n/a" : stats.hitRate.toFixed(3)}`,
     `c=${input.confidence.toFixed(3)}`,
     ...(input.vetoReason ? [`veto=${input.vetoReason}`] : []),
     `cal=${calText}`,
     ...(typeof disagree === "number" ? [`disagree=${disagree.toFixed(3)}`] : []),
+    ...(typeof fs.ewma_hit_rate === "number"
+      ? [`ewma=${fs.ewma_hit_rate.toFixed(4)}`]
+      : []),
     `regime=${String(fs.regime ?? "n/a")}`,
     `models=[${modelsText}]`,
   ];
@@ -578,6 +591,13 @@ const defaultPredictFn = (
           ensemble_disagreement: evaluation.diagnostics?.ensembleDisagreement ?? null,
           raw_probability: evaluation.diagnostics?.rawProbability ?? null,
           used_calibrated: evaluation.diagnostics?.usedCalibrated ?? null,
+          // Pass 20: the shrinkage BASELINE — outputs are clipped to
+          // baseline ± ACIE_MODEL_MAX_DEV and shrunk toward it, so this
+          // number IS why probability sits where it does. If ewma lags
+          // fair (0.7692), the ensemble is tracking recent reality, not
+          // miscalibrated.
+          ewma_hit_rate: online.ewmaHitRate ?? null,
+          observation_count: online.observationCount ?? null,
           ...(liveSafeMode ? { safe_baseline: 1 } : {}),
         },
         modelVersion: "acie-v3",

@@ -18,7 +18,6 @@
 import { randomUUID } from "node:crypto";
 import { getSql, getCriticalSql, type Sql } from "@/lib/db";
 import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
-import { runInTransaction, logSlowTxStages } from "@/lib/prediction/live/tx";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEndPredict } from "@/lib/prediction/live/predictor";
@@ -199,27 +198,51 @@ export async function onGameEnd(
   })();
   let releasedPrediction = false;
 
+  // PASS 20: the explicit runInTransaction wrapper is GONE. Both remaining
+  // statements are single data-modifying CTEs — each atomic on its own —
+  // so the BEGIN/COMMIT wrapper was 2 pure Neon RTTs (~360ms) on every ED:
+  //   - no-pending path (COMMON while NO_BET dominates): 1 stmt = 1 RTT,
+  //     previously begin+body+commit = 3 RTTs (~534-541ms logs);
+  //   - pending path: 2 stmts = 2 RTTs, previously 4.
+  // Atomicity analysis: stmt1 (anchor+claim+rel) is one statement — its
+  // FOR UPDATE lock never needed to span stmt2, because stmt2 is idempotent
+  // WITHOUT it: prediction_validations has a unique constraint (on conflict
+  // do nothing), the pp matched-update is guarded by exists(ins), and the
+  // outbox CTE is guarded by exists(ins) — a concurrent or re-broadcast ED
+  // cannot double-validate or double-enqueue. A crash BETWEEN stmt1 and
+  // stmt2 leaves the pending row matched=false — the existing
+  // poll/recovery re-pass revalidates on the next ED (matched=false),
+  // which is exactly the recovery the TX version used. Durable guarantees
+  // preserved; ownership/dedup/fencing untouched.
+  const slowStmt = (label: string, ms: number) => {
+    if (ms < 300) return;
+    logger.warn(
+      { component: "live-validator", stmtMs: Number(ms.toFixed(1)) },
+      `[tx] validator.onGameEnd.persist ${label} slow_stmt_ms=${ms.toFixed(1)}`,
+    );
+  };
+
   try {
-    await runInTransaction(sql, async (tx) => {
-      // First, anchor the round's crash outcome AND claim the pending
-      // prediction in ONE round trip (pass 12 RTT collapse). These two
-      // statements are independent (different tables, no data dependency)
-      // and the claim's FOR UPDATE lock is held to TX end regardless of
-      // which statement acquired it, so merging them is semantics-neutral.
-      // The anchor row may not exist yet (the predictor doesn't pre-insert
-      // crash_rounds because the schema requires multiplier+crashed_at to
-      // be NOT NULL — both arrive on this ed event). UPSERT with RETURNING
-      // for idempotency (P2.2); the coalesce fallback covers the
-      // already-crashed conflict case (upsert no-op → RETURNING empty →
-      // read the pre-existing row) without a separate round trip.
-      {
-        const endDate = new Date(evt.endTime);
-        const crashedParam = Number.isNaN(endDate.getTime()) ? new Date() : endDate;
-        // Fix 3: do NOT fabricate began_at = crash - 3s. When ED arrives
-        // before BG, began_at stays NULL; the BG handler is the ONLY
-        // authoritative source of the real round start (COALESCE backfill).
-        const beganParam: Date | null = null;
-        const anchorAndClaim = await tx<{
+    // First, anchor the round's crash outcome AND claim the pending
+    // prediction in ONE round trip (pass 12 RTT collapse). These two
+    // statements are independent (different tables, no data dependency)
+    // and the claim's FOR UPDATE lock is held to TX end regardless of
+    // which statement acquired it, so merging them is semantics-neutral.
+    // The anchor row may not exist yet (the predictor doesn't pre-insert
+    // crash_rounds because the schema requires multiplier+crashed_at to
+    // be NOT NULL — both arrive on this ed event). UPSERT with RETURNING
+    // for idempotency (P2.2); the coalesce fallback covers the
+    // already-crashed conflict case (upsert no-op → RETURNING empty →
+    // read the pre-existing row) without a separate round trip.
+    {
+      const tAnchor = performance.now();
+      const endDate = new Date(evt.endTime);
+      const crashedParam = Number.isNaN(endDate.getTime()) ? new Date() : endDate;
+      // Fix 3: do NOT fabricate began_at = crash - 3s. When ED arrives
+      // before BG, began_at stays NULL; the BG handler is the ONLY
+      // authoritative source of the real round start (COALESCE backfill).
+      const beganParam: Date | null = null;
+      const anchorAndClaim = await sql<{
           began_at: string | Date | null;
           crashed_at: string | Date | null;
           prediction_id: string | null;
@@ -297,20 +320,28 @@ export async function onGameEnd(
             : { began_at: anchorRow.began_at, crashed_at: anchorRow.crashed_at };
         if (anchorRow.prediction_id != null) {
           state.pending = anchorRow as unknown as PendingRow;
-        } else {
-          // No pending row targets this round (terminal NO_BET makes this
-          // the COMMON ED path). PASS 19: both follow-up awaits from HEAD
-          // are gone. (1) The matched-detect SELECT only decided whether
-          // to run the orphan UPDATE; (2) the orphan UPDATE wrote
-          // coalesce(crashed_at, ts) into a NOT NULL column — a
-          // dead-tuple no-op plus a full Neon RTT. The orphaned/
-          // bg_arrived_late classification below is derived from
-          // crashRow.began_at and never depended on either.
-          return;
+        }
+        // PASS 20: stmt1 committed (autocommit). Wake the prediction lane
+        // NOW when the rel release fired — was: only after the whole TX
+        // wrapper resolved post-stmt2. Fires on BOTH paths (rel runs in
+        // stmt1 every ED).
+        slowStmt("anchor", performance.now() - tAnchor);
+        if (releasedPrediction) {
+          void import("@/lib/prediction/live/outbox-wake")
+            .then(({ notifyOutbox }) => notifyOutbox("prediction"))
+            .catch(() => undefined);
         }
       }
 
-      if (state.pending == null) return;
+      pass20Pending: {
+        // PASS 20: this was an early `return` inside the runInTransaction
+        // callback — a callback return only SKIPPED the pending-validation
+        // work while onGameEnd continued to the observe/feedback/
+        // classification sections below. A bare return from onGameEnd here
+        // would skip ACIE observeRound on the COMMON no-pending path and
+        // freeze the model. The labeled block preserves that exact split:
+        // skip pending work, keep the post-persist pipeline.
+        if (state.pending == null) break pass20Pending;
 
       const target = Number(state.pending!.target_multiplier);
       const result: "WIN" | "LOSS" = evt.multiplier >= target ? "WIN" : "LOSS";
@@ -401,7 +432,8 @@ export async function onGameEnd(
       // matched flag). live_event_log + validation Telegram outbox were
       // sibling CTEs that added Neon RTT work inside body_ms (~590ms logs).
       // They do not affect WIN/LOSS correctness and run post-commit.
-      const validateOutcome = await tx<{
+      const tValidate = performance.now();
+      const validateOutcome = await sql<{
         inserted_prediction_id: string | null;
       }>`
         with ins as (
@@ -447,18 +479,11 @@ export async function onGameEnd(
         deadline: valDeadlineAt,
         skip: alreadyValidated,
       };
-    }, logSlowTxStages("validator.onGameEnd.persist"));
+      slowStmt("validate", performance.now() - tValidate);
+      } // pass20Pending
 
-    // PASS 16: the TX committed, so the held prediction signal for N+1 is
-    // now claimable (next_attempt_at = now(), DB clock). Wake the
-    // prediction lane so delivery happens THIS instant instead of waiting
-    // for the next recovery tick — the release only matters if the
-    // dispatcher finds out. Fire-and-forget, never blocks validation.
-    if (releasedPrediction) {
-      void import("@/lib/prediction/live/outbox-wake")
-        .then(({ notifyOutbox }) => notifyOutbox("prediction"))
-        .catch(() => undefined);
-    }
+    // PASS 20: the old post-TX wake for releasedPrediction lived here —
+    // the wake now fires immediately after stmt1 (autocommit), above.
 
     // Post-commit: validation Telegram + event log (general pool, non-blocking)
     const notify = (state as { _validationNotify?: {
