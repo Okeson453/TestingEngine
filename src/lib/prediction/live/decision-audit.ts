@@ -33,6 +33,10 @@ export interface NoBetDecisionRecord {
   needProbability: number;
   edge: number;
   vetoReason: string | null;
+  /** Tier: 'BET_ELIGIBLE' never lands here (persisted via pending_predictions);
+   *  'WATCH' = 65%+ prediction kept for band backtest, not a betting signal;
+   *  'NO_BET' = below the prediction floor. */
+  decision?: string;
   mode: string | null;
   regime: string | null;
   modelProbabilities: Record<string, number> | null;
@@ -57,7 +61,7 @@ export function recordNoBetDecision(rec: NoBetDecisionRecord): void {
             ${rec.gameId}, ${rec.sourceGameId}, ${rec.targetMultiplier},
             ${rec.probability}, ${rec.confidence}, ${rec.fairProbability},
             ${rec.minEdge}, ${rec.needProbability}, ${rec.edge},
-            ${rec.vetoReason}, 'NO_BET', ${rec.mode}, ${rec.regime},
+            ${rec.vetoReason}, ${rec.decision ?? "NO_BET"}, ${rec.mode}, ${rec.regime},
             ${JSON.stringify(rec.modelProbabilities ?? null)}::jsonb,
             ${rec.ensembleDisagreement}, ${rec.usedCalibrated}
           )

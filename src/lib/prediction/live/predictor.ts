@@ -26,6 +26,7 @@ import {
   recordNoBet,
   recordSignalPersisted,
   recordEligibleRound,
+  recordWatch,
 } from "@/lib/prediction/live/funnel-metrics";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
@@ -148,6 +149,12 @@ const DEFAULT_TARGET: ThresholdTarget = 1.3;
 export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.03);
 export const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
 export const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
+/** Directive 2026-09-12: predictions at 65%+ are RECORDED (WATCH tier,
+ *  durable decision-audit row for band backtest) instead of being silently
+ *  discarded — but they are NOT betting signals. BET eligibility is still
+ *  governed by the full gate chain (edge vs fair+minEdge, strategy, risk,
+ *  temporal). 0.7692 remains the mathematical break-even for 1.30×. */
+export const PREDICTION_FLOOR = Number(process.env.PREDICTION_FLOOR ?? 0.65);
 /** When false (default), REDUCED_ENTRY is treated like SKIP for delivery. */
 export const ALLOW_REDUCED_ENTRY =
   process.env.ALLOW_REDUCED_ENTRY === "1" ||
@@ -1558,6 +1565,10 @@ export async function onGameEndPredict(
     });
     const skip = skipCheck.skip;
     const vetoReason = skipCheck.reason;
+    // Tier separation: a prediction at/above the 65% floor is RECORDED
+    // (durable audit row, band-backtestable) but is NOT a betting signal.
+    // BET eligibility is unchanged (full gate chain below).
+    const tier: "WATCH" | "NO_BET" = p >= PREDICTION_FLOOR ? "WATCH" : "NO_BET";
     // Funnel telemetry (directive 2026-09-12): per-gate marginal counts +
     // terminal veto reason. In-memory only — zero DB, zero hot-path latency.
     // Classification: cooldown/pacing/drawdown strategy vetoes are RISK;
@@ -1577,6 +1588,7 @@ export async function onGameEndPredict(
         temporal: !slaViolated,
       });
       if (skip) recordNoBet(vetoReason ?? "unknown");
+      if (tier === "WATCH") recordWatch();
     }
     if (skip) {
       const targetNum = Number(DEFAULT_TARGET);
@@ -1614,8 +1626,8 @@ export async function onGameEndPredict(
           recoveryMode,
         },
         strategySkip
-          ? `skip signal — strategy/pipeline veto (NO BET this round) [veto=${vetoReason}] ${edgeDiag}`
-          : `skip signal — no edge vs fair odds (not every round should fire) [veto=${vetoReason}] ${edgeDiag}`,
+          ? `skip signal — strategy/pipeline veto (NO BET this round) [veto=${vetoReason}] [tier=${p >= PREDICTION_FLOOR ? "WATCH" : "NO_BET"}] ${edgeDiag}`
+          : `skip signal — no edge vs fair odds (not every round should fire) [veto=${vetoReason}] [tier=${p >= PREDICTION_FLOOR ? "WATCH" : "NO_BET"}] ${edgeDiag}`,
       );
       // Pass 19: durable decision audit — NO_BET decisions are otherwise
       // invisible to walk-forward evaluation (emitted signals persist
@@ -1634,6 +1646,7 @@ export async function onGameEndPredict(
         needProbability: needP,
         edge: p - fair,
         vetoReason,
+        decision: tier,
         mode: String(fs.mode ?? "") || null,
         regime: String(fs.regime ?? fs.regimeId ?? fs.regime_name ?? "") || null,
         modelProbabilities:

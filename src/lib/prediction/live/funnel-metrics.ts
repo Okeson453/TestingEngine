@@ -35,6 +35,7 @@ type DayCounters = {
   signals_created: number;
   signals_persisted: number;
   signals_dispatched: number;
+  watch_rounds: number;
   no_bet_total: number;
   no_bet_by_reason: Record<string, number>;
 };
@@ -61,6 +62,7 @@ function newDay(): DayCounters {
     signals_created: 0,
     signals_persisted: 0,
     signals_dispatched: 0,
+    watch_rounds: 0,
     no_bet_total: 0,
     no_bet_by_reason: {},
   };
@@ -88,7 +90,8 @@ function funnelLine(prefix: string): string {
     `edge_pass=${d.edge_pass} confidence_pass=${d.confidence_pass} ` +
     `quality_pass=${d.quality_pass} risk_pass=${d.risk_pass} temporal_pass=${d.temporal_pass} ` +
     `signals_created=${d.signals_created} signals_persisted=${d.signals_persisted} ` +
-    `signals_dispatched=${d.signals_dispatched} no_bet_total=${d.no_bet_total} ` +
+    `signals_dispatched=${d.signals_dispatched} watch_rounds=${d.watch_rounds} ` +
+    `no_bet_total=${d.no_bet_total} ` +
     `no_bet_by_reason: ${reasons || "none"}`
   );
 }
@@ -166,6 +169,11 @@ export function recordSignalPersisted(): void {
 /** Dispatcher delivered the notification (type=prediction). */
 export function recordSignalDispatched(): void {
   bump("signals_dispatched");
+}
+
+/** 65%+ prediction recorded for band backtest (WATCH tier, never delivered). */
+export function recordWatch(): void {
+  bump("watch_rounds");
 }
 
 /** Snapshot of the current UTC day's counters (tests / metrics endpoint). */
