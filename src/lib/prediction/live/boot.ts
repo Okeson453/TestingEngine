@@ -303,15 +303,44 @@ async function runBackgroundHydration(
         "@/lib/prediction/acie/shared-engine"
       );
       const eng = getSharedACIEEngine();
+      // Race safety: if live PR/BG/ED already advanced ACIE past the DB
+      // snapshot, do NOT importSnapshot (would clobber newer live state).
+      let livePoints = 0;
+      try {
+        const snap = eng.exportSnapshot();
+        livePoints = Array.isArray(snap.crashPoints) ? snap.crashPoints.length : 0;
+      } catch {
+        livePoints = 0;
+      }
+      if (livePoints >= 5) {
+        logger.info(
+          {
+            component: "live-boot",
+            liveCrashPoints: livePoints,
+            acieInstanceId: getSharedACIEInstanceId(),
+          },
+          "ACIE background restore SKIPPED — live observations already advanced past cold start",
+        );
+        return;
+      }
       const result = await loadAcieStateFromDb(eng);
       (globalThis as { __acieEngine__?: typeof eng }).__acieEngine__ = eng;
       if (result.restored) {
+        // Re-check: if live advanced during the DB round-trip, we may have
+        // overwritten — log clearly for forensics (import is last-write-wins).
+        let after = 0;
+        try {
+          after = eng.exportSnapshot().crashPoints?.length ?? 0;
+        } catch {
+          after = 0;
+        }
         logger.info(
           {
             component: "live-boot",
             reason: result.reason,
             observationCount: result.observationCount,
             crashPoints: result.crashPoints,
+            liveCrashPointsAfter: after,
             acieInstanceId: getSharedACIEInstanceId(),
           },
           "ACIE online state restored into shared singleton (warm, background)",

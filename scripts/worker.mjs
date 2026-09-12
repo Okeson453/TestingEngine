@@ -149,19 +149,31 @@ async function ensureMigrations() {
   }
 }
 
+// ROOT CAUSE (17:25 logs): pool_acquire≈1055ms with waiting=0 is Neon
+// TLS+auth on first connect, NOT pool contention. Pay that cost in pure JS
+// before strip-types compiles the app graph (event_loop_lag≈1475ms class),
+// so network progress is not blocked behind synchronous TS compile.
+const { neonPreconnect } = await import("./neon-preconnect.mjs");
+await neonPreconnect();
+
 // P2 (sep 12 pass 4): THIS is where the ~1.5s boot event-loop stall lives.
-// These three dynamic imports compile the entire TypeScript app graph under
-// --experimental-strip-types — synchronous CPU, boot-window only (the WS
-// pipeline starts later; no BG event can be processed yet). Measure and name
-// it so the stall is attributed by construction, not inferred.
+// These dynamic imports compile the TypeScript app graph under
+// --experimental-strip-types — synchronous CPU, boot-window only. Measure
+// each import so the stall is attributed by construction.
 const appImportT0 = Date.now();
-const liveBoot = await import("@/lib/prediction/live/boot");
-const events = await import("@/lib/prediction/events/game-event-handlers");
+const tDb0 = Date.now();
 const db = await import("@/lib/db");
+console.log(`[worker] import @/lib/db ms=${Date.now() - tDb0}`);
+endPgPoolLazy = db.endPgPool;
+const tBoot0 = Date.now();
+const liveBoot = await import("@/lib/prediction/live/boot");
+console.log(`[worker] import live/boot ms=${Date.now() - tBoot0}`);
+const tEv0 = Date.now();
+const events = await import("@/lib/prediction/events/game-event-handlers");
+console.log(`[worker] import game-event-handlers ms=${Date.now() - tEv0}`);
 console.log(
   `[worker] app module graph import ms=${Date.now() - appImportT0} (strip-types compile — the boot event_loop_lag class)`,
 );
-endPgPoolLazy = db.endPgPool;
 const edgeHttp = await import("@/lib/prediction/live/edge-http");
 
 let shuttingDown = false;
@@ -199,10 +211,18 @@ async function bootWithRetry(maxAttempts = 8) {
         continue;
       }
       // Lock held — wait for previous instance TTL then retry (rolling deploy).
-      if (msg.includes("Worker lock not acquired")) {
-        const wait = Math.min(15_000 * attempt, 45_000);
+      if (
+        msg.includes("Worker lock not acquired") ||
+        msg.includes("Worker lease not acquired")
+      ) {
+        // Align with boot.ts fencing message. Short poll — old worker should
+        // release on SIGTERM; do not steal an unexpired lease.
+        const wait = Math.min(
+          Number(process.env.WORKER_LEASE_RETRY_MS ?? 500) * attempt,
+          5_000,
+        );
         console.error(
-          `[worker] lock held by another instance — waiting ${wait}ms before retry`,
+          `[worker] lease held by another instance — waiting ${wait}ms before retry (fencing preserved)`,
         );
         await new Promise((r) => setTimeout(r, wait));
         continue;
