@@ -141,6 +141,102 @@ export function observeCrashForACIE(
   }
 }
 
+/**
+ * COLD-START HYDRATION (production 15:46:56, target 9603950): a crash that
+ * landed while this worker had no wired handlers (deploy / lease wait) is in
+ * crash_rounds but was never observed into THIS process's ACIE engine — the
+ * first BG prediction then rejects with STALE_REJECTED source_mismatch.
+ * Hydrate the exact freshness source from its authoritative crash_rounds row
+ * (real persisted crash data) and observe it. The stale check is NOT
+ * weakened: N+1 still only emits after ACIE has observed the true source
+ * crash in-process, and a source OLDER than the last observation is refused
+ * (observing it would drag lastObservedGameId backwards).
+ * Injectable sqlFn for tests. Returns true when the source is now observed.
+ */
+export async function hydrateAcieFreshnessSource(
+  sourceGameId: string,
+  sqlFn?: () => Promise<Sql>,
+): Promise<boolean> {
+  const src = String(sourceGameId);
+  const prev = getLastAcieObservation();
+  if (prev.gameId === src && prev.observationCount > 0) return true;
+  // Monotonic-source guard: never move the freshness provenance backwards.
+  if (
+    prev.gameId != null &&
+    /^\d+$/.test(prev.gameId) &&
+    /^\d+$/.test(src) &&
+    Number(src) <= Number(prev.gameId)
+  ) {
+    return false;
+  }
+  try {
+    const sql = sqlFn ? await sqlFn() : await getSql();
+    const rows = await sql<{
+      game_id: string;
+      multiplier: string | null;
+      crashed_at: string | Date;
+    }>`
+      SELECT game_id, multiplier::text AS multiplier, crashed_at
+      FROM crash_rounds
+      WHERE game_id = ${src} AND multiplier IS NOT NULL
+      LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row || row.multiplier == null) return false;
+    const crashedAtIso =
+      row.crashed_at instanceof Date
+        ? row.crashed_at.toISOString()
+        : new Date(row.crashed_at).toISOString();
+    observeCrashForACIE(row.game_id, Number(row.multiplier), crashedAtIso);
+    return getLastAcieObservation().gameId === src;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Boot-time tail hydration: observe every crash_rounds row the ACIE snapshot
+ * missed (deploy/lease-wait gap) so the FIRST live BG prediction of a boot
+ * proves fresh instead of rejecting to ED. Rows strictly newer than the
+ * snapshot's lastSourceGameId are observed oldest→newest (engine-level
+ * round dedupe makes this idempotent); a cold engine (no snapshot) gets the
+ * newest 10 for context. Boot-window only — never on the live hot path.
+ */
+export async function hydrateAcieTailFromCrashRounds(sql: Sql): Promise<number> {
+  const prev = getLastAcieObservation();
+  const hasSeed = prev.gameId != null && /^\d+$/.test(prev.gameId);
+  const rows = hasSeed
+    ? await sql<{ game_id: string; multiplier: string; crashed_at: string | Date }>`
+        SELECT game_id, multiplier::text AS multiplier, crashed_at
+        FROM crash_rounds
+        WHERE multiplier IS NOT NULL AND crashed_at IS NOT NULL
+          AND game_id ~ '^[0-9]+$' AND game_id::numeric > ${Number(prev.gameId)}
+        ORDER BY game_id::numeric ASC
+        LIMIT 50
+      `
+    : await sql<{ game_id: string; multiplier: string; crashed_at: string | Date }>`
+        SELECT game_id, multiplier::text AS multiplier, crashed_at
+        FROM crash_rounds
+        WHERE multiplier IS NOT NULL AND crashed_at IS NOT NULL
+        ORDER BY crashed_at DESC
+        LIMIT 10
+      `;
+  if (!hasSeed) rows.reverse(); // cold engine: observe oldest→newest
+  else rows.sort((a, b) => Number(a.game_id) - Number(b.game_id)); // belt-and-braces: numeric ASC regardless of DB row order, newest observed LAST
+  let hydrated = 0;
+  for (const r of rows) {
+    try {
+      const crashedAtIso =
+        r.crashed_at instanceof Date ? r.crashed_at.toISOString() : new Date(r.crashed_at).toISOString();
+      observeCrashForACIE(r.game_id, Number(r.multiplier), crashedAtIso);
+      hydrated += 1;
+    } catch {
+      /* soft — never block boot on observation */
+    }
+  }
+  return hydrated;
+}
+
 /** Prediction-related constants. */
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
 /** Require model P to beat fair odds (1/target) by this margin before emitting.
@@ -1511,7 +1607,30 @@ export async function onGameEndPredict(
     const freshnessSource = deps.bgTrigger
       ? (priorRounds[priorRounds.length - 1]?.externalRoundId ?? gameId)
       : gameId;
-    const check = assertFreshAcieState(freshnessSource);
+    let check = assertFreshAcieState(freshnessSource);
+    if (!check.ok) {
+      // COLD-START HYDRATION (9603950): the source crash may have landed while
+      // this worker had no wired handlers (deploy/lease wait) — hydrate it
+      // from persisted round history and re-assert ONCE. The guard is
+      // not weakened: emission still requires ACIE to have observed the true
+      // source crash; hydrating ADDS the missing observation, it never skips
+      // the check. Hot path cost: 1 general-pool RTT, stale path only.
+      const hydrated = await hydrateAcieFreshnessSource(freshnessSource).catch(() => false);
+      if (hydrated) {
+        check = assertFreshAcieState(freshnessSource);
+        if (check.ok) {
+          logger.warn(
+            {
+              component: "live-predictor",
+              freshnessSource,
+              targetGameId,
+              predictionId,
+            },
+            "ACIE cold-start tail hydrated from persisted round history — freshness re-proven",
+          );
+        }
+      }
+    }
     if (!check.ok) {
       logger.error(
         {

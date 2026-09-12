@@ -89,6 +89,9 @@ export class NativeBcGameSocket {
   private handlers = new Set<EventHandler>();
   private statusHandlers = new Set<StatusHandler>();
   private status: string = "stopped";
+  /** Monotonic stamp of the last raw frame arrival (directive 16:52Z
+   *  instrumentation). Synchronous parse chain ⇒ no interleaving. */
+  private frameArrivedMono: number | null = null;
   private lastError: string | null = null;
   private lastEventAt: number | null = null;
   private lastEdAt: number | null = null;
@@ -192,6 +195,12 @@ export class NativeBcGameSocket {
       });
 
       socket.on("message", (data, isBinary) => {
+        // SEP 12 directive: monotonic raw-frame-received stamp. The parse
+        // chain (onText/onBinary → parsePacket → handleEvent) is fully
+        // synchronous in one tick, so this field is race-free and lets the
+        // per-event log PROVE zero buffering between frame arrival and event
+        // dispatch (frame_to_event_ms in the "bc <event> event" line).
+        this.frameArrivedMono = performance.now();
         // node `ws` delivers text frames as Buffer with isBinary=false.
         // Treating those as binary skipped EIO open (0{sid...}) → never
         // encodeConnect/join → server 1006 close ~60s later (seen in prod).
@@ -354,9 +363,24 @@ export class NativeBcGameSocket {
       // displays ONLY the msg field, and "crash event from native WS" for a
       // bg (round START) packet made every round start look like a crash
       // that produced no prediction. Now reads "bc ed event" / "bc bg event".
+      const frameDelta =
+        this.frameArrivedMono != null
+          ? (performance.now() - this.frameArrivedMono).toFixed(2)
+          : null;
       logger.info(
-        { component: "native-bc-socket", event: packet.event, gameId, multiplier },
-        `bc ${packet.event} event from native WS`,
+        {
+          component: "native-bc-socket",
+          event: packet.event,
+          gameId,
+          multiplier,
+          frame_to_event_ms: frameDelta != null ? Number(frameDelta) : null,
+        },
+        // Directive 16:52Z: monotonic frame-arrival → event-dispatch delta,
+        // INLINE in the message (Railway strips JSON context fields). ~0.00
+        // proves the native WS path has zero buffering between raw frame
+        // receipt and BG/ED handler dispatch (the ~7s pr→bg gap is the
+        // game's own betting-open window, upstream of this socket).
+        `bc ${packet.event} event from native WS frame_to_event_ms=${frameDelta ?? "n/a"}`,
       );
     }
 

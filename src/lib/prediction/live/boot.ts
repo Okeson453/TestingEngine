@@ -419,6 +419,32 @@ class LiveBoot {
         withBootStage("safe-baseline-restore", () => restoreSafeBaselineState(sql)),
       ]);
 
+      // COLD-START (9603950, 15:46:56): crashes that landed while this worker
+      // had no wired handlers (deploy / lease wait) exist in crash_rounds but
+      // were never observed into THIS process's ACIE engine — the first BG
+      // prediction rejected STALE_REJECTED and fell to ED. Observe the missed
+      // tail (rows newer than the snapshot's lastSourceGameId) here, before
+      // any handler is wired. Boot-window only, 1 general-pool query.
+      try {
+        await withBootStage("acie-tail-hydrate", async () => {
+          const { hydrateAcieTailFromCrashRounds } = await import(
+            "@/lib/prediction/live/predictor"
+          );
+          const hydrated = await hydrateAcieTailFromCrashRounds(sql);
+          if (hydrated > 0) {
+            logger.info(
+              { component: "live-boot", hydrated_rounds: hydrated },
+              "ACIE tail hydrated from crash_rounds (missed crash observations)",
+            );
+          }
+        });
+      } catch (e) {
+        logger.warn(
+          { component: "live-boot", error: String(e) },
+          "ACIE tail hydration failed (soft) — stale-guard retry covers the first round",
+        );
+      }
+
       // Pre-warm the PredictionEngine so the first live prediction avoids
       // constructor + module-resolution cost on the hot path.
       await withBootStage("prediction-engine-prewarm", async () => prewarmPredictionEngine());

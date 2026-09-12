@@ -237,6 +237,34 @@ async function loadSignUtils(): Promise<SignUtils> {
 }
 
 async function loadSignUtilsOnce(): Promise<SignUtils> {
+  // SEP 12 (15:46 boot): start the worker_state cache read IN PARALLEL with
+  // the fresh fetch chain. Previously the cache was only consulted after all
+  // 3 fresh attempts failed — a guaranteed fail-wait-retry-fallback sequence
+  // (~2.5s added to sign-ready) whenever bc.game was flaky. With the read
+  // in-flight, a failed fresh attempt can short-circuit to the cache
+  // immediately; a successful fresh fetch still wins and persists a new
+  // last-good bundle.
+  const cachedPromise: Promise<Awaited<ReturnType<typeof loadCachedWrUtilsBundle>> | null> =
+    loadCachedWrUtilsBundle().catch(() => null);
+  const applyCached = async (): Promise<SignUtils | null> => {
+    const cached = await cachedPromise;
+    if (!cached) return null;
+    try {
+      const utils = await evaluateWrUtilsBundleInSandbox(cached.body);
+      cachedUtils = utils;
+      logger.warn(
+        { cachedAt: new Date(cached.at).toISOString(), source: cached.url },
+        "wr_utils loaded from worker_state cache (fresh fetch chain failed)",
+      );
+      return utils;
+    } catch (e) {
+      logger.warn(
+        { error: e instanceof Error ? e.message : String(e) },
+        "wr_utils DB-cache fallback failed — stale or rotated bundle",
+      );
+      return null;
+    }
+  };
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -303,7 +331,18 @@ async function loadSignUtilsOnce(): Promise<SignUtils> {
         { attempt, error: e instanceof Error ? e.message : String(e) },
         "wr_utils load attempt failed",
       );
-      if (attempt < 3) await sleep(400 * attempt);
+      if (attempt < 3) {
+        // Cache landed while we were failing? Use it now — no fail-wait-retry.
+        const early = await Promise.race([
+          cachedPromise,
+          new Promise<null>((r) => setTimeout(() => r(null), 0)),
+        ]);
+        if (early) {
+          const utils = await applyCached();
+          if (utils) return utils;
+        }
+        await sleep(400 * attempt);
+      }
     }
   }
 
@@ -312,23 +351,10 @@ async function loadSignUtilsOnce(): Promise<SignUtils> {
   // fetches from Railway were flaky at boot (7 failed attempts, ~19s of
   // sign-readiness delay, 00:12 deploy log) and the bundle rotates rarely.
   // Fresh fetch is always preferred; this cache only rescues a failing boot.
-  const cached = await loadCachedWrUtilsBundle().catch(() => null);
-  if (cached) {
-    try {
-      const utils = await evaluateWrUtilsBundleInSandbox(cached.body);
-      cachedUtils = utils;
-      logger.warn(
-        { cachedAt: new Date(cached.at).toISOString(), source: cached.url },
-        "wr_utils loaded from worker_state cache (fresh fetch chain failed)",
-      );
-      return utils;
-    } catch (e) {
-      logger.warn(
-        { error: e instanceof Error ? e.message : String(e) },
-        "wr_utils DB-cache fallback failed — stale or rotated bundle",
-      );
-    }
-  }
+  // The cache read has been running in parallel since function entry, so
+  // this await is usually already resolved (no serialized 543ms tail).
+  const utils = await applyCached();
+  if (utils) return utils;
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 

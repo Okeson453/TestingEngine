@@ -22,6 +22,7 @@ export default defineConfig({
       "src/lib/prediction/live/skew-monitor-batching.test.ts",
       "src/lib/prediction/live/zero-db-regression.test.ts",
       "src/lib/prediction/live/outbox-toctou-race.test.ts",
+      "src/lib/prediction/live/stale-hydration.test.ts",
       "src/lib/prediction/live/live-round-registry.test.ts",
       "src/lib/prediction/live/feedback.test.ts",
       "src/lib/prediction/live/funnel-metrics.test.ts",
