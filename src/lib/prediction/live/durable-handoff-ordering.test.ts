@@ -41,7 +41,7 @@ describe("durable prediction handoff ordering (P0)", () => {
     const handoffStart = predictorSrc.indexOf("P0 DURABLE HANDOFF", start);
     expect(handoffStart).toBeGreaterThan(start);
     const handoffBody = predictorSrc.slice(handoffStart, handoffStart + 1500);
-    expect(handoffBody).toContain("deps.getSqlFn ?? getCriticalSql");
+    expect(handoffBody).toContain("deps.getSqlFn ?? getPredictionPersistSql");
     expect(handoffBody).not.toMatch(/deps\.getSqlFn\s*\?\?\s*getSql[^A-Za-z]/);
   });
 

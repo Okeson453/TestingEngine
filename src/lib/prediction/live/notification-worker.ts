@@ -16,7 +16,7 @@
  *   INFLIGHT stuck > STALE_MS  --tick-->  PENDING (recovered)
  *   attempts >= MAX_ATTEMPTS  --tick-->  DEAD
  */
-import { getCriticalSql, getSql, getCriticalPool, type Sql } from "@/lib/db";
+import { getCriticalSql, getDispatchCriticalSql, getSql, getCriticalPool, type Sql } from "@/lib/db";
 import { runInTransaction, logSlowTxStages } from "@/lib/prediction/live/tx";
 import {
   sendTelegramMessage,
@@ -188,7 +188,7 @@ export class OutboxDispatcher {
     backlogWarnings: 0,
     lastError: null,
   };
-  private getSqlFn: () => Promise<Sql> = getCriticalSql;
+  private getSqlFn: () => Promise<Sql> = getDispatchCriticalSql;
   /** Normal lane (validation/alert rows) pool. CO-DELIVERY FIX 3: defaults
    * to the GENERAL pool — normal-lane claim/auth/stamp/finalize DB work was
    * riding the critical pool (max=3) and starving the N+1 prediction persist

@@ -47,7 +47,174 @@ const globalRef = globalThis as typeof globalThis & {
   __pgPoolEnding__?: Promise<void>;
   __poolExhaustionAlerted__?: boolean;
   __lastPoolAcquireMs__?: number;
+  __pgHotLanes__?: Map<string, PinnedLaneState>;
 };
+
+/**
+ * PINNED HOT-PATH LANES (sep 12 latency-gate pass).
+ *
+ * Production evidence (09:52-09:56 logs, and every prior pass since sep 11):
+ * the BG prediction persist and the prediction-lane claim both live on the
+ * CRITICAL pool, and both have paid multi-second acquires mid-stream
+ * (pool_acquire_ms=1093 with idle=2 → the 1287ms prediction outlier;
+ * pool_acquire_ms=1059/1062/1128/1159 in earlier windows). Every one of
+ * those numbers matches Neon TLS+auth (~1.0-1.1s): an acquire that had to
+ * CREATE a replacement client because a pooled connection was found dead,
+ * or pool scheduling that stalled behind that rebuild.
+ *
+ * A pool guarantees good AVERAGE acquire latency; the hot path needs a
+ * bounded WORST case. So the two hot paths get dedicated, permanently
+ * checked-out critical-pool clients ("pinned lanes"):
+ *   - persist lane  → predictor durable handoff (pending_predictions+outbox)
+ *   - dispatch lane → prediction-lane outbox claim/finalize
+ * Pinned clients are created once at boot (prewarmed + validated with
+ * SELECT 1), pinged by the same keepalive that protects the pools, and
+ * rebuilt in the background on connection-class errors. While a lane is
+ * rebuilding, callers fall back to the critical pool for that ONE query —
+ * the hot path degrades to today's behaviour instead of failing.
+ *
+ * This is NOT a pool-size increase: the pinned clients are 2 of the existing
+ * critical max (4) — the remaining dynamic headroom is 2, which covers the
+ * only remaining critical-pool consumers (reconcile CTE + legacy fallback).
+ */
+interface PinnedLaneState {
+  label: string;
+  pool: import("pg").Pool | null;
+  client: import("pg").PoolClient | null;
+  building: Promise<import("pg").PoolClient | null> | null;
+  dead: boolean;
+  sql?: Sql | null;
+}
+
+function isConnectionClassError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /timeout|ECONNRESET|ECONNREFUSED|EPIPE|Connection terminated|socket hang up|connection.*closed/i.test(
+    msg,
+  );
+}
+
+function getPinnedLanes(): Map<string, PinnedLaneState> {
+  if (!globalRef.__pgHotLanes__) globalRef.__pgHotLanes__ = new Map();
+  return globalRef.__pgHotLanes__;
+}
+
+/** Tear down a dead pinned client and mark the lane for background rebuild. */
+function discardPinnedClient(lane: PinnedLaneState, why: string): void {
+  lane.dead = true;
+  const c = lane.client;
+  lane.client = null;
+  if (c) {
+    try { c.removeAllListeners?.("error"); } catch { /* soft */ }
+    try { c.release(); } catch { /* soft */ }
+  }
+  console.warn(`[db] ${lane.label} pinned client discarded: ${why}`);
+}
+
+async function ensurePinnedClient(lane: PinnedLaneState): Promise<import("pg").PoolClient | null> {
+  if (lane.client && !lane.dead) return lane.client;
+  if (!lane.building) {
+    lane.building = (async () => {
+      const pool = lane.pool;
+      if (!pool) return null;
+      try {
+        const c = await pool.connect();
+        await c.query("select 1"); // validate + pay TLS/auth now, not mid-round
+        c.on("error", (err: Error) => {
+          // Async socket death on a checked-out client — discard so the next
+          // hot-path query rebuilds instead of failing on a zombie socket.
+          discardPinnedClient(lane, `client error: ${err.message}`);
+        });
+        lane.client = c;
+        lane.dead = false;
+        console.log(`[db] ${lane.label} pinned client ready`);
+        return c;
+      } catch (e) {
+        console.warn(
+          `[db] ${lane.label} pinned client build failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+        return null;
+      } finally {
+        lane.building = null;
+      }
+    })();
+  }
+  return lane.building;
+}
+
+/** Run one query on a pinned lane; fall back to the critical pool on
+ * connection-class errors so the hot path never fails because of the lane. */
+function makePinnedRun(lane: PinnedLaneState): Run {
+  const fallbackRun = lane.pool ? makeRun(lane.pool, `${lane.label}-fallback`) : null;
+  return async <T>(text: string, params: unknown[]): Promise<T[]> => {
+    const client = await ensurePinnedClient(lane);
+    if (!client) {
+      if (!fallbackRun) throw new Error(`${lane.label}: no pinned client and no fallback pool`);
+      return fallbackRun<T>(text, params);
+    }
+    try {
+      const res = await client.query(text, params);
+      return res.rows as T[];
+    } catch (err) {
+      if (isConnectionClassError(err)) {
+        // The statement may or may not have reached the server. Every hot-path
+        // statement on these lanes is idempotent-by-guard (persist CTE conflicts
+        // DO NOTHING; claim/finalize are status-guarded), so ONE fallback retry
+        // on the pool is safe and preserves the durable semantics.
+        discardPinnedClient(lane, err instanceof Error ? err.message : String(err));
+        void ensurePinnedClient(lane); // rebuild in background for the next round
+        if (!fallbackRun) throw err;
+        return fallbackRun<T>(text, params);
+      }
+      throw err;
+    }
+  };
+}
+
+function toPinnedSql(lane: PinnedLaneState): Sql {
+  const sql = (async <T = Record<string, unknown>>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): Promise<T[]> => {
+    let text = strings[0] ?? "";
+    const params: unknown[] = [];
+    for (let i = 0; i < values.length; i++) {
+      params.push(values[i]);
+      text += `$${i + 1}` + (strings[i + 1] ?? "");
+    }
+    return makePinnedRun(lane)<T>(text, params);
+  }) as Sql;
+  sql.query = async <T = Record<string, unknown>>(text: string, params?: unknown[]) =>
+    makePinnedRun(lane)<T>(text, params ?? []);
+  return sql;
+}
+
+async function getPinnedLaneSql(laneKey: "persist" | "dispatch"): Promise<Sql> {
+  await getSql(); // ensure pools initialized (also works under PGLite)
+  const pool = getCriticalPool();
+  if (!pool) return getCriticalSql(); // PGLite / tests: unchanged behaviour
+  const lanes = getPinnedLanes();
+  let lane = lanes.get(laneKey);
+  if (!lane) {
+    lane = { label: `hot-${laneKey}`, pool, client: null, building: null, dead: false, sql: null };
+    lanes.set(laneKey, lane);
+  } else if (lane.pool !== pool) {
+    lane.pool = pool;
+  }
+  if (!lane.sql) lane.sql = toPinnedSql(lane);
+  // Build eagerly (don't await): the first round must not pay TLS+auth.
+  void ensurePinnedClient(lane);
+  return lane.sql;
+}
+
+/** Prediction persist lane: pending_predictions + notification_outbox handoff. */
+export async function getPredictionPersistSql(): Promise<Sql> {
+  return getPinnedLaneSql("persist");
+}
+
+/** Dispatcher prediction-lane: outbox claim + finalize. */
+export async function getDispatchCriticalSql(): Promise<Sql> {
+  return getPinnedLaneSql("dispatch");
+}
 
 const OID_INT8 = 20;
 const OID_DATE = 1082;
@@ -155,6 +322,7 @@ function makeRun(
 ): Run {
   return async <T>(text: string, params: unknown[]) => {
     const t0 = Date.now();
+    const t0Perf = performance.now();
     let client: import("pg").PoolClient;
     try {
       client = await pool.connect();
@@ -186,8 +354,14 @@ function makeRun(
     const acquireMs = Date.now() - t0;
     globalRef.__lastPoolAcquireMs__ = acquireMs;
     if (acquireMs > 100) {
+      // FORENSIC ATTRIBUTION (sep 12): an acquire that waits >100ms while
+      // idle clients exist is indistinguishable — from acquireMs alone —
+      // from an event-loop stall that starved the connect() continuation.
+      // Report the max loop lag inside the acquire window so the 1093ms
+      // class of outlier is attributable in the log itself.
+      const loopLag = Math.round(maxLoopLagBetween(t0Perf, performance.now()));
       console.warn(
-        `[db] ${label} pool_acquire_ms=${acquireMs} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
+        `[db] ${label} pool_acquire_ms=${acquireMs} loop_lag_ms=${loopLag} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`,
       );
     }
     try {
@@ -361,6 +535,21 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
           ),
         );
     }
+    // PINNED LANES: keep the dedicated hot-path clients warm too. Neon kills
+    // idle TCP server-side; a dead pinned client discovered at ping time
+    // costs a background rebuild, never a mid-round 1.1s re-auth.
+    for (const lane of getPinnedLanes().values()) {
+      if (lane.pool !== criticalPool) continue;
+      void (async () => {
+        try {
+          const c = await ensurePinnedClient(lane);
+          if (c) await c.query("select 1");
+        } catch (e) {
+          discardPinnedClient(lane, `keepalive: ${e instanceof Error ? e.message : String(e)}`);
+          void ensurePinnedClient(lane);
+        }
+      })();
+    }
   }, Number(process.env.PG_KEEPALIVE_MS ?? 20_000) || 20_000);
   keepAlive.unref?.();
 
@@ -384,6 +573,12 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   // Forensic attribution (sep 11 19:05-19:12): slow-query lines carry
   // loop_lag_ms, which requires the sampler to be running.
   startEventLoopLagSampler();
+
+  // PINNED LANES (sep 12): build both hot-path clients NOW, during boot
+  // (fire-and-forget — getSql() resolves when this function returns). The
+  // first prediction must never be the one paying TLS+auth.
+  void getPinnedLaneSql("persist");
+  void getPinnedLaneSql("dispatch");
 
   return {
     critical: toSql(makeRun(criticalPool, "critical"), criticalPool),
@@ -436,6 +631,7 @@ export async function endPgPool(): Promise<void> {
     globalRef.__pgCriticalPool__ = undefined;
     globalRef.__pgSqlPromise__ = undefined;
     globalRef.__pgCriticalSqlPromise__ = undefined;
+    globalRef.__pgHotLanes__ = undefined;
     await Promise.all([
       g ? g.end().catch(() => undefined) : Promise.resolve(),
       c ? c.end().catch(() => undefined) : Promise.resolve(),

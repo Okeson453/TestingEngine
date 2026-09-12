@@ -21,7 +21,7 @@ import { claimTarget, completeTarget, releaseTarget } from "@/lib/prediction/liv
 import { notifyOutbox } from "@/lib/prediction/live/outbox-wake";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
 import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
-import { getSql, getCriticalSql, getPgPool, getLastPoolAcquireMs, type Sql } from "@/lib/db";
+import { getSql, getPredictionPersistSql, getPgPool, getLastPoolAcquireMs, type Sql } from "@/lib/db";
 import { runInTransaction, logSlowTxStages, type TxStageTimings } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
 import type { FeaturePath, HistoricalRound, ThresholdTarget } from "@/lib/prediction/types";
@@ -795,8 +795,12 @@ export async function onGameStart(
       );
     }
   }
-  // P0: reserved critical pool — never queue behind dashboard/general work
-  const getSqlFn = deps.getSqlFn ?? getCriticalSql;
+  // PINNED PERSIST LANE (sep 12): the durable handoff runs on a dedicated,
+  // permanently warm critical client so a mid-round pool rebuild (Neon
+  // TLS+auth ~1.0-1.1s) can never land on the N+1 persist — the 1287ms
+  // production outlier was exactly that acquire. Deps-injected callers
+  // (tests) are unaffected.
+  const getSqlFn = deps.getSqlFn ?? getPredictionPersistSql;
   const predictFn = deps.predictFn ?? defaultPredictFn;
   const now = deps.now ?? Date.now;
   const minHistory = deps.minHistory ?? MIN_HISTORY;
@@ -1662,7 +1666,9 @@ export async function onGameEndPredict(
   // must complete before the round-N+1 deadline; it belongs on the critical
   // pool like every other caller in this file (see onGameStart above, and
   // the dispatcher's getCriticalSql default in notification-worker.ts).
-  const getSqlFn = deps.getSqlFn ?? getCriticalSql;
+  // PINNED PERSIST LANE (sep 12): see onGameStart note — dedicated warm
+  // client for the durable handoff; eliminates the cold-acquire outlier.
+  const getSqlFn = deps.getSqlFn ?? getPredictionPersistSql;
   const persistT0 = Date.now();
   let outboxEnqueued = 0;
   let pendingWasDuplicate = false;
