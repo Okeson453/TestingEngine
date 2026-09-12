@@ -14,7 +14,7 @@ import { getRealtimePipeline, logRealtimeSnapshot } from "@/lib/realtime/realtim
 import { getSql, getCriticalSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
-import { attemptNPlusOnePrediction } from "@/lib/prediction/live/prediction-attempt";
+import { attemptNPlusOnePrediction, bgPrimaryEnabled } from "@/lib/prediction/live/prediction-attempt";
 import { isBgOwnedOrTerminal } from "@/lib/prediction/live/target-coordinator";
 import { observeCrashForACIE } from "@/lib/prediction/live/predictor";
 import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
@@ -242,17 +242,13 @@ export async function bgHandler(payload: unknown): Promise<void> {
   noteRoundStarted(gameId, new Date(beganAt).getTime());
 
   // BG-PRIMARY (latency): N+1 at BG so the signal is ready before the
-  // target round starts. Opt into ED-primary with ED_PRIMARY_PREDICT=1
-  // or BG_PRIMARY_PREDICT=0 (then ED owns primary generation).
+  // target round starts. bgPrimaryEnabled() (prediction-attempt.ts) is the
+  // single authoritative toggle; opt into ED-primary with ED_PRIMARY_PREDICT=1
+  // or BG_PRIMARY_PREDICT=0.
   const targetGameIdForBg = nextTargetGameId(gameId);
   const bgReserveAt = Date.now();
   let bgReserved = false;
-  const edPrimary =
-    process.env.ED_PRIMARY_PREDICT === "1" ||
-    process.env.ED_PRIMARY_PREDICT === "true" ||
-    process.env.BG_PRIMARY_PREDICT === "0" ||
-    process.env.BG_PRIMARY_PREDICT === "false";
-  const bgPrimaryPredict = !edPrimary;
+  const bgPrimaryPredict = bgPrimaryEnabled();
   if (bgPrimaryPredict && isAuthoritative() && /^\d+$/.test(gameId)) {
     const reserve = reserveTargetForBg(targetGameIdForBg, gameId);
     bgReserved = reserve.owned;
@@ -269,7 +265,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
         correlationId,
       },
       reserve.owned
-        ? "BG→N+1 ownership RESERVED (legacy BG_PRIMARY_PREDICT)"
+        ? "BG→N+1 ownership RESERVED (BG-primary — single authoritative path)"
         : `BG→N+1 reserve skipped reason=${reserve.reason}`,
     );
   }

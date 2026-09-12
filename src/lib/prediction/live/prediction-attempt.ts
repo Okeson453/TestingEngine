@@ -24,6 +24,28 @@ const logger = getLogger("prediction-attempt");
 
 export type PredictionSource = "ED" | "RECOVERY" | "BG";
 
+/**
+ * SINGLE SOURCE OF TRUTH for BG-primary N+1 prediction (this change:
+ * previously duplicated as an inline env evaluation in both
+ * game-event-handlers.ts bgHandler and validator.ts onGameEnd — two places
+ * that could silently disagree about who owns N+1 generation).
+ *
+ * BG-primary is the ONE authoritative implementation: BG(N) received (round
+ * N started) reserves and generates the N+1 prediction; ED(N) is fallback
+ * only (it never races BG for a target BG owns). Opting out restores the
+ * legacy ED-primary behaviour via ED_PRIMARY_PREDICT=1/true or
+ * BG_PRIMARY_PREDICT=0/false — both legacy names are honoured for
+ * deploy-env continuity.
+ */
+export function bgPrimaryEnabled(): boolean {
+  return !(
+    process.env.ED_PRIMARY_PREDICT === "1" ||
+    process.env.ED_PRIMARY_PREDICT === "true" ||
+    process.env.BG_PRIMARY_PREDICT === "0" ||
+    process.env.BG_PRIMARY_PREDICT === "false"
+  );
+}
+
 // ── Batch 3: rejection telemetry ────────────────────────────────────────────
 // Every N+1 attempt that does NOT produce a signal is counted by
 // (source, kind) so the "why did 20:50:26 ED not produce a prediction?"

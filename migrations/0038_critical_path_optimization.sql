@@ -19,13 +19,16 @@ ON prediction_validations (game_id) WHERE game_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS notification_outbox_target_game_idx 
 ON notification_outbox (target_game_id) WHERE target_game_id IS NOT NULL;
 
--- 6. Add index for pending_predictions decision field for NO_BET tracking
-CREATE INDEX IF NOT EXISTS pending_predictions_decision_idx 
-ON pending_predictions (decision) WHERE decision IS NOT NULL;
-
--- 7. Add decision column to pending_predictions if it doesn't exist
-ALTER TABLE pending_predictions 
+-- 6. Add decision column to pending_predictions if it doesn't exist
+-- (MUST precede the index — a fresh database failed here before, the
+-- column was added two statements too late; production Neon never noticed
+-- because the column already existed from an earlier deploy.)
+ALTER TABLE pending_predictions
 ADD COLUMN IF NOT EXISTS decision text;
+
+-- 7. Add index for pending_predictions decision field for NO_BET tracking
+CREATE INDEX IF NOT EXISTS pending_predictions_decision_idx
+ON pending_predictions (decision) WHERE decision IS NOT NULL;
 
 -- 8. Add comment for decision column
 COMMENT ON COLUMN pending_predictions.decision IS 'Canonical decision state: ENTRY, REDUCED_ENTRY, SKIP, or NO_BET';

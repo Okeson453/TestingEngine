@@ -20,19 +20,23 @@ describe("outbox TOCTOU temporal contract (source)", () => {
     expect(src).toContain("returning id");
   });
 
-  it("temporal DB check fails closed (no .catch(() => []) on target lookup)", () => {
-    // The fail-open pattern must not appear on the prediction temporal query path.
-    // POOL-BUDGET FIX: the temporal gate + send stamp are ONE atomic
-    // authorization UPDATE; a DB error on it must requeue without sending.
-    expect(src).toContain("SEND_AUTH_DB_ERROR");
-    expect(src).toContain("fail-closed");
-    expect(src).toContain("send_auth_db_error");
-    // The atomic authorization must fail closed INSIDE the send path: the
-    // authorization UPDATE must appear before sendTelegramMessage.
-    const authIdx = src.indexOf("SEND_AUTH_DB_ERROR");
+  it("temporal authorization fails closed at claim time (no claim, no send)", () => {
+    // CLAIM-TIME AUTHORIZATION: the temporal gate lives INSIDE the claim
+    // statement — an unauthorized row is dead-lettered by the same UPDATE,
+    // and a DB error on the claim means nothing is claimed and nothing is
+    // sent. The old separate authorization UPDATE (and its
+    // SEND_AUTH_DB_ERROR requeue path) no longer exists; fail-closed is now
+    // structural: no claim → no send.
+    expect(src).toContain("CLAIM-TIME AUTHORIZATION");
+    expect(src).toContain("claim-time temporal gate");
+    // The claim must still be the FOR UPDATE SKIP LOCKED statement that both
+    // gates and stamps — authorization must precede sendTelegramMessage.
+    const claimIdx = src.indexOf("claim-time temporal gate");
     const sendIdx = src.indexOf("sendTelegramMessage(row.content");
-    expect(authIdx).toBeGreaterThan(-1);
-    expect(sendIdx).toBeGreaterThan(authIdx);
+    expect(claimIdx).toBeGreaterThan(-1);
+    expect(sendIdx).toBeGreaterThan(claimIdx);
+    // The old fail-open pattern must still not appear on the temporal path.
+    expect(src).not.toMatch(/catch\s*\(\(\)\s*=>\s*\[\]\).*target/i);
   });
 
   it("does not force min 200ms send timeout when residual budget is smaller", () => {

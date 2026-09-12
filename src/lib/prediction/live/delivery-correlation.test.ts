@@ -14,13 +14,15 @@ describe("prediction delivery correlation timeline", () => {
   );
 
   it("stamps send_started_at while inflight before sendTelegramMessage", () => {
-    // POOL-BUDGET FIX: the stamp lives inside the atomic authorization UPDATE
-    // (set send_started_at = clock_timestamp()) which still precedes the send.
-    const stampIdx = nw.indexOf("set send_started_at = clock_timestamp()");
+    // CLAIM-TIME AUTHORIZATION: send_started_at is stamped by the claim
+    // statement itself (send_started_at = clock_timestamp() in the claim
+    // UPDATE), which necessarily precedes the send. The separate
+    // authorization UPDATE is gone.
+    const stampIdx = nw.indexOf("send_started_at = clock_timestamp()");
     const sendIdx = nw.indexOf("sendTelegramMessage(row.content");
     expect(stampIdx).toBeGreaterThan(-1);
     expect(sendIdx).toBeGreaterThan(stampIdx);
-    expect(nw).toContain("authorization refused (BG/expiry)");
+    expect(nw).toContain("claim-time temporal gate");
   });
 
   it("lifecycle logs include predictionId, targetGameId, sourceGameId, queuedAt", () => {

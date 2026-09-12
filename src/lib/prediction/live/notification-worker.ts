@@ -102,6 +102,10 @@ interface OutboxRow {
   target_game_id?: string | null;
   /** Server-stamped claim time (canonical per-row dispatch start). */
   dispatch_claimed_at?: string | Date | null;
+  /** Server-stamped send authorization time (stamped atomically at claim). */
+  send_started_at?: string | Date | null;
+  /** Prediction lane: result of the claim-time temporal authorization. */
+  authorized?: boolean;
 }
 
 /** Per-attempt lifecycle timestamps captured in memory and persisted at the
@@ -351,31 +355,74 @@ export class OutboxDispatcher {
     // transaction.
     const claimLimit =
       lane === "prediction" ? Math.max(1, PREDICTION_BATCH_SIZE) : BATCH_SIZE;
+    // STAGE DIAGNOSTIC: the claim is the first DB leg after wake; its
+    // duration (pool acquire + UPDATE…FROM + temporal predicates) is logged
+    // per tick in OUTBOX_TICK so a slow claim is attributable directly.
+    const claimT0 = this.now();
     const claimed = await (async () => {
       try {
         if (lane === "prediction") {
+          // CLAIM-TIME AUTHORIZATION (this change): the claim statement IS the
+          // temporal authorization. The `authorized` computed column in the
+          // picked CTE re-uses the exact pre-send predicate (deadline +
+          // target-not-started/crashed) and the UPDATE stamps
+          // send_started_at / dead_letter atomically in the same statement.
+          // One critical-pool round trip total — the previous design was
+          // claim (1 RTT) + authorization UPDATE (1 RTT), two sequential
+          // ~100–250ms Neon legs on the SIGNAL_READY→dispatch path. Safety
+          // invariants unchanged: the zero-RTT in-memory registry gate runs
+          // immediately before send (covers the claim→send window), the
+          // deadline/lead gates are unchanged, and the finalize
+          // late-acceptance gate remains the last write. Rows that fail the
+          // temporal predicate are dead-lettered by the claim itself —
+          // nothing is ever sent late, and no zombie pending row lingers.
           return await sql<OutboxRow>`
             WITH picked AS (
-              SELECT id
+              SELECT id,
+                (
+                  (telegram_deadline_at IS NULL OR telegram_deadline_at > clock_timestamp())
+                  AND (
+                    coalesce(target_game_id, metadata->>'targetGameId', metadata->>'target_game_id') IS NULL
+                    OR (
+                      NOT EXISTS (
+                        SELECT 1 FROM live_round_state lrs
+                        WHERE lrs.game_id = coalesce(notification_outbox.target_game_id, notification_outbox.metadata->>'targetGameId', notification_outbox.metadata->>'target_game_id')
+                          AND lrs.began_at IS NOT NULL
+                          AND lrs.began_at <= clock_timestamp()
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM crash_rounds cr
+                        WHERE cr.game_id = coalesce(notification_outbox.target_game_id, notification_outbox.metadata->>'targetGameId', notification_outbox.metadata->>'target_game_id')
+                          AND cr.crashed_at IS NOT NULL
+                          AND cr.crashed_at <= clock_timestamp()
+                      )
+                    )
+                  )
+                ) AS authorized
               FROM notification_outbox
               WHERE status = 'pending'::text
                 AND type = 'prediction'
                 AND next_attempt_at <= now()
-                AND (telegram_deadline_at IS NULL OR telegram_deadline_at > now())
+                AND (telegram_deadline_at IS NULL OR telegram_deadline_at > clock_timestamp())
               ORDER BY priority DESC, next_attempt_at ASC, id ASC
               LIMIT ${claimLimit}
               FOR UPDATE SKIP LOCKED
             )
             UPDATE notification_outbox n
-            SET status = 'inflight',
-                attempt_count = attempt_count + 1,
-                dispatch_claimed_at = now()
+            SET status = CASE WHEN picked.authorized THEN 'inflight' ELSE 'dead_letter' END,
+                attempt_count = n.attempt_count + 1,
+                dispatch_claimed_at = now(),
+                send_started_at = CASE WHEN picked.authorized THEN clock_timestamp() ELSE n.send_started_at END,
+                last_error = CASE
+                  WHEN picked.authorized THEN NULL
+                  ELSE 'expired_late_signal: target started/crashed (claim-time temporal gate)'
+                END
             FROM picked
             WHERE n.id = picked.id AND n.status = 'pending'
             RETURNING n.id, n.notification_id, n.type, n.content, n.metadata, n.status,
                       n.attempt_count, n.next_attempt_at, n.created_at,
                       n.telegram_deadline_at, n.priority, n.target_game_id,
-                      n.dispatch_claimed_at
+                      n.dispatch_claimed_at, n.send_started_at, picked.authorized
           `;
         }
         return await sql<OutboxRow>`
@@ -409,13 +456,14 @@ export class OutboxDispatcher {
           UPDATE notification_outbox n
           SET status = 'inflight',
               attempt_count = attempt_count + 1,
-              dispatch_claimed_at = now()
+              dispatch_claimed_at = now(),
+              send_started_at = clock_timestamp()
           FROM picked
           WHERE n.id = picked.id AND n.status = 'pending'
           RETURNING n.id, n.notification_id, n.type, n.content, n.metadata, n.status,
                     n.attempt_count, n.next_attempt_at, n.created_at,
                     n.telegram_deadline_at, n.priority, n.target_game_id,
-                    n.dispatch_claimed_at
+                    n.dispatch_claimed_at, n.send_started_at
         `;
       } catch (claimErr) {
         // Only fall back for genuine SQL-shape rejection. Pool timeouts /
@@ -498,6 +546,7 @@ export class OutboxDispatcher {
     // Client-side claim clock: consistent basis for all in-process durations
     // (DB now() vs client clock skew must not pollute queue_wait/dispatch ms).
     const claimClientMs = this.now();
+    const claimMs = Math.max(0, claimClientMs - claimT0);
 
     // Parallel dispatch: prediction lane is strictly single-item (P0).
     // Freshness > throughput for N+1. Normal lane retains BATCH_PARALLELISM.
@@ -604,141 +653,41 @@ export class OutboxDispatcher {
               }
             }
 
-            // For predictions: HARD temporal contract — a signal for a target
-            // that has ALREADY STARTED is semantically wrong (false-timing).
-            // Late delivery is REMOVED (was "delivering late signal anyway").
-            //
-            // POOL-BUDGET FIX: the temporal gate and the send_started_at stamp
-            // used to be two separate round trips (SELECT live/crash state,
-            // then UPDATE send_started_at). They are now ONE atomic
-            // authorization UPDATE: the send_started stamp is only written
-            // when the row is still inflight, within deadline, and — for
-            // predictions — the target has not started or crashed. Fail
-            // closed: a DB error requeues without sending.
-            // CLOCK HYGIENE (forensic report Issue 3): the client send-start
-            // clock is captured AFTER the authorization resolves, so
-            // telegramSendMs (client accepted − client send-start) measures
-            // only the Telegram leg. The server-side send_started_at from the
-            // auth RETURNING is the dispatch-leg source of truth.
-            let sendStartedServerIso: string | null = null;
-            let authorized: { id: number; send_started_at: string | Date }[];
-            try {
-              authorized = await sql<{ id: number; send_started_at: string | Date }>`
-                update notification_outbox o
-                set send_started_at = clock_timestamp()
-                where o.id = ${row.id}
-                  and o.status = 'inflight'
-                  and (o.telegram_deadline_at is null or o.telegram_deadline_at > clock_timestamp())
-                  and (
-                    o.type <> 'prediction'
-                    or coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id') is null
-                    or (
-                      not exists (
-                        select 1 from live_round_state lrs
-                        where lrs.game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id')
-                          and lrs.began_at is not null
-                          and lrs.began_at <= clock_timestamp()
-                      )
-                      and not exists (
-                        select 1 from crash_rounds cr
-                        where cr.game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId', o.metadata->>'target_game_id')
-                          and cr.crashed_at is not null
-                          and cr.crashed_at <= clock_timestamp()
-                      )
-                    )
-                  )
-                returning o.id, o.send_started_at
-              `;
-              lc.sendStartedMs = this.now();
-              if (authorized.length > 0) {
-                sendStartedServerIso = new Date(authorized[0]!.send_started_at).toISOString();
-              }
-            } catch (authErr) {
-              // Fail closed: do not send while authorization is unverifiable.
-              await sql`
-                update notification_outbox
-                set status = 'pending',
-                    next_attempt_at = now() + interval '250 milliseconds',
-                    last_error = ${'send_auth_db_error: ' + String(authErr).slice(0, 180)}
-                where id = ${row.id} and status = 'inflight'
-              `.catch(() => undefined);
-              this.stats.requeued += 1;
-              logger.warn(
-                {
-                  component: "outbox-dispatcher",
-                  notificationId: row.notification_id,
-                  error: String(authErr),
-                },
-                "SEND_AUTH_DB_ERROR — fail-closed; requeued without send",
-              );
-              return "requeued" as const;
-            }
-            if (authorized.length === 0) {
-              // Authorization did not match: classify WHY with one follow-up
-              // read (rare path) so the row lands in the right terminal state.
-              let reason = "row_no_longer_inflight_bg_or_expiry";
-              try {
-                const meta = (row.metadata ?? {}) as Record<string, unknown>;
-                const targetGameId =
-                  (row.target_game_id as string | null) ??
-                  ((meta.targetGameId as string) ||
-                    (meta.target_game_id as string) ||
-                    null);
-                const state = await sql<{
-                  status: string;
-                  deadline_passed: boolean;
-                  target_started: boolean;
-                  target_crashed: boolean;
-                }>`
-                  select o.status,
-                    (o.telegram_deadline_at is not null and o.telegram_deadline_at <= now()) as deadline_passed,
-                    exists (
-                      select 1 from live_round_state lrs
-                      where lrs.game_id = ${targetGameId} and lrs.began_at is not null and lrs.began_at <= now()
-                    ) as target_started,
-                    exists (
-                      select 1 from crash_rounds cr
-                      where cr.game_id = ${targetGameId} and cr.crashed_at is not null and cr.crashed_at <= now()
-                    ) as target_crashed
-                  from notification_outbox o
-                  where o.id = ${row.id}
-                `;
-                const s = state[0];
-                if (s?.target_started) reason = "expired_late_signal: target started before delivery";
-                else if (s?.target_crashed) reason = "target_already_crashed_before_delivery";
-                else if (s?.deadline_passed) reason = "expired_before_send: telegram_deadline_at passed";
-                else if (s && s.status !== "inflight") reason = `row_no_longer_inflight: ${s.status}`;
-                if (s?.target_started || s?.target_crashed || s?.deadline_passed || (s && s.status !== "inflight")) {
-                  await sql`
-                    update notification_outbox
-                    set status = 'dead_letter',
-                        last_error = ${reason}
-                    where id = ${row.id} and status = 'inflight'
-                  `.catch(() => undefined);
-                  this.stats.dead += 1;
-                  logger.warn(
-                    {
-                      component: "outbox-dispatcher",
-                      notificationId: row.notification_id,
-                      targetGameId,
-                      expiration_reason: reason,
-                    },
-                    "SIGNAL_EXPIRED — pre-send authorization refused delivery",
-                  );
-                  return "dead" as const;
-                }
-              } catch { /* classification best-effort */ }
+            // CLAIM-TIME AUTHORIZATION (this change): the temporal contract is
+            // enforced ATOMICALLY by the claim statement itself — the claim
+            // stamped send_started_at only when the row was within deadline
+            // and (for predictions) the target had not started/crashed, and
+            // dead-lettered unauthorized rows in the same statement. The
+            // separate post-claim authorization UPDATE (one more sequential
+            // Neon RTT on the SIGNAL_READY→dispatch critical path) is gone.
+            // Fail-closed semantics are preserved: a DB error at claim means
+            // nothing was claimed and nothing is sent.
+            // CLOCK HYGIENE (forensic report Issue 3): lc.sendStartedMs is the
+            // client clock at claim; telegramSendMs (accepted − send-start)
+            // still measures only the Telegram leg. The server-side
+            // send_started_at from the claim RETURNING is the dispatch-leg
+            // source of truth.
+            lc.sendStartedMs = this.now();
+            const sendStartedServerIso = row.send_started_at
+              ? new Date(row.send_started_at as string | Date).toISOString()
+              : null;
+            if (lane === "prediction" && row.authorized === false) {
+              // Claim-time temporal gate refused this row — already
+              // dead-lettered by the claim statement with the reason stamped.
               this.stats.dead += 1;
               logger.warn(
                 {
                   component: "outbox-dispatcher",
-                  notificationId: row.notification_id,
-                  type: row.type,
+                  ...lifecycleLogFields(row, lc, this.now(), "dead_claim_time_temporal_gate"),
                 },
-                "OUTBOX_DISPATCH aborted before send — authorization refused (BG/expiry)",
+                "SIGNAL_EXPIRED — claim-time temporal gate refused delivery (target started/crashed)",
               );
               return "dead" as const;
             }
+            // Note: rows from the legacy multi-statement fallback claim do not
+            // carry send_started_at/authorized — sendStartedServerIso is null
+            // there (telemetry-only field) and the registry gate, deadline
+            // checks and finalize late-acceptance gate still apply.
 
             // Cap Telegram timeout by remaining deadline.
             // P0/P1: never start a send whose minimum timeout exceeds the residual budget.
@@ -1197,6 +1146,7 @@ export class OutboxDispatcher {
           dead,
           requeued,
           drainMs: Math.round(this.now() - tickStartMs),
+          claimMs: Math.round(claimMs),
           notifyToClaimMs: notifyToClaimMs != null ? Math.round(notifyToClaimMs) : null,
           wakeKindCounts: {
             prediction: wake.predictionWakeCount,
@@ -1527,27 +1477,46 @@ export class OutboxDispatcher {
         // (~1.0–1.2s) that then sat on the critical path of a real
         // SIGNAL_READY→OUTBOX_DISPATCH wake. Now:
         //   • prediction wake → claim immediately (primary path)
-        //   • recovery every 20 ticks (~2s) → catch missed wakes / crashes
+        //   • recovery every 50 ticks (~5s) → catch missed wakes / crashes.
+        //     The wake channel is LATCHED (a notify with no waiter sets a
+        //     flag the next wait consumes), so a missed wake can only occur
+        //     on a process restart or dispatcher bug — 5s is a safe bound
+        //     and cuts empty critical-pool claims 2.5x vs the old 2s.
         //   • pure normal / timer ticks do NOT touch the critical pool
         const runPrediction =
           wake == null ||
           wake.prediction ||
-          loopTick % 20 === 0;
+          loopTick % 50 === 0;
         if (runPrediction) {
           await this.processLane("prediction");
         }
         // Maintenance: general pool only, never ahead of prediction claim.
-        if (loopTick % 10 === 0) {
+        // CADENCE FIX (this change): recoverStale runs 4-5 general-pool
+        // queries (backlog counts + two multi-table temporal sweeps + stale
+        // inflight reset). At every 10 ticks (~1s) that was a standing
+        // general-pool fire drill (observed idle=0 / waiting=1-2) competing
+        // with heartbeats and audit writes. It is recovery cleanup — 5s
+        // cadence bounds zombie cleanup without the constant load.
+        if (loopTick % 50 === 0) {
           void this.recoverStale().catch(() => undefined);
         }
-        if (loopTick % 30 === 0) {
+        // Forensic reconciliation is analytics, not lifecycle: 30s cadence
+        // (was 3s). Delivery correctness never depended on it — outcome
+        // classification only.
+        if (loopTick % 300 === 0) {
           void this.reconcileForensics();
         }
-        // NORMAL LANE: only when woken for normal work or on timer recovery
-        // (wake == null). Skip on pure prediction wakes so WIN/LOSS does not
-        // race the N+1 signal on the same ED tick (ordering fix).
+        // NORMAL LANE: only when woken for normal work, or every 50 ticks
+        // (~5s) as missed-wake recovery. CADENCE FIX (this change): the
+        // previous `(!wake.prediction && !wake.normal)` clause ran the
+        // normal-lane claim (UPDATE…FROM with a correlated NOT EXISTS JSON
+        // gate) on EVERY 100ms timer tick — ~10 heavy general-pool queries
+        // per second with an empty outbox, the single largest source of
+        // general-pool pressure (idle=0 / waiting=1-2). wake.normal covers
+        // all producer enqueues (validator/alerts); the timer term is
+        // recovery only.
         const runNormal =
-          wake == null || wake.normal || (!wake.prediction && !wake.normal);
+          wake == null || wake.normal || loopTick % 50 === 0;
         if (runNormal) {
           this.runBackgroundDetached();
         }

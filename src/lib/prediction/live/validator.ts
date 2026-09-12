@@ -21,6 +21,7 @@ import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEndPredict } from "@/lib/prediction/live/predictor";
+import { bgPrimaryEnabled } from "@/lib/prediction/live/prediction-attempt";
 import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
 import { markPredictionResolved } from "@/lib/prediction/live/live-round-state";
 import { edProcessingLatencyMs } from "@/lib/observability/metrics/lifecycle-metrics";
@@ -153,12 +154,10 @@ export async function onGameEnd(
   const now = deps.now ?? Date.now;
 
   // BG-PRIMARY (default): N+1 is owned by BG; do not schedule a competing
-  // ED predict from the validator. ED_PRIMARY_PREDICT=1 restores this path.
-  const edPrimary =
-    process.env.ED_PRIMARY_PREDICT === "1" ||
-    process.env.ED_PRIMARY_PREDICT === "true" ||
-    process.env.BG_PRIMARY_PREDICT === "0" ||
-    process.env.BG_PRIMARY_PREDICT === "false";
+  // ED predict from the validator. bgPrimaryEnabled() (prediction-attempt.ts)
+  // is the single authoritative toggle; ED_PRIMARY_PREDICT=1 restores the
+  // legacy ED-primary path.
+  const edPrimary = !bgPrimaryEnabled();
   if (!evt.skipPredict && edPrimary) {
     try {
       globalIncrementalState.update(evt.multiplier);
