@@ -22,9 +22,9 @@ beforeEach(() => {
 });
 
 describe("adaptive edge", () => {
-  it("starts near base edge", () => {
+  it("starts at base edge (default 0 under absolute 65% gate)", () => {
     const e = getAdaptiveMinEdge();
-    assert.ok(e >= 0.01 && e <= 0.08, `edge out of range: ${e}`);
+    assert.ok(e >= 0 && e <= 0.08, `edge out of range: ${e}`);
   });
 
   it("raises edge after a losing streak of emitted signals", () => {
@@ -41,13 +41,13 @@ describe("adaptive edge", () => {
     for (let i = 0; i < 20; i++) recordSignalOutcome(true);
     const e = getAdaptiveMinEdge();
     // Should not go above base when overperforming
-    assert.ok(e <= Number(process.env.MIN_SIGNAL_EDGE ?? 0.03) + 0.001);
+    assert.ok(e <= Number(process.env.MIN_SIGNAL_EDGE ?? 0) + 0.001);
   });
 
   it("does not permanently lock at MAX after a mediocre window (recovery)", () => {
     for (let i = 0; i < 20; i++) recordSignalOutcome(false);
     const high = getAdaptiveMinEdge();
-    assert.ok(high >= Number(process.env.MIN_SIGNAL_EDGE ?? 0.03), `expected elevated edge, got ${high}`);
+    assert.ok(high >= Number(process.env.MIN_SIGNAL_EDGE ?? 0), `expected elevated edge, got ${high}`);
     for (let i = 0; i < 30; i++) recordSignalOutcome(true);
     const recovered = getAdaptiveMinEdge();
     assert.ok(

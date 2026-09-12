@@ -18,11 +18,14 @@ const FAIR_130 = 1 / 1.3;
 const TARGET_HIT =
   Number(process.env.SIGNAL_TARGET_HIT_RATE ?? FAIR_130 + 0.05); // ~0.819
 
-/** Base edge from env / predictor MIN_SIGNAL_EDGE default. */
-const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.03);
+/** Base edge from env — default 0 aligns with absolute 65% probability gate.
+ *  Set MIN_SIGNAL_EDGE>0 to re-enable fair+edge selectivity. */
+const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
 
 const MAX_EDGE = Number(process.env.SIGNAL_MAX_EDGE ?? 0.08);
-const MIN_EDGE_FLOOR = Number(process.env.SIGNAL_MIN_EDGE_FLOOR ?? 0.02);
+/** Floor for adaptive edge. Default 0 so a zero BASE_EDGE stays at absolute
+ *  probability gate (65%) until outcomes justify raising selectivity. */
+const MIN_EDGE_FLOOR = Number(process.env.SIGNAL_MIN_EDGE_FLOOR ?? 0);
 
 const WINDOW = Math.max(20, Number(process.env.SIGNAL_EDGE_WINDOW ?? 40));
 

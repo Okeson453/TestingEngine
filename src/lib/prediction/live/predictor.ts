@@ -239,17 +239,20 @@ export async function hydrateAcieTailFromCrashRounds(sql: Sql): Promise<number> 
 
 /** Prediction-related constants. */
 const DEFAULT_TARGET: ThresholdTarget = 1.3;
-/** Require model P to beat fair odds (1/target) by this margin before emitting.
- *  Selective default: fair + 0.03 ≈ 79.9% for 1.30× — quality over volume.
- *  Set MIN_SIGNAL_EDGE=0 only for diagnostics (emits near every evaluable round). */
-export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.03);
-export const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0);
+/** Edge over fair odds (1/target). Default 0 — betting eligibility is the
+ *  absolute probability gate (MIN_SIGNAL_PROBABILITY=0.65). Set
+ *  MIN_SIGNAL_EDGE>0 (e.g. 0.03) to re-enable fair+edge selectivity
+ *  (~79.9% at 1.30×). */
+export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
+/** Absolute probability gate for BET eligibility (directive: edge gate 65%).
+ *  needP resolves to this when MIN_SIGNAL_EDGE<=0; when edge>0, needP is
+ *  max(this, fair+edge). Persistence floor remains PREDICTION_FLOOR (same
+ *  default) so every eligible bet is also recorded for band backtest. */
+export const MIN_SIGNAL_PROBABILITY = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0.65);
 export const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ?? 0);
-/** Directive 2026-09-12: predictions at 65%+ are RECORDED (WATCH tier,
- *  durable decision-audit row for band backtest) instead of being silently
- *  discarded — but they are NOT betting signals. BET eligibility is still
- *  governed by the full gate chain (edge vs fair+minEdge, strategy, risk,
- *  temporal). 0.7692 remains the mathematical break-even for 1.30×. */
+/** Predictions at 65%+ are RECORDED (taxonomy tier + decision-audit).
+ *  0.7692 remains the mathematical break-even for 1.30× EV analysis —
+ *  it is NOT the live betting gate when MIN_SIGNAL_EDGE=0. */
 export const PREDICTION_FLOOR = Number(process.env.PREDICTION_FLOOR ?? 0.65);
 
 /**
@@ -311,7 +314,9 @@ export function shouldSkipSignal(input: {
   const minEdge = input.minEdge ?? getAdaptiveMinEdge();
   const minP = input.minProbability ?? MIN_SIGNAL_PROBABILITY;
   const minC = input.minConfidence ?? MIN_SIGNAL_CONFIDENCE;
-  const needP = Math.max(minP, fair + minEdge);
+  // Absolute probability gate when minEdge<=0 (default: needP=0.65).
+  // fair+edge only raises the bar when MIN_SIGNAL_EDGE>0 is set explicitly.
+  const needP = minEdge > 0 ? Math.max(minP, fair + minEdge) : Math.max(minP, 0);
   const p = input.probability;
   const c = input.confidence;
   const strategyAction = String(input.strategyAction ?? "").toUpperCase();
@@ -372,7 +377,9 @@ export function shouldSkipReason(input: {
   const minEdge = input.minEdge ?? getAdaptiveMinEdge();
   const minP = input.minProbability ?? MIN_SIGNAL_PROBABILITY;
   const minC = input.minConfidence ?? MIN_SIGNAL_CONFIDENCE;
-  const needP = Math.max(minP, fair + minEdge);
+  // Absolute probability gate when minEdge<=0 (default: needP=0.65).
+  // fair+edge only raises the bar when MIN_SIGNAL_EDGE>0 is set explicitly.
+  const needP = minEdge > 0 ? Math.max(minP, fair + minEdge) : Math.max(minP, 0);
   const p = input.probability;
   const c = input.confidence;
   const strategyAction = String(input.strategyAction ?? "").toUpperCase();
@@ -417,10 +424,9 @@ export function edgeDiagText(input: {
   const targetNum = Number(input.target ?? 1.3);
   const fair = targetNum > 1 ? 1 / targetNum : 0.5;
   const minEdge = input.minEdge ?? getAdaptiveMinEdge();
-  const needP = Math.max(
-    input.minProbability ?? MIN_SIGNAL_PROBABILITY,
-    fair + minEdge,
-  );
+  const minPGate = input.minProbability ?? MIN_SIGNAL_PROBABILITY;
+  const needP =
+    minEdge > 0 ? Math.max(minPGate, fair + minEdge) : Math.max(minPGate, 0);
   const edge = input.probability - fair;
   const fs = input.featureSummary ?? {};
   const models = fs.model_probabilities as Record<string, number> | undefined;
@@ -1726,10 +1732,11 @@ export async function onGameEndPredict(
     // row, band-backtestable) but is NOT a betting signal. BET eligibility
     // is unchanged (full gate chain below); 0.7692 stays mathematical
     // break-even; BET_CANDIDATE (76.92%-needP) is explicitly NOT a bet.
-    const needPForTier = Math.max(
-      MIN_SIGNAL_PROBABILITY,
-      1 / Number(DEFAULT_TARGET) + getAdaptiveMinEdge(),
-    );
+    const adaptiveForTier = getAdaptiveMinEdge();
+    const needPForTier =
+      adaptiveForTier > 0
+        ? Math.max(MIN_SIGNAL_PROBABILITY, 1 / Number(DEFAULT_TARGET) + adaptiveForTier)
+        : Math.max(MIN_SIGNAL_PROBABILITY, 0);
     const tier: PredictionTier = classifyPredictionTier(p, needPForTier);
     // Funnel telemetry (directive 2026-09-12): per-gate marginal counts +
     // terminal veto reason. In-memory only — zero DB, zero hot-path latency.
@@ -1756,7 +1763,10 @@ export async function onGameEndPredict(
       const targetNum = Number(DEFAULT_TARGET);
       const fair = targetNum > 1 ? 1 / targetNum : 0.5;
       const adaptiveEdge = getAdaptiveMinEdge();
-      const needP = Math.max(MIN_SIGNAL_PROBABILITY, fair + adaptiveEdge);
+      const needP =
+        adaptiveEdge > 0
+          ? Math.max(MIN_SIGNAL_PROBABILITY, fair + adaptiveEdge)
+          : Math.max(MIN_SIGNAL_PROBABILITY, 0);
       const strategySkip =
         String(strategyAction ?? "").toUpperCase() === "SKIP" ||
         String(pipelineAction ?? "").toUpperCase() === "SKIP";
