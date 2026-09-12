@@ -1,8 +1,9 @@
 /**
  * BC.Game native WS → live prediction pipeline.
  *
- * ED(N)  → PRIMARY N+1 prediction (completed crash N) + validation of N
- * BG(N)  → started_at stamp + temporal kill; optional N+1 via BG_PRIMARY_PREDICT=1
+ * BG(N)  → PRIMARY N+1 prediction (reserve + in-memory evaluate + outbox)
+ * ED(N)  → FALLBACK N+1 only if BG did not own target; validation of N
+ * Opt out of BG-primary with ED_PRIMARY_PREDICT=1 or BG_PRIMARY_PREDICT=0
  * Poll   → recovery only
  */
 import { randomUUID } from "node:crypto";
@@ -14,6 +15,7 @@ import { getSql, getCriticalSql } from "@/lib/db";
 import { getLogger } from "@/lib/observability/logger";
 import { onGameEnd } from "@/lib/prediction/live/validator";
 import { attemptNPlusOnePrediction } from "@/lib/prediction/live/prediction-attempt";
+import { isBgOwnedOrTerminal } from "@/lib/prediction/live/target-coordinator";
 import { observeCrashForACIE } from "@/lib/prediction/live/predictor";
 import { globalIncrementalState } from "@/lib/prediction/state/incremental-state-engine";
 import {
@@ -205,9 +207,8 @@ function nextTargetGameId(sourceGameId: string): string {
 /**
  * BG(N): reconcile target start + temporal kill of late signals for N.
  *
- * Default (ED-primary): does NOT claim or compute N+1. Optional legacy path
- * when BG_PRIMARY_PREDICT=1: reserve + attemptNPlusOnePrediction for N+1
- * while round N is still running (history/ACIE through N-1 only).
+ * Default (BG-primary): reserve + attemptNPlusOnePrediction for N+1 at
+ * BG receipt (history/ACIE through N-1). ED is fallback when BG missed.
  *
  * Always:
  *  1. noteRoundStarted (zero-RTT registry)
@@ -240,17 +241,18 @@ export async function bgHandler(payload: unknown): Promise<void> {
   // ONLY the real BG (round start) writes startedAt — never pr.
   noteRoundStarted(gameId, new Date(beganAt).getTime());
 
-  // ED-PRIMARY (2026-09-11): N+1 is generated on ED(N) with the completed
-  // crash result, then delivered immediately. BG no longer reserves/claims
-  // N+1 by default — that blocked ED from computing with crash N and left
-  // held signals arriving after the target round started.
-  // Opt-in legacy: BG_PRIMARY_PREDICT=1 restores pre-reserve + BG compute.
+  // BG-PRIMARY (latency): N+1 at BG so the signal is ready before the
+  // target round starts. Opt into ED-primary with ED_PRIMARY_PREDICT=1
+  // or BG_PRIMARY_PREDICT=0 (then ED owns primary generation).
   const targetGameIdForBg = nextTargetGameId(gameId);
   const bgReserveAt = Date.now();
   let bgReserved = false;
-  const bgPrimaryPredict =
-    process.env.BG_PRIMARY_PREDICT === "1" ||
-    process.env.BG_PRIMARY_PREDICT === "true";
+  const edPrimary =
+    process.env.ED_PRIMARY_PREDICT === "1" ||
+    process.env.ED_PRIMARY_PREDICT === "true" ||
+    process.env.BG_PRIMARY_PREDICT === "0" ||
+    process.env.BG_PRIMARY_PREDICT === "false";
+  const bgPrimaryPredict = !edPrimary;
   if (bgPrimaryPredict && isAuthoritative() && /^\d+$/.test(gameId)) {
     const reserve = reserveTargetForBg(targetGameIdForBg, gameId);
     bgReserved = reserve.owned;
@@ -669,11 +671,11 @@ export function normalizeCrashEnd(
 }
 
 /**
- * ED(N): PRIMARY N+1 prediction trigger (completed-round result path).
+ * ED(N): FALLBACK N+1 when BG missed ownership; always validates outcome N.
  * Crash N is observed, then N+1 is predicted and enqueued for immediate
  * delivery so the signal is ready before BG(N+1). attemptNPlusOnePrediction
  * remains the sole ownership boundary (dedup vs poll recovery / optional
- * legacy BG_PRIMARY_PREDICT). BG still stamps start + temporal-kills late
+ * ED_PRIMARY_PREDICT). BG still stamps start + temporal-kills late
  * signals for the started target.
  */
 export async function edHandler(payload: unknown): Promise<void> {
@@ -776,11 +778,29 @@ export async function edHandler(payload: unknown): Promise<void> {
 
     const targetGameId = nextTargetGameId(gameId);
     trace.targetGameId = targetGameId;
-    // Phase 2: attemptNPlusOnePrediction is the sole ownership boundary
-    // (claimTarget lives inside onGameEndPredict). ED no longer double-claims.
+    // BG-PRIMARY: ED must not race BG for N+1. Skip predict when BG already
+    // reserved/owned/terminal; validation of N still runs below.
+    const bgOwnsTarget = isBgOwnedOrTerminal(targetGameId);
     mark(trace, "target_claimed");
 
+    if (bgOwnsTarget) {
+      logger.info(
+        {
+          component: "game-event-handlers",
+          event: sourceEvent,
+          gameId,
+          targetGameId,
+          ownership_result: "bg_primary_skip_ed_predict",
+        },
+        "ED→N+1 skipped — BG already owns target (ED is fallback only)",
+      );
+    }
+
     try {
+      if (bgOwnsTarget) {
+        // Fall through to validation-only path below without predicting.
+        throw new Error("__BG_OWNED_SKIP_PREDICT__");
+      }
       const result = await attemptNPlusOnePrediction({
         sourceRoundId: gameId,
         sourceCrashAt: crashedAt,
@@ -851,28 +871,32 @@ export async function edHandler(payload: unknown): Promise<void> {
         }
       }
     } catch (error) {
-      // attemptNPlusOnePrediction already swallows and returns; this is defensive.
-      releaseTarget(targetGameId, `ed:${gameId}`);
       const err = error instanceof Error ? error : new Error(String(error));
-      logger.error(
-        {
-          event: sourceEvent,
-          gameId,
-          targetGameId,
+      if (err.message === "__BG_OWNED_SKIP_PREDICT__") {
+        // intentional — BG primary owns N+1
+      } else {
+        // attemptNPlusOnePrediction already swallows and returns; this is defensive.
+        releaseTarget(targetGameId, `ed:${gameId}`);
+        logger.error(
+          {
+            event: sourceEvent,
+            gameId,
+            targetGameId,
+            correlationId,
+            stage: (err as { stage?: string }).stage ?? "unknown",
+            errorName: err.name,
+            errorMessage: err.message,
+            errorStack: err.stack?.slice(0, 2000) ?? null,
+          },
+          "ED→N+1 prediction failed",
+        );
+        scheduleImmediateN1Recovery({
+          sourceRoundId: gameId,
+          sourceCrashAt: crashedAt,
+          sourceMultiplier: multiplier,
           correlationId,
-          stage: (err as { stage?: string }).stage ?? "unknown",
-          errorName: err.name,
-          errorMessage: err.message,
-          errorStack: err.stack?.slice(0, 2000) ?? null,
-        },
-        "ED→N+1 prediction failed",
-      );
-      scheduleImmediateN1Recovery({
-        sourceRoundId: gameId,
-        sourceCrashAt: crashedAt,
-        sourceMultiplier: multiplier,
-        correlationId,
-      });
+        });
+      }
     }
 
     // --- P2 DURABILITY / validation async (must not block signal) ---
@@ -997,7 +1021,7 @@ export function initializeEventHandlers(): void {
     );
   });
 
-  logger.info({ component: "game-event-handlers" }, "event handlers wired (ED-primary N+1, BG temporal + optional BG_PRIMARY_PREDICT)");
+  logger.info({ component: "game-event-handlers" }, "event handlers wired (BG-primary N+1, ED fallback + validation)");
 }
 
 /** Called by worker boot — native WS primary; socket.io optional fallback. */

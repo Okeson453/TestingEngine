@@ -16,7 +16,7 @@
  * reconnect) can complete the validation.
  */
 import { randomUUID } from "node:crypto";
-import { getSql, type Sql } from "@/lib/db";
+import { getSql, getCriticalSql, type Sql } from "@/lib/db";
 import { authoritativeNowMs } from "@/lib/prediction/live/clock-offset";
 import { runInTransaction, logSlowTxStages } from "@/lib/prediction/live/tx";
 import { getConfiguredChatIds } from "@/lib/notifications/telegram";
@@ -153,19 +153,31 @@ export async function onGameEnd(
   const getChatIds = deps.getChatIds ?? getConfiguredChatIds;
   const now = deps.now ?? Date.now;
 
-  // Fire N+1 prediction IMMEDIATELY — do not wait for validation TX.
-  // Under live WS, validation of N and predict N+1 must race in parallel or
-  // residual window collapses (logs: "too late" / "tight residual").
-  if (!evt.skipPredict) {
+  // BG-PRIMARY (default): N+1 is owned by BG; do not schedule a competing
+  // ED predict from the validator. ED_PRIMARY_PREDICT=1 restores this path.
+  const edPrimary =
+    process.env.ED_PRIMARY_PREDICT === "1" ||
+    process.env.ED_PRIMARY_PREDICT === "true" ||
+    process.env.BG_PRIMARY_PREDICT === "0" ||
+    process.env.BG_PRIMARY_PREDICT === "false";
+  if (!evt.skipPredict && edPrimary) {
     try {
       globalIncrementalState.update(evt.multiplier);
     } catch {
       /* soft */
     }
     scheduleNextPrediction(evt.gameId, evt.endTime, evt.multiplier, null);
+  } else if (!evt.skipPredict) {
+    try {
+      globalIncrementalState.update(evt.multiplier);
+    } catch {
+      /* soft */
+    }
   }
 
-  const sql = await getSqlFn();
+  // Critical pool: validation TX must not queue behind general-pool sweeps
+  // (prod: ~1s acquires on general while acquire_ms=0 on warm critical).
+  const sql = await (deps.getSqlFn ? getSqlFn() : getCriticalSql());
 
   // Step 1+2: anchor the round's crashed_at, then SELECT … FOR UPDATE
   // SKIP LOCKED to claim the pending row.
@@ -293,18 +305,8 @@ export async function onGameEnd(
           limit 1
         `;
         if (matchedRows.length > 0) {
-          // Already validated; record live_event_log and return.
-          await tx`
-            insert into live_event_log (
-              correlation_id, event_kind, game_id, payload, received_at, processed_at,
-              processor_latency_ms, sla_violated
-            ) values (
-              ${randomUUID()}::text, 'ED', ${evt.gameId},
-              ${JSON.stringify({ endTime: evt.endTime, multiplier: evt.multiplier })},
-              ${evt.receivedAt}::timestamptz, now(), 0, false
-            )
-            on conflict do nothing
-          `;
+          // Already validated — telemetry deferred (was a full Neon RTT
+          // inside the critical TX; ~200ms BEGIN-scale cost on every re-ED).
         } else if (!state.crashRow || state.crashRow.began_at == null) {
           // No crash_rounds.began_at → the bg event was missed entirely.
           // Mark as orphaned for the poll-worker to clean up later.
@@ -402,6 +404,10 @@ export async function onGameEnd(
         dispatchDelayMs: validationDelayMs,
       });
 
+      // LATENCY: only durable correctness writes in the TX (validation row +
+      // matched flag). live_event_log + validation Telegram outbox were
+      // sibling CTEs that added Neon RTT work inside body_ms (~590ms logs).
+      // They do not affect WIN/LOSS correctness and run post-commit.
       const validateOutcome = await tx<{
         inserted_prediction_id: string | null;
       }>`
@@ -430,38 +436,24 @@ export async function onGameEnd(
           where prediction_id = ${state.pending!.prediction_id}
             and exists (select 1 from ins)
           returning 1
-        ),
-        el as (
-          insert into live_event_log (
-            correlation_id, event_kind, game_id, payload, received_at, processed_at,
-            processor_latency_ms, sla_violated
-          ) values (
-            ${state.pending!.correlation_id ?? randomUUID()}::text, 'ED', ${evt.gameId},
-            ${JSON.stringify({ endTime: evt.endTime, multiplier: evt.multiplier, result })},
-            ${evt.receivedAt}::timestamptz, now(),
-            ${Math.max(0, now() - new Date(evt.receivedAt).getTime())},
-            false
-          )
-          on conflict do nothing
-        ),
-        ob as (
-          insert into notification_outbox (
-            notification_id, type, content, metadata, status, priority,
-            attempt_count, next_attempt_at, telegram_deadline_at
-          )
-          select
-            ${randomUUID()}::uuid, 'validation',
-            ${validationContent}, ${validationMetadata}::jsonb,
-            'pending', 2, 0,
-            ${valNextAttemptAt}::timestamptz, ${valDeadlineAt}::timestamptz
-          where exists (select 1 from ins)
-          returning 1
         )
         select (select prediction_id from ins) as inserted_prediction_id
       `;
       const alreadyValidated = validateOutcome[0]!.inserted_prediction_id == null;
-
-      // (ED live_event_log write moved into the el CTE above — pass 12.)
+      // Stash for post-commit validation notification enqueue.
+      (state as { _validationNotify?: {
+        content: string;
+        metadata: string;
+        nextAttempt: string;
+        deadline: string;
+        skip: boolean;
+      } })._validationNotify = {
+        content: validationContent,
+        metadata: validationMetadata,
+        nextAttempt: valNextAttemptAt,
+        deadline: valDeadlineAt,
+        skip: alreadyValidated,
+      };
     }, logSlowTxStages("validator.onGameEnd.persist"));
 
     // PASS 16: the TX committed, so the held prediction signal for N+1 is
@@ -473,6 +465,55 @@ export async function onGameEnd(
       void import("@/lib/prediction/live/outbox-wake")
         .then(({ notifyOutbox }) => notifyOutbox("prediction"))
         .catch(() => undefined);
+    }
+
+    // Post-commit: validation Telegram + event log (general pool, non-blocking)
+    const notify = (state as { _validationNotify?: {
+      content: string;
+      metadata: string;
+      nextAttempt: string;
+      deadline: string;
+      skip: boolean;
+    } })._validationNotify;
+    if (notify && !notify.skip && state.pending) {
+      const pendingId = state.pending.prediction_id;
+      const gameId = evt.gameId;
+      const content = notify.content;
+      const metadata = notify.metadata;
+      const nextAttempt = notify.nextAttempt;
+      const deadline = notify.deadline;
+      setImmediate(() => {
+        void (async () => {
+          try {
+            const gsql = await getSql();
+            await gsql`
+              insert into notification_outbox (
+                notification_id, type, content, metadata, status, priority,
+                attempt_count, next_attempt_at, telegram_deadline_at
+              ) values (
+                ${randomUUID()}::uuid, 'validation',
+                ${content}, ${metadata}::jsonb,
+                'pending', 2, 0,
+                ${nextAttempt}::timestamptz, ${deadline}::timestamptz
+              )
+              on conflict do nothing
+            `;
+            void import("@/lib/prediction/live/outbox-wake")
+              .then(({ notifyOutbox }) => notifyOutbox("normal"))
+              .catch(() => undefined);
+          } catch (err) {
+            logger.warn(
+              {
+                component: "live-validator",
+                gameId,
+                predictionId: pendingId,
+                error: String(err),
+              },
+              "deferred validation outbox enqueue failed (soft)",
+            );
+          }
+        })();
+      });
     }
   } catch (e) {
     // Fix 9: structured error telemetry — name, message, stack, game,

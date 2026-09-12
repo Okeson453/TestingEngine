@@ -160,6 +160,28 @@ export function markBgRunning(targetGameId: string, owner: string): void {
  * Respects priority: BG can claim over incomplete ED/RECOVERY;
  * ED/RECOVERY cannot steal from active BG reservation/running.
  */
+/** Read-only view of target ownership (no mutation). */
+export function peekTargetClaim(
+  targetGameId: string,
+): { source: "BG" | "ED" | "RECOVERY"; state: OwnershipState; completed: boolean; noBet?: boolean } | null {
+  const e = claims.get(targetGameId);
+  if (!e) return null;
+  return {
+    source: e.source,
+    state: e.state,
+    completed: e.completed,
+    noBet: e.noBet,
+  };
+}
+
+/** True when BG already reserved/owns or target is terminal (ED must not race). */
+export function isBgOwnedOrTerminal(targetGameId: string): boolean {
+  const e = claims.get(targetGameId);
+  if (!e) return false;
+  if (e.completed) return true;
+  return e.source === "BG";
+}
+
 export function claimTarget(targetGameId: string, owner: string): ClaimResult {
   prune();
   const source = parseSource(owner);
