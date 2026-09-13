@@ -14,6 +14,25 @@ import { pathToFileURL } from "node:url";
 import vm from "node:vm";
 import { registerProcessFailureHandlers } from "./worker-fatal.mjs";
 
+// Node writes ExperimentalWarning to stderr; platforms often tag stderr as
+// severity=error. We intentionally use --experimental-vm-modules / strip-types;
+// re-emit as structured info so operators don't treat it as a worker failure.
+process.on("warning", (warning) => {
+  if (warning?.name === "ExperimentalWarning") {
+    // eslint-disable-next-line no-console
+    console.log(
+      JSON.stringify({
+        level: "info",
+        time: new Date().toISOString(),
+        name: "node-warning",
+        msg: warning.message,
+        warningName: warning.name,
+        intentional: true,
+      }),
+    );
+  }
+});
+
 // Fix plan Phase 3: the wr_utils sandbox is a STARTUP REQUIREMENT in
 // production. Without --experimental-vm-modules the sign loader would fall
 // back to a privileged dynamic import of downloaded third-party code —

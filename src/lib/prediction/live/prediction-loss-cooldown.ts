@@ -159,10 +159,12 @@ export function resetLossCooldownForTests(): void {
 export function restoreLossCooldown(snap: Partial<LossCooldownSnapshot> | null | undefined): void {
   if (!snap) return;
   if (typeof snap.consecutivePredictionLosses === "number") {
+    // Telemetry only — never drives skipRemaining (one LOSS = one skip).
     consecutivePredictionLosses = Math.max(0, Math.floor(snap.consecutivePredictionLosses));
   }
   if (typeof snap.skipRemaining === "number") {
-    skipRemaining = Math.max(0, Math.floor(snap.skipRemaining));
+    // Cap at 1: never stack cooldown rounds from a restored counter.
+    skipRemaining = Math.min(1, Math.max(0, Math.floor(snap.skipRemaining)));
   }
   if (typeof snap.lossTargetGameId === "string") lossTargetGameId = snap.lossTargetGameId;
   if (typeof snap.skipTargetGameId === "string") skipTargetGameId = snap.skipTargetGameId;
@@ -170,6 +172,10 @@ export function restoreLossCooldown(snap: Partial<LossCooldownSnapshot> | null |
     for (const k of snap.seenValidationKeys.slice(-SEEN_MAX)) {
       if (typeof k === "string") seenValidations.add(k);
     }
+  }
+  // Re-apply ownership terminal so PR cannot reserve the skip target after restart.
+  if (skipRemaining > 0 && skipTargetGameId) {
+    markCooldownSkipTarget(skipTargetGameId);
   }
 }
 
@@ -202,12 +208,14 @@ export function noteValidatedPredictionOutcome(args: {
 
   // LOSS on issued prediction targeting N → mandatory skip of N+1 only.
   // Identity is the losing target (args.targetGameId), not "whatever is current".
+  // consecutivePredictionLosses is streak telemetry only; skipRemaining is
+  // always 0|1 (one confirmed LOSS → exactly one mandatory skip of N+1).
   consecutivePredictionLosses += 1;
   const lossN = args.targetGameId;
   const next = nextNumericId(lossN);
   lossTargetGameId = lossN;
   skipTargetGameId = next;
-  skipRemaining = Math.max(skipRemaining, 1);
+  skipRemaining = 1;
 
   logger.info(
     {
