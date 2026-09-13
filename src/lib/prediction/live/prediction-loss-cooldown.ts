@@ -199,25 +199,94 @@ export function noteValidatedPredictionOutcome(args: {
     return;
   }
 
-  // LOSS: exactly one mandatory skip of the next target round.
+  // LOSS on issued prediction targeting N → mandatory skip of N+1 only.
+  // Identity is the losing target (args.targetGameId), not "whatever is current".
   consecutivePredictionLosses += 1;
-  const next = nextNumericId(args.targetGameId);
-  lossTargetGameId = args.targetGameId;
+  const lossN = args.targetGameId;
+  const next = nextNumericId(lossN);
+  lossTargetGameId = lossN;
   skipTargetGameId = next;
   skipRemaining = Math.max(skipRemaining, 1);
 
   logger.info(
     {
       component: "prediction-loss-cooldown",
+      event: "COOLDOWN_ARMED",
       predictionId: args.predictionId,
-      lossTargetGameId: args.targetGameId,
+      lossTargetGameId: lossN,
       skipTargetGameId: next,
       skipRemaining,
       consecutivePredictionLosses,
     },
-    `prediction LOSS — cooldown armed: skip next betting round target=${next ?? "next-attempt"}`,
+    `prediction LOSS — cooldown armed: skip next betting round target=${next ?? "next-attempt"} (loss_on=${lossN})`,
   );
   schedulePersist();
+}
+
+/**
+ * PR-primary race: prediction for N+1 is often issued at PR(N) *before*
+ * ED(N) validates LOSS on the issued prediction for N. After arming, kill
+ * undelivered outbox rows and retire unmatched pending for the skip target
+ * so no betting signal remains live. History/crash ingestion for N+1 is
+ * unaffected (validator still records the round).
+ */
+export async function suppressCooldownTargetBetting(
+  sql: Sql,
+  skipTarget: string,
+  lossTarget: string,
+): Promise<{ outboxKilled: number; pendingRetired: number }> {
+  let outboxKilled = 0;
+  let pendingRetired = 0;
+  try {
+    const killed = await sql<{ notification_id: string }>`
+      UPDATE notification_outbox
+      SET status = 'dead_letter',
+          last_error = ${`loss_cooldown_suppress: LOSS on ${lossTarget} requires skip of ${skipTarget}`},
+          updated_at = now()
+      WHERE type = 'prediction'
+        AND target_game_id = ${skipTarget}
+        AND status IN ('pending', 'inflight')
+      RETURNING notification_id
+    `;
+    outboxKilled = killed.length;
+  } catch (e) {
+    logger.warn(
+      { skipTarget, lossTarget, error: String(e) },
+      "cooldown outbox suppress failed (soft)",
+    );
+  }
+  try {
+    // Retire unmatched pending so ED(N+1) does not grade a suppressed bet.
+    // matched=true without a validation row is intentional — cooldown skip,
+    // not a WIN/LOSS. Prevents re-arming cooldown from a phantom grade.
+    const retired = await sql<{ prediction_id: string }>`
+      UPDATE pending_predictions
+      SET matched = true,
+          matched_at = now(),
+          matched_game_id = target_game_id
+      WHERE target_game_id = ${skipTarget}
+        AND matched = false
+      RETURNING prediction_id
+    `;
+    pendingRetired = retired.length;
+  } catch (e) {
+    logger.warn(
+      { skipTarget, lossTarget, error: String(e) },
+      "cooldown pending retire failed (soft)",
+    );
+  }
+  logger.info(
+    {
+      component: "prediction-loss-cooldown",
+      event: "COOLDOWN_SUPPRESS",
+      skipTarget,
+      lossTarget,
+      outboxKilled,
+      pendingRetired,
+    },
+    `COOLDOWN_SUPPRESS target=${skipTarget} after LOSS on ${lossTarget} outbox_killed=${outboxKilled} pending_retired=${pendingRetired}`,
+  );
+  return { outboxKilled, pendingRetired };
 }
 
 /**

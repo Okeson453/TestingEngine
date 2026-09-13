@@ -1744,6 +1744,16 @@ export async function onGameEndPredict(
     const vetoReason = skipCheck.reason;
     if (skip && vetoReason === "loss_cooldown") {
       consumeLossCooldownSkip(targetGameId);
+      logger.info(
+        {
+          component: "live-predictor",
+          event: "COOLDOWN_SKIP",
+          targetGameId,
+          correlationId,
+          probability: p,
+        },
+        `COOLDOWN_SKIP — mandatory post-LOSS skip target=${targetGameId} (no betting signal; history still updates)`,
+      );
     }
     // Tier separation (directive 17:27Z): five-state taxonomy, pure function
     // of the probability. p >= PREDICTION_FLOOR is RECORDED (durable audit

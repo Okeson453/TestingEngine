@@ -176,4 +176,44 @@ describe("prediction-loss-cooldown", () => {
     expect(g.reason).toBe("strategy_veto");
     expect(getLossCooldownState().skipRemaining).toBe(0);
   });
+
+  it("LOSS on N arms skip of N+1 exactly (not current/processing round)", () => {
+    noteValidatedPredictionOutcome({
+      predictionId: "issued-n",
+      targetGameId: "9607070",
+      result: "LOSS",
+    });
+    const s = getLossCooldownState();
+    expect(s.lossTargetGameId).toBe("9607070");
+    expect(s.skipTargetGameId).toBe("9607071");
+    expect(shouldForceLossCooldownSkip("9607071").skip).toBe(true);
+    expect(shouldForceLossCooldownSkip("9607072").skip).toBe(false);
+  });
+
+  it("N+2 resumes after N+1 skip consumed (PR-primary sequence)", () => {
+    noteValidatedPredictionOutcome({
+      predictionId: "p-n",
+      targetGameId: "9607070",
+      result: "LOSS",
+    });
+    expect(
+      shouldSkipReason({
+        probability: 0.92,
+        confidence: 0.99,
+        targetGameId: "9607071",
+        minProbability: 0.65,
+        minEdge: 0,
+      }).reason,
+    ).toBe("loss_cooldown");
+    consumeLossCooldownSkip("9607071");
+    expect(
+      shouldSkipReason({
+        probability: 0.7,
+        confidence: 0.9,
+        targetGameId: "9607072",
+        minProbability: 0.65,
+        minEdge: 0,
+      }).skip,
+    ).toBe(false);
+  });
 });

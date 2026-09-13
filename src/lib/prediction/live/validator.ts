@@ -29,6 +29,8 @@ import { processResolvedPredictionFeedback } from "@/lib/prediction/live/feedbac
 import {
   noteValidatedPredictionOutcome,
   noteRoundCompletedForCooldown,
+  getLossCooldownState,
+  suppressCooldownTargetBetting,
 } from "@/lib/prediction/live/prediction-loss-cooldown";
 
 const logger = getLogger("live-validator");
@@ -468,14 +470,34 @@ export async function onGameEnd(
         select (select prediction_id from ins) as inserted_prediction_id
       `;
       const alreadyValidated = validateOutcome[0]!.inserted_prediction_id == null;
-      // Prediction-loss cooldown: only first confirmed validation of this
-      // pending row arms/clears the state machine (duplicates are no-ops).
+      // Prediction-loss cooldown: only first confirmed validation of an
+      // ISSUED pending row arms/clears the machine (duplicates are no-ops).
       if (!alreadyValidated && state.pending) {
         noteValidatedPredictionOutcome({
           predictionId: state.pending.prediction_id,
           targetGameId: evt.gameId,
           result,
         });
+        // PR-primary race: N+1 may already have an outbox/pending row from
+        // PR(N) before ED(N) validated LOSS. Suppress those betting artifacts
+        // immediately so the skip target cannot remain a live signal.
+        if (result === "LOSS") {
+          const cd = getLossCooldownState();
+          if (cd.skipTargetGameId) {
+            const skipT = cd.skipTargetGameId;
+            const lossT = cd.lossTargetGameId ?? evt.gameId;
+            setImmediate(() => {
+              void (async () => {
+                try {
+                  const generalSql = await getSql();
+                  await suppressCooldownTargetBetting(generalSql, skipT, lossT);
+                } catch {
+                  /* soft — in-memory skip still blocks new attempts */
+                }
+              })();
+            });
+          }
+        }
       }
       // Always observe round completion for cooldown clear (idempotent).
       noteRoundCompletedForCooldown(evt.gameId);
