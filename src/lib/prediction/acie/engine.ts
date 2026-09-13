@@ -470,7 +470,7 @@ export class ACIEEngine {
       currentExposure: riskState?.currentExposure ?? 0,
       consecutiveLosses: riskState?.consecutiveLosses ?? this.consecutiveLosses,
       dailyEntriesUsed: riskState?.dailyEntriesUsed ?? 0,
-      dailyEntriesLimit: riskState?.dailyEntriesLimit ?? 500,
+      dailyEntriesLimit: riskState?.dailyEntriesLimit ?? 1500,
       balance: riskState?.balance ?? 0,
     };
 

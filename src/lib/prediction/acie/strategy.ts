@@ -156,9 +156,14 @@ export class StrategyLayer {
     // Regime-adaptive + mild loss-streak threshold escalation (only after reduceAt)
     threshold = this.regimeAdjustedThreshold(threshold, regime, ctx);
 
-    // Soft daily pacing
+    // Daily volume: hard stop at limit (product max 1500/day), soft pacing before.
     const used = riskState.dailyEntriesUsed ?? 0;
-    const limit = riskState.dailyEntriesLimit ?? 500;
+    const limit = riskState.dailyEntriesLimit ?? 1500;
+    if (limit > 0 && used >= limit) {
+      return this.skip(
+        `Daily signal volume limit reached: ${used}/${limit}.`,
+      );
+    }
     if (limit > 0 && used / limit > 0.85) {
       threshold += 0.03;
     } else if (
