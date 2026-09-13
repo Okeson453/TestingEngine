@@ -218,21 +218,19 @@ export async function reconcileForensicOutcomes(
       const raw = Number(process.env.FORENSIC_AUDIT_WINDOW_MINUTES ?? 15);
       return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 15;
     })();
+    // Prefer live_round_state / pending_predictions only — crash_rounds
+    // LATERAL was a sequential per-row lookup that dominated REPAIR cost
+    // (~500ms) when the partial index missed AWAITING_TARGET_START rows.
     const selectColumns = `
       SELECT o.notification_id, o.telegram_accepted_at, o.delivery_outcome,
              o.metadata, o.created_at, o.dispatch_claimed_at,
              o.send_started_at, o.target_game_id,
-             COALESCE(p.target_round_started_at, lrs.began_at, cr.began_at) AS target_started_at
+             COALESCE(p.target_round_started_at, lrs.began_at) AS target_started_at
       FROM notification_outbox o
       LEFT JOIN pending_predictions p
-        ON p.prediction_id = o.metadata->>'predictionId'
+        ON p.prediction_id = (o.metadata->>'predictionId')
       LEFT JOIN live_round_state lrs
         ON lrs.game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId')
-      LEFT JOIN LATERAL (
-        SELECT began_at FROM crash_rounds
-        WHERE game_id = coalesce(o.target_game_id, o.metadata->>'targetGameId')
-        ORDER BY began_at DESC LIMIT 1
-      ) cr ON true
     `;
     type ForensicRow = {
       notification_id: string;
@@ -261,15 +259,17 @@ export async function reconcileForensicOutcomes(
       [repairHours, batchSize],
     );
 
-    // AUDIT scan: recently-delivered, optimistically-classified rows —
-    // the only place a "masked LATE" can still be hiding. 15 minutes.
+    // AUDIT: only ON_TIME without a measured lead (possible optimistic
+    // misclassification). EARLY with lead_time_ms is terminal for PR-primary
+    // (large lead is expected — delivery is minutes before target start).
     const auditRows = await sql.query<ForensicRow>(
       `${selectColumns}
       WHERE o.type = 'prediction'
         AND o.status = 'delivered'
         AND o.telegram_accepted_at IS NOT NULL
         AND o.delivered_at > now() - ($1::int * interval '1 minute')
-        AND o.delivery_outcome IN ('ON_TIME', 'EARLY')
+        AND o.delivery_outcome = 'ON_TIME'
+        AND o.lead_time_ms IS NULL
       ORDER BY o.delivered_at DESC NULLS LAST
       LIMIT $2`,
       [auditMinutes, batchSize],
@@ -602,7 +602,9 @@ export async function reclassifyOnTargetStart(
               ? c.meta.predictionComputeMs
               : null,
         },
-        `PREDICTION_DELIVERY_FORENSICS ${c.outcome} lead_ms=${c.leadTimeMs ?? "n/a"} (target_start_reconcile; delivery stamps unchanged trigger=${triggerEvent ?? "n/a"})`,
+        // PR-primary: delivery at PR(N-1) is often 20–70s before BG(N).
+        // EARLY with large lead_ms is the healthy outcome, not a clock bug.
+        `PREDICTION_DELIVERY_FORENSICS ${c.outcome} lead_ms=${c.leadTimeMs ?? "n/a"} target=${targetGameId} (target_start_reconcile; accepted_at immutable; PR-primary large lead expected trigger=${triggerEvent ?? "n/a"})`,
       );
     }
 

@@ -61,6 +61,21 @@ describe("classifyDelivery", () => {
     expect(r.unknownReason).toBeNull();
   });
 
+  it("PR-primary large lead (20–70s) classifies EARLY without mutating acceptance", () => {
+    // Delivery at PR(N-1); target starts at BG(N) often 20–70s later.
+    const accepted = 1_000_000;
+    const targetStart = accepted + 29_059;
+    const r = classifyDelivery({
+      telegramAcceptedAtMs: accepted,
+      targetStartedAtMs: targetStart,
+      outboxStatus: "delivered",
+    });
+    expect(r.outcome).toBe("EARLY");
+    expect(r.leadTimeMs).toBe(29_059);
+    // Immutable acceptance: classification uses the same accepted ms.
+    expect(r.unknownReason).toBeNull();
+  });
+
   it("UNKNOWN only when acceptance stamp is missing", () => {
     const r = classifyDelivery({
       telegramAcceptedAtMs: null,
@@ -85,9 +100,11 @@ describe("reconcileForensicOutcomes (durable forensic retry)", () => {
         // pg Result is an array subclass (iterable + rowCount) — spread-consumed
         // by the sweep ([...repairRows, ...auditRows]). Route by scan semantics
         // so a row is returned by exactly one scan, like the real partial
-        // indexes: REPAIR targets NULL/UNKNOWN/AWAITING_TARGET_START,
-        // AUDIT targets ON_TIME/EARLY.
-        const isAudit = text.includes("IN ('ON_TIME', 'EARLY')");
+        // REPAIR: NULL/UNKNOWN/AWAITING_TARGET_START
+        // AUDIT: ON_TIME with no lead yet (EARLY+lead is terminal for PR-primary)
+        const isAudit =
+          text.includes("delivery_outcome = 'ON_TIME'") ||
+          text.includes("IN ('ON_TIME', 'EARLY')");
         const matched = seedRows.filter((r) =>
           isAudit
             ? r.delivery_outcome === "ON_TIME" || r.delivery_outcome === "EARLY"
