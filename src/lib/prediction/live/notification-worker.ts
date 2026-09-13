@@ -27,6 +27,7 @@ import { getLogger } from "@/lib/observability/logger";
 import { isAuthoritative } from "@/lib/prediction/live/fencing";
 import { isTargetPastBettingWindow } from "@/lib/prediction/live/live-round-registry";
 import { getWakeStats, notifyOutbox, waitForOutboxWake } from "@/lib/prediction/live/outbox-wake";
+import { notePredictionOutboxCleared } from "@/lib/prediction/live/outbox-pending-targets";
 
 const logger = getLogger("outbox-dispatcher");
 
@@ -941,6 +942,9 @@ export class OutboxDispatcher {
               console.log(
                 `[outbox] delivered type=${row.type} notification=${row.notification_id} prediction=${(row.metadata as Record<string, unknown> | null)?.predictionId ?? "n/a"} correlation=${(row.metadata as Record<string, unknown> | null)?.correlationId ?? "n/a"} target=${row.target_game_id ?? (row.metadata as Record<string, unknown> | null)?.gameId ?? "n/a"} source=${(row.metadata as Record<string, unknown> | null)?.sourceGameId ?? "n/a"} attempt=${row.attempt_count} claim_to_send_ms=${lc.sendStartedMs != null ? Math.max(0, Math.round(lc.sendStartedMs - lc.claimClientMs)) : "n/a"} send_to_accept_ms=${lc.telegramAcceptedMs != null && lc.sendStartedMs != null ? Math.round(lc.telegramAcceptedMs - lc.sendStartedMs) : "n/a"}`,
               );
+              if (row.type === "prediction" && row.target_game_id) {
+                notePredictionOutboxCleared(String(row.target_game_id));
+              }
               logger.info(
                 {
                   component: "outbox-dispatcher",

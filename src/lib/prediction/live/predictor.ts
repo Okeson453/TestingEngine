@@ -64,6 +64,8 @@ import {
   shouldForceLossCooldownSkip,
   consumeLossCooldownSkip,
 } from "@/lib/prediction/live/prediction-loss-cooldown";
+import { notePredictionOutboxEnqueued } from "@/lib/prediction/live/outbox-pending-targets";
+import { classifyPersistBudget } from "@/lib/prediction/live/latency-budgets";
 
 const logger = getLogger("live-predictor");
 // SYNTAX_GUARD_20260906: file must parse under node --experimental-strip-types
@@ -2153,6 +2155,7 @@ export async function onGameEndPredict(
       pendingWasDuplicate = true;
     } else {
       outboxEnqueued = 1;
+      notePredictionOutboxEnqueued(targetGameId);
     }
 
     // live_event_log outside TX (not required for correctness / delivery).
@@ -2236,6 +2239,11 @@ export async function onGameEndPredict(
     try { completeTarget(targetGameId, owner); } catch { /* soft */ }
 
     const persistMs = Number((performance.now() - t4).toFixed(2));
+    const persistBudget = classifyPersistBudget({
+      persistMs,
+      poolWaitMs,
+      txMs,
+    });
     logger.info(
       {
         component: "live-predictor",
@@ -2246,6 +2254,7 @@ export async function onGameEndPredict(
         persistenceMs: persistMs,
         poolWaitMs,
         txMs,
+        persist_budget: persistBudget,
         claimMs: Number((t1 - t0).toFixed(2)),
         historyMs: Number((t2 - t1).toFixed(2)),
         predictionComputeMs: Number((t3 - t2).toFixed(2)),

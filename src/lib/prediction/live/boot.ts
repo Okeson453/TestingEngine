@@ -677,6 +677,28 @@ class LiveBoot {
       );
     }
 
+    // Seed undelivered prediction outbox targets so BG kill can skip Neon RTT
+    // when nothing is pending (restart-safe: empty set forces SQL kill until hydrate).
+    try {
+      const {
+        notePredictionOutboxEnqueued,
+        markOutboxPendingTargetsHydrated,
+      } = await import("@/lib/prediction/live/outbox-pending-targets");
+      const pending = await sql<{ target_game_id: string }>`
+        SELECT target_game_id FROM notification_outbox
+        WHERE type = 'prediction'
+          AND status IN ('pending', 'inflight')
+          AND target_game_id IS NOT NULL
+        LIMIT 50
+      `.catch(() => [] as { target_game_id: string }[]);
+      for (const r of pending) {
+        if (r.target_game_id) notePredictionOutboxEnqueued(String(r.target_game_id));
+      }
+      markOutboxPendingTargetsHydrated();
+    } catch {
+      /* soft — BG kill falls back to full SQL */
+    }
+
     // ── 6. HOT history warm — barrier before LIVE_N1_READY ──
     // Root-cause fix: never accept N+1-requiring events until MIN_HISTORY
     // is in the in-memory buffer. This eliminates the race:

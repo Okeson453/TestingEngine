@@ -48,6 +48,10 @@ import {
   consumeLossCooldownSkip,
 } from "@/lib/prediction/live/prediction-loss-cooldown";
 import {
+  shouldSkipBgTemporalKillDb,
+  notePredictionOutboxCleared,
+} from "@/lib/prediction/live/outbox-pending-targets";
+import {
   startTrace,
   mark,
   markAt,
@@ -468,26 +472,23 @@ export async function bgHandler(payload: unknown): Promise<void> {
     // network/query RTT on an already-available client. Contention would show
     // kill_checkout_ms ≫ 0 and waitingCount > 0 on the pool.
     const killCheckoutT0 = mono();
-    const killSql = await getCriticalSql();
-    const killCheckoutMs = Math.round(mono() - killCheckoutT0);
-    const killQueryT0 = mono();
     let signalsKilled = 0;
-    try {
-      const killRows = await killSql`
-        UPDATE notification_outbox
-        SET status = 'dead_letter',
-            last_error = 'expired_late_signal: target round started (BG received)'
-        WHERE type = 'prediction'
-          AND status IN ('pending', 'inflight')
-          AND target_game_id = ${gameId}
-        RETURNING 1
-      `;
-      signalsKilled = killRows.length;
-    } catch (killErr1) {
-      logger.warn(
-        { event: "bg", gameId, error: String(killErr1), attempt: 1 },
-        `BG temporal kill failed — retrying once: ${String(killErr1).slice(0, 300)}`,
+    let killCheckoutMs = 0;
+    let killQueryMs = 0;
+    // Skip Neon RTT when this process has no undelivered prediction for the
+    // target (common case: PR already delivered → killed=0 every time).
+    // After restart the set is cold → still run DB kill until hydrated.
+    if (shouldSkipBgTemporalKillDb(gameId)) {
+      killCheckoutMs = Math.round(mono() - killCheckoutT0);
+      killQueryMs = 0;
+      logger.info(
+        { event: "bg", gameId, correlationId, kill_skipped: true },
+        `[bg] kill leg skipped — no undelivered prediction outbox for target=${gameId}`,
       );
+    } else {
+      const killSql = await getCriticalSql();
+      killCheckoutMs = Math.round(mono() - killCheckoutT0);
+      const killQueryT0 = mono();
       try {
         const killRows = await killSql`
           UPDATE notification_outbox
@@ -499,15 +500,33 @@ export async function bgHandler(payload: unknown): Promise<void> {
           RETURNING 1
         `;
         signalsKilled = killRows.length;
-      } catch (killErr2) {
-        logger.error(
-          { event: "bg", gameId, error: String(killErr2), attempt: 2 },
-          `BG temporal kill FAILED after retry — dispatcher claim-time auth is the backstop: ${String(killErr2).slice(0, 300)}`,
+      } catch (killErr1) {
+        logger.warn(
+          { event: "bg", gameId, error: String(killErr1), attempt: 1 },
+          `BG temporal kill failed — retrying once: ${String(killErr1).slice(0, 300)}`,
         );
+        try {
+          const killRows = await killSql`
+            UPDATE notification_outbox
+            SET status = 'dead_letter',
+                last_error = 'expired_late_signal: target round started (BG received)'
+            WHERE type = 'prediction'
+              AND status IN ('pending', 'inflight')
+              AND target_game_id = ${gameId}
+            RETURNING 1
+          `;
+          signalsKilled = killRows.length;
+        } catch (killErr2) {
+          logger.error(
+            { event: "bg", gameId, error: String(killErr2), attempt: 2 },
+            `BG temporal kill FAILED after retry — dispatcher claim-time auth is the backstop: ${String(killErr2).slice(0, 300)}`,
+          );
+        }
       }
+      killQueryMs = Math.round(mono() - killQueryT0);
+      if (signalsKilled > 0) notePredictionOutboxCleared(gameId);
     }
     reconcileMs = Date.now() - reconcileT0;
-    const killQueryMs = Math.round(mono() - killQueryT0);
     const killAcquireMs = killCheckoutMs; // alias retained for log field compat
 
     // ── Leg 2: lifecycle bookkeeping (general pool, detached) ──
