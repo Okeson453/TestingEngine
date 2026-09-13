@@ -1,11 +1,12 @@
 /**
  * BC.Game native WS → live prediction pipeline.
  *
- * Architecture (2026-09-13 restore BG-primary):
- *   BG(N)  → PRIMARY N+1 prediction at round-start (authoritative)
- *   PR(N)  → optional early path only when PR_PRIMARY_PREDICT=1/true (default OFF)
- *   ED(N)  → FALLBACK N+1 only if primary did not own target; validation of N
- * Opt out of BG primary: ED_PRIMARY_PREDICT=1 or BG_PRIMARY_PREDICT=0
+ * Wire: pr=betting-open, bg=round-start (~7s later upstream), ed=crash.
+ * Architecture:
+ *   PR(N)  → PRIMARY N+1 at betting-open (earliest valid; default ON)
+ *   BG(N)  → CONFIRM (temporal kill + lifecycle); N+1 only if PR missed
+ *   ED(N)  → FALLBACK if primary did not own target; validation of N
+ * Opt out of PR: PR_PRIMARY_PREDICT=0  |  Opt out of primary tier: BG_PRIMARY_PREDICT=0
  * Poll   → recovery only
  */
 import { randomUUID } from "node:crypto";
@@ -656,13 +657,13 @@ export async function bgHandler(payload: unknown): Promise<void> {
 }
 
 /**
- * PR (prepare — betting opens) — OPTIONAL early N+1 path.
+ * PR (prepare — betting opens) — PRIMARY N+1 path (default ON).
  *
- * Default OFF (PR_PRIMARY_PREDICT unset/false). When enabled, may reserve and
- * predict ~7s before BG; BG remains the intended authoritative path when PR
- * is disabled. Does NOT write began_at or noteRoundStarted — BG remains the
- * sole round-start authority for temporal kill / registry. Does NOT run
- * temporal kill (would dead-letter signals ~7s early).
+ * BC.Game wire: pr is betting-open for round N; bg is round-start ~7s later.
+ * Predicting N+1 at PR is the earliest valid moment (no N outcome leakage).
+ * Does NOT write began_at / noteRoundStarted — BG remains sole round-start
+ * authority for temporal kill. Does NOT run temporal kill (would dead-letter
+ * signals ~7s early). Opt out: PR_PRIMARY_PREDICT=0.
  */
 export async function prHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
@@ -729,8 +730,8 @@ export async function prHandler(payload: unknown): Promise<void> {
     logger.info(
       { event: "pr", gameId, correlationId, targetGameId, prReserved },
       prPrimary
-        ? "bc pr (betting-open) observed — PR early N+1 enabled; expect bg ~7s later (upstream window)"
-        : "bc pr (betting-open) observed — PR early path disabled; BG remains authoritative N+1",
+        ? "bc pr (betting-open) observed — PR-primary N+1 trigger; expect bg ~7s later (upstream window)"
+        : "bc pr (betting-open) observed — PR primary disabled; BG remains authoritative N+1",
     );
 
     // PRIMARY N+1: fire concurrently with the detached log write.

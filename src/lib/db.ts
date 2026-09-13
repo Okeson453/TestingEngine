@@ -392,8 +392,11 @@ function makeRun(
       // is post-completion and cannot show waiters).
       const loopLag = Math.round(maxLoopLagBetween(t0Perf, performance.now()));
       const newConn = pool.totalCount > totalBefore ? 1 : 0;
+      // new_conn=1 ⇒ wall time is TLS+auth (not pool-slot wait).
+      // new_conn=0 + waiting>0 ⇒ true pool contention.
+      // new_conn=0 + loop_lag≈acquire ⇒ event-loop starved the continuation.
       console.warn(
-        `[db] ${label} pool_acquire_ms=${acquireMs} loop_lag_ms=${loopLag} new_conn=${newConn} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} | during: maxTotal=${maxTotal} maxIdle=${maxIdle} maxWaiting=${maxWaiting}`,
+        `[db] ${label} pool_acquire_ms=${acquireMs} loop_lag_ms=${loopLag} new_conn=${newConn}${newConn ? " (TLS/connect create, not pool wait)" : ""} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} | during: maxTotal=${maxTotal} maxIdle=${maxIdle} maxWaiting=${maxWaiting}`,
       );
     }
     try {
@@ -531,20 +534,22 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   // Neon TLS+auth while "idle" clients were still being built.
   //
   // Await warm BEFORE createNeonPools returns so getSql() never resolves
-  // onto a cold pool. Prod 05:56Z still showed new_conn=1 acquires after
-  // min-only prewarm (critical 2→3→4, general 3→5→6) during background
-  // hydration concurrency — each growth paid ~1.1–1.3s TLS. Prewarm to
-  // max (not a max increase: max stays 4/6) so steady-state never creates
-  // sockets on the hot path. Parallel critical+general is network-bound.
+  // onto a cold pool. Prewarm to max (max stays 4/6 — not a size increase).
+  //
+  // Prod 05:56Z: sequential connect×SELECT1 made general prewarm ~4001ms
+  // (≈ n × Neon TLS RTT). Parallelize ALL connects within each pool so wall
+  // time ≈ one RTT (~1.3s), not n×RTT. Critical+general still run in parallel.
   const warm = async (pool: import("pg").Pool, label: string, n: number) => {
-    const clients: import("pg").PoolClient[] = [];
     const t0 = Date.now();
+    let clients: import("pg").PoolClient[] = [];
     try {
-      for (let i = 0; i < n; i++) {
-        const c = await pool.connect();
-        await c.query("select 1");
-        clients.push(c);
-      }
+      clients = await Promise.all(
+        Array.from({ length: n }, async () => {
+          const c = await pool.connect();
+          await c.query("select 1");
+          return c;
+        }),
+      );
       console.log(
         `[db] ${label} prewarmed clients=${clients.length}/${n} ms=${Date.now() - t0}`,
       );

@@ -150,16 +150,13 @@ async function ensureMigrations() {
 }
 
 // ROOT CAUSE (17:25 logs): pool_acquire≈1055ms with waiting=0 is Neon
-// TLS+auth on first connect, NOT pool contention. Pay that cost in pure JS
-// before strip-types compiles the app graph (event_loop_lag≈1475ms class),
-// so network progress is not blocked behind synchronous TS compile.
+// TLS+auth on first connect, NOT pool contention. Start preconnect in
+// parallel with strip-types compile so network RTT overlaps CPU work
+// (prod 05:56Z paid 1347ms then 657ms serially — waste of wall clock).
 const { neonPreconnect } = await import("./neon-preconnect.mjs");
-await neonPreconnect();
+const preconnectP = neonPreconnect();
 
-// P2 (sep 12 pass 4): THIS is where the ~1.5s boot event-loop stall lives.
-// These dynamic imports compile the TypeScript app graph under
-// --experimental-strip-types — synchronous CPU, boot-window only. Measure
-// each import so the stall is attributed by construction.
+// P2 (sep 12 pass 4): strip-types compile of the app graph (boot-window CPU).
 const appImportT0 = Date.now();
 const tDb0 = Date.now();
 const db = await import("@/lib/db");
@@ -175,6 +172,8 @@ console.log(
   `[worker] app module graph import ms=${Date.now() - appImportT0} (strip-types compile — the boot event_loop_lag class)`,
 );
 const edgeHttp = await import("@/lib/prediction/live/edge-http");
+// Join preconnect after imports so TLS session is warm before migrations/getSql.
+await preconnectP;
 
 let shuttingDown = false;
 

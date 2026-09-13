@@ -27,15 +27,19 @@ export type PredictionSource = "ED" | "RECOVERY" | "BG" | "PR";
 /**
  * SINGLE SOURCE OF TRUTH for primary-tier N+1 prediction.
  *
- * Intended architecture (restored 2026-09-13):
- *   BG(N) PRIMARY  — authoritative N+1 prediction at round-start
- *   PR(N) OPTIONAL — early precompute only when PR_PRIMARY_PREDICT=1/true;
- *                    must not default-own targets or force BG into confirmation-only
- *   ED(N) FALLBACK — never races a primary-owned target
+ * Wire semantics (native BC.Game WS, proven by frame stamps):
+ *   pr = betting-open for round N  (prepare)
+ *   bg = round-start for round N   (~7s after pr — game-side betting window)
+ *   ed = crash of round N
+ * frame_to_event_ms≈0.05–0.15 (our dispatch); pr_to_bg_ms≈7s is upstream only.
  *
- * Opt out of BG primary via ED_PRIMARY_PREDICT=1/true or BG_PRIMARY_PREDICT=0/false.
- * PR is OFF by default — prod logs showed PR permanently owning N+1 and
- * suppressing BG recomputation (BG confirmation only / no_bet_terminal).
+ * Architecture (PR restored after wire proof):
+ *   PR(N) PRIMARY  — N+1 at earliest valid betting-open; signal before BG
+ *   BG(N) CONFIRM  — temporal kill + lifecycle; N+1 only if PR missed
+ *   ED(N) FALLBACK — never races a primary-owned / terminal target
+ *
+ * Opt out of primary tier via ED_PRIMARY_PREDICT=1 or BG_PRIMARY_PREDICT=0.
+ * Opt out of PR only via PR_PRIMARY_PREDICT=0 (BG becomes sole primary).
  */
 export function bgPrimaryEnabled(): boolean {
   return !(
@@ -47,14 +51,14 @@ export function bgPrimaryEnabled(): boolean {
 }
 
 /**
- * PR early path is opt-in only. Default false so BG remains the sole
- * authoritative primary unless an operator explicitly enables PR.
+ * PR primary defaults ON when BG primary is on — PR is the earliest valid
+ * betting-open event for N+1. Set PR_PRIMARY_PREDICT=0 to force BG-only.
  */
 export function prPrimaryEnabled(): boolean {
   if (!bgPrimaryEnabled()) return false;
-  return (
-    process.env.PR_PRIMARY_PREDICT === "1" ||
-    process.env.PR_PRIMARY_PREDICT === "true"
+  return !(
+    process.env.PR_PRIMARY_PREDICT === "0" ||
+    process.env.PR_PRIMARY_PREDICT === "false"
   );
 }
 
