@@ -602,7 +602,7 @@ export async function reclassifyOnTargetStart(
               ? c.meta.predictionComputeMs
               : null,
         },
-        `PREDICTION_DELIVERY_FORENSICS ${c.outcome} (target_start_reconcile trigger=${triggerEvent ?? "n/a"})`,
+        `PREDICTION_DELIVERY_FORENSICS ${c.outcome} lead_ms=${c.leadTimeMs ?? "n/a"} (target_start_reconcile; delivery stamps unchanged trigger=${triggerEvent ?? "n/a"})`,
       );
     }
 

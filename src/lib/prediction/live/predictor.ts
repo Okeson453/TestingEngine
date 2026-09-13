@@ -29,7 +29,12 @@ import {
   recordWatch,
 } from "@/lib/prediction/live/funnel-metrics";
 import type { Trace } from "@/lib/prediction/live/latency-trace";
-import { predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
+import { mark as markTrace, predictionLifecycleCounters } from "@/lib/prediction/live/latency-trace";
+import {
+  appendCompletedRound,
+  getPriorRoundsSync,
+  isHistoryReadyForPrediction,
+} from "@/lib/prediction/live/live-history-buffer";
 import { getSql, getPredictionPersistSql, getPgPool, getLastPoolAcquireMs, type Sql } from "@/lib/db";
 import { runInTransaction, logSlowTxStages, type TxStageTimings } from "@/lib/prediction/live/tx";
 import { PredictionEngine } from "@/lib/prediction/prediction-engine";
@@ -1482,11 +1487,11 @@ export async function onGameEndPredict(
   // for the poll-worker path which calls onGameEndPredict directly.
   // BG-PRIMARY: the source round N has NOT crashed — appending it would
   // corrupt the history buffer with a phantom round. Skip.
+  // Static import of live-history-buffer — dynamic import on every PR/BG/ED
+  // was paying strip-types resolve cost on the hot path (prod gaps ~1–2s
+  // between ACIE generation and SIGNAL_READY under concurrent load).
   if (!deps.bgTrigger) {
     try {
-      const { appendCompletedRound } = await import(
-        "@/lib/prediction/live/live-history-buffer"
-      );
       appendCompletedRound({
         gameId,
         multiplier,
@@ -1503,11 +1508,6 @@ export async function onGameEndPredict(
   let priorRounds: HistoricalRound[] = [];
   let historyReady = false;
   try {
-    const {
-      getPriorRoundsSync,
-      isHistoryReadyForPrediction,
-    } = await import("@/lib/prediction/live/live-history-buffer");
-
     historyReady = isHistoryReadyForPrediction();
     if (!historyReady) {
       logger.warn(
@@ -1635,11 +1635,11 @@ export async function onGameEndPredict(
       "prediction exceeded PREDICT_TIMEOUT_MS budget — consider offloading to worker thread",
     );
   }
+  // Metrics optional — never await dynamic import on hot path.
   try {
-    const { predictionGenerationMs } = await import(
-      "@/lib/observability/performance/latency"
-    );
-    predictionGenerationMs.observe(predictElapsed);
+    void import("@/lib/observability/performance/latency").then((m) => {
+      m.predictionGenerationMs.observe(predictElapsed);
+    });
   } catch { /* metrics optional */ }
 
   const predictionId = signal.predictionId;
@@ -2067,8 +2067,7 @@ export async function onGameEndPredict(
     // text shipped to Postgres as SQL and every persist failed with a
     // syntax error. Comments live OUTSIDE the template literal. Always.
     try {
-      const { mark } = await import("@/lib/prediction/live/latency-trace");
-      if (trace) mark(trace, "persist_started");
+      if (trace) markTrace(trace, "persist_started");
     } catch { /* soft */ }
     const ins = await sql<{ notification_id: string }>`
           with inserted_prediction as (
@@ -2161,8 +2160,8 @@ export async function onGameEndPredict(
       notifyOutbox("prediction");
     } catch { /* soft */ }
 
+    const txMs = Date.now() - txT0;
     {
-      const txMs = Date.now() - txT0;
       // RTT FIX: single-statement persist — no explicit TX, so stage timings
       // are unavailable; profile falls back to wall-clock deltas below.
       const stage = null as TxStageTimings | null;
@@ -2190,18 +2189,12 @@ export async function onGameEndPredict(
         tx_ms: txMs,
         tx_statements: 1,
         outboxEnqueued,
-        // Full pre-dispatch timeline in one line: ED receipt (undefined on
-        // recovery) → persist commit = outbox created_at = outbox_enqueued_at.
         persisted_at: new Date().toISOString(),
         ed_received_at: deps.edReceivedAt ?? null,
       };
       if (txMs + poolWaitMs > 300) {
-        // P5 plain-text line: Railway strips JSON fields — keep the slow-
-        // handoff decision data INLINE so the next 1.5s-class window is
-        // attributable from raw logs (pinned-vs-fallback is the discriminator
-        // between lane rebuild and pool/network issues).
         console.warn(
-          `[persist] slow durable handoff target=${targetGameId} prediction=${predictionId} correlation=${correlationId} persist_ms=${profile.prediction_persistence_ms} pool_wait_ms=${poolWaitMs} outboxEnqueued=${outboxEnqueued}`,
+          `[persist] slow durable handoff target=${targetGameId} prediction=${predictionId} correlation=${correlationId} persist_ms=${profile.prediction_persistence_ms} pool_wait_ms=${poolWaitMs} tx_ms=${txMs} outboxEnqueued=${outboxEnqueued}`,
         );
         logger.info(profile, "PERSIST_PROFILE");
       } else {
@@ -2210,12 +2203,12 @@ export async function onGameEndPredict(
     }
 
     try {
-      const { mark } = await import("@/lib/prediction/live/latency-trace");
-      if (trace) mark(trace, "outbox_enqueued");
+      if (trace) markTrace(trace, "outbox_enqueued");
     } catch { /* soft */ }
 
     try { completeTarget(targetGameId, owner); } catch { /* soft */ }
 
+    const persistMs = Number((performance.now() - t4).toFixed(2));
     logger.info(
       {
         component: "live-predictor",
@@ -2223,11 +2216,17 @@ export async function onGameEndPredict(
         targetGameId,
         correlationId,
         outboxEnqueued,
-        persistenceMs: Number((performance.now() - t4).toFixed(2)),
+        persistenceMs: persistMs,
+        poolWaitMs,
+        txMs,
+        claimMs: Number((t1 - t0).toFixed(2)),
+        historyMs: Number((t2 - t1).toFixed(2)),
+        predictionComputeMs: Number((t3 - t2).toFixed(2)),
+        predictionToSignalMs: Number((t4 - t3).toFixed(2)),
       },
       outboxEnqueued > 0
-        ? `durable prediction handoff complete — outbox pending before return target=${targetGameId} prediction=${predictionId} correlation=${correlationId}`
-        : `durable prediction handoff complete — duplicate pending (no new outbox row; existing undelivered row for this target delivers) target=${targetGameId} prediction=${predictionId} correlation=${correlationId}`,
+        ? `durable prediction handoff complete — outbox pending before return target=${targetGameId} prediction=${predictionId} correlation=${correlationId} persist_ms=${persistMs} pool_wait_ms=${poolWaitMs} tx_ms=${txMs} compute_ms=${Number((t3 - t2).toFixed(1))} signal_gap_ms=${Number((t4 - t3).toFixed(1))}`
+        : `durable prediction handoff complete — duplicate pending target=${targetGameId} prediction=${predictionId} correlation=${correlationId} persist_ms=${persistMs}`,
     );
     predictionLifecycleCounters.predictionsPersisted += 1;
     if (outboxEnqueued > 0) recordSignalPersisted();
