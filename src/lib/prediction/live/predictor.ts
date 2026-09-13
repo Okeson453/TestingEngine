@@ -1938,6 +1938,28 @@ export async function onGameEndPredict(
     // transaction holds the pooled client for the minimum possible time.
     const regimeText = signal.regimeId ? ` (${signal.regimeId})` : "";
     const lateTag = slaViolated ? " (delayed)" : "";
+    // Message alignment (prod Telegram 2026-09-13): "bet NOW — round starting"
+    // was wrong for PR/BG. At PR(N)/BG(N) the TARGET is N+1 — that round is
+    // NOT open and NOT starting. Betting for N+1 opens only after N ends.
+    // ED(N) is closest to the N+1 betting window (opens on the next PR).
+    const primary = deps.primarySource === "PR" ? "PR" : deps.bgTrigger ? "BG" : null;
+    const gameIdActionLine = primary
+      ? `Game ID: ${targetGameId} (next round — bet when it opens, after round ${gameId} ends)`
+      : recoveryMode
+        ? `Game ID: ${targetGameId} (next round — verify betting is open before entry)`
+        : `Game ID: ${targetGameId} (bet soon — next round opens after this crash)`;
+    const triggerLine = primary === "PR"
+      ? `Trigger: round ${gameId} betting-open — predicting round ${targetGameId}`
+      : primary === "BG"
+        ? `Trigger: round ${gameId} started — predicting round ${targetGameId}`
+        : `Source round: ${gameId} completed — predicting round ${targetGameId}`;
+    const sourceLine = recoveryMode
+      ? "Source: poll recovery"
+      : primary === "PR"
+        ? "Source: live PR (betting-open of previous round)"
+        : primary === "BG"
+          ? "Source: live BG (round-start of previous round)"
+          : "Source: live ED (after crash of previous round)";
     const predictionContent = [
       `NEW PREDICTION${regimeText}${lateTag}`,
       "",
@@ -1945,24 +1967,11 @@ export async function onGameEndPredict(
       `Probability: ${(signal.probability * 100).toFixed(1)}%`,
       `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
       "",
-      // SEP 11: the message previously had NO round identifier — a signal
-      // delivered ~2s after crash N read as a LATE prediction for round N,
-      // when it is actually for the UPCOMING round N+1 (delivered during
-      // round N+1's betting window). Game ID matches the Game ID the
-      // WIN/LOSS message later reports, so the pair is verifiable.
-      // The completed SOURCE round is stated explicitly so the signal can
-      // never be misread as a prediction FOR round N.
-      `Game ID: ${targetGameId} (bet NOW — round starting)`,
-      deps.bgTrigger
-        ? `Trigger round: ${gameId} started — predicting round ${targetGameId}`
-        : `Source round: ${gameId} completed — predicting round ${targetGameId}`,
+      gameIdActionLine,
+      triggerLine,
       `Prediction ID: ${predictionId}`,
       `Generated: ${generatedAt}`,
-      recoveryMode
-        ? "Source: poll recovery"
-        : deps.bgTrigger
-          ? "Source: live BG (generated during previous round)"
-          : "Source: live ED",
+      sourceLine,
     ].join("\n");
     // Shorter live deadline keeps temporal contract tight; recovery keeps more budget.
     // P1: tighter creation-relative deadline (was 8s). Semantic validity is

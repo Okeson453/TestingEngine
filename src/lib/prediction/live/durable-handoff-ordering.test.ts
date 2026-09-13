@@ -89,11 +89,13 @@ describe("durable prediction handoff ordering (P0)", () => {
     expect(attemptSrc).toContain("edReceivedAt: input.edReceivedAt");
     // Predictor persists it in outbox metadata for end-to-end timeline queries.
     expect(predictorSrc).toContain("edReceivedAt: deps.edReceivedAt ?? null");
-    // Message contract: explicit target with bet-now wording + explicit
-    // completed source round (N never masquerades as the prediction target).
-    expect(predictorSrc).toContain("(bet NOW — round starting)");
+    // Message contract: target is N+1; PR/BG must NOT say "bet NOW / round
+    // starting" (that is the trigger round, not the prediction target).
+    expect(predictorSrc).toContain("next round — bet when it opens");
+    expect(predictorSrc).toContain("bet soon — next round opens after this crash");
+    expect(predictorSrc).not.toContain("(bet NOW — round starting)");
     expect(predictorSrc).toContain(
-      "`Source round: ${gameId} completed — predicting round ${targetGameId}`",
+      "Source round: ${gameId} completed — predicting round ${targetGameId}",
     );
   });
 });
