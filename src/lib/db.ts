@@ -530,10 +530,12 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   // schema validation / lease / boot queries, so those paths paid full
   // Neon TLS+auth while "idle" clients were still being built.
   //
-  // Await min-client warm BEFORE createNeonPools returns so getSql() never
-  // resolves onto a cold pool. Parallel warm of critical+general is fine
-  // (network-bound); sequential connect inside each pool avoids stampedes
-  // within one pool.
+  // Await warm BEFORE createNeonPools returns so getSql() never resolves
+  // onto a cold pool. Prod 05:56Z still showed new_conn=1 acquires after
+  // min-only prewarm (critical 2→3→4, general 3→5→6) during background
+  // hydration concurrency — each growth paid ~1.1–1.3s TLS. Prewarm to
+  // max (not a max increase: max stays 4/6) so steady-state never creates
+  // sockets on the hot path. Parallel critical+general is network-bound.
   const warm = async (pool: import("pg").Pool, label: string, n: number) => {
     const clients: import("pg").PoolClient[] = [];
     const t0 = Date.now();
@@ -544,7 +546,7 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
         clients.push(c);
       }
       console.log(
-        `[db] ${label} prewarmed clients=${clients.length} ms=${Date.now() - t0}`,
+        `[db] ${label} prewarmed clients=${clients.length}/${n} ms=${Date.now() - t0}`,
       );
     } catch (e) {
       console.warn(
@@ -561,8 +563,8 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
     }
   };
   await Promise.all([
-    warm(criticalPool, "critical", criticalMin),
-    warm(generalPool, "general", Math.max(1, generalMin)),
+    warm(criticalPool, "critical", criticalMax),
+    warm(generalPool, "general", generalMax),
   ]);
 
   const keepAlive = setInterval(() => {
