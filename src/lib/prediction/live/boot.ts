@@ -576,13 +576,51 @@ class LiveBoot {
       lock = await acquireWorkerLock(sql);
       if (lock.ok) break;
       if (leaseAttempts === 1) {
+        // Forensic: prove whether a genuine active owner exists (owner_id,
+        // expires_at, heartbeat age). Do not shorten TTL or steal — only log.
+        let holder: {
+          owner_id: string;
+          expires_at: string | Date;
+          heartbeat_at: string | Date;
+        } | null = null;
+        try {
+          const rows = await sql<{
+            owner_id: string;
+            expires_at: string | Date;
+            heartbeat_at: string | Date;
+          }>`
+            SELECT owner_id, expires_at, heartbeat_at
+            FROM worker_locks
+            WHERE lock_key = ${LOCK_KEY}
+            LIMIT 1
+          `;
+          holder = rows[0] ?? null;
+        } catch {
+          /* soft */
+        }
+        const hbMs =
+          holder?.heartbeat_at != null
+            ? Date.now() -
+              (holder.heartbeat_at instanceof Date
+                ? holder.heartbeat_at.getTime()
+                : new Date(holder.heartbeat_at).getTime())
+            : null;
+        const expMs =
+          holder?.expires_at != null
+            ? (holder.expires_at instanceof Date
+                ? holder.expires_at.getTime()
+                : new Date(holder.expires_at).getTime()) - Date.now()
+            : null;
         logger.warn(
           {
             component: "live-boot",
             workerId: WORKER_ID,
             leaseWaitMs: Number(process.env.WORKER_LEASE_WAIT_MS ?? 45_000),
+            holderOwnerId: holder?.owner_id ?? null,
+            holderHeartbeatAgeMs: hbMs,
+            holderExpiresInMs: expMs,
           },
-          "WORKER_LEASE_WAITING: another worker holds an unexpired lease — retrying until it proves expired",
+          `WORKER_LEASE_WAITING: holder=${holder?.owner_id ?? "unknown"} heartbeat_age_ms=${hbMs ?? "n/a"} expires_in_ms=${expMs ?? "n/a"} — retrying until lease proves expired (fencing preserved)`,
         );
       }
       await new Promise((r) => setTimeout(r, Number(process.env.WORKER_LEASE_RETRY_MS ?? 500)));

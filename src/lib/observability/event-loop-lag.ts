@@ -35,7 +35,7 @@ interface LagSample {
 }
 
 const ring: LagSample[] = [];
-let lastTick = performance.now();
+let lastTick = 0;
 let started = false;
 
 /** Threshold for the standalone stall warn (first-lag log only). */
@@ -43,6 +43,15 @@ const WARN_LAG_MS = 400;
 
 function sample(): void {
   const now = performance.now();
+  // First tick after start: establish baseline only — do not treat the
+  // (module-load → sampler-start) gap as event-loop stall. Production
+  // 05:27Z reported event_loop_lag_ms=1583 on the first sample because
+  // lastTick was stamped at import of this module while the sampler was
+  // only started later inside createNeonPools (migrations + pool init).
+  if (lastTick === 0) {
+    lastTick = now;
+    return;
+  }
   const lagMs = Math.max(0, now - lastTick - SAMPLE_INTERVAL_MS);
   lastTick = now;
   ring.push({ at: now, lagMs });
@@ -57,6 +66,8 @@ function sample(): void {
 export function startEventLoopLagSampler(): void {
   if (started) return;
   started = true;
+  // Reset baseline at start — never attribute pre-sampler wall time to lag.
+  lastTick = 0;
   const t = setInterval(sample, SAMPLE_INTERVAL_MS);
   t.unref?.();
 }

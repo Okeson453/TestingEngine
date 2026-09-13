@@ -256,23 +256,23 @@ export const MIN_SIGNAL_CONFIDENCE = Number(process.env.MIN_SIGNAL_CONFIDENCE ??
 export const PREDICTION_FLOOR = Number(process.env.PREDICTION_FLOOR ?? 0.65);
 
 /**
- * Directive 17:27Z: five-state prediction taxonomy. Classification is a pure
- * function of the prediction probability — coverage (persistence) is fully
- * separated from betting eligibility. PERSISTED tiers (p >= PREDICTION_FLOOR)
- * are durable decision-audit rows, band-backtestable; only NO_BET (below
- * floor) is excluded from band statistics by construction.
+ * Directive 17:27Z / 2026-09-13: five-state prediction taxonomy.
+ * Classification is a pure function of probability + needP — coverage
+ * (persistence) is fully separated from betting eligibility.
  *
  *   PREDICTION_65_PLUS  65-69.99%   — recorded, weakest evidence tier
  *   WATCH               70-74.99%   — recorded, below break-even
  *   BREAK_EVEN_ZONE     75-76.91%   — recorded, at/just under break-even
- *   BET_CANDIDATE       76.92%-needP — ABOVE mathematical break-even, below
- *                          the runtime edge gate (NOT automatically a bet)
- *   BET_ELIGIBLE        p >= needP  — passed the edge gate; other gates
- *                          (strategy/risk/temporal) may still veto
+ *   BET_CANDIDATE       break-even ≤ p < needP when needP > break-even
+ *                       — above mathematical break-even, below runtime edge
+ *   BET_ELIGIBLE        p >= max(needP, breakEven)
+ *                       — meets both the runtime edge gate AND break-even;
+ *                       strategy/risk/temporal may still veto emission
  *
  * 76.92% (= 1/1.30) remains the mathematical break-even under the 1.30x
- * payout convention. No tier below BET_ELIGIBLE is a betting signal, and
- * BET_ELIGIBLE itself still runs the full gate chain.
+ * payout convention. BET_ELIGIBLE must never label a below-break-even
+ * probability (prod 05:27Z incorrectly marked 73–76% as BET_ELIGIBLE when
+ * needP defaulted to 0.65). Strategy veto is independent of this tier.
  */
 export type PredictionTier =
   | "PREDICTION_65_PLUS"
@@ -285,7 +285,11 @@ export type PredictionTier =
 export function classifyPredictionTier(p: number, needP: number): PredictionTier {
   if (!(p >= PREDICTION_FLOOR)) return "NO_BET";
   const breakEven = 1 / DEFAULT_TARGET; // 0.7692… at 1.30x
-  if (p >= needP) return "BET_ELIGIBLE";
+  // Betting-eligible only when above break-even AND at/above the runtime gate.
+  // When needP <= breakEven, break-even is the effective floor for BET_ELIGIBLE.
+  const eligibleFloor = Math.max(needP, breakEven);
+  if (p >= eligibleFloor) return "BET_ELIGIBLE";
+  // Above break-even but below elevated needP → candidate, not a signal.
   if (p >= breakEven) return "BET_CANDIDATE";
   if (p >= 0.75) return "BREAK_EVEN_ZONE";
   if (p >= 0.70) return "WATCH";

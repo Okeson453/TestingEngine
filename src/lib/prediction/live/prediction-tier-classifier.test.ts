@@ -1,14 +1,10 @@
 /**
- * Directive 17:27Z — five-state prediction taxonomy.
+ * Directive 17:27Z / 2026-09-13 — five-state prediction taxonomy.
  *
  * Coverage (persistence) is fully separated from betting eligibility:
- * every prediction >= PREDICTION_FLOOR (0.65) is durably recorded in
- * prediction_decisions via the decision column, in one of four recorded
- * tiers; only NO_BET (below floor) is excluded by construction. 0.7692
- * (= 1/1.30) stays the mathematical break-even under the 1.30x payout
- * convention; BET_CANDIDATE (76.92%-needP) is EXPLICITLY not a bet when
- * needP is raised above break-even via MIN_SIGNAL_EDGE>0.
- * Default runtime needP is now 0.65 (absolute probability gate).
+ * every prediction >= PREDICTION_FLOOR (0.65) is durably recorded.
+ * BET_ELIGIBLE requires p >= max(needP, breakEven=1/1.30) so below-break-even
+ * probabilities are never mislabeled as betting-eligible (prod 05:27Z).
  */
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
@@ -21,8 +17,9 @@ import {
 
 // Default absolute gate (edge=0): needP = 0.65.
 const NEEDP = 0.65;
+const BREAK_EVEN = 1 / 1.3;
 // Elevated gate for BET_CANDIDATE band coverage (fair + 0.03).
-const NEEDP_ELEVATED = 1 / 1.3 + 0.03;
+const NEEDP_ELEVATED = BREAK_EVEN + 0.03;
 
 describe("classifyPredictionTier — band boundaries", () => {
   it("below floor is NO_BET (not persisted to band stats)", () => {
@@ -31,10 +28,13 @@ describe("classifyPredictionTier — band boundaries", () => {
     expect(classifyPredictionTier(0.6499, NEEDP)).toBe("NO_BET");
   });
 
-  it("default needP=0.65 makes all >=65% BET_ELIGIBLE", () => {
-    expect(classifyPredictionTier(0.65, NEEDP)).toBe("BET_ELIGIBLE");
-    expect(classifyPredictionTier(0.70, NEEDP)).toBe("BET_ELIGIBLE");
-    expect(classifyPredictionTier(0.75, NEEDP)).toBe("BET_ELIGIBLE");
+  it("default needP=0.65 preserves absolute bands; BET_ELIGIBLE only at/above break-even", () => {
+    expect(classifyPredictionTier(0.65, NEEDP)).toBe("PREDICTION_65_PLUS");
+    expect(classifyPredictionTier(0.70, NEEDP)).toBe("WATCH");
+    expect(classifyPredictionTier(0.7324, NEEDP)).toBe("WATCH");
+    expect(classifyPredictionTier(0.75, NEEDP)).toBe("BREAK_EVEN_ZONE");
+    expect(classifyPredictionTier(0.7582, NEEDP)).toBe("BREAK_EVEN_ZONE");
+    expect(classifyPredictionTier(BREAK_EVEN, NEEDP)).toBe("BET_ELIGIBLE");
     expect(classifyPredictionTier(0.80, NEEDP)).toBe("BET_ELIGIBLE");
     expect(classifyPredictionTier(0.85, NEEDP)).toBe("BET_ELIGIBLE");
   });
@@ -46,7 +46,7 @@ describe("classifyPredictionTier — band boundaries", () => {
     expect(classifyPredictionTier(0.7499, NEEDP_ELEVATED)).toBe("WATCH");
     expect(classifyPredictionTier(0.75, NEEDP_ELEVATED)).toBe("BREAK_EVEN_ZONE");
     expect(classifyPredictionTier(0.7691, NEEDP_ELEVATED)).toBe("BREAK_EVEN_ZONE");
-    expect(classifyPredictionTier(1 / 1.3, NEEDP_ELEVATED)).toBe("BET_CANDIDATE");
+    expect(classifyPredictionTier(BREAK_EVEN, NEEDP_ELEVATED)).toBe("BET_CANDIDATE");
     expect(classifyPredictionTier(0.7899, NEEDP_ELEVATED)).toBe("BET_CANDIDATE");
     expect(classifyPredictionTier(NEEDP_ELEVATED, NEEDP_ELEVATED)).toBe("BET_ELIGIBLE");
   });

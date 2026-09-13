@@ -140,6 +140,11 @@ export async function evaluateWrUtilsBundleInSandbox(
     navigator: { userAgent: UA, language: "en-US", languages: ["en-US"] },
     requestAnimationFrame: () => 0,
     cancelAnimationFrame: () => {},
+    // Prod 05:27Z: ReferenceError: addEventListener is not defined —
+    // some wr_utils variants call bare global addEventListener(...), not
+    // document.addEventListener. Stub at global scope (still host-free).
+    addEventListener: () => {},
+    removeEventListener: () => {},
     // Anti-bot preamble: new URL(document[decoded]) — parser only, no I/O.
     URL,
     // Timer variants: no-op stubs — deterministic, and no VM-created timer
