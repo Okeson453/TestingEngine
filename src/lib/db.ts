@@ -346,6 +346,7 @@ function makeRun(
     let maxWaiting = pool.waitingCount;
     let maxIdle = pool.idleCount;
     let maxTotal = pool.totalCount;
+    const totalBefore = pool.totalCount;
     const poolSampler = setInterval(() => {
       if (pool.waitingCount > maxWaiting) maxWaiting = pool.waitingCount;
       if (pool.idleCount > maxIdle) maxIdle = pool.idleCount;
@@ -383,16 +384,16 @@ function makeRun(
     const acquireMs = Date.now() - t0;
     globalRef.__lastPoolAcquireMs__ = acquireMs;
     if (acquireMs > 100) {
-      // FORENSIC ATTRIBUTION (sep 12): an acquire that waits >100ms while
-      // idle clients exist is indistinguishable — from acquireMs alone —
-      // from an event-loop stall that starved the connect() continuation.
-      // Report the max loop lag inside the acquire window so the 1093ms
-      // class of outlier is attributable in the log itself. maxWaiting /
-      // maxIdle / maxTotal are sampled DURING the wait (the trailing
-      // waiting=/idle= snapshot is post-completion and cannot show waiters).
+      // FORENSIC ATTRIBUTION (sep 12/13):
+      // - loop_lag ≈ acquireMs ⇒ event-loop starved the connect continuation
+      // - new_conn=1 ⇒ this acquire created a socket (TLS+auth ~1s on Neon)
+      // - new_conn=0 + idle>0 + loop_lag≈0 ⇒ unexpected (should be <10ms)
+      // maxWaiting/maxIdle/maxTotal sampled DURING the wait (trailing snapshot
+      // is post-completion and cannot show waiters).
       const loopLag = Math.round(maxLoopLagBetween(t0Perf, performance.now()));
+      const newConn = pool.totalCount > totalBefore ? 1 : 0;
       console.warn(
-        `[db] ${label} pool_acquire_ms=${acquireMs} loop_lag_ms=${loopLag} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} | during: maxTotal=${maxTotal} maxIdle=${maxIdle} maxWaiting=${maxWaiting}`,
+        `[db] ${label} pool_acquire_ms=${acquireMs} loop_lag_ms=${loopLag} new_conn=${newConn} total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount} | during: maxTotal=${maxTotal} maxIdle=${maxIdle} maxWaiting=${maxWaiting}`,
       );
     }
     try {
@@ -523,35 +524,46 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   globalRef.__pgCriticalPool__ = criticalPool;
   globalRef.__pgPool__ = generalPool; // getPgPool / dashboard pin = general
 
-  // PREWARM + KEEPALIVE (sep 11 latency): node-pg min creates sockets, but
-  // Neon still closes idle TCP from the server side. Observed: idleCount≥1
-  // yet pool_acquire_ms≈1059–1159 because the "idle" client was half-open and
-  // connect() rebuilt TLS. Force min clients through SELECT 1 at boot, then
-  // ping both pools every 25s so server-side idle kill never lands on the
-  // prediction/dispatch hot path.
-  void (async () => {
-    const warm = async (pool: import("pg").Pool, label: string, n: number) => {
-      const clients: import("pg").PoolClient[] = [];
-      try {
-        for (let i = 0; i < n; i++) {
-          const c = await pool.connect();
-          await c.query("select 1");
-          clients.push(c);
-        }
-        console.log(`[db] ${label} prewarmed clients=${clients.length}`);
-      } catch (e) {
-        console.warn(`[db] ${label} prewarm failed: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        for (const c of clients) {
-          try { c.release(); } catch { /* soft */ }
+  // PREWARM + KEEPALIVE (sep 11 latency; sep 13 await-before-return):
+  // Production 05:27Z: pool_acquire_ms≈1050–1167 with idle≥3 AND prewarm
+  // logging AFTER the first slow acquires. Fire-and-forget prewarm raced
+  // schema validation / lease / boot queries, so those paths paid full
+  // Neon TLS+auth while "idle" clients were still being built.
+  //
+  // Await min-client warm BEFORE createNeonPools returns so getSql() never
+  // resolves onto a cold pool. Parallel warm of critical+general is fine
+  // (network-bound); sequential connect inside each pool avoids stampedes
+  // within one pool.
+  const warm = async (pool: import("pg").Pool, label: string, n: number) => {
+    const clients: import("pg").PoolClient[] = [];
+    const t0 = Date.now();
+    try {
+      for (let i = 0; i < n; i++) {
+        const c = await pool.connect();
+        await c.query("select 1");
+        clients.push(c);
+      }
+      console.log(
+        `[db] ${label} prewarmed clients=${clients.length} ms=${Date.now() - t0}`,
+      );
+    } catch (e) {
+      console.warn(
+        `[db] ${label} prewarm failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    } finally {
+      for (const c of clients) {
+        try {
+          c.release();
+        } catch {
+          /* soft */
         }
       }
-    };
-    await Promise.all([
-      warm(criticalPool, "critical", criticalMin),
-      warm(generalPool, "general", Math.max(1, generalMin)),
-    ]);
-  })();
+    }
+  };
+  await Promise.all([
+    warm(criticalPool, "critical", criticalMin),
+    warm(generalPool, "general", Math.max(1, generalMin)),
+  ]);
 
   const keepAlive = setInterval(() => {
     for (const [label, pool] of [
@@ -598,14 +610,6 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   }, 5_000);
   monitor.unref?.();
 
-  // PASS 5 (11:23Z window): kick both pinned-lane builds EAGERLY at pool
-  // init — the first BG event can otherwise reach getPinnedLaneSql before
-  // any prewarm stage ran, and (pre-pass-5) its handoff would await the
-  // full TLS+auth build. Combined with the makePinnedRun fast fallback,
-  // a first-round handoff can no longer pay connection setup.
-  void getPredictionPersistSql().catch(() => undefined);
-  void getDispatchCriticalSql().catch(() => undefined);
-
   criticalPool.on("error", (err) => console.error("[db] critical pool error:", err.message));
   generalPool.on("error", (err) => console.error("[db] general pool error:", err.message));
 
@@ -613,11 +617,30 @@ async function createNeonPools(): Promise<{ general: Sql; critical: Sql }> {
   // loop_lag_ms, which requires the sampler to be running.
   startEventLoopLagSampler();
 
-  // PINNED LANES (sep 12): build both hot-path clients NOW, during boot
-  // (fire-and-forget — getSql() resolves when this function returns). The
-  // first prediction must never be the one paying TLS+auth.
-  void getPinnedLaneSql("persist");
-  void getPinnedLaneSql("dispatch");
+  // PINNED LANES: build both hot-path clients before getSql resolves so the
+  // first prediction never pays TLS+auth on persist/dispatch. Call
+  // ensurePinnedClient directly — getPinnedLaneSql/getSql would deadlock
+  // because createNeonPools is still on the stack under __pgSqlPromise__.
+  {
+    const lanes = getPinnedLanes();
+    for (const key of ["persist", "dispatch"] as const) {
+      let lane = lanes.get(key);
+      if (!lane) {
+        lane = {
+          label: `hot-${key}`,
+          pool: criticalPool,
+          client: null,
+          building: null,
+          dead: false,
+          sql: null,
+        };
+        lanes.set(key, lane);
+      } else {
+        lane.pool = criticalPool;
+      }
+      await ensurePinnedClient(lane).catch(() => undefined);
+    }
+  }
 
   return {
     critical: toSql(makeRun(criticalPool, "critical"), criticalPool),
