@@ -10,13 +10,21 @@
  *   WIN does not enter cooldown; consecutive prediction losses each
  *   schedule exactly one additional skip round (never bypassed by PR/BG/ED).
  *
- * Only VALIDATED prediction outcomes (pending_predictions matched WIN/LOSS)
- * activate this machine — intermediate ED/BG market crashes do not.
+ * Only VALIDATED outcomes of ISSUED betting predictions (pending_predictions
+ * matched WIN/LOSS after durable outbox handoff) arm this machine.
+ * Strategy veto / skipped_no_edge / never-issued rows do not create pending
+ * rows and therefore cannot trigger cooldown. Intermediate ED/BG crashes do not.
+ *
+ * State is durable in worker_state so restart/fencing/recovery cannot bypass
+ * an armed skip.
  */
 
 import { getLogger } from "@/lib/observability/logger";
+import type { Sql } from "@/lib/db";
 
 const logger = getLogger("prediction-loss-cooldown");
+
+export const LOSS_COOLDOWN_STATE_KEY = "prediction_loss_cooldown_v1";
 
 export type LossCooldownSnapshot = {
   consecutivePredictionLosses: number;
@@ -26,6 +34,8 @@ export type LossCooldownSnapshot = {
   lossTargetGameId: string | null;
   /** Target that must not receive a betting signal. */
   skipTargetGameId: string | null;
+  /** Recent validation keys for idempotency across restart (bounded). */
+  seenValidationKeys?: string[];
 };
 
 let consecutivePredictionLosses = 0;
@@ -36,6 +46,73 @@ let skipTargetGameId: string | null = null;
 /** Processed validation keys — duplicate ED cannot re-arm cooldown. */
 const seenValidations = new Set<string>();
 const SEEN_MAX = 500;
+
+let persistQueued = false;
+let persistSqlFn: (() => Promise<Sql>) | null = null;
+
+/** Wire a SQL factory so state changes can durable-write without blocking. */
+export function setLossCooldownPersistSql(fn: (() => Promise<Sql>) | null): void {
+  persistSqlFn = fn;
+}
+
+function schedulePersist(): void {
+  if (!persistSqlFn || persistQueued) return;
+  persistQueued = true;
+  setImmediate(() => {
+    persistQueued = false;
+    void persistLossCooldownNow().catch(() => undefined);
+  });
+}
+
+export async function persistLossCooldownNow(): Promise<void> {
+  if (!persistSqlFn) return;
+  try {
+    const sql = await persistSqlFn();
+    const snap: LossCooldownSnapshot = {
+      ...getLossCooldownState(),
+      seenValidationKeys: [...seenValidations].slice(-100),
+    };
+    const payload = JSON.stringify(snap);
+    await sql`
+      INSERT INTO worker_state (key, value, updated_at)
+      VALUES (${LOSS_COOLDOWN_STATE_KEY}, ${payload}, now())
+      ON CONFLICT (key) DO UPDATE
+        SET value = excluded.value, updated_at = excluded.updated_at
+    `;
+  } catch (e) {
+    logger.warn(
+      { error: String(e) },
+      "loss cooldown durable persist failed (in-memory state retained)",
+    );
+  }
+}
+
+/** Load durable cooldown before LIVE_N1_READY so restart cannot bypass skip. */
+export async function loadLossCooldownFromSql(sql: Sql): Promise<LossCooldownSnapshot | null> {
+  try {
+    const rows = await sql<{ value: unknown }>`
+      SELECT value FROM worker_state WHERE key = ${LOSS_COOLDOWN_STATE_KEY} LIMIT 1
+    `;
+    const raw = rows[0]?.value;
+    if (raw == null) return null;
+    const snap =
+      typeof raw === "string"
+        ? (JSON.parse(raw) as Partial<LossCooldownSnapshot>)
+        : (raw as Partial<LossCooldownSnapshot>);
+    restoreLossCooldown(snap);
+    logger.info(
+      { component: "prediction-loss-cooldown", ...getLossCooldownState() },
+      "loss cooldown restored from worker_state",
+    );
+    return getLossCooldownState();
+  } catch (e) {
+    logger.warn(
+      { error: String(e) },
+      "loss cooldown restore failed — starting ACTIVE",
+    );
+    return null;
+  }
+}
 
 function nextNumericId(gameId: string): string | null {
   if (!/^\d+$/.test(gameId)) return null;
@@ -88,6 +165,11 @@ export function restoreLossCooldown(snap: Partial<LossCooldownSnapshot> | null |
   }
   if (typeof snap.lossTargetGameId === "string") lossTargetGameId = snap.lossTargetGameId;
   if (typeof snap.skipTargetGameId === "string") skipTargetGameId = snap.skipTargetGameId;
+  if (Array.isArray(snap.seenValidationKeys)) {
+    for (const k of snap.seenValidationKeys.slice(-SEEN_MAX)) {
+      if (typeof k === "string") seenValidations.add(k);
+    }
+  }
 }
 
 /**
@@ -113,6 +195,7 @@ export function noteValidatedPredictionOutcome(args: {
       },
       "prediction WIN — consecutive loss streak cleared (active skip unchanged)",
     );
+    schedulePersist();
     return;
   }
 
@@ -134,6 +217,7 @@ export function noteValidatedPredictionOutcome(args: {
     },
     `prediction LOSS — cooldown armed: skip next betting round target=${next ?? "next-attempt"}`,
   );
+  schedulePersist();
 }
 
 /**
@@ -191,11 +275,13 @@ export function consumeLossCooldownSkip(targetGameId: string): void {
     },
     "loss cooldown skip consumed",
   );
+  schedulePersist();
 }
 
 /**
  * When the skip-target round completes (ED/history), clear cooldown even if
- * no prediction attempt ran (e.g. deploy gap).
+ * no prediction attempt ran (e.g. deploy gap). Crash is still ingested for
+ * history/model — only betting is skipped.
  */
 export function noteRoundCompletedForCooldown(gameId: string): void {
   if (skipRemaining <= 0 || skipTargetGameId == null) return;
@@ -206,4 +292,5 @@ export function noteRoundCompletedForCooldown(gameId: string): void {
     { component: "prediction-loss-cooldown", gameId },
     "loss cooldown cleared — skip-target round completed",
   );
+  schedulePersist();
 }

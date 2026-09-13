@@ -660,6 +660,23 @@ class LiveBoot {
     }
     advanceHotStage("PREDICTION_STATE_READY");
 
+    // ── 5b. Loss-cooldown restore (must precede LIVE_N1 so restart cannot
+    // bypass an armed post-LOSS skip). Persist uses general pool async.
+    try {
+      const {
+        loadLossCooldownFromSql,
+        setLossCooldownPersistSql,
+      } = await import("@/lib/prediction/live/prediction-loss-cooldown");
+      const { getSql } = await import("@/lib/db");
+      setLossCooldownPersistSql(() => getSql());
+      await withBootStage("loss-cooldown-restore", () => loadLossCooldownFromSql(sql));
+    } catch (e) {
+      logger.warn(
+        { component: "live-boot", error: String(e) },
+        "loss cooldown restore failed (soft — ACTIVE)",
+      );
+    }
+
     // ── 6. HOT history warm — barrier before LIVE_N1_READY ──
     // Root-cause fix: never accept N+1-requiring events until MIN_HISTORY
     // is in the in-memory buffer. This eliminates the race:

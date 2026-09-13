@@ -6,6 +6,7 @@ import {
   consumeLossCooldownSkip,
   noteRoundCompletedForCooldown,
   getLossCooldownState,
+  restoreLossCooldown,
 } from "./prediction-loss-cooldown.ts";
 import { shouldSkipReason } from "./predictor.ts";
 
@@ -129,5 +130,50 @@ describe("prediction-loss-cooldown", () => {
     expect(shouldForceLossCooldownSkip("103").skip).toBe(true);
     consumeLossCooldownSkip("103");
     expect(shouldForceLossCooldownSkip("104").skip).toBe(false);
+  });
+
+  it("restore after restart preserves armed skip (fencing/recovery)", () => {
+    noteValidatedPredictionOutcome({
+      predictionId: "r1",
+      targetGameId: "500",
+      result: "LOSS",
+    });
+    const snap = getLossCooldownState();
+    resetLossCooldownForTests();
+    expect(shouldForceLossCooldownSkip("501").skip).toBe(false);
+    restoreLossCooldown(snap);
+    expect(shouldForceLossCooldownSkip("501").skip).toBe(true);
+    expect(getLossCooldownState().lossTargetGameId).toBe("500");
+  });
+
+  it("64.99% rejected and 65.00% eligible when not in cooldown", () => {
+    expect(
+      shouldSkipReason({
+        probability: 0.6499,
+        confidence: 0.9,
+        minProbability: 0.65,
+        minEdge: 0,
+      }).reason,
+    ).toBe("probability_below_min");
+    expect(
+      shouldSkipReason({
+        probability: 0.65,
+        confidence: 0.9,
+        minProbability: 0.65,
+        minEdge: 0,
+      }).skip,
+    ).toBe(false);
+  });
+
+  it("strategy_veto above 65% still skips without arming cooldown", () => {
+    const g = shouldSkipReason({
+      probability: 0.85,
+      confidence: 0.95,
+      strategyAction: "SKIP",
+      minProbability: 0.65,
+      minEdge: 0,
+    });
+    expect(g.reason).toBe("strategy_veto");
+    expect(getLossCooldownState().skipRemaining).toBe(0);
   });
 });
