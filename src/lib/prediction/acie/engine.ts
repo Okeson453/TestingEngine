@@ -42,6 +42,7 @@ import { acieHeavyEvidenceLatencyMs } from '../metrics-acie.ts';
 import { PlattCalibrator } from '../calibration/platt-calibrator.ts';
 import { scheduleAcieStateSave } from './state-persistence.ts';
 import { getLogger } from '../../observability/logger.ts';
+import { evaluateMotifGate } from './temporal-motif-gate.ts';
 
 const logger = getLogger('acie-engine');
 
@@ -113,7 +114,8 @@ export class ACIEEngine {
     this.heavyEvery = opts.heavyValidationEvery ?? 50;
     // Evidence window derives from unified history (§7.3).
     this.evidenceMaxN = Number(process.env.ACIE_EVIDENCE_MAX_N ?? Math.min(1000, ACIE_MAX_HISTORY));
-    this.ewmaAlpha = opts.ewmaAlpha ?? 0.05;
+    // Faster regime adaptation (was 0.05)
+    this.ewmaAlpha = opts.ewmaAlpha ?? 0.10;
   }
 
   /** Seed historical crashes — each point still goes through lightweight online updates. */
@@ -561,6 +563,26 @@ export class ACIEEngine {
       };
     }
 
+    // Layer 3: temporal motif gate (opt-in ACIE_MOTIF_GATE=1; default off)
+    const motifGateEnabled = process.env.ACIE_MOTIF_GATE === '1';
+    let motifGate:
+      | { passed: boolean; motif: '001111' | '011011' | null; enabled: boolean }
+      | undefined;
+    if (motifGateEnabled) {
+      const solRecords = this.sol.getRecords();
+      const r = evaluateMotifGate(solRecords);
+      motifGate = { passed: r.passes, motif: r.matchedMotif, enabled: true };
+      if (signal && !r.passes) {
+        signal = null;
+        strategy.action = 'SKIP';
+        strategy.isOpportunity = false;
+        strategy.reason =
+          (strategy.reason ? strategy.reason + ' | ' : '') +
+          'Motif gate: prior 6 outcomes not in {001111, 011011}.';
+        strategy.stake = 0;
+      }
+    }
+
     return {
       psi,
       evidence: { ...evidence, status: evidenceStatus },
@@ -568,6 +590,7 @@ export class ACIEEngine {
       signal,
       sequenceState,
       regime,
+      motifGate,
       // Pass 19: expose the exact decision inputs for per-round edge logging.
       diagnostics: {
         modelProbabilities: { ...this.lastModelProbabilities },

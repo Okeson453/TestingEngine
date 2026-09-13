@@ -265,4 +265,10 @@ export interface ACIEEvaluationResult {
   sequenceState: SequenceState;
   regime: RegimeLabel;
   diagnostics?: ACIEEvaluationDiagnostics;
+  /** Layer 3 motif gate (populated when ACIE_MOTIF_GATE=1). */
+  motifGate?: {
+    passed: boolean;
+    motif: '001111' | '011011' | null;
+    enabled: boolean;
+  };
 }

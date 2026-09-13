@@ -41,11 +41,12 @@ export const DEFAULT_STRATEGY_POLICY: StrategyPolicy = {
   fallbackThreshold: ABS_FLOOR,
   maxCalibrationError: 0.12,
   highUncertainty: 0.18,
-  consecutiveLossReduceAt: 2,
+  // streak_below==2 in normal regime has WR≈80% — do not skip at 2
+  consecutiveLossReduceAt: 3,
   reducedStakeFactor: 0.45,
   defaultStake: 700,
-  /** Skip as soon as streak hits 2 — never wait for 3/4/5. */
-  consecutiveLossSkipAt: 2,
+  /** Skip at 3 consecutive losses (was 2). */
+  consecutiveLossSkipAt: 3,
   /** Keep skipping for the duration of the ongoing streak (capped). */
   consecutiveLossMaxSkip: 8,
   lossStreakThresholdEscalation: 0.02,
@@ -61,10 +62,10 @@ export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
   fallbackThreshold: ABS_FLOOR,
   maxCalibrationError: 0.14,
   highUncertainty: 0.22,
-  consecutiveLossReduceAt: 2,
+  consecutiveLossReduceAt: 3,
   reducedStakeFactor: 0.55,
   defaultStake: 700,
-  consecutiveLossSkipAt: 2,
+  consecutiveLossSkipAt: 3,
   consecutiveLossMaxSkip: 6,
   lossStreakThresholdEscalation: 0.015,
 };
@@ -95,7 +96,7 @@ export class StrategyLayer {
     const p = this.policy;
     const cl = riskState?.consecutiveLosses ?? 0;
 
-    // Max losing streak = 2: once cl >= 2, SKIP until the streak breaks.
+    // Max losing streak gate (default skip-at 3).
     if (cl >= p.consecutiveLossSkipAt && p.consecutiveLossMaxSkip > 0) {
       const skipRounds = cl - p.consecutiveLossSkipAt + 1;
       if (skipRounds <= p.consecutiveLossMaxSkip) {
@@ -109,6 +110,13 @@ export class StrategyLayer {
           `${cl} consecutive losses — max skip exhausted, prob ${(probability * 100).toFixed(1)}% too weak.`
         );
       }
+    }
+
+    // Hostile regimes: empirical WR below fair with high variance
+    if (regime === 'low-cluster' || regime === 'deep-low') {
+      return this.skip(
+        `Regime=${regime}: empirical WR below fair with high variance; require normal/high-activity.`,
+      );
     }
 
     // Extreme calibration failure — skip only in strict mode
