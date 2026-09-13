@@ -21,6 +21,7 @@
 
 import { getLogger } from "@/lib/observability/logger";
 import type { Sql } from "@/lib/db";
+import { markCooldownSkipTarget } from "@/lib/prediction/live/target-coordinator";
 
 const logger = getLogger("prediction-loss-cooldown");
 
@@ -220,6 +221,8 @@ export function noteValidatedPredictionOutcome(args: {
     },
     `prediction LOSS — cooldown armed: skip next betting round target=${next ?? "next-attempt"} (loss_on=${lossN})`,
   );
+  // Force NO_BET terminal on N+1 so PR/BG/ED cannot reserve/issue after arm.
+  if (next) markCooldownSkipTarget(next);
   schedulePersist();
 }
 

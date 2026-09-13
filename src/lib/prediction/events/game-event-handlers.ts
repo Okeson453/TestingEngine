@@ -44,6 +44,10 @@ import {
   peekClaim,
 } from "@/lib/prediction/live/target-coordinator";
 import {
+  shouldForceLossCooldownSkip,
+  consumeLossCooldownSkip,
+} from "@/lib/prediction/live/prediction-loss-cooldown";
+import {
   startTrace,
   mark,
   markAt,
@@ -742,6 +746,22 @@ export async function prHandler(payload: unknown): Promise<void> {
         const prTrace = startTrace(prCorrelationId, gameId);
         const attemptT0 = Date.now();
         try {
+          // Loss-cooldown gate before model/persist — mandatory skip of N+1
+          // after LOSS(N), even at high probability.
+          const cd = shouldForceLossCooldownSkip(targetGameId);
+          if (cd.skip) {
+            consumeLossCooldownSkip(targetGameId);
+            logger.info(
+              {
+                event: "pr",
+                component: "game-event-handlers",
+                targetGameId,
+                correlationId: prCorrelationId,
+              },
+              `COOLDOWN_SKIP — PR blocked for target=${targetGameId} (${cd.reason})`,
+            );
+            return;
+          }
           // Mono basis only — do not overwrite ws_received with epoch ms.
           markAt(prTrace, "ownership_reserved", prReserveAt);
           if (prReserved) {

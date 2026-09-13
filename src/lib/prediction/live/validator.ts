@@ -486,16 +486,15 @@ export async function onGameEnd(
           if (cd.skipTargetGameId) {
             const skipT = cd.skipTargetGameId;
             const lossT = cd.lossTargetGameId ?? evt.gameId;
-            setImmediate(() => {
-              void (async () => {
-                try {
-                  const generalSql = await getSql();
-                  await suppressCooldownTargetBetting(generalSql, skipT, lossT);
-                } catch {
-                  /* soft — in-memory skip still blocks new attempts */
-                }
-              })();
-            });
+            // Await suppress on the validation path so N+1 outbox/pending are
+            // retired before concurrent PR can complete a signal (was setImmediate
+            // and lost the race → consecutive LOSS rows on the dashboard).
+            try {
+              const generalSql = await getSql();
+              await suppressCooldownTargetBetting(generalSql, skipT, lossT);
+            } catch {
+              /* in-memory markCooldownSkipTarget + shouldSkipReason still block */
+            }
           }
         }
       }

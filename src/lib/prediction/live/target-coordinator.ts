@@ -369,6 +369,26 @@ export function completeTarget(
 }
 
 /**
+ * Loss-cooldown: force target N+1 to NO_BET terminal so PR/BG/ED cannot
+ * reserve or issue a betting prediction for the mandatory skip round.
+ * Idempotent if already completed as NO_BET/SIGNAL.
+ */
+export function markCooldownSkipTarget(targetGameId: string): void {
+  prune();
+  const existing = claims.get(targetGameId);
+  if (existing?.completed && existing.noBet) return;
+  // Override in-flight PR/BG claim: cooldown is authoritative for this target.
+  claims.set(targetGameId, {
+    owner: `cooldown:${targetGameId}`,
+    source: "ED",
+    claimedAt: Date.now(),
+    state: "NO_BET",
+    completed: true,
+    noBet: true,
+  });
+}
+
+/**
  * Release only recoverable failures. NO_BET / SIGNAL_READY stay closed.
  * Marks recoverable when a primary owner releases without completing.
  */
