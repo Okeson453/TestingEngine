@@ -1003,6 +1003,7 @@ export class OutboxDispatcher {
                     sendStartedAtServerIso: sendStartedServerIso,
                     telegramAcceptedAtMs: acceptedMs,
                     serverAcceptedAtIso: acceptedAt,
+                    metadata: metaF,
                   });
                 })().catch(() => {
                   /* soft — forensics must never break delivery */

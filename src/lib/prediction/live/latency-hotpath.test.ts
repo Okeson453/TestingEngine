@@ -73,13 +73,14 @@ describe("delivery forensics classification", () => {
     assert.ok(leadTimeMs != null && leadTimeMs > 0);
   });
 
-  it("UNKNOWN only when target start missing (honest)", () => {
-    const { outcome } = classifyDelivery({
+  it("AWAITING_TARGET_START when target start missing (PR interim, not UNKNOWN)", () => {
+    const { outcome, unknownReason } = classifyDelivery({
       telegramAcceptedAtMs: Date.now(),
       targetStartedAtMs: null,
       outboxStatus: "delivered",
     });
-    assert.equal(outcome, "UNKNOWN");
+    assert.equal(outcome, "AWAITING_TARGET_START");
+    assert.equal(unknownReason, null);
   });
 });
 

@@ -5,11 +5,13 @@
  * Aggregates distributed timestamps into one durable classification.
  *
  * Outcomes:
- *   ON_TIME  — telegram_accepted_at < target_round_started_at
- *   LATE     — telegram_accepted_at >= target_round_started_at
- *   EXPIRED  — never delivered; killed by BG or deadline (dead_letter)
- *   FAILED   — terminal failure / dead without delivery
- *   UNKNOWN  — delivered but target start not yet known
+ *   EARLY                 — accepted ≥ EARLY_LEAD_MS before target start
+ *   ON_TIME               — accepted before target start (margin < EARLY_LEAD)
+ *   LATE                  — accepted at/after target start
+ *   EXPIRED               — never delivered; killed by BG or deadline
+ *   FAILED                — terminal send failure
+ *   AWAITING_TARGET_START — accepted; target start not yet known (normal PR path)
+ *   UNKNOWN               — genuine missing/invalid transition (must carry reason)
  */
 
 import type { Sql } from "@/lib/db";
@@ -24,6 +26,7 @@ export type DeliveryOutcome =
   | "LATE"
   | "EXPIRED"
   | "FAILED"
+  | "AWAITING_TARGET_START"
   | "UNKNOWN";
 
 export interface DeliveryForensicsRecord {
@@ -32,17 +35,25 @@ export interface DeliveryForensicsRecord {
   correlationId: string | null;
   sourceGameId: string | null;
   targetGameId: string | null;
+  triggerEvent: string | null;
   queuedAt: string | null;
   dispatchStartedAt: string | null;
   telegramSendStartedAt: string | null;
   telegramAcceptedAt: string | null;
   targetRoundStartedAt: string | null;
+  /** Generation-side stamps from outbox metadata (immutable at enqueue). */
+  sourceEventAt: string | null;
+  predictionStartedAt: string | null;
+  predictionReadyAt: string | null;
   queueWaitMs: number | null;
   dispatchMs: number | null;
   telegramSendMs: number | null;
+  predictionComputeMs: number | null;
   totalDeliveryMs: number | null;
   leadTimeMs: number | null;
   outcome: DeliveryOutcome;
+  /** Only set when outcome === UNKNOWN — exact missing transition. */
+  unknownReason: string | null;
 }
 
 export const EARLY_LEAD_MS = Number(process.env.DELIVERY_EARLY_LEAD_MS ?? 4_000);
@@ -51,36 +62,49 @@ export function classifyDelivery(args: {
   telegramAcceptedAtMs: number | null;
   targetStartedAtMs: number | null;
   outboxStatus: string;
-}): { outcome: DeliveryOutcome; leadTimeMs: number | null } {
+}): {
+  outcome: DeliveryOutcome;
+  leadTimeMs: number | null;
+  unknownReason: string | null;
+} {
   const { telegramAcceptedAtMs, targetStartedAtMs, outboxStatus } = args;
 
   if (outboxStatus === "dead_letter") {
-    return { outcome: "EXPIRED", leadTimeMs: null };
+    return { outcome: "EXPIRED", leadTimeMs: null, unknownReason: null };
   }
   if (outboxStatus === "failed") {
-    return { outcome: "FAILED", leadTimeMs: null };
+    return { outcome: "FAILED", leadTimeMs: null, unknownReason: null };
   }
   if (telegramAcceptedAtMs == null || !Number.isFinite(telegramAcceptedAtMs)) {
-    return { outcome: "UNKNOWN", leadTimeMs: null };
+    // Delivered/pending without acceptance stamp is a real data gap.
+    return {
+      outcome: "UNKNOWN",
+      leadTimeMs: null,
+      unknownReason: `missing_telegram_accepted_at status=${outboxStatus}`,
+    };
   }
-  // DELIVERED + NO TARGET START YET = UNKNOWN (documented semantics).
-  // This used to optimistically return ON_TIME, which silently converts
-  // "outcome not yet determinable" into a healthy count — and if the BG
-  // reclassification later fails (best-effort), the row stays miscast as
-  // ON_TIME forever. UNKNOWN is truthful; the forensic reconciliation
-  // sweep upgrades it to EARLY/ON_TIME/LATE once target start is known.
+  // PR-primary: signal is accepted ~7s before target N+1 starts. That is a
+  // deterministic interim state — not UNKNOWN. BG target-start reconcile
+  // upgrades to EARLY/ON_TIME/LATE once began_at is known.
   if (targetStartedAtMs == null || !Number.isFinite(targetStartedAtMs)) {
-    return { outcome: "UNKNOWN", leadTimeMs: null };
+    return {
+      outcome: "AWAITING_TARGET_START",
+      leadTimeMs: null,
+      unknownReason: null,
+    };
   }
   const leadTimeMs = targetStartedAtMs - telegramAcceptedAtMs;
-  // EARLY: delivered with comfortable margin — operationally distinct from a
-  // 1-2ms hairline ON_TIME delivery (same delivery, different health).
   if (leadTimeMs >= EARLY_LEAD_MS) {
-    return { outcome: "EARLY", leadTimeMs: Math.round(leadTimeMs) };
+    return {
+      outcome: "EARLY",
+      leadTimeMs: Math.round(leadTimeMs),
+      unknownReason: null,
+    };
   }
   return {
     outcome: leadTimeMs > 0 ? "ON_TIME" : "LATE",
     leadTimeMs: Math.round(leadTimeMs),
+    unknownReason: null,
   };
 }
 
@@ -222,17 +246,16 @@ export async function reconcileForensicOutcomes(
       target_game_id: string | null;
     };
 
-    // REPAIR scan: rows whose forensic write never landed (crash between
-    // delivery and persist). Bounded to 24h — older NULLs are noise.
-    // sql.query (raw text + params) — the tagged wrapper does not support
-    // nested fragments, so the shared SELECT body is inlined verbatim.
+    // REPAIR: NULL / UNKNOWN / AWAITING_TARGET_START (upgrade once target start known).
     const repairRows = await sql.query<ForensicRow>(
       `${selectColumns}
       WHERE o.type = 'prediction'
         AND o.status = 'delivered'
         AND o.telegram_accepted_at IS NOT NULL
         AND o.delivered_at > now() - ($1::int * interval '1 hour')
-        AND (o.delivery_outcome IS NULL OR o.delivery_outcome = 'UNKNOWN')
+        AND (o.delivery_outcome IS NULL
+             OR o.delivery_outcome = 'UNKNOWN'
+             OR o.delivery_outcome = 'AWAITING_TARGET_START')
       ORDER BY o.delivered_at DESC NULLS LAST
       LIMIT $2`,
       [repairHours, batchSize],
@@ -270,9 +293,7 @@ export async function reconcileForensicOutcomes(
         outboxStatus: "delivered",
       });
 
-      // MASKED LATE (remediation §9/§10): the raw timeline says the signal
-      // was accepted at/after target start, but the stored outcome does not
-      // say LATE. This is exactly how real late deliveries used to vanish.
+      // MASKED LATE: raw timeline says LATE but stored outcome does not.
       if (outcome === "LATE" && row.delivery_outcome !== "LATE") {
         result.maskedLate += 1;
       }
@@ -327,6 +348,8 @@ export async function recordDeliveredForensics(
     telegramAcceptedAtMs: number;
     /** Server-stamped telegram_accepted_at (finalize RETURNING) — preferred clock. */
     serverAcceptedAtIso?: string | null;
+    /** Outbox metadata (generation stamps, triggerEvent, predictionComputeMs). */
+    metadata?: Record<string, unknown> | null;
   },
 ): Promise<DeliveryForensicsRecord> {
   let targetStartedAt: string | null = null;
@@ -374,7 +397,7 @@ export async function recordDeliveredForensics(
   const acceptedMsAuthoritative = args.serverAcceptedAtIso
     ? new Date(args.serverAcceptedAtIso).getTime()
     : args.telegramAcceptedAtMs;
-  const { outcome, leadTimeMs } = classifyDelivery({
+  const { outcome, leadTimeMs, unknownReason } = classifyDelivery({
     telegramAcceptedAtMs: acceptedMsAuthoritative,
     targetStartedAtMs: targetMs,
     outboxStatus: "delivered",
@@ -396,39 +419,57 @@ export async function recordDeliveredForensics(
           args.sendStartedAtMs != null ? new Date(args.sendStartedAtMs).toISOString() : null,
         );
 
+  // Generation-side stamps from outbox metadata (set at enqueue; immutable).
+  const meta = args.metadata ?? {};
+  const metaStr = (k: string): string | null =>
+    typeof meta[k] === "string" ? (meta[k] as string) : null;
+  const metaNum = (k: string): number | null =>
+    typeof meta[k] === "number" && Number.isFinite(meta[k] as number)
+      ? (meta[k] as number)
+      : null;
+
   const rec: DeliveryForensicsRecord = {
     predictionId: args.predictionId,
     notificationId: args.notificationId,
     correlationId: args.correlationId,
     sourceGameId: args.sourceGameId,
     targetGameId: args.targetGameId,
+    triggerEvent: metaStr("triggerEvent"),
     queuedAt: args.createdAt,
     dispatchStartedAt: args.dispatchClaimedAt ?? null,
     telegramSendStartedAt: sendIso,
     telegramAcceptedAt: acceptedIso,
     targetRoundStartedAt: targetStartedAt,
+    sourceEventAt: metaStr("edReceivedAt") ?? metaStr("predictionStartedAt"),
+    predictionStartedAt: metaStr("predictionStartedAt"),
+    predictionReadyAt: metaStr("signalReadyAt") ?? metaStr("predictionGeneratedAt"),
     queueWaitMs: msDiff(args.dispatchClaimedAt ?? null, args.createdAt),
     dispatchMs: msDiff(sendIso, args.dispatchClaimedAt ?? null),
     telegramSendMs,
+    predictionComputeMs: metaNum("predictionComputeMs"),
     totalDeliveryMs: msDiff(acceptedIso, args.createdAt),
     leadTimeMs,
     outcome,
+    unknownReason,
   };
 
   await persistDeliveryOutcome(sql, args.notificationId, outcome, leadTimeMs);
 
-  const logLevel = outcome === "LATE" ? "warn" : "info";
+  const logLevel = outcome === "LATE" || outcome === "UNKNOWN" ? "warn" : "info";
   logger[logLevel](
     {
       component: "delivery-forensics",
-      // Authoritative per-prediction delivery record: one structured line
-      // with the complete timestamp chain (queued -> claimed -> send started
-      // -> Telegram accepted -> target start) so production latency can be
-      // attributed leg-by-leg instead of inferred from adjacent messages.
       event: "PREDICTION_DELIVERY",
       ...rec,
+      // Explicit latency budgets (never fold persistence/Telegram into compute).
+      outbox_claim_ms: rec.queueWaitMs,
+      dispatch_send_ms: rec.dispatchMs,
+      provider_accept_ms: rec.telegramSendMs,
+      total_prediction_delivery_ms: rec.totalDeliveryMs,
     },
-    `PREDICTION_DELIVERY_FORENSICS ${outcome}`,
+    outcome === "UNKNOWN"
+      ? `PREDICTION_DELIVERY_FORENSICS UNKNOWN reason=${unknownReason ?? "unspecified"}`
+      : `PREDICTION_DELIVERY_FORENSICS ${outcome}`,
   );
 
   return rec;
@@ -537,22 +578,31 @@ export async function reclassifyOnTargetStart(
     }
 
     for (const c of classified) {
-      const logLevel = c.logLevel;
-      logger[logLevel](
+      // BG only supplies target_round_started_at. Delivery timestamps remain
+      // the original PR (or ED) acceptance — never re-sourced from BG.
+      const triggerEvent =
+        typeof c.meta.triggerEvent === "string" ? c.meta.triggerEvent : null;
+      logger[c.logLevel](
         {
           component: "delivery-forensics",
+          event: "PREDICTION_DELIVERY_TARGET_START_RECONCILE",
           predictionId: typeof c.meta.predictionId === "string" ? c.meta.predictionId : null,
           notificationId: c.notificationId,
           correlationId: typeof c.meta.correlationId === "string" ? c.meta.correlationId : null,
           sourceGameId: typeof c.meta.sourceGameId === "string" ? c.meta.sourceGameId : null,
           targetGameId,
+          triggerEvent,
           telegramAcceptedAt: c.telegramAcceptedAt,
           targetRoundStartedAt: beganIso,
           leadTimeMs: c.leadTimeMs,
           outcome: c.outcome,
           totalDeliveryMs: msDiff(c.telegramAcceptedAt, c.createdAt),
+          predictionComputeMs:
+            typeof c.meta.predictionComputeMs === "number"
+              ? c.meta.predictionComputeMs
+              : null,
         },
-        `PREDICTION_DELIVERY_FORENSICS ${c.outcome} (BG reclassify)`,
+        `PREDICTION_DELIVERY_FORENSICS ${c.outcome} (target_start_reconcile trigger=${triggerEvent ?? "n/a"})`,
       );
     }
 
@@ -563,7 +613,9 @@ export async function reclassifyOnTargetStart(
       WHERE type = 'prediction'
         AND target_game_id = ${targetGameId}
         AND status = 'dead_letter'
-        AND (delivery_outcome IS NULL OR delivery_outcome = 'UNKNOWN')
+        AND (delivery_outcome IS NULL
+             OR delivery_outcome = 'UNKNOWN'
+             OR delivery_outcome = 'AWAITING_TARGET_START')
     `.catch(() => undefined);
   } catch (e) {
     logger.warn(

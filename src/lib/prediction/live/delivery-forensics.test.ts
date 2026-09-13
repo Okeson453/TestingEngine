@@ -50,17 +50,25 @@ describe("classifyDelivery", () => {
     ).toBe("EXPIRED");
   });
 
-  it("UNKNOWN when delivered and target start not yet known (documented semantics)", () => {
-    // Was ON_TIME pre-remediation: that silently converted "not yet
-    // determinable" into a healthy count and stuck if BG reclassification
-    // failed. UNKNOWN is truthful; the reconcile sweep upgrades it later.
-    expect(
-      classifyDelivery({
-        telegramAcceptedAtMs: 1_000,
-        targetStartedAtMs: null,
-        outboxStatus: "delivered",
-      }).outcome,
-    ).toBe("UNKNOWN");
+  it("AWAITING_TARGET_START when accepted but target start not yet known (PR path)", () => {
+    // Not UNKNOWN — acceptance is known; target start arrives on BG reconcile.
+    const r = classifyDelivery({
+      telegramAcceptedAtMs: 1_000,
+      targetStartedAtMs: null,
+      outboxStatus: "delivered",
+    });
+    expect(r.outcome).toBe("AWAITING_TARGET_START");
+    expect(r.unknownReason).toBeNull();
+  });
+
+  it("UNKNOWN only when acceptance stamp is missing", () => {
+    const r = classifyDelivery({
+      telegramAcceptedAtMs: null,
+      targetStartedAtMs: null,
+      outboxStatus: "delivered",
+    });
+    expect(r.outcome).toBe("UNKNOWN");
+    expect(r.unknownReason).toMatch(/missing_telegram_accepted_at/);
   });
 });
 
@@ -77,12 +85,15 @@ describe("reconcileForensicOutcomes (durable forensic retry)", () => {
         // pg Result is an array subclass (iterable + rowCount) — spread-consumed
         // by the sweep ([...repairRows, ...auditRows]). Route by scan semantics
         // so a row is returned by exactly one scan, like the real partial
-        // indexes: REPAIR targets NULL/UNKNOWN, AUDIT targets ON_TIME/EARLY.
+        // indexes: REPAIR targets NULL/UNKNOWN/AWAITING_TARGET_START,
+        // AUDIT targets ON_TIME/EARLY.
         const isAudit = text.includes("IN ('ON_TIME', 'EARLY')");
         const matched = seedRows.filter((r) =>
           isAudit
             ? r.delivery_outcome === "ON_TIME" || r.delivery_outcome === "EARLY"
-            : r.delivery_outcome == null || r.delivery_outcome === "UNKNOWN",
+            : r.delivery_outcome == null ||
+              r.delivery_outcome === "UNKNOWN" ||
+              r.delivery_outcome === "AWAITING_TARGET_START",
         );
         return Promise.resolve(Object.assign([...matched], { rowCount: matched.length }));
       }
@@ -134,7 +145,7 @@ describe("reconcileForensicOutcomes (durable forensic retry)", () => {
     ]);
   });
 
-  it("downgrades the old optimistic ON_TIME to UNKNOWN when target start is unresolvable", async () => {
+  it("downgrades optimistic ON_TIME to AWAITING_TARGET_START when target start is unresolvable", async () => {
     const { sql, updates } = makeFakeSql([
       {
         notification_id: "n-stale",
@@ -145,9 +156,9 @@ describe("reconcileForensicOutcomes (durable forensic retry)", () => {
     ]);
     const r = await reconcileForensicOutcomes(sql);
     expect(r.reclassified).toBe(1);
-    expect(r.mismatches).toBe(1); // stored ON_TIME vs derived UNKNOWN
+    expect(r.mismatches).toBe(1); // stored ON_TIME vs derived AWAITING_TARGET_START
     expect(updates).toEqual([
-      { id: "n-stale", outcome: "UNKNOWN", lead: null },
+      { id: "n-stale", outcome: "AWAITING_TARGET_START", lead: null },
     ]);
   });
 
