@@ -20,23 +20,25 @@ import type {
 } from './types.ts';
 
 /**
- * Fair odds for 1.30× cash-out: 1/1.30 ≈ 0.7692.
- * Any ENTRY threshold BELOW fair is negative EV on average and drags
- * realized win rate toward (or below) the base rate.
+ * Live qualification floor aligns with MIN_SIGNAL_PROBABILITY (default 0.65).
+ * 1/1.30 ≈ 0.7692 remains the mathematical break-even for EV analysis only —
+ * it is NOT the live ENTRY floor when the product gate is absolute 65%.
  *
- * QUALITY mode (default): require probability ≥ fair + edge so emitted
- * signals are positive-EV candidates. Volume is secondary to hit rate.
+ * Prod was labeling 65–76% as strategy_veto because thresholds sat at
+ * fair+edge (~0.80). Qualified predictions must start at 65%+.
+ * Raise ACIE_QUALITY_EDGE / ACIE_STRONG_EDGE to re-tighten selectivity.
  */
 const FAIR_130 = 1 / 1.3;
-const QUALITY_EDGE = Number(process.env.ACIE_QUALITY_EDGE ?? 0.025);
-const STRONG_EDGE = Number(process.env.ACIE_STRONG_EDGE ?? 0.045);
+const ABS_FLOOR = Number(process.env.MIN_SIGNAL_PROBABILITY ?? 0.65);
+const QUALITY_EDGE = Number(process.env.ACIE_QUALITY_EDGE ?? 0);
+const STRONG_EDGE = Number(process.env.ACIE_STRONG_EDGE ?? 0.02);
 
-/** Quality-first defaults — thresholds at/above fair + edge. */
+/** Default policy — absolute 65% floor (matches MIN_SIGNAL_PROBABILITY). */
 export const DEFAULT_STRATEGY_POLICY: StrategyPolicy = {
   mode: 'adaptive',
-  supportedThreshold: FAIR_130 + QUALITY_EDGE, // ~0.804
-  weakThreshold: FAIR_130 + STRONG_EDGE, // ~0.814
-  fallbackThreshold: FAIR_130 + QUALITY_EDGE + 0.01,
+  supportedThreshold: Math.max(ABS_FLOOR, ABS_FLOOR + QUALITY_EDGE),
+  weakThreshold: Math.max(ABS_FLOOR, ABS_FLOOR + STRONG_EDGE),
+  fallbackThreshold: ABS_FLOOR,
   maxCalibrationError: 0.12,
   highUncertainty: 0.18,
   consecutiveLossReduceAt: 2,
@@ -50,14 +52,13 @@ export const DEFAULT_STRATEGY_POLICY: StrategyPolicy = {
 };
 
 /**
- * High-frequency policy kept for explicit opt-in only.
- * Still floors at fair odds so volume cannot force negative-EV entries.
+ * High-frequency policy — same 65% floor, slightly looser secondary gates.
  */
 export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
   mode: 'adaptive',
-  supportedThreshold: FAIR_130 + 0.01,
-  weakThreshold: FAIR_130 + QUALITY_EDGE,
-  fallbackThreshold: FAIR_130,
+  supportedThreshold: ABS_FLOOR,
+  weakThreshold: Math.max(ABS_FLOOR, ABS_FLOOR + QUALITY_EDGE),
+  fallbackThreshold: ABS_FLOOR,
   maxCalibrationError: 0.14,
   highUncertainty: 0.22,
   consecutiveLossReduceAt: 2,
@@ -286,9 +287,9 @@ export class StrategyLayer {
       t += Math.min(extra, 0.05);
     }
 
-    // Floor at fair odds; ceiling allows selective high-confidence entries.
-    // Prior clamp at 0.75 was BELOW fair (~0.769) and forced negative-EV ENTRY.
-    return Math.max(FAIR_130, Math.min(0.92, t));
+    // Floor at absolute qualification gate (65%); ceiling allows selective
+    // high-confidence entries. Break-even (FAIR_130) is analysis-only.
+    return Math.max(ABS_FLOOR, Math.min(0.92, t));
   }
 
   private reducedStake(_risk: StrategyDecisionContext['riskState']): number {

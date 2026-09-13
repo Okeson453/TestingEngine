@@ -28,12 +28,12 @@ describe("classifyPredictionTier — band boundaries", () => {
     expect(classifyPredictionTier(0.6499, NEEDP)).toBe("NO_BET");
   });
 
-  it("default needP=0.65 preserves absolute bands; BET_ELIGIBLE only at/above break-even", () => {
-    expect(classifyPredictionTier(0.65, NEEDP)).toBe("PREDICTION_65_PLUS");
-    expect(classifyPredictionTier(0.70, NEEDP)).toBe("WATCH");
-    expect(classifyPredictionTier(0.7324, NEEDP)).toBe("WATCH");
-    expect(classifyPredictionTier(0.75, NEEDP)).toBe("BREAK_EVEN_ZONE");
-    expect(classifyPredictionTier(0.7582, NEEDP)).toBe("BREAK_EVEN_ZONE");
+  it("default needP=0.65 qualifies all predictions at/above 65% as BET_ELIGIBLE", () => {
+    expect(classifyPredictionTier(0.65, NEEDP)).toBe("BET_ELIGIBLE");
+    expect(classifyPredictionTier(0.70, NEEDP)).toBe("BET_ELIGIBLE");
+    expect(classifyPredictionTier(0.7324, NEEDP)).toBe("BET_ELIGIBLE");
+    expect(classifyPredictionTier(0.75, NEEDP)).toBe("BET_ELIGIBLE");
+    expect(classifyPredictionTier(0.7582, NEEDP)).toBe("BET_ELIGIBLE");
     expect(classifyPredictionTier(BREAK_EVEN, NEEDP)).toBe("BET_ELIGIBLE");
     expect(classifyPredictionTier(0.80, NEEDP)).toBe("BET_ELIGIBLE");
     expect(classifyPredictionTier(0.85, NEEDP)).toBe("BET_ELIGIBLE");
