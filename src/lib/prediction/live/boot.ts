@@ -783,15 +783,28 @@ class LiveBoot {
       timedOut: false,
     };
     this.lastResult = { seed: emptySeed, bootStartedAt };
-    logger.info(
-      {
-        component: "live-boot",
-        bootStartedAt,
-        liveReadyMs: Date.now() - new Date(bootStartedAt).getTime(),
-        hotStage: getHotReadinessStage(),
-      },
-      "LIVE PATH READY — HOT_STATE barrier passed; background hydration starting",
-    );
+    {
+      const now = Date.now();
+      const processBootOrigin = hotStageEnteredAt.get("BOOTING");
+      const liveBootOrigin = new Date(bootStartedAt).getTime();
+      logger.info(
+        {
+          component: "live-boot",
+          bootStartedAt,
+          // Two clocks (not a discrepancy): processBootMs = module-load→ready
+          // (includes strip-types import + migrations); liveBootMs = startLiveBoot
+          // wall only (lease, sign, history, subscriber).
+          processBootMs: processBootOrigin != null ? now - processBootOrigin : null,
+          liveBootMs: now - liveBootOrigin,
+          hotStage: getHotReadinessStage(),
+          liveN1ReadyMs: (() => {
+            const t = hotStageEnteredAt.get("LIVE_N1_READY");
+            return t != null && processBootOrigin != null ? t - processBootOrigin : null;
+          })(),
+        },
+        "LIVE PATH READY — HOT_STATE barrier passed; background hydration starting",
+      );
+    }
 
     // ── 9. BACKGROUND hydration (fire-and-forget; does NOT include history warm) ──
     void runBackgroundHydration(sql, seeder).catch((e) => {

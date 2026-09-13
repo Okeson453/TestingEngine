@@ -215,8 +215,9 @@ function nextTargetGameId(sourceGameId: string): string {
 /**
  * BG(N): reconcile target start + temporal kill of late signals for N.
  *
- * Default (BG-primary): reserve + attemptNPlusOnePrediction for N+1 at
- * BG receipt (history/ACIE through N-1). ED is fallback when BG missed.
+ * Architecture: PR-primary N+1 (default). BG reserves/predicts only when PR
+ * missed; otherwise confirmation + temporal kill + lifecycle. ED is fallback
+ * when neither primary owns the target.
  *
  * Always:
  *  1. noteRoundStarted (zero-RTT registry)
@@ -278,7 +279,7 @@ export async function bgHandler(payload: unknown): Promise<void> {
         correlationId,
       },
       reserve.owned
-        ? `BG→N+1 ownership RESERVED (BG-primary — single authoritative path) target=${targetGameIdForBg} correlation=${correlationId}`
+        ? `BG→N+1 ownership RESERVED (BG fallback — PR missed) target=${targetGameIdForBg} correlation=${correlationId}`
         : `BG→N+1 reserve skipped reason=${reserve.reason} target=${targetGameIdForBg} correlation=${correlationId}`,
     );
   }
@@ -1169,7 +1170,10 @@ export function initializeEventHandlers(): void {
     );
   });
 
-  logger.info({ component: "game-event-handlers" }, "event handlers wired (BG-primary N+1, ED fallback + validation)");
+  logger.info(
+    { component: "game-event-handlers" },
+    "event handlers wired (PR-primary N+1, BG confirm/reconcile, ED fallback + validation)",
+  );
 }
 
 /** Called by worker boot — native WS primary; socket.io optional fallback. */
