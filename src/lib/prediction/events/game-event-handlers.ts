@@ -1,12 +1,11 @@
 /**
  * BC.Game native WS → live prediction pipeline.
  *
- * Directive 2026-09-12 PR-primary:
- *   PR(N)  → PRIMARY N+1 prediction at betting-open (~7s before BG)
- *   BG(N)  → CONFIRM/reconcile (began_at, temporal kill); N+1 only if PR missed
+ * Architecture (2026-09-13 restore BG-primary):
+ *   BG(N)  → PRIMARY N+1 prediction at round-start (authoritative)
+ *   PR(N)  → optional early path only when PR_PRIMARY_PREDICT=1/true (default OFF)
  *   ED(N)  → FALLBACK N+1 only if primary did not own target; validation of N
- * Opt out of primary tier: ED_PRIMARY_PREDICT=1 or BG_PRIMARY_PREDICT=0
- * Opt out of PR trigger only: PR_PRIMARY_PREDICT=0 (BG remains primary)
+ * Opt out of BG primary: ED_PRIMARY_PREDICT=1 or BG_PRIMARY_PREDICT=0
  * Poll   → recovery only
  */
 import { randomUUID } from "node:crypto";
@@ -310,8 +309,8 @@ export async function bgHandler(payload: unknown): Promise<void> {
     // receipt and "reconcile complete" — the reconcile TX (pool acquire +
     // 5 statements), NOT the model, owns that cost. bg_receipt_to_reconcile
     // and bg_to_prediction_total below make the split visible per round.
-    // PR-primary: if PR already reserved/completed N+1, BG is confirmation
-    // only (reconcile + temporal kill below). Attempt N+1 only when PR missed.
+    // If PR early path (opt-in) already reserved/completed N+1, BG is
+    // confirmation only. Default: PR off → BG always attempts N+1.
     const primaryAlreadyOwns =
       isPrimaryOwnedOrTerminal(targetGameIdForBg) && !bgReserved;
     if (primaryAlreadyOwns) {
@@ -657,16 +656,13 @@ export async function bgHandler(payload: unknown): Promise<void> {
 }
 
 /**
- * PR (prepare — betting opens) — PRIMARY N+1 prediction trigger.
+ * PR (prepare — betting opens) — OPTIONAL early N+1 path.
  *
- * Directive 2026-09-12: promote pr to authoritative N+1 trigger so the
- * signal is generated ~7s before BG (upstream BC.Game betting window), not after
- * round start. Does NOT write began_at or noteRoundStarted — BG remains
- * the sole round-start authority for temporal kill / registry. Does NOT
- * run temporal kill (that would dead-letter signals ~7s early).
- *
- * Ownership: reserveTargetForPr → attemptNPlusOnePrediction(source=PR).
- * BG later becomes confirmation; ED remains fallback only.
+ * Default OFF (PR_PRIMARY_PREDICT unset/false). When enabled, may reserve and
+ * predict ~7s before BG; BG remains the intended authoritative path when PR
+ * is disabled. Does NOT write began_at or noteRoundStarted — BG remains the
+ * sole round-start authority for temporal kill / registry. Does NOT run
+ * temporal kill (would dead-letter signals ~7s early).
  */
 export async function prHandler(payload: unknown): Promise<void> {
   const gameId = extractLastGameId(payload);
@@ -732,7 +728,9 @@ export async function prHandler(payload: unknown): Promise<void> {
 
     logger.info(
       { event: "pr", gameId, correlationId, targetGameId, prReserved },
-      "bc pr (betting-open) observed — PR-primary N+1 trigger; expect bg ~7s later (upstream window)",
+      prPrimary
+        ? "bc pr (betting-open) observed — PR early N+1 enabled; expect bg ~7s later (upstream window)"
+        : "bc pr (betting-open) observed — PR early path disabled; BG remains authoritative N+1",
     );
 
     // PRIMARY N+1: fire concurrently with the detached log write.

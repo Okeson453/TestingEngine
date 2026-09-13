@@ -1,7 +1,7 @@
 /**
  * Priority-ordered ownership for target game N+1 prediction.
  *
- * Architecture (source of truth) — directive 2026-09-12 PR-primary:
+ * Architecture (source of truth) — BG-primary (PR optional via PR_PRIMARY_PREDICT=1):
  *   PR(N) PRIMARY  → reserve/claim N+1 at betting-open (~7s before BG)
  *   BG(N) CONFIRM  → reconciliation only when PR already owns; primary
  *                    trigger only if PR missed (fallback within primary tier)

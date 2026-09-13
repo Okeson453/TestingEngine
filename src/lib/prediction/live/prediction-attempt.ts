@@ -27,14 +27,15 @@ export type PredictionSource = "ED" | "RECOVERY" | "BG" | "PR";
 /**
  * SINGLE SOURCE OF TRUTH for primary-tier N+1 prediction.
  *
- * Directive 2026-09-12 PR-primary:
- *   PR(N) PRIMARY  — betting-open reserves + generates N+1 (~7s before BG)
- *   BG(N) CONFIRM  — reconciliation; generates N+1 only if PR missed
+ * Intended architecture (restored 2026-09-13):
+ *   BG(N) PRIMARY  — authoritative N+1 prediction at round-start
+ *   PR(N) OPTIONAL — early precompute only when PR_PRIMARY_PREDICT=1/true;
+ *                    must not default-own targets or force BG into confirmation-only
  *   ED(N) FALLBACK — never races a primary-owned target
  *
- * Opt out of primary tier (PR+BG) via ED_PRIMARY_PREDICT=1/true or
- * BG_PRIMARY_PREDICT=0/false. PR_PRIMARY_PREDICT=0 disables PR trigger only
- * (BG remains primary within the tier).
+ * Opt out of BG primary via ED_PRIMARY_PREDICT=1/true or BG_PRIMARY_PREDICT=0/false.
+ * PR is OFF by default — prod logs showed PR permanently owning N+1 and
+ * suppressing BG recomputation (BG confirmation only / no_bet_terminal).
  */
 export function bgPrimaryEnabled(): boolean {
   return !(
@@ -45,12 +46,15 @@ export function bgPrimaryEnabled(): boolean {
   );
 }
 
-/** PR trigger is on when primary tier is enabled and PR is not opted out. */
+/**
+ * PR early path is opt-in only. Default false so BG remains the sole
+ * authoritative primary unless an operator explicitly enables PR.
+ */
 export function prPrimaryEnabled(): boolean {
   if (!bgPrimaryEnabled()) return false;
-  return !(
-    process.env.PR_PRIMARY_PREDICT === "0" ||
-    process.env.PR_PRIMARY_PREDICT === "false"
+  return (
+    process.env.PR_PRIMARY_PREDICT === "1" ||
+    process.env.PR_PRIMARY_PREDICT === "true"
   );
 }
 
