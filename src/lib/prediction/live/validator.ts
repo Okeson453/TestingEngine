@@ -26,6 +26,10 @@ import { globalIncrementalState } from "@/lib/prediction/state/incremental-state
 import { markPredictionResolved } from "@/lib/prediction/live/live-round-state";
 import { edProcessingLatencyMs } from "@/lib/observability/metrics/lifecycle-metrics";
 import { processResolvedPredictionFeedback } from "@/lib/prediction/live/feedback";
+import {
+  noteValidatedPredictionOutcome,
+  noteRoundCompletedForCooldown,
+} from "@/lib/prediction/live/prediction-loss-cooldown";
 
 const logger = getLogger("live-validator");
 
@@ -464,6 +468,17 @@ export async function onGameEnd(
         select (select prediction_id from ins) as inserted_prediction_id
       `;
       const alreadyValidated = validateOutcome[0]!.inserted_prediction_id == null;
+      // Prediction-loss cooldown: only first confirmed validation of this
+      // pending row arms/clears the state machine (duplicates are no-ops).
+      if (!alreadyValidated && state.pending) {
+        noteValidatedPredictionOutcome({
+          predictionId: state.pending.prediction_id,
+          targetGameId: evt.gameId,
+          result,
+        });
+      }
+      // Always observe round completion for cooldown clear (idempotent).
+      noteRoundCompletedForCooldown(evt.gameId);
       // Stash for post-commit validation notification enqueue.
       (state as { _validationNotify?: {
         content: string;

@@ -60,6 +60,10 @@ import {
 } from "@/lib/core/sheath-mode";
 import { getAdaptiveMinEdge, getAdaptiveEdgeStats } from "@/lib/prediction/live/adaptive-edge";
 import { recordNoBetDecision } from "@/lib/prediction/live/decision-audit";
+import {
+  shouldForceLossCooldownSkip,
+  consumeLossCooldownSkip,
+} from "@/lib/prediction/live/prediction-loss-cooldown";
 
 const logger = getLogger("live-predictor");
 // SYNTAX_GUARD_20260906: file must parse under node --experimental-strip-types
@@ -354,12 +358,14 @@ export type SkipVetoReason =
   | "reduced_entry_blocked"
   | "strategy_veto"
   | "pipeline_veto"
-  | "reasoning_skip";
+  | "reasoning_skip"
+  | "loss_cooldown";
 
 export function shouldSkipReason(input: {
   probability: number;
   confidence: number;
   target?: number;
+  targetGameId?: string | null;
   strategyAction?: string | null;
   pipelineAction?: string | null;
   reasoning?: string[] | string | null;
@@ -394,6 +400,13 @@ export function shouldSkipReason(input: {
   const reducedBlocked =
     !ALLOW_REDUCED_ENTRY &&
     (strategyAction === "REDUCED_ENTRY" || pipelineAction === "REDUCED_ENTRY");
+
+  // Loss cooldown is independent of probability — even 90%+ must skip the
+  // mandatory post-LOSS round. Checked first so PR/BG/ED cannot bypass it.
+  if (input.targetGameId) {
+    const cd = shouldForceLossCooldownSkip(String(input.targetGameId));
+    if (cd.skip) return { skip: true, reason: "loss_cooldown" };
+  }
 
   if (minP > 0 && p < minP) return { skip: true, reason: "probability_below_min" };
   if (minC > 0 && c < minC) return { skip: true, reason: "confidence_below_min" };
@@ -1722,12 +1735,16 @@ export async function onGameEndPredict(
       probability: p,
       confidence: c,
       target: Number(DEFAULT_TARGET),
+      targetGameId,
       strategyAction,
       pipelineAction,
       reasoning: signal.reasoning,
     });
     const skip = skipCheck.skip;
     const vetoReason = skipCheck.reason;
+    if (skip && vetoReason === "loss_cooldown") {
+      consumeLossCooldownSkip(targetGameId);
+    }
     // Tier separation (directive 17:27Z): five-state taxonomy, pure function
     // of the probability. p >= PREDICTION_FLOOR is RECORDED (durable audit
     // row, band-backtestable) but is NOT a betting signal. BET eligibility
