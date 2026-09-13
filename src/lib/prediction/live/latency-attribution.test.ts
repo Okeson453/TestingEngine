@@ -123,4 +123,52 @@ describe("BG latency profile in message text (Railway strips pino fields)", () =
       "[reconcile=${profile.bg_receipt_to_reconcile_ms}ms prediction=${profile.prediction_ms}ms total=${profile.bg_receipt_to_prediction_done_ms}ms]",
     );
   });
+
+  it("kill leg log distinguishes checkout vs query (not false pool-contention)", () => {
+    expect(handlerSrc).toContain("checkout_ms=");
+    expect(handlerSrc).toContain("checkout≈0+query>0 ⇒ RTT/exec not pool wait");
+  });
+
+  it("does not overwrite stage marks with Date.now()/epoch ms", () => {
+    // Root cause of negative state_to_claim / claim_to_predict: handlers
+    // assigned Date.now() epoch into marks that finishSignalReady subtracts
+    // from performance.now() values.
+    expect(handlerSrc).not.toMatch(
+      /marks\.ws_received\s*=\s*new Date\([^)]*\)\.getTime\(\)/,
+    );
+    expect(handlerSrc).not.toMatch(
+      /marks\.ownership_reserved\s*=\s*(Date\.now\(\)|bgReserveAt|prReserveAt)/,
+    );
+    expect(handlerSrc).toContain("markAt(bgTrace, \"ownership_reserved\"");
+    expect(handlerSrc).toContain("markAt(prTrace, \"ownership_reserved\"");
+  });
+});
+
+describe("latency-trace mono basis (negative stage delta guard)", () => {
+  it("markAt rejects epoch timestamps and finishSignalReady drops negative deltas", async () => {
+    const {
+      startTrace,
+      markAt,
+      mark,
+      finishSignalReady,
+      mono,
+    } = await import("./latency-trace.ts");
+    const t = startTrace("test-neg", "g1");
+    const t0 = mono();
+    // Poison with epoch (historical bug) — markAt must replace with mono.
+    markAt(t, "ownership_reserved", Date.now());
+    expect(t.marks.ownership_reserved!).toBeLessThan(1e11);
+    markAt(t, "target_claimed", t0 + 1);
+    markAt(t, "state_acquired", t0 + 2);
+    mark(t, "prediction_started");
+    mark(t, "prediction_completed");
+    mark(t, "gates_passed");
+    const total = finishSignalReady(t);
+    expect(total).toBeGreaterThanOrEqual(0);
+    // Explicit inverted order must not enter samples as negative.
+    t.marks.state_updated = t0 + 10;
+    t.marks.target_claimed = t0 + 1; // inverted
+    const total2 = finishSignalReady(t);
+    expect(total2).toBeGreaterThanOrEqual(0);
+  });
 });

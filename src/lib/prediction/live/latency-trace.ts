@@ -48,7 +48,13 @@ export const predictionLifecycleCounters = {
   persistenceFailures: 0,
 };
 
-function mono(): number {
+/**
+ * Monotonic elapsed-ms clock for application stage durations.
+ * NEVER mix with Date.now() / epoch timestamps — that produced impossible
+ * negative stage deltas (state_to_claim=-1.8ms, claim_to_predict=-1.5ms)
+ * when handlers overwrote marks with wall-clock epoch ms.
+ */
+export function mono(): number {
   return typeof performance !== "undefined" && performance.now
     ? performance.now()
     : Number(process.hrtime.bigint()) / 1e6;
@@ -63,11 +69,27 @@ export function mark(trace: Trace, stage: Stage): void {
   trace.marks[stage] = mono();
 }
 
+/**
+ * Set a stage mark only when the value is on the mono() basis.
+ * Rejects epoch-ms values (Date.now() ~ 1.7e12) so handlers cannot
+ * accidentally poison the trace with wall-clock timestamps.
+ */
+export function markAt(trace: Trace, stage: Stage, atMs: number): void {
+  // performance.now() is ms since process start — typically < 1e10 for any
+  // realistic process lifetime. Epoch ms is ~1.7e12. Reject the latter.
+  if (!Number.isFinite(atMs) || atMs > 1e11) {
+    trace.marks[stage] = mono();
+    return;
+  }
+  trace.marks[stage] = atMs;
+}
+
 export function finishSignalReady(trace: Trace): number {
   mark(trace, "signal_ready");
   const start = trace.marks.ws_received ?? trace.t0;
   const end = trace.marks.signal_ready ?? mono();
-  const total = end - start;
+  // Clamp: clock basis mismatch must never publish negative totals.
+  const total = Math.max(0, end - start);
   samples.push(total);
   if (samples.length > MAX_SAMPLES) samples.shift();
   lastSignalAt = Date.now();
@@ -88,7 +110,10 @@ export function finishSignalReady(trace: Trace): number {
   for (const [name, a, b] of stages) {
     const ta = trace.marks[a];
     const tb = trace.marks[b];
-    if (ta != null && tb != null) {
+    // Only record when both marks exist, share a plausible mono basis, and
+    // order is non-decreasing. Negative deltas are discarded (not clamped
+    // into the distribution) so p50/p95 stay honest.
+    if (ta != null && tb != null && tb >= ta && ta < 1e11 && tb < 1e11) {
       const arr = (stageSamples[name] ??= []);
       arr.push(tb - ta);
       if (arr.length > MAX_SAMPLES) arr.shift();

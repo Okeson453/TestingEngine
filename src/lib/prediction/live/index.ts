@@ -25,7 +25,14 @@ export {
 } from "./notification-worker";
 export { PollWorker, POLL_INTERVAL_MS, STALE_PREDICTED_MS } from "./poll-worker";
 export { ClockSkewMonitor, SKEW_INTERVAL_MS } from "./clock-skew-monitor";
-export { startLiveBoot, stopLiveBoot, getLiveBoot, validateSchema } from "./boot";
+export {
+  startLiveBoot,
+  stopLiveBoot,
+  getLiveBoot,
+  validateSchema,
+  getHotReadinessStage,
+  type HotReadinessStage,
+} from "./boot";
 export {
   isHistoryReadyForPrediction,
   isLiveHistoryWarmed,

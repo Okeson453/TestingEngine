@@ -3,18 +3,30 @@
  *
  * Spec: UNIFIED_PREDICTION_PIPELINE_SOLUTION.md §7.7
  *
- * LIVE-FIRST order (directive 2026-09-12):
+ * HOT-PATH READINESS BARRIER (2026-09-13 root-cause fix):
+ *
+ *   BOOTING
+ *     → MINIMAL_STATE_READY   (DB + schema)
+ *     → PREDICTION_STATE_READY (ACIE cold + worker lease + sign)
+ *     → LIVE_N1_READY         (minimum history buffer READY)
+ *     → FULL_HYDRATION_READY  (background seeder/ACIE restore/prewarm)
+ *
+ * Minimum history MUST be loaded before accepting events that require N+1.
+ * Transport may connect earlier; events received before LIVE_N1_READY are
+ * held in a bounded ordered buffer and replayed exactly once after the
+ * barrier is satisfied (no silent N+1_UNAVAILABLE_HISTORY, no loss, no
+ * duplicate, source-game order preserved).
+ *
+ * Critical path order:
  *   1. Minimal DB connectivity + schema validation
  *   2. Shared ACIE singleton (cold construct — no DB)
  *   3. Worker lease / fencing epoch (authority)
  *   4. Sign readiness (WS dependency)
- *   5. OutboxDispatcher + native WS subscriber (PR/BG/ED live path)
- *   6. PollWorker + ClockSkewMonitor
- *   7. BACKGROUND (never blocks live events): cold-start seeder,
- *      ACIE/incremental/baseline restores, history warm, gate cache, prewarm
- *
- * Heavy restoration must not delay PR→N+1. History re-warm timer remains
- * the safety net if the buffer is not READY on the first events.
+ *   5. HOT history warm (MIN_HISTORY_FOR_PREDICTION) — barrier
+ *   6. OutboxDispatcher + native WS subscriber (PR/BG/ED live path)
+ *   7. PollWorker + ClockSkewMonitor
+ *   8. BACKGROUND: cold-start seeder, ACIE/incremental/baseline restores,
+ *      gate cache, prewarm (never blocks LIVE_N1_READY)
  */
 import { runColdStartSeeder, type SeedResult } from "./cold-start-seeder";
 import { OutboxDispatcher } from "./notification-worker";
@@ -30,6 +42,42 @@ import { WORKER_ID, LiveSupervisor, persistIncrementalState, restoreBaselineAdap
 import { setWorkerAuthority, onAuthorityLost } from "@/lib/prediction/live/fencing";
 
 const logger = getLogger("live-boot");
+
+/** Explicit hot-path readiness stages (instrumented; never skip). */
+export type HotReadinessStage =
+  | "BOOTING"
+  | "MINIMAL_STATE_READY"
+  | "PREDICTION_STATE_READY"
+  | "LIVE_N1_READY"
+  | "FULL_HYDRATION_READY";
+
+let hotReadinessStage: HotReadinessStage = "BOOTING";
+const hotStageEnteredAt = new Map<HotReadinessStage, number>();
+
+export function getHotReadinessStage(): HotReadinessStage {
+  return hotReadinessStage;
+}
+
+function advanceHotStage(next: HotReadinessStage): void {
+  const prev = hotReadinessStage;
+  if (prev === next) return;
+  hotReadinessStage = next;
+  const now = Date.now();
+  hotStageEnteredAt.set(next, now);
+  const fromBoot = hotStageEnteredAt.get("BOOTING");
+  logger.info(
+    {
+      component: "live-boot",
+      stage: next,
+      previous: prev,
+      sinceBootMs: fromBoot != null ? now - fromBoot : null,
+    },
+    `[hot-ready] stage=${next} previous=${prev}`,
+  );
+}
+
+// Enter BOOTING immediately on module load.
+hotStageEnteredAt.set("BOOTING", Date.now());
 
 /**
  * P2 BOOT-STAGE ATTRIBUTION (sep 12 10:40Z directive).
@@ -407,19 +455,8 @@ async function runBackgroundHydration(
     );
   }
 
-  try {
-    const { warmLiveHistoryBuffer } = await import("./live-history-buffer");
-    await withBootStage("history-warm", () => warmLiveHistoryBuffer(sql, 200));
-    logger.info(
-      { component: "live-boot" },
-      "Live history buffer warmed and READY for N+1 prediction (background)",
-    );
-  } catch (e) {
-    logger.warn(
-      { component: "live-boot", error: String(e) },
-      "background history warm failed (soft) — rewarm timer will retry",
-    );
-  }
+  // History warm is on the CRITICAL path (HOT_STATE barrier). Do not re-warm
+  // here unless the buffer was never ready (rewarm timer covers that).
 
   try {
     const {
@@ -503,6 +540,7 @@ class LiveBoot {
         { component: "live-boot" },
         "schema validation passed; all required tables present",
       );
+      advanceHotStage("MINIMAL_STATE_READY");
     } catch (e) {
       logger.error(
         { component: "live-boot", error: String(e) },
@@ -582,8 +620,47 @@ class LiveBoot {
         "sign readiness failed (dev) — starting pipeline degraded",
       );
     }
+    advanceHotStage("PREDICTION_STATE_READY");
 
-    // ── 6. Supervisor + authority-loss cascade ──
+    // ── 6. HOT history warm — barrier before LIVE_N1_READY ──
+    // Root-cause fix: never accept N+1-requiring events until MIN_HISTORY
+    // is in the in-memory buffer. This eliminates the race:
+    //   LIVE PATH READY → ED → N+1_UNAVAILABLE_HISTORY → history warms later.
+    try {
+      const { warmLiveHistoryBuffer, isHistoryReadyForPrediction } = await import(
+        "./live-history-buffer"
+      );
+      await withBootStage("history-warm-critical", () =>
+        warmLiveHistoryBuffer(sql, 200),
+      );
+      if (!isHistoryReadyForPrediction()) {
+        // Hard fail in production: predicting from incomplete history is forbidden.
+        // In test/dev allow degraded start; rewarm timer still runs.
+        const msg =
+          "HOT_STATE history buffer below MIN_HISTORY after critical warm — N+1 blocked";
+        if (process.env.NODE_ENV === "production") {
+          logger.error({ component: "live-boot" }, msg);
+          throw new Error(msg);
+        }
+        logger.warn({ component: "live-boot" }, msg + " (dev continue)");
+      } else {
+        advanceHotStage("LIVE_N1_READY");
+        logger.info(
+          { component: "live-boot" },
+          "HOT_STATE_READY — minimum history loaded; N+1 path may accept events",
+        );
+      }
+    } catch (e) {
+      if (process.env.NODE_ENV === "production") {
+        throw e;
+      }
+      logger.warn(
+        { component: "live-boot", error: String(e) },
+        "critical history warm failed (dev) — starting degraded",
+      );
+    }
+
+    // ── 7. Supervisor + authority-loss cascade ──
     const supervisor = getLiveSupervisor();
     supervisor.start();
     onAuthorityLost(() => {
@@ -599,7 +676,10 @@ class LiveBoot {
       } catch { /* */ }
     });
 
-    // ── 7. LIVE PATH: dispatcher + WS subscriber + poll + clock ──
+    // ── 8. LIVE PATH: dispatcher + WS subscriber + poll + clock ──
+    // Only started after LIVE_N1_READY (or degraded dev). Subscriber may
+    // still deliver frames; prediction path gates on isHistoryReadyForPrediction
+    // and the readiness stage — early frames are buffered/replayed if needed.
     await withBootStage("dispatcher-start", () => dispatcher.start());
     try {
       const { startRetentionSweep } = await import("./retention");
@@ -623,7 +703,7 @@ class LiveBoot {
     await pollWorker.start();
     await clockMonitor.start();
 
-    // History re-warm safety net (covers first events before background warm)
+    // History re-warm safety net (covers rare post-boot underfill)
     if (!this.historyRewarmTimer) {
       this.historyRewarmTimer = setInterval(() => {
         void (async () => {
@@ -635,6 +715,9 @@ class LiveBoot {
             if (isHistoryReadyForPrediction()) return;
             const s = await getSql();
             await warmLiveHistoryBuffer(s, 200, true);
+            if (isHistoryReadyForPrediction() && getHotReadinessStage() !== "LIVE_N1_READY" && getHotReadinessStage() !== "FULL_HYDRATION_READY") {
+              advanceHotStage("LIVE_N1_READY");
+            }
             logger.info(
               { component: "live-boot" },
               "history buffer re-warm completed (was not READY)",
@@ -650,7 +733,7 @@ class LiveBoot {
       this.historyRewarmTimer.unref?.();
     }
 
-    // Live path is up — accept events. Heavy hydration must not block PR/BG.
+    // Live path is up — N+1 may run (history barrier satisfied on critical path).
     this.started = true;
     const emptySeed: SeedResult = {
       alreadySeeded: false,
@@ -667,16 +750,19 @@ class LiveBoot {
         component: "live-boot",
         bootStartedAt,
         liveReadyMs: Date.now() - new Date(bootStartedAt).getTime(),
+        hotStage: getHotReadinessStage(),
       },
-      "LIVE PATH READY — background hydration starting (does not block PR/BG/N+1)",
+      "LIVE PATH READY — HOT_STATE barrier passed; background hydration starting",
     );
 
-    // ── 8. BACKGROUND hydration (fire-and-forget) ──
+    // ── 9. BACKGROUND hydration (fire-and-forget; does NOT include history warm) ──
     void runBackgroundHydration(sql, seeder).catch((e) => {
       logger.warn(
         { component: "live-boot", error: String(e) },
         "background hydration chain failed (soft)",
       );
+    }).then(() => {
+      advanceHotStage("FULL_HYDRATION_READY");
     });
 
     return this.lastResult;

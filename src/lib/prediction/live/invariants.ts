@@ -194,7 +194,11 @@ export async function sampleProductionInvariants(
   }})());
 
   probes.push(() => (async () => { try {
-    // Temporal violations on recent pending rows
+    // Temporal violations on recent pending rows.
+    // Bound the scan to the last 24h so we use pending_predictions_pending_requested_desc_idx
+    // / temporal partial index instead of a full-table filter on the cross-column
+    // predicate requested_at >= target_round_started_at (which cannot use a
+    // simple btree efficiently and was measured ~524ms on large tables).
     const temporal = await db<{
       prediction_id: string;
       target_game_id: string;
@@ -204,6 +208,7 @@ export async function sampleProductionInvariants(
       SELECT prediction_id, target_game_id, requested_at, target_round_started_at
       FROM pending_predictions
       WHERE target_round_started_at IS NOT NULL
+        AND requested_at >= now() - interval '24 hours'
         AND requested_at >= target_round_started_at
       ORDER BY requested_at DESC
       LIMIT 5

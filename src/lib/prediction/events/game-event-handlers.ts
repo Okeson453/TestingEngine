@@ -46,6 +46,8 @@ import {
 import {
   startTrace,
   mark,
+  markAt,
+  mono,
   finishSignalReady,
   finishPersist,
   logLatencyBudgetSnapshot,
@@ -252,7 +254,9 @@ export async function bgHandler(payload: unknown): Promise<void> {
   // single authoritative toggle; opt into ED-primary with ED_PRIMARY_PREDICT=1
   // or BG_PRIMARY_PREDICT=0.
   const targetGameIdForBg = nextTargetGameId(gameId);
-  const bgReserveAt = Date.now();
+  // Mono basis for stage marks; wall-clock only for receipt→reserve telemetry.
+  const bgReserveMono = mono();
+  const bgReserveWall = Date.now();
   let bgReserved = false;
   const bgPrimaryPredict = bgPrimaryEnabled();
   if (bgPrimaryPredict && isAuthoritative() && /^\d+$/.test(gameId)) {
@@ -267,7 +271,10 @@ export async function bgHandler(payload: unknown): Promise<void> {
         ownership: reserve.owned ? "RESERVED_BG" : reserve.reason,
         owner: reserve.owned ? `bg:${gameId}` : reserve.owner,
         state: reserve.owned ? reserve.state : reserve.state,
-        bg_receipt_to_reserve_ms: Math.max(0, bgReserveAt - new Date(receivedAt).getTime()),
+        bg_receipt_to_reserve_ms: Math.max(
+          0,
+          bgReserveWall - new Date(receivedAt).getTime(),
+        ),
         correlationId,
       },
       reserve.owned
@@ -328,12 +335,13 @@ export async function bgHandler(payload: unknown): Promise<void> {
       void (async () => {
         const bgCorrelationId = `${correlationId}:bg-n1`;
         const bgTrace = startTrace(bgCorrelationId, gameId);
-        const bgReceivedMs = new Date(receivedAt).getTime();
+        // Wall-clock only for receipt→done telemetry (not stage marks).
+        const bgReceivedWall = new Date(receivedAt).getTime();
         const attemptT0 = Date.now();
         try {
-          // Stage: ownership already reserved synchronously at handler entry.
-          bgTrace.marks.ownership_reserved = bgReserveAt;
-          bgTrace.marks.ws_received = bgReceivedMs;
+          // Stage marks: mono() only. startTrace already set ws_received.
+          // ownership_reserved was captured at reserve time on mono basis.
+          markAt(bgTrace, "ownership_reserved", bgReserveMono);
           const result = await attemptNPlusOnePrediction({
             sourceRoundId: gameId,
             sourceCrashAt: beganAt,
@@ -359,10 +367,10 @@ export async function bgHandler(payload: unknown): Promise<void> {
             // first, fall back to elapsed-at-emission (both honest).
             bg_receipt_to_reconcile_ms: reconcileMs ?? Math.max(
               0,
-              Date.now() - bgReceivedMs - predictionMs,
+              Date.now() - bgReceivedWall - predictionMs,
             ),
             prediction_ms: predictionMs,
-            bg_receipt_to_prediction_done_ms: Math.max(0, Date.now() - bgReceivedMs),
+            bg_receipt_to_prediction_done_ms: Math.max(0, Date.now() - bgReceivedWall),
             predictionId: result.predictionId,
             correlationId: bgCorrelationId,
           };
@@ -383,8 +391,11 @@ export async function bgHandler(payload: unknown): Promise<void> {
             for (const [name, a, b] of pairs) {
               const ta = marks[a];
               const tb = marks[b];
+              // Mono-basis only; never publish negative stage deltas.
               stageBreakdown[name] =
-                ta != null && tb != null ? Math.round(tb - ta) : null;
+                ta != null && tb != null && tb >= ta && ta < 1e11 && tb < 1e11
+                  ? Math.round(tb - ta)
+                  : null;
             }
             logger.info(
               { ...profile, total_signal_ms: Math.round(totalMs), stages: stageBreakdown },
@@ -445,10 +456,16 @@ export async function bgHandler(payload: unknown): Promise<void> {
     const beganParam = new Date(beganAt);
 
     // ── Leg 1: temporal kill (critical pool, awaited) ──
-    const killAcquireT0 = Date.now();
+    // Timing split (mathematically correct):
+    //   kill_checkout_ms  = wall time to obtain a sql handle (getCriticalSql)
+    //   kill_query_ms     = wall time of the UPDATE (includes Neon RTT + exec)
+    // acquire_ms≈0 with query_ms≈180–200ms is NOT pool contention — it is
+    // network/query RTT on an already-available client. Contention would show
+    // kill_checkout_ms ≫ 0 and waitingCount > 0 on the pool.
+    const killCheckoutT0 = mono();
     const killSql = await getCriticalSql();
-    const killAcquireMs = Date.now() - killAcquireT0;
-    const killQueryT0 = Date.now();
+    const killCheckoutMs = Math.round(mono() - killCheckoutT0);
+    const killQueryT0 = mono();
     let signalsKilled = 0;
     try {
       const killRows = await killSql`
@@ -485,7 +502,8 @@ export async function bgHandler(payload: unknown): Promise<void> {
       }
     }
     reconcileMs = Date.now() - reconcileT0;
-    const killQueryMs = Date.now() - killQueryT0;
+    const killQueryMs = Math.round(mono() - killQueryT0);
+    const killAcquireMs = killCheckoutMs; // alias retained for log field compat
 
     // ── Leg 2: lifecycle bookkeeping (general pool, detached) ──
     void (async () => {
@@ -613,9 +631,10 @@ export async function bgHandler(payload: unknown): Promise<void> {
         // ~1.24s here (pool contention) vs ~2ms of model time — this
         // field is the per-round proof of where the cost sits.
         bg_receipt_to_reconcile_ms: Math.max(0, Date.now() - new Date(receivedAt).getTime()),
-        // PASS 5: acquire-vs-query split for the kill leg — if this is slow
-        // again, these two fields decide contention vs network with no
-        // inference.
+        // checkout-vs-query split: checkout is getCriticalSql only; query is
+        // UPDATE wall time (Neon RTT + exec). checkout≈0 does not imply
+        // contention when query_ms is high — that is network/exec cost.
+        kill_checkout_ms: killCheckoutMs,
         kill_acquire_ms: killAcquireMs,
         kill_query_ms: killQueryMs,
         // signals_killed>0 is the proof the temporal kill actually ran.
@@ -623,10 +642,12 @@ export async function bgHandler(payload: unknown): Promise<void> {
       },
       "bg reconcile complete — kill committed; lifecycle leg detached (general pool)",
     );
-    // Railway strips JSON fields — the acquire-vs-query split must be in the
+    // Railway strips JSON fields — the checkout-vs-query split must be in the
     // MESSAGE to be readable from raw logs (that split is the P1 evidence).
+    // checkout_ms≈0 + query_ms≈180–200 ⇒ available client, cost is Neon RTT/exec.
+    // checkout_ms≫0 ⇒ pool wait / connection create (check waitingCount).
     console.log(
-      `[bg] kill leg: acquire_ms=${killAcquireMs} query_ms=${killQueryMs} killed=${signalsKilled} (acquire≈RTT-floor when 0-wait; acquire≫query ⇒ pool contention)`,
+      `[bg] kill leg: checkout_ms=${killCheckoutMs} query_ms=${killQueryMs} killed=${signalsKilled} (checkout≈0+query>0 ⇒ RTT/exec not pool wait; checkout≫0 ⇒ pool/connect)`,
     );
   } catch (error) {
     logger.error({ event: "bg", gameId, error: String(error) }, "bg observability failed");
@@ -666,7 +687,8 @@ export async function prHandler(payload: unknown): Promise<void> {
 
   const targetGameId = nextTargetGameId(gameId);
   const prPrimary = prPrimaryEnabled();
-  const prReserveAt = Date.now();
+  // Mono basis only — wall-clock Date.now() poisoned stage deltas (negatives).
+  const prReserveAt = mono();
   let prReserved = false;
 
   if (prPrimary && isAuthoritative() && /^\d+$/.test(gameId)) {
@@ -720,8 +742,8 @@ export async function prHandler(payload: unknown): Promise<void> {
         const prTrace = startTrace(prCorrelationId, gameId);
         const attemptT0 = Date.now();
         try {
-          prTrace.marks.ownership_reserved = prReserveAt;
-          prTrace.marks.ws_received = new Date(receivedAt).getTime();
+          // Mono basis only — do not overwrite ws_received with epoch ms.
+          markAt(prTrace, "ownership_reserved", prReserveAt);
           if (prReserved) {
             markPrRunning(targetGameId, `pr:${gameId}`);
           }
