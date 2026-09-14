@@ -607,9 +607,9 @@ export class ACIEEngine {
       };
     }
 
-    // Layer 3: temporal motif gate — ON by default (pattern recognition).
+    // Layer 3: temporal motif gate — OFF by default (checkout; set ACIE_MOTIF_GATE=1 to enable).
     // Disable with ACIE_MOTIF_GATE=0 if higher volume is preferred over ~80% WR.
-    const motifGateEnabled = process.env.ACIE_MOTIF_GATE !== '0';
+    const motifGateEnabled = process.env.ACIE_MOTIF_GATE === '1';
     let motifGate:
       | { passed: boolean; motif: '001111' | '011011' | null; enabled: boolean }
       | undefined;

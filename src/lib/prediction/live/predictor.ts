@@ -674,9 +674,10 @@ function getPipelineFn(): PipelineFn | null {
 }
 
 /**
- * P0 authoritative path: observe is done by the caller (onGameEndPredict)
- * on the shared ACIE; this function evaluates N+1 from that shared state.
- * Falls back to PredictionEngine only when ACIE is unavailable.
+ * Signal prediction path.
+ * PREDICTION_PRIMARY_ENGINE=old|acie (default: old — PredictionEngine primary).
+ * ACIE_MOTIF_GATE=1 enables pattern motif; default off for checkout.
+ * Observe still runs on shared ACIE for learning when available.
  */
 const defaultPredictFn = (
   priorRounds: HistoricalRound[],
@@ -684,8 +685,12 @@ const defaultPredictFn = (
   timestamp: string,
   target: ThresholdTarget,
 ) => {
-  // Prefer ACIE evaluation from the shared singleton (post-observe).
-  try {
+  const primary =
+    String(process.env.PREDICTION_PRIMARY_ENGINE ?? "old").toLowerCase();
+  const useAciePrimary = primary === "acie" || primary === "acie-v3";
+
+  // Prefer ACIE only when explicitly selected as primary.
+  if (useAciePrimary) try {
     // P0 FIX: was require() — ReferenceError under the ESM worker made this
     // fall back to PredictionEngine on every crash. Static import now.
     const sharedMod = {
@@ -823,7 +828,7 @@ const defaultPredictFn = (
     );
   }
 
-  // FALLBACK_BASELINE path (must be visible)
+  // PredictionEngine path — primary when PREDICTION_PRIMARY_ENGINE=old (default).
   const engine = getSharedPredictionEngine();
   const signal = engine.predict({
     priorRounds,
@@ -835,13 +840,18 @@ const defaultPredictFn = (
   let probability = signal.probability;
   const confidence = signal.confidence;
   let modelVersion = signal.modelVersion ?? "live-v2";
-  let executionMode = "FALLBACK_BASELINE";
+  let executionMode = useAciePrimary ? "FALLBACK_BASELINE" : "PRIMARY_BASELINE";
   const reasoning: string[] = Array.isArray(signal.reasoning)
     ? [...signal.reasoning]
     : signal.reasoning
       ? [String(signal.reasoning)]
       : [];
-  reasoning.push("execution_mode=FALLBACK_BASELINE");
+  reasoning.push(`execution_mode=${executionMode}`);
+  reasoning.push(
+    useAciePrimary
+      ? "PredictionEngine fallback after ACIE"
+      : "PredictionEngine primary (PREDICTION_PRIMARY_ENGINE=old)",
+  );
 
   // Same pattern motif gate as ACIE — old PredictionEngine must not bypass it.
   let fallbackMotif: {
@@ -849,7 +859,7 @@ const defaultPredictFn = (
     passed: boolean | null;
     motif: string | null;
   } = { enabled: false, passed: null, motif: null };
-  const motifOn = process.env.ACIE_MOTIF_GATE !== "0";
+  const motifOn = process.env.ACIE_MOTIF_GATE === "1";
   if (motifOn && priorRounds.length >= 6) {
     fallbackMotif.enabled = true;
     const solLike = priorRounds.map((r) => ({
