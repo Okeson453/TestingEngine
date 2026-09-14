@@ -254,7 +254,7 @@ const DEFAULT_TARGET: ThresholdTarget = 1.3;
  *  absolute probability gate (MIN_SIGNAL_PROBABILITY=0.65). Set
  *  MIN_SIGNAL_EDGE>0 (e.g. 0.03) to re-enable fair+edge selectivity
  *  (~79.9% at 1.30×). */
-export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
+export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.02);
 /** Absolute probability gate for BET eligibility (directive: edge gate 65%).
  *  needP resolves to this when MIN_SIGNAL_EDGE<=0; when edge>0, needP is
  *  max(this, fair+edge). Persistence floor remains PREDICTION_FLOOR (same

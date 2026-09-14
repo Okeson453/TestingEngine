@@ -14,11 +14,11 @@ const FAIR_130 = 1 / 1.3;
 
 /** Target realized hit rate on emitted signals (absolute). */
 const TARGET_HIT =
-  Number(process.env.SIGNAL_TARGET_HIT_RATE ?? FAIR_130 + 0.05); // ~0.819
+  Number(process.env.SIGNAL_TARGET_HIT_RATE ?? 0.80);
 
 /** Base edge from env — default 0 aligns with absolute 65% probability gate.
  *  Set MIN_SIGNAL_EDGE>0 to re-enable fair+edge selectivity. */
-const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
+const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.02);
 
 /** Soft cap — was 0.08 (needP≈0.85) which silenced the engine for hours. */
 const MAX_EDGE = Number(process.env.SIGNAL_MAX_EDGE ?? 0.04);
