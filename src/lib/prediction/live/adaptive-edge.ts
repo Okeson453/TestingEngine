@@ -18,7 +18,7 @@ const TARGET_HIT =
 
 /** Base edge from env — default 0 aligns with absolute 65% probability gate.
  *  Set MIN_SIGNAL_EDGE>0 to re-enable fair+edge selectivity. */
-const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.02);
+const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
 
 /** Soft cap — was 0.08 (needP≈0.85) which silenced the engine for hours. */
 const MAX_EDGE = Number(process.env.SIGNAL_MAX_EDGE ?? 0.04);

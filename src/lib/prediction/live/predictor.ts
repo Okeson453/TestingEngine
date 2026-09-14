@@ -49,6 +49,11 @@ import { getLogger } from "@/lib/observability/logger";
 // FALLBACK_BASELINE). Static ESM imports work in both the Vite dev server
 // and the standalone ESM worker.
 import { getSharedACIEEngine, getSharedACIEInstanceId } from "@/lib/prediction/acie/shared-engine";
+import {
+  recordDailySignalIssued,
+  dailyVolumeRiskFields,
+  getDailySignalVolume,
+} from "@/lib/prediction/live/daily-signal-volume";
 import { liveSafeModeOverride } from "@/lib/prediction/lifecycle/safe-baseline-controller";
 import { buildAcieFeatureFingerprint, buildProvenance, computeFeatureHash } from "@/lib/prediction/acie/provenance";
 import { recordAcieObservation, assertFreshAcieState, getLastAcieObservation } from "@/lib/prediction/acie/stale-guard";
@@ -254,7 +259,7 @@ const DEFAULT_TARGET: ThresholdTarget = 1.3;
  *  absolute probability gate (MIN_SIGNAL_PROBABILITY=0.65). Set
  *  MIN_SIGNAL_EDGE>0 (e.g. 0.03) to re-enable fair+edge selectivity
  *  (~79.9% at 1.30×). */
-export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0.02);
+export const MIN_SIGNAL_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
 /** Absolute probability gate for BET eligibility (directive: edge gate 65%).
  *  needP resolves to this when MIN_SIGNAL_EDGE<=0; when edge>0, needP is
  *  max(this, fair+edge). Persistence floor remains PREDICTION_FLOOR (same
@@ -409,6 +414,13 @@ export function shouldSkipReason(input: {
     const cd = shouldForceLossCooldownSkip(String(input.targetGameId));
     if (cd.skip) return { skip: true, reason: "loss_cooldown" };
   }
+
+  // Daily signal hard max (target 1500 / limit 1500).
+  try {
+    if (getDailySignalVolume().atLimit) {
+      return { skip: true, reason: "strategy_veto" };
+    }
+  } catch { /* soft */ }
 
   if (minP > 0 && p < minP) return { skip: true, reason: "probability_below_min" };
   if (minC > 0 && c < minC) return { skip: true, reason: "confidence_below_min" };
@@ -685,7 +697,8 @@ const defaultPredictFn = (
     };
     const acie = sharedMod.getSharedACIEEngine();
     if (acie.historySize() >= 5) {
-      const evaluation = acie.evaluateNext();
+      // Pass daily volume so strategy paces toward 1500 target / hard max.
+      const evaluation = acie.evaluateNext(dailyVolumeRiskFields());
       const online = acie.getOnlineState();
       const snap = acie.exportSnapshot();
       let probability = Math.min(
@@ -2190,6 +2203,21 @@ export async function onGameEndPredict(
     } else {
       outboxEnqueued = 1;
       notePredictionOutboxEnqueued(targetGameId);
+      recordDailySignalIssued();
+      try {
+        const vol = getDailySignalVolume();
+        logger.info(
+          {
+            component: "daily-signal-volume",
+            issued: vol.issued,
+            target: vol.target,
+            limit: vol.limit,
+            progress: Number(vol.progress.toFixed(3)),
+            behindPace: vol.behindPace,
+          },
+          `daily signal volume ${vol.issued}/${vol.target} (limit ${vol.limit})`,
+        );
+      } catch { /* soft */ }
     }
 
     // live_event_log outside TX (not required for correctness / delivery).

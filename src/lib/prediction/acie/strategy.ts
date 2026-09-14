@@ -156,7 +156,7 @@ export class StrategyLayer {
     // Regime-adaptive + mild loss-streak threshold escalation (only after reduceAt)
     threshold = this.regimeAdjustedThreshold(threshold, regime, ctx);
 
-    // Daily volume: hard stop at limit (product max 1500/day), soft pacing before.
+    // Daily volume: 1500 is TARGET + hard MAX.
     const used = riskState.dailyEntriesUsed ?? 0;
     const limit = riskState.dailyEntriesLimit ?? 1500;
     if (limit > 0 && used >= limit) {
@@ -164,16 +164,14 @@ export class StrategyLayer {
         `Daily signal volume limit reached: ${used}/${limit}.`,
       );
     }
-    if (limit > 0 && used / limit > 0.85) {
-      threshold += 0.03;
-    } else if (
-      !this.selectiveOnly &&
-      limit > 0 &&
-      used / limit < 0.25 &&
-      used < limit * 0.25
-    ) {
-      // HF only: never lower the bar in selective quality mode.
-      threshold -= 0.015;
+    // Near cap → tighten; behind target pace → ease slightly (never below floor).
+    if (limit > 0 && used / limit > 0.9) {
+      threshold += 0.04;
+    } else if (limit > 0 && used / limit > 0.75) {
+      threshold += 0.02;
+    } else if (limit > 0 && used / limit < 0.5) {
+      // Pace toward daily target — modest ease for both quality and HF.
+      threshold -= this.selectiveOnly ? 0.01 : 0.02;
     }
 
     if (uncertainty.total > p.highUncertainty && evidence !== 'SUPPORTED') {
