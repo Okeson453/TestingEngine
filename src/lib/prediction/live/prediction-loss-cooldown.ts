@@ -311,6 +311,29 @@ export function shouldForceLossCooldownSkip(targetGameId: string): {
   if (skipRemaining <= 0) return { skip: false, reason: null };
 
   if (skipTargetGameId != null) {
+    // Stale cooldown: if the live target is already past the skip round,
+    // the mandatory skip window is over — clear and allow prediction.
+    if (
+      /^\d+$/.test(targetGameId) &&
+      /^\d+$/.test(skipTargetGameId) &&
+      BigInt(targetGameId) > BigInt(skipTargetGameId)
+    ) {
+      const cleared = skipTargetGameId;
+      skipRemaining = 0;
+      skipTargetGameId = null;
+      schedulePersist();
+      logger.info(
+        {
+          component: "prediction-loss-cooldown",
+          event: "COOLDOWN_STALE_CLEARED",
+          targetGameId,
+          clearedSkipWas: cleared,
+        },
+        "loss cooldown cleared — live target already past skip round",
+      );
+      return { skip: false, reason: null };
+    }
+
     if (String(targetGameId) === String(skipTargetGameId)) {
       return {
         skip: true,
