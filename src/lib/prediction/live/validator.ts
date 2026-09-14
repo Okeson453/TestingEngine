@@ -483,15 +483,20 @@ export async function onGameEnd(
         // immediately so the skip target cannot remain a live signal.
         if (result === "LOSS") {
           const cd = getLossCooldownState();
-          if (cd.skipTargetGameId) {
-            const skipT = cd.skipTargetGameId;
+          if (cd.skipTargetGameId && cd.skipRemaining > 0) {
             const lossT = cd.lossTargetGameId ?? evt.gameId;
-            // Await suppress on the validation path so N+1 outbox/pending are
-            // retired before concurrent PR can complete a signal (was setImmediate
-            // and lost the race → consecutive LOSS rows on the dashboard).
+            // Suppress the full skip window (escalating streak may be >1).
             try {
               const generalSql = await getSql();
-              await suppressCooldownTargetBetting(generalSql, skipT, lossT);
+              let cur: string | null = cd.skipTargetGameId;
+              for (let i = 0; i < cd.skipRemaining && cur; i++) {
+                await suppressCooldownTargetBetting(generalSql, cur, lossT);
+                try {
+                  cur = String(BigInt(cur) + 1n);
+                } catch {
+                  cur = null;
+                }
+              }
             } catch {
               /* in-memory markCooldownSkipTarget + shouldSkipReason still block */
             }

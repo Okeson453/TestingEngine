@@ -3,21 +3,26 @@
  *
  * Rules (round-based, not time-based):
  *   ACTIVE
- *     → confirmed LOSS on target T  →  COOLDOWN(skip T+1)
+ *     → confirmed LOSS on target T  →  COOLDOWN starting at T+1
  *   COOLDOWN
- *     → betting prediction for T+1 is forced SKIP (even at 90%+)
- *     → T+1 completes (or skip is consumed)  →  ACTIVE
- *   WIN does not enter cooldown; consecutive prediction losses each
- *   schedule exactly one additional skip round (never bypassed by PR/BG/ED).
+ *     → skipRemaining consecutive betting rounds forced SKIP (even at 90%+)
+ *     → each completed skip round decrements; when 0 → ACTIVE
+ *   WIN clears the consecutive-loss streak (and any active skip window).
  *
- * Only VALIDATED outcomes of ISSUED betting predictions (pending_predictions
- * matched WIN/LOSS after durable outbox handoff) arm this machine.
- * Strategy veto / skipped_no_edge / never-issued rows do not create pending
- * rows and therefore cannot trigger cooldown. Intermediate ED/BG crashes do not.
+ * Escalation (stops multi-loss rolls):
+ *   1 consecutive LOSS → skip 1 round
+ *   2 consecutive      → skip 2 rounds
+ *   3+ consecutive     → skip min(streak, MAX) rounds (default MAX=5)
  *
- * State is durable in worker_state so restart/fencing/recovery cannot bypass
- * an armed skip.
+ * Only VALIDATED outcomes of ISSUED betting predictions arm this machine.
+ * State is durable in worker_state so restart cannot bypass an armed skip.
  */
+
+/** Max mandatory skip rounds after a long loss streak. */
+const MAX_SKIP_ROUNDS = Math.max(
+  1,
+  Math.min(10, Number(process.env.LOSS_COOLDOWN_MAX_SKIP ?? 5)),
+);
 
 import { getLogger } from "@/lib/observability/logger";
 import type { Sql } from "@/lib/db";
@@ -159,12 +164,13 @@ export function resetLossCooldownForTests(): void {
 export function restoreLossCooldown(snap: Partial<LossCooldownSnapshot> | null | undefined): void {
   if (!snap) return;
   if (typeof snap.consecutivePredictionLosses === "number") {
-    // Telemetry only — never drives skipRemaining (one LOSS = one skip).
     consecutivePredictionLosses = Math.max(0, Math.floor(snap.consecutivePredictionLosses));
   }
   if (typeof snap.skipRemaining === "number") {
-    // Cap at 1: never stack cooldown rounds from a restored counter.
-    skipRemaining = Math.min(1, Math.max(0, Math.floor(snap.skipRemaining)));
+    skipRemaining = Math.min(
+      MAX_SKIP_ROUNDS,
+      Math.max(0, Math.floor(snap.skipRemaining)),
+    );
   }
   if (typeof snap.lossTargetGameId === "string") lossTargetGameId = snap.lossTargetGameId;
   if (typeof snap.skipTargetGameId === "string") skipTargetGameId = snap.skipTargetGameId;
@@ -193,29 +199,30 @@ export function noteValidatedPredictionOutcome(args: {
 
   if (args.result === "WIN") {
     consecutivePredictionLosses = 0;
+    // WIN ends any active cooldown window — streak broken.
+    skipRemaining = 0;
+    skipTargetGameId = null;
+    lossTargetGameId = null;
     logger.info(
       {
         component: "prediction-loss-cooldown",
         predictionId: args.predictionId,
         targetGameId: args.targetGameId,
-        skipRemaining,
       },
-      "prediction WIN — consecutive loss streak cleared (active skip unchanged)",
+      "prediction WIN — consecutive loss streak + cooldown cleared",
     );
     schedulePersist();
     return;
   }
 
-  // LOSS on issued prediction targeting N → mandatory skip of N+1 only.
-  // Identity is the losing target (args.targetGameId), not "whatever is current".
-  // consecutivePredictionLosses is streak telemetry only; skipRemaining is
-  // always 0|1 (one confirmed LOSS → exactly one mandatory skip of N+1).
+  // LOSS on issued prediction targeting N → escalate skip window from N+1.
   consecutivePredictionLosses += 1;
   const lossN = args.targetGameId;
   const next = nextNumericId(lossN);
   lossTargetGameId = lossN;
   skipTargetGameId = next;
-  skipRemaining = 1;
+  // Escalate: 1 loss → 1 skip, 2 → 2, … capped at MAX_SKIP_ROUNDS.
+  skipRemaining = Math.min(MAX_SKIP_ROUNDS, consecutivePredictionLosses);
 
   logger.info(
     {
@@ -226,11 +233,20 @@ export function noteValidatedPredictionOutcome(args: {
       skipTargetGameId: next,
       skipRemaining,
       consecutivePredictionLosses,
+      maxSkip: MAX_SKIP_ROUNDS,
     },
-    `prediction LOSS — cooldown armed: skip next betting round target=${next ?? "next-attempt"} (loss_on=${lossN})`,
+    `prediction LOSS — cooldown armed: skip ${skipRemaining} round(s) from target=${next ?? "next-attempt"} (loss_on=${lossN} streak=${consecutivePredictionLosses})`,
   );
-  // Force NO_BET terminal on N+1 so PR/BG/ED cannot reserve/issue after arm.
+  // Mark the first skip target; further targets marked as each prior completes.
   if (next) markCooldownSkipTarget(next);
+  // Also mark the full skip window when numeric (blocks PR race across N+1..N+k).
+  if (next && /^\d+$/.test(next) && skipRemaining > 1) {
+    let cur: string | null = next;
+    for (let i = 1; i < skipRemaining && cur; i++) {
+      cur = nextNumericId(cur);
+      if (cur) markCooldownSkipTarget(cur);
+    }
+  }
   schedulePersist();
 }
 
@@ -304,6 +320,18 @@ export async function suppressCooldownTargetBetting(
  * True when this target must not emit a betting signal.
  * Enforced at strategy/selectivity — PR/BG/ED all share shouldSkipReason.
  */
+/** Last game id in the current skip window (inclusive). */
+function skipWindowEndId(): string | null {
+  if (skipRemaining <= 0 || skipTargetGameId == null) return null;
+  let end = skipTargetGameId;
+  for (let i = 1; i < skipRemaining; i++) {
+    const n = nextNumericId(end);
+    if (!n) break;
+    end = n;
+  }
+  return end;
+}
+
 export function shouldForceLossCooldownSkip(targetGameId: string): {
   skip: boolean;
   reason: string | null;
@@ -311,51 +339,34 @@ export function shouldForceLossCooldownSkip(targetGameId: string): {
   if (skipRemaining <= 0) return { skip: false, reason: null };
 
   if (skipTargetGameId != null) {
-    // Stale cooldown: if the live target is already past the skip round,
-    // the mandatory skip window is over — clear and allow prediction.
+    const end = skipWindowEndId();
+    // Pure check — never mutate here (noteRoundCompleted advances the window).
     if (
       /^\d+$/.test(targetGameId) &&
-      /^\d+$/.test(skipTargetGameId) &&
-      BigInt(targetGameId) > BigInt(skipTargetGameId)
+      lossTargetGameId != null &&
+      /^\d+$/.test(lossTargetGameId) &&
+      end != null &&
+      /^\d+$/.test(end)
     ) {
-      const cleared = skipTargetGameId;
-      skipRemaining = 0;
-      skipTargetGameId = null;
-      schedulePersist();
-      logger.info(
-        {
-          component: "prediction-loss-cooldown",
-          event: "COOLDOWN_STALE_CLEARED",
-          targetGameId,
-          clearedSkipWas: cleared,
-        },
-        "loss cooldown cleared — live target already past skip round",
-      );
+      const t = BigInt(targetGameId);
+      if (t > BigInt(lossTargetGameId) && t <= BigInt(end)) {
+        return {
+          skip: true,
+          reason: `loss_cooldown: skip window after LOSS on ${lossTargetGameId} (${skipRemaining} left)`,
+        };
+      }
       return { skip: false, reason: null };
     }
 
     if (String(targetGameId) === String(skipTargetGameId)) {
       return {
         skip: true,
-        reason: `loss_cooldown: mandatory skip after LOSS on ${lossTargetGameId}`,
+        reason: `loss_cooldown: skip ${skipRemaining} remaining after LOSS on ${lossTargetGameId}`,
       };
-    }
-    // Numeric ordering: any target still at/before the skip target while
-    // skipRemaining>0 stays blocked (reconnect/out-of-order protection).
-    if (/^\d+$/.test(targetGameId) && /^\d+$/.test(skipTargetGameId)) {
-      if (BigInt(targetGameId) <= BigInt(skipTargetGameId) && lossTargetGameId != null) {
-        if (BigInt(targetGameId) > BigInt(lossTargetGameId)) {
-          return {
-            skip: true,
-            reason: `loss_cooldown: mandatory skip after LOSS on ${lossTargetGameId}`,
-          };
-        }
-      }
     }
     return { skip: false, reason: null };
   }
 
-  // Non-numeric ids: skip the next prediction attempt only.
   return {
     skip: true,
     reason: `loss_cooldown: mandatory skip after LOSS on ${lossTargetGameId}`,
@@ -388,12 +399,67 @@ export function consumeLossCooldownSkip(targetGameId: string): void {
  */
 export function noteRoundCompletedForCooldown(gameId: string): void {
   if (skipRemaining <= 0 || skipTargetGameId == null) return;
-  if (String(gameId) !== String(skipTargetGameId)) return;
-  skipRemaining = 0;
-  skipTargetGameId = null;
-  logger.info(
-    { component: "prediction-loss-cooldown", gameId },
-    "loss cooldown cleared — skip-target round completed",
-  );
+
+  const end = skipWindowEndId();
+  // Fully past the window (missed intermediate ED) → clear.
+  if (
+    end != null &&
+    /^\d+$/.test(gameId) &&
+    /^\d+$/.test(end) &&
+    BigInt(gameId) > BigInt(end)
+  ) {
+    skipRemaining = 0;
+    skipTargetGameId = null;
+    logger.info(
+      { component: "prediction-loss-cooldown", gameId, event: "COOLDOWN_CLEARED", clearedEnd: end },
+      "loss cooldown cleared — completed round past skip window",
+    );
+    schedulePersist();
+    return;
+  }
+
+  // Consume every skip head ≤ completed gameId.
+  if (!/^\d+$/.test(gameId) || !/^\d+$/.test(skipTargetGameId)) {
+    if (String(gameId) === String(skipTargetGameId)) {
+      skipRemaining = Math.max(0, skipRemaining - 1);
+      skipTargetGameId = skipRemaining > 0 ? nextNumericId(gameId) : null;
+      if (skipTargetGameId) markCooldownSkipTarget(skipTargetGameId);
+      schedulePersist();
+    }
+    return;
+  }
+
+  let advanced = false;
+  while (
+    skipRemaining > 0 &&
+    skipTargetGameId != null &&
+    /^\d+$/.test(skipTargetGameId) &&
+    BigInt(gameId) >= BigInt(skipTargetGameId)
+  ) {
+    skipRemaining -= 1;
+    skipTargetGameId = nextNumericId(skipTargetGameId);
+    advanced = true;
+  }
+  if (!advanced) return;
+
+  if (skipRemaining <= 0) {
+    skipTargetGameId = null;
+    logger.info(
+      { component: "prediction-loss-cooldown", gameId, event: "COOLDOWN_CLEARED" },
+      "loss cooldown cleared — skip window completed",
+    );
+  } else {
+    if (skipTargetGameId) markCooldownSkipTarget(skipTargetGameId);
+    logger.info(
+      {
+        component: "prediction-loss-cooldown",
+        gameId,
+        event: "COOLDOWN_ADVANCE",
+        skipRemaining,
+        nextSkipTarget: skipTargetGameId,
+      },
+      `loss cooldown advanced — ${skipRemaining} skip(s) left, next=${skipTargetGameId}`,
+    );
+  }
   schedulePersist();
 }
