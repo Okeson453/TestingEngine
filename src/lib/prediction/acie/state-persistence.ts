@@ -14,6 +14,16 @@ import type { OnlineAdaptiveState } from "./online-state";
 
 const logger = getLogger("acie-state-persistence");
 
+export interface AciePersistedPlatt {
+  A: number;
+  B: number;
+  fitted: boolean;
+  sampleCount: number;
+  preferCalibrated: boolean;
+  rawBrierEwma: number;
+  calBrierEwma: number;
+}
+
 export interface AciePersistedSnapshot {
   version: 1;
   savedAt: string;
@@ -23,6 +33,8 @@ export interface AciePersistedSnapshot {
   /** Optional (added sep 11): last source game observed by shared ACIE, so
    *  the stale-guard provenance survives restarts. Backward compatible. */
   lastSourceGameId?: string;
+  /** §5.2 Platt calibrator parameters (survive restart). */
+  platt?: AciePersistedPlatt;
 }
 
 export type AcieSnapshotSource = {
@@ -30,11 +42,13 @@ export type AcieSnapshotSource = {
     online: OnlineAdaptiveState;
     crashPoints: number[];
     consecutiveLosses: number;
+    platt?: AciePersistedPlatt;
   };
   importSnapshot: (snap: {
     online?: OnlineAdaptiveState;
     crashPoints?: number[];
     consecutiveLosses?: number;
+    platt?: AciePersistedPlatt;
   }) => void;
 };
 
@@ -119,6 +133,7 @@ export async function loadAcieStateFromDb(
         online: snap.online,
         crashPoints: snap.crashPoints ?? [],
         consecutiveLosses: snap.consecutiveLosses ?? 0,
+        platt: snap.platt,
       });
     } catch (e) {
       logger.warn(
@@ -175,6 +190,7 @@ export async function saveAcieStateToDb(
       crashPoints: snap.crashPoints.slice(-2000), // ACIE_MAX_HISTORY default
       consecutiveLosses: snap.consecutiveLosses,
       lastSourceGameId: getLastAcieObservation().gameId ?? undefined,
+      platt: snap.platt,
     };
     const sql = await getSqlFn();
     await sql`

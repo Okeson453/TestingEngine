@@ -136,11 +136,30 @@ export class ACIEEngine {
     online: OnlineAdaptiveState;
     crashPoints: number[];
     consecutiveLosses: number;
+    /** §5.2 Platt params so calibrated path survives restart */
+    platt?: {
+      A: number;
+      B: number;
+      fitted: boolean;
+      sampleCount: number;
+      preferCalibrated: boolean;
+      rawBrierEwma: number;
+      calBrierEwma: number;
+    };
   } {
     return {
       online: { ...this.online },
       crashPoints: this.crashPoints.slice(-ACIE_MAX_HISTORY),
       consecutiveLosses: this.consecutiveLosses,
+      platt: {
+        A: this.platt.A,
+        B: this.platt.B,
+        fitted: this.platt.fitted,
+        sampleCount: this.platt.sampleCount,
+        preferCalibrated: this.preferCalibrated,
+        rawBrierEwma: this.rawBrierEwma,
+        calBrierEwma: this.calBrierEwma,
+      },
     };
   }
 
@@ -148,6 +167,15 @@ export class ACIEEngine {
     online?: OnlineAdaptiveState;
     crashPoints?: number[];
     consecutiveLosses?: number;
+    platt?: {
+      A?: number;
+      B?: number;
+      fitted?: boolean;
+      sampleCount?: number;
+      preferCalibrated?: boolean;
+      rawBrierEwma?: number;
+      calBrierEwma?: number;
+    };
   }): void {
     if (snap.crashPoints?.length) {
       this.seedHistory(
@@ -163,6 +191,22 @@ export class ACIEEngine {
     }
     if (typeof snap.consecutiveLosses === 'number') {
       this.consecutiveLosses = snap.consecutiveLosses;
+    }
+    // Restore Platt so Strategy sees calibrated probabilities immediately after restart.
+    if (snap.platt && typeof snap.platt.A === 'number' && typeof snap.platt.B === 'number') {
+      this.platt.A = snap.platt.A;
+      this.platt.B = snap.platt.B;
+      this.platt.fitted = Boolean(snap.platt.fitted);
+      this.platt.sampleCount = Number(snap.platt.sampleCount ?? 0);
+      if (typeof snap.platt.preferCalibrated === 'boolean') {
+        this.preferCalibrated = snap.platt.preferCalibrated;
+      }
+      if (typeof snap.platt.rawBrierEwma === 'number') {
+        this.rawBrierEwma = snap.platt.rawBrierEwma;
+      }
+      if (typeof snap.platt.calBrierEwma === 'number') {
+        this.calBrierEwma = snap.platt.calBrierEwma;
+      }
     }
   }
 
@@ -603,6 +647,11 @@ export class ACIEEngine {
     };
   }
 
+  /**
+   * §5.3 Lightweight real-time evidence — O(1) every crash.
+   * Uses online EWMA Brier, drift, calibration bins, and short-window
+   * residual bias so Strategy reacts within a few rounds (not every 50).
+   */
   private lightweightEvidence(): EvidenceReport {
     const bins = onlineCalibrationBins(this.online).filter((b) => b.sampleSize > 0);
     const meanCal =
@@ -611,14 +660,22 @@ export class ACIEEngine {
           bins.reduce((s, b) => s + b.sampleSize, 0)
         : 0.1;
     const n = this.online.observationCount;
+    const residualBias = Math.abs(this.online.lastDrift?.residualBias ?? 0);
+    const drift = Boolean(this.online.lastDrift?.detected);
+    const brier = this.online.ewmaBrier;
+
     let status: EvidenceReport['status'] = 'INSUFFICIENT';
-    if (n >= 500 && !this.online.lastDrift.detected && this.online.ewmaBrier < 0.22) {
+    // Tighter real-time thresholds: react before the heavy 50-round cycle.
+    if (n >= 200 && !drift && brier < 0.22 && residualBias < 0.08 && meanCal < 0.12) {
       status = 'SUPPORTED';
-    } else if (n >= 150 && this.online.ewmaBrier < 0.28) {
+    } else if (n >= 80 && brier < 0.28 && residualBias < 0.12) {
       status = 'WEAK';
-    } else if (n >= 150 && (this.online.lastDrift.detected || this.online.ewmaBrier > 0.35)) {
+    } else if (n >= 80 && (drift || brier > 0.32 || residualBias > 0.15)) {
       status = 'DEGRADED';
+    } else if (n >= 80) {
+      status = 'WEAK';
     }
+
     return {
       status,
       baselineProbability: this.online.ewmaHitRate,
@@ -626,13 +683,13 @@ export class ACIEEngine {
       improvementSignificant: false,
       calibrationStatus: meanCal < 0.05 ? 'good' : meanCal < 0.1 ? 'good' : 'poor',
       meanCalibrationError: meanCal,
-      performanceTrend: this.online.lastDrift.detected ? 'degrading' : 'stable',
-      driftDetected: this.online.lastDrift.detected,
+      performanceTrend: drift ? 'degrading' : 'stable',
+      driftDetected: drift,
       sampleSize: n,
-      sampleAdequate: n >= 500,
+      sampleAdequate: n >= 200,
       recommendedMode:
         status === 'SUPPORTED' ? 'ACTIVE' : status === 'WEAK' ? 'CAUTIOUS' : 'OBSERVATION',
-      reasoning: `Online evidence n=${n} ewmaBrier=${this.online.ewmaBrier.toFixed(3)} drift=${this.online.lastDrift.reason}`,
+      reasoning: `Online evidence n=${n} ewmaBrier=${brier.toFixed(3)} residual=${residualBias.toFixed(3)} drift=${this.online.lastDrift.reason}`,
       calibration: null,
     };
   }
