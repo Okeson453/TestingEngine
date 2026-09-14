@@ -607,9 +607,9 @@ export class ACIEEngine {
       };
     }
 
-    // Layer 3: temporal motif gate — OFF by default (daily target 1500).
+    // Layer 3: temporal motif gate — ON by default (pattern recognition).
     // Disable with ACIE_MOTIF_GATE=0 if higher volume is preferred over ~80% WR.
-    const motifGateEnabled = process.env.ACIE_MOTIF_GATE === '1';
+    const motifGateEnabled = process.env.ACIE_MOTIF_GATE !== '0';
     let motifGate:
       | { passed: boolean; motif: '001111' | '011011' | null; enabled: boolean }
       | undefined;
@@ -625,6 +625,25 @@ export class ACIEEngine {
           (strategy.reason ? strategy.reason + ' | ' : '') +
           'Motif gate: prior 6 outcomes not in {001111, 011011}.';
         strategy.stake = 0;
+        logger.info(
+          {
+            component: 'acie-motif-gate',
+            event: 'MOTIF_BLOCK',
+            matchedMotif: r.matchedMotif,
+            historyDepth: r.historyDepth,
+          },
+          'pattern motif gate blocked ENTRY (need 001111 or 011011)',
+        );
+      } else if (signal && r.passes) {
+        logger.info(
+          {
+            component: 'acie-motif-gate',
+            event: 'MOTIF_PASS',
+            matchedMotif: r.matchedMotif,
+            historyDepth: r.historyDepth,
+          },
+          `pattern motif gate passed (${r.matchedMotif})`,
+        );
       }
     }
 

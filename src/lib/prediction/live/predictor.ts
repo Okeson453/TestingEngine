@@ -785,6 +785,9 @@ const defaultPredictFn = (
           // pacing) from a quality-gate veto (evidence/calibration) in the
           // daily no_bet_by_reason breakdown.
           strategy_reason: String(evaluation.strategy?.reason ?? "") || null,
+          motif_gate_enabled: evaluation.motifGate?.enabled ?? false,
+          motif_gate_passed: evaluation.motifGate?.passed ?? null,
+          motif_matched: evaluation.motifGate?.motif ?? null,
           // Regime must be on featureSummary — edgeDiagText / decision-audit
           // read fs.regime; regimeId alone left production logs as regime=n/a.
           regime: String(evaluation.regime ?? "unknown"),
