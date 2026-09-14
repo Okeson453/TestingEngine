@@ -29,6 +29,7 @@ import { processResolvedPredictionFeedback } from "@/lib/prediction/live/feedbac
 import {
   noteValidatedPredictionOutcome,
   noteRoundCompletedForCooldown,
+  noteLowBandCrashStreak,
   getLossCooldownState,
   suppressCooldownTargetBetting,
 } from "@/lib/prediction/live/prediction-loss-cooldown";
@@ -521,6 +522,15 @@ export async function onGameEnd(
       };
       slowStmt("validate", performance.now() - tValidate);
       } // pass20Pending
+
+    // Low-band streak (1.00–1.20x) + cooldown advance on EVERY ED, including
+    // rounds with no issued pending prediction.
+    try {
+      noteLowBandCrashStreak({ gameId: evt.gameId, multiplier: evt.multiplier });
+      noteRoundCompletedForCooldown(evt.gameId);
+    } catch {
+      /* soft — never fail validation */
+    }
 
     // PASS 20: the old post-TX wake for releasedPrediction lived here —
     // the wake now fires immediately after stmt1 (autocommit), above.

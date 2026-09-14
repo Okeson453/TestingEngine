@@ -40,14 +40,32 @@ export type LossCooldownSnapshot = {
   lossTargetGameId: string | null;
   /** Target that must not receive a betting signal. */
   skipTargetGameId: string | null;
+  /** Consecutive completed crashes in [1.00, 1.20]x. */
+  lowBandStreak?: number;
   /** Recent validation keys for idempotency across restart (bounded). */
   seenValidationKeys?: string[];
 };
+
+/** Crash multipliers in this closed interval count toward the low-band streak. */
+const LOW_BAND_MIN = Number(process.env.LOW_BAND_STREAK_MIN ?? 1.0);
+const LOW_BAND_MAX = Number(process.env.LOW_BAND_STREAK_MAX ?? 1.2);
+/** How many consecutive low-band crashes arm the skip. */
+const LOW_BAND_ARM_AT = Math.max(
+  1,
+  Number(process.env.LOW_BAND_STREAK_ARM_AT ?? 2),
+);
+/** Betting rounds to skip when low-band streak arms. */
+const LOW_BAND_SKIP_ROUNDS = Math.max(
+  1,
+  Number(process.env.LOW_BAND_STREAK_SKIP_ROUNDS ?? 2),
+);
 
 let consecutivePredictionLosses = 0;
 let skipRemaining = 0;
 let lossTargetGameId: string | null = null;
 let skipTargetGameId: string | null = null;
+/** Consecutive ED crashes with multiplier in [LOW_BAND_MIN, LOW_BAND_MAX]. */
+let lowBandStreak = 0;
 
 /** Processed validation keys — duplicate ED cannot re-arm cooldown. */
 const seenValidations = new Set<string>();
@@ -145,6 +163,7 @@ export function getLossCooldownState(): LossCooldownSnapshot {
     skipRemaining,
     lossTargetGameId,
     skipTargetGameId,
+    lowBandStreak,
   };
 }
 
@@ -154,6 +173,7 @@ export function resetLossCooldownForTests(): void {
   skipRemaining = 0;
   lossTargetGameId = null;
   skipTargetGameId = null;
+  lowBandStreak = 0;
   seenValidations.clear();
 }
 
@@ -171,6 +191,9 @@ export function restoreLossCooldown(snap: Partial<LossCooldownSnapshot> | null |
       MAX_SKIP_ROUNDS,
       Math.max(0, Math.floor(snap.skipRemaining)),
     );
+  }
+  if (typeof snap.lowBandStreak === "number") {
+    lowBandStreak = Math.max(0, Math.floor(snap.lowBandStreak));
   }
   if (typeof snap.lossTargetGameId === "string") lossTargetGameId = snap.lossTargetGameId;
   if (typeof snap.skipTargetGameId === "string") skipTargetGameId = snap.skipTargetGameId;
@@ -388,6 +411,82 @@ export function consumeLossCooldownSkip(targetGameId: string): void {
       skipRemaining,
     },
     "loss cooldown skip consumed",
+  );
+  schedulePersist();
+}
+
+/**
+ * Low-band crash streak (1.00x–1.20x): consecutive hits in this band arm a
+ * mandatory 2-round betting skip (independent of issued-prediction LOSS).
+ * Called on every completed crash (ED), including rounds with no issued bet.
+ */
+export function noteLowBandCrashStreak(args: {
+  gameId: string;
+  multiplier: number;
+}): void {
+  const m = Number(args.multiplier);
+  if (!Number.isFinite(m) || m <= 0) return;
+
+  if (m >= LOW_BAND_MIN && m <= LOW_BAND_MAX) {
+    lowBandStreak += 1;
+  } else {
+    if (lowBandStreak > 0) {
+      logger.info(
+        {
+          component: "prediction-loss-cooldown",
+          event: "LOW_BAND_STREAK_BROKEN",
+          previousStreak: lowBandStreak,
+          multiplier: m,
+          gameId: args.gameId,
+        },
+        `low-band streak broken at ${m.toFixed(2)}x (was ${lowBandStreak})`,
+      );
+    }
+    lowBandStreak = 0;
+    schedulePersist();
+    return;
+  }
+
+  if (lowBandStreak < LOW_BAND_ARM_AT) {
+    schedulePersist();
+    return;
+  }
+
+  // Arm / extend skip window: at least LOW_BAND_SKIP_ROUNDS from next round.
+  const next = nextNumericId(args.gameId);
+  if (!next) {
+    schedulePersist();
+    return;
+  }
+
+  const need = LOW_BAND_SKIP_ROUNDS;
+  // Take the stronger of existing LOSS cooldown vs low-band skip.
+  if (skipRemaining < need || skipTargetGameId == null) {
+    lossTargetGameId = args.gameId;
+    skipTargetGameId = next;
+    skipRemaining = Math.max(skipRemaining, need);
+  } else if (skipRemaining < need) {
+    skipRemaining = need;
+  }
+
+  let cur: string | null = skipTargetGameId;
+  for (let i = 0; i < skipRemaining && cur; i++) {
+    markCooldownSkipTarget(cur);
+    cur = nextNumericId(cur);
+  }
+
+  logger.info(
+    {
+      component: "prediction-loss-cooldown",
+      event: "LOW_BAND_COOLDOWN_ARMED",
+      gameId: args.gameId,
+      multiplier: m,
+      lowBandStreak,
+      skipRemaining,
+      skipTargetGameId,
+      band: `[${LOW_BAND_MIN}, ${LOW_BAND_MAX}]`,
+    },
+    `low-band streak ${lowBandStreak} in ${LOW_BAND_MIN}-${LOW_BAND_MAX}x — skip ${skipRemaining} betting round(s) from ${skipTargetGameId}`,
   );
   schedulePersist();
 }
