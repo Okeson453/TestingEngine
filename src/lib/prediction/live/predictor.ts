@@ -1984,25 +1984,42 @@ export async function onGameEndPredict(
       roundsAfterLast === 1
         ? "1 round after last"
         : `${roundsAfterLast} rounds after last`;
-    const lastRoundLine = `Last round: ${gameId}`;
+    // Last completed crash points from memory history (not game ids).
+    // At PR(N) the source round has not crashed yet — use priorRounds tail.
+    const recentCrashes = priorRounds
+      .slice(-5)
+      .map((r) => {
+        const cp = Number(r.crashPoint);
+        return Number.isFinite(cp) && cp > 0 ? `${cp.toFixed(2)}x` : null;
+      })
+      .filter((s): s is string => s != null);
+    const lastCrash =
+      recentCrashes.length > 0 ? recentCrashes[recentCrashes.length - 1]! : null;
+    const lastRoundLine = lastCrash
+      ? `Last crash: ${lastCrash}`
+      : `Last crash: n/a`;
+    const recentLine =
+      recentCrashes.length > 1
+        ? `Recent: ${recentCrashes.join(" → ")}`
+        : null;
     const betRoundLine = `Bet round: ${targetGameId} (${roundsAfterLabel})`;
     const gameIdActionLine = primary
-      ? `Action: bet when round ${targetGameId} opens — after last round ${gameId} ends`
+      ? `Action: bet when round ${targetGameId} opens — after current round ends`
       : recoveryMode
         ? `Action: verify betting is open on round ${targetGameId} before entry`
-        : `Action: bet soon on round ${targetGameId} — opens after last round ${gameId} crashes`;
+        : `Action: bet soon on round ${targetGameId} — opens after current crash settles`;
     const triggerLine = primary === "PR"
-      ? `Trigger: last round ${gameId} betting-open → predict ${targetGameId}`
+      ? `Trigger: betting-open → predict next (${targetGameId})`
       : primary === "BG"
-        ? `Trigger: last round ${gameId} started → predict ${targetGameId}`
-        : `Trigger: last round ${gameId} completed → predict ${targetGameId}`;
+        ? `Trigger: round-start → predict next (${targetGameId})`
+        : `Trigger: crash settled → predict next (${targetGameId})`;
     const sourceLine = recoveryMode
       ? "Source: poll recovery"
       : primary === "PR"
-        ? "Source: live PR (betting-open of last round)"
+        ? "Source: live PR (betting-open)"
         : primary === "BG"
-          ? "Source: live BG (round-start of last round)"
-          : "Source: live ED (after crash of last round)";
+          ? "Source: live BG (round-start)"
+          : "Source: live ED (after crash)";
     const predictionContent = [
       `NEW PREDICTION${regimeText}${lateTag}`,
       "",
@@ -2011,6 +2028,7 @@ export async function onGameEndPredict(
       `Confidence: ${(signal.confidence * 100).toFixed(1)}%`,
       "",
       lastRoundLine,
+      ...(recentLine ? [recentLine] : []),
       betRoundLine,
       gameIdActionLine,
       triggerLine,
