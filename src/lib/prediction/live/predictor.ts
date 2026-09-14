@@ -54,6 +54,8 @@ import {
   dailyVolumeRiskFields,
   getDailySignalVolume,
 } from "@/lib/prediction/live/daily-signal-volume";
+import { evaluateMotifGate } from "@/lib/prediction/acie/temporal-motif-gate";
+import type { SOLRecord } from "@/lib/prediction/acie/types";
 import { liveSafeModeOverride } from "@/lib/prediction/lifecycle/safe-baseline-controller";
 import { buildAcieFeatureFingerprint, buildProvenance, computeFeatureHash } from "@/lib/prediction/acie/provenance";
 import { recordAcieObservation, assertFreshAcieState, getLastAcieObservation } from "@/lib/prediction/acie/stale-guard";
@@ -841,6 +843,62 @@ const defaultPredictFn = (
       : [];
   reasoning.push("execution_mode=FALLBACK_BASELINE");
 
+  // Same pattern motif gate as ACIE — old PredictionEngine must not bypass it.
+  let fallbackMotif: {
+    enabled: boolean;
+    passed: boolean | null;
+    motif: string | null;
+  } = { enabled: false, passed: null, motif: null };
+  const motifOn = process.env.ACIE_MOTIF_GATE !== "0";
+  if (motifOn && priorRounds.length >= 6) {
+    fallbackMotif.enabled = true;
+    const solLike = priorRounds.map((r) => ({
+      reached130: Number(r.crashPoint) >= 1.3,
+    })) as unknown as readonly SOLRecord[];
+    const r = evaluateMotifGate(solLike);
+    fallbackMotif = {
+      enabled: true,
+      passed: r.passes,
+      motif: r.matchedMotif,
+    };
+    if (!r.passes) {
+      reasoning.push(
+        "action=SKIP",
+        "Motif gate: prior 6 outcomes not in {001111, 011011}",
+        `pipeline_action=SKIP`,
+      );
+      (signal as { featureSummary?: Record<string, unknown> }).featureSummary = {
+        ...((signal.featureSummary as Record<string, unknown> | undefined) ?? {}),
+        strategy_action: "SKIP",
+        pipeline_action: "SKIP",
+        strategy_reason: "motif_gate",
+        motif_gate_enabled: true,
+        motif_gate_passed: false,
+        motif_matched: null,
+      };
+      logger.info(
+        {
+          component: "live-predictor",
+          event: "MOTIF_BLOCK",
+          path: "FALLBACK_BASELINE",
+          historyDepth: r.historyDepth,
+        },
+        "pattern motif gate blocked FALLBACK_BASELINE ENTRY",
+      );
+    } else {
+      reasoning.push(`motif_pass=${r.matchedMotif}`);
+      logger.info(
+        {
+          component: "live-predictor",
+          event: "MOTIF_PASS",
+          path: "FALLBACK_BASELINE",
+          matchedMotif: r.matchedMotif,
+        },
+        `pattern motif gate passed on FALLBACK_BASELINE (${r.matchedMotif})`,
+      );
+    }
+  }
+
   if (USE_ADVANCED_PIPELINE) {
     try {
       const runPipeline = getPipelineFn();
@@ -914,6 +972,9 @@ const defaultPredictFn = (
       prediction_mode: executionMode,
       execution_path: "PredictionEngine.predict",
       acieAuthoritative: false,
+      motif_gate_enabled: fallbackMotif.enabled,
+      motif_gate_passed: fallbackMotif.passed,
+      motif_matched: fallbackMotif.motif,
       regime: String(
         (signal.featureSummary as Record<string, unknown> | undefined)?.regime ??
           signal.regimeId ??
