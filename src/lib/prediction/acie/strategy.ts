@@ -72,7 +72,7 @@ export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
 
 /** Resolve active policy: QUALITY (default) or HF when ACIE_STRATEGY_MODE=hf. */
 function resolveDefaultPolicy(): StrategyPolicy {
-  const mode = String(process.env.ACIE_STRATEGY_MODE ?? "quality").toLowerCase();
+  const mode = String(process.env.ACIE_STRATEGY_MODE ?? "hf").toLowerCase();
   return mode === "hf" || mode === "high_frequency"
     ? HIGH_FREQUENCY_STRATEGY_POLICY
     : DEFAULT_STRATEGY_POLICY;

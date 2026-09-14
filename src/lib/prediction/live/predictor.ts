@@ -675,7 +675,7 @@ function getPipelineFn(): PipelineFn | null {
 
 /**
  * Signal prediction path.
- * PREDICTION_PRIMARY_ENGINE=old|acie (default: old — PredictionEngine primary).
+ * PREDICTION_PRIMARY_ENGINE=acie|old (default: acie).
  * ACIE_MOTIF_GATE=1 enables pattern motif; default off for checkout.
  * Observe still runs on shared ACIE for learning when available.
  */
@@ -686,7 +686,7 @@ const defaultPredictFn = (
   target: ThresholdTarget,
 ) => {
   const primary =
-    String(process.env.PREDICTION_PRIMARY_ENGINE ?? "old").toLowerCase();
+    String(process.env.PREDICTION_PRIMARY_ENGINE ?? "acie").toLowerCase();
   const useAciePrimary = primary === "acie" || primary === "acie-v3";
 
   // Prefer ACIE only when explicitly selected as primary.
