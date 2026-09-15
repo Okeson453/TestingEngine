@@ -52,7 +52,7 @@ const LOW_BAND_MAX = Number(process.env.LOW_BAND_STREAK_MAX ?? 1.2);
 /** How many consecutive low-band crashes arm the skip. */
 const LOW_BAND_ARM_AT = Math.max(
   1,
-  Number(process.env.LOW_BAND_STREAK_ARM_AT ?? 2),
+  Number(process.env.LOW_BAND_STREAK_ARM_AT ?? 1),
 );
 /** Betting rounds to skip when low-band streak arms. */
 const LOW_BAND_SKIP_ROUNDS = Math.max(
@@ -427,9 +427,10 @@ export function noteLowBandCrashStreak(args: {
   const m = Number(args.multiplier);
   if (!Number.isFinite(m) || m <= 0) return;
 
-  if (m >= LOW_BAND_MIN && m <= LOW_BAND_MAX) {
-    lowBandStreak += 1;
-  } else {
+  // Inclusive [1.00, 1.20] with float slack so 1.20 / 1.199999 always count.
+  const inBand = m >= LOW_BAND_MIN && m <= LOW_BAND_MAX + 1e-9;
+
+  if (!inBand) {
     if (lowBandStreak > 0) {
       logger.info(
         {
@@ -447,26 +448,48 @@ export function noteLowBandCrashStreak(args: {
     return;
   }
 
+  lowBandStreak += 1;
+
   if (lowBandStreak < LOW_BAND_ARM_AT) {
+    logger.info(
+      {
+        component: "prediction-loss-cooldown",
+        event: "LOW_BAND_STREAK_TICK",
+        gameId: args.gameId,
+        multiplier: m,
+        lowBandStreak,
+        armAt: LOW_BAND_ARM_AT,
+      },
+      `low-band tick ${m.toFixed(2)}x streak=${lowBandStreak}/${LOW_BAND_ARM_AT}`,
+    );
     schedulePersist();
     return;
   }
 
-  // Arm / extend skip window: at least LOW_BAND_SKIP_ROUNDS from next round.
+  // Arm from NEXT round. Escalate: 1st hit → base skips; each extra low-band
+  // hit while armed extends remaining by 1 (capped at MAX_SKIP_ROUNDS).
   const next = nextNumericId(args.gameId);
   if (!next) {
     schedulePersist();
     return;
   }
 
-  const need = LOW_BAND_SKIP_ROUNDS;
-  // Take the stronger of existing LOSS cooldown vs low-band skip.
-  if (skipRemaining < need || skipTargetGameId == null) {
-    lossTargetGameId = args.gameId;
+  const escalated = Math.min(
+    MAX_SKIP_ROUNDS,
+    LOW_BAND_SKIP_ROUNDS + Math.max(0, lowBandStreak - LOW_BAND_ARM_AT),
+  );
+  const need = Math.max(LOW_BAND_SKIP_ROUNDS, escalated);
+
+  // Always re-anchor from this crash so a fresh 1.00–1.20x cannot be ignored
+  // while an older skip window is draining.
+  lossTargetGameId = args.gameId;
+  if (skipTargetGameId == null || skipRemaining <= 0) {
+    skipTargetGameId = next;
+    skipRemaining = need;
+  } else {
+    // Extend remaining to at least `need` from *this* next id.
     skipTargetGameId = next;
     skipRemaining = Math.max(skipRemaining, need);
-  } else if (skipRemaining < need) {
-    skipRemaining = need;
   }
 
   let cur: string | null = skipTargetGameId;
@@ -486,7 +509,7 @@ export function noteLowBandCrashStreak(args: {
       skipTargetGameId,
       band: `[${LOW_BAND_MIN}, ${LOW_BAND_MAX}]`,
     },
-    `low-band streak ${lowBandStreak} in ${LOW_BAND_MIN}-${LOW_BAND_MAX}x — skip ${skipRemaining} betting round(s) from ${skipTargetGameId}`,
+    `low-band ${m.toFixed(2)}x streak=${lowBandStreak} — skip ${skipRemaining} betting round(s) from ${skipTargetGameId}`,
   );
   schedulePersist();
 }
