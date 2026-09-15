@@ -14,14 +14,14 @@ const FAIR_130 = 1 / 1.3;
 
 /** Target realized hit rate on emitted signals (absolute). */
 const TARGET_HIT =
-  Number(process.env.SIGNAL_TARGET_HIT_RATE ?? FAIR_130 + 0.02); // ~0.79
+  Number(process.env.SIGNAL_TARGET_HIT_RATE ?? FAIR_130); // break-even — don't chase 80% into silence
 
 /** Base edge from env — default 0 aligns with absolute 65% probability gate.
  *  Set MIN_SIGNAL_EDGE>0 to re-enable fair+edge selectivity. */
 const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
 
 /** Soft cap — was 0.08 (needP≈0.85) which silenced the engine for hours. */
-const MAX_EDGE = Number(process.env.SIGNAL_MAX_EDGE ?? 0.03);
+const MAX_EDGE = Number(process.env.SIGNAL_MAX_EDGE ?? 0.015); // needP ceiling ≈ 0.784
 /** Floor for adaptive edge. Default 0 so a zero BASE_EDGE stays at absolute
  *  probability gate (65%) until outcomes justify raising selectivity. */
 const MIN_EDGE_FLOOR = Number(process.env.SIGNAL_MIN_EDGE_FLOOR ?? 0);
@@ -41,8 +41,8 @@ const EDGE_BLEND = Number(process.env.SIGNAL_EDGE_BLEND ?? 0.35);
  * keeps predicting (loss-cooldown still enforces post-LOSS skips).
  */
 const SILENCE_RECOVERY_MS = Number(
-  process.env.SIGNAL_EDGE_SILENCE_RECOVERY_MS ?? 45 * 60 * 1000,
-); // 45 min
+  process.env.SIGNAL_EDGE_SILENCE_RECOVERY_MS ?? 15 * 60 * 1000,
+); // 15 min
 
 type Outcome = { win: boolean; at: number };
 const outcomes: Outcome[] = [];
@@ -85,7 +85,7 @@ function recompute(): void {
   const gap = TARGET_HIT - hitRate;
   // Softer upward gain: a ~70% window no longer forces the full 0.08 ceiling.
   // gap>0 → underperforming → raise; gap<0 → overperforming → ease.
-  const adjustment = Math.max(-0.02, Math.min(0.035, gap * 0.45));
+  const adjustment = Math.max(-0.02, Math.min(0.015, gap * 0.35));
   const targetEdge = Math.max(
     MIN_EDGE_FLOOR,
     Math.min(MAX_EDGE, BASE_EDGE + adjustment),
