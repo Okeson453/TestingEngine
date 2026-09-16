@@ -69,6 +69,7 @@ import { getAdaptiveMinEdge, getAdaptiveEdgeStats, recordNoIssueDecision } from 
 import { recordNoBetDecision } from "@/lib/prediction/live/decision-audit";
 import {
   shouldForceLossCooldownSkip,
+  getElevatedMinProbability,
   consumeLossCooldownSkip,
 } from "@/lib/prediction/live/prediction-loss-cooldown";
 import { notePredictionOutboxEnqueued } from "@/lib/prediction/live/outbox-pending-targets";
@@ -424,7 +425,14 @@ export function shouldSkipReason(input: {
     }
   } catch { /* soft */ }
 
-  if (minP > 0 && p < minP) return { skip: true, reason: "probability_below_min" };
+  const elevatedP = getElevatedMinProbability();
+  const effectiveMinP = elevatedP != null ? Math.max(minP, elevatedP) : minP;
+  if (effectiveMinP > 0 && p < effectiveMinP) {
+    return {
+      skip: true,
+      reason: elevatedP != null && p >= minP ? "strategy_veto" : "probability_below_min",
+    };
+  }
   if (minC > 0 && c < minC) return { skip: true, reason: "confidence_below_min" };
   if (Number.isFinite(minEdge) && minEdge > 0 && p < needP)
     return { skip: true, reason: "edge_below_threshold" };

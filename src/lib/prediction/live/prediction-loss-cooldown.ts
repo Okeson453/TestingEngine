@@ -1,21 +1,15 @@
 /**
  * Prediction-loss cooldown — risk control independent of the 65% floor.
  *
- * Rules (round-based, not time-based):
- *   ACTIVE
- *     → confirmed LOSS on target T  →  COOLDOWN starting at T+1
- *   COOLDOWN
- *     → skipRemaining consecutive betting rounds forced SKIP (even at 90%+)
- *     → each completed skip round decrements; when 0 → ACTIVE
- *   WIN clears the consecutive-loss streak (and any active skip window).
+ * Soft quality mode (default) — prefer raised bar over blanking rounds:
+ *   After LOSS / low-band crash → elevate min probability for a few rounds
+ *   (still allow bets when p is strong). Hard skip only after severe streaks.
  *
- * Escalation (stops multi-loss rolls):
- *   1 consecutive LOSS → skip 1 round
- *   2 consecutive      → skip 2 rounds
- *   3+ consecutive     → skip min(streak, MAX) rounds (default MAX=5)
+ * HARD_SKIP_AFTER (default 3 consecutive issued LOSSes) arms forced skips.
+ * LOW_BAND uses soft elevate by default (LOW_BAND_HARD_SKIP=1 to restore skips).
  *
- * Only VALIDATED outcomes of ISSUED betting predictions arm this machine.
- * State is durable in worker_state so restart cannot bypass an armed skip.
+ * Only VALIDATED outcomes of ISSUED betting predictions arm loss state.
+ * State is durable in worker_state.
  */
 
 /** Max mandatory skip rounds after a long loss streak. */
@@ -40,8 +34,10 @@ export type LossCooldownSnapshot = {
   lossTargetGameId: string | null;
   /** Target that must not receive a betting signal. */
   skipTargetGameId: string | null;
-  /** Consecutive completed crashes in [1.00, 1.20]x. */
+  /** Consecutive completed crashes in low-band. */
   lowBandStreak?: number;
+  /** Soft elevated-selectivity rounds remaining. */
+  elevateRemaining?: number;
   /** Recent validation keys for idempotency across restart (bounded). */
   seenValidationKeys?: string[];
 };
@@ -60,12 +56,35 @@ const LOW_BAND_SKIP_ROUNDS = Math.max(
   Number(process.env.LOW_BAND_STREAK_SKIP_ROUNDS ?? 3),
 );
 
+/** Soft mode: raise probability bar instead of hard-skipping every adverse event. */
+const SOFT_QUALITY = process.env.LOSS_SOFT_QUALITY !== "0";
+/** Elevated min p while soft window active (absolute). */
+const ELEVATED_MIN_P = Math.min(
+  0.92,
+  Math.max(0.65, Number(process.env.LOSS_ELEVATED_MIN_P ?? 0.82)),
+);
+/** Rounds to keep elevated bar after LOSS / low-band (soft). */
+const ELEVATE_ROUNDS = Math.max(
+  1,
+  Number(process.env.LOSS_ELEVATE_ROUNDS ?? 3),
+);
+/** Hard skip only after this many consecutive issued LOSSes (soft mode). */
+const HARD_SKIP_AFTER = Math.max(
+  2,
+  Number(process.env.LOSS_HARD_SKIP_AFTER ?? 3),
+);
+/** Low-band hard-skips only when explicitly enabled. */
+const LOW_BAND_HARD_SKIP = process.env.LOW_BAND_HARD_SKIP === "1";
+
+
 let consecutivePredictionLosses = 0;
 let skipRemaining = 0;
 let lossTargetGameId: string | null = null;
 let skipTargetGameId: string | null = null;
 /** Consecutive ED crashes with multiplier in [LOW_BAND_MIN, LOW_BAND_MAX]. */
 let lowBandStreak = 0;
+/** Soft: rounds remaining with elevated min probability (not hard skip). */
+let elevateRemaining = 0;
 
 /** Processed validation keys — duplicate ED cannot re-arm cooldown. */
 const seenValidations = new Set<string>();
@@ -164,7 +183,14 @@ export function getLossCooldownState(): LossCooldownSnapshot {
     lossTargetGameId,
     skipTargetGameId,
     lowBandStreak,
+    elevateRemaining,
   };
+}
+
+/** Soft quality: elevated absolute min probability while window active. */
+export function getElevatedMinProbability(): number | null {
+  if (elevateRemaining > 0) return ELEVATED_MIN_P;
+  return null;
 }
 
 /** Test/reset helper. */
@@ -174,6 +200,7 @@ export function resetLossCooldownForTests(): void {
   lossTargetGameId = null;
   skipTargetGameId = null;
   lowBandStreak = 0;
+  elevateRemaining = 0;
   seenValidations.clear();
 }
 
@@ -194,6 +221,9 @@ export function restoreLossCooldown(snap: Partial<LossCooldownSnapshot> | null |
   }
   if (typeof snap.lowBandStreak === "number") {
     lowBandStreak = Math.max(0, Math.floor(snap.lowBandStreak));
+  }
+  if (typeof snap.elevateRemaining === "number") {
+    elevateRemaining = Math.max(0, Math.floor(snap.elevateRemaining));
   }
   if (typeof snap.lossTargetGameId === "string") lossTargetGameId = snap.lossTargetGameId;
   if (typeof snap.skipTargetGameId === "string") skipTargetGameId = snap.skipTargetGameId;
@@ -222,10 +252,10 @@ export function noteValidatedPredictionOutcome(args: {
 
   if (args.result === "WIN") {
     consecutivePredictionLosses = 0;
-    // WIN ends any active cooldown window — streak broken.
     skipRemaining = 0;
     skipTargetGameId = null;
     lossTargetGameId = null;
+    elevateRemaining = 0;
     logger.info(
       {
         component: "prediction-loss-cooldown",
@@ -238,17 +268,37 @@ export function noteValidatedPredictionOutcome(args: {
     return;
   }
 
-  // LOSS on issued prediction targeting N → escalate skip window from N+1.
   consecutivePredictionLosses += 1;
   const lossN = args.targetGameId;
   const next = nextNumericId(lossN);
   lossTargetGameId = lossN;
+
+  // Soft quality (default): raise the bar for ELEVATE_ROUNDS instead of
+  // blanking every post-LOSS round. Hard skip only on severe streaks.
+  if (SOFT_QUALITY && consecutivePredictionLosses < HARD_SKIP_AFTER) {
+    elevateRemaining = Math.max(elevateRemaining, ELEVATE_ROUNDS);
+    skipRemaining = 0;
+    skipTargetGameId = null;
+    logger.info(
+      {
+        component: "prediction-loss-cooldown",
+        event: "SOFT_QUALITY_ARMED",
+        predictionId: args.predictionId,
+        lossTargetGameId: lossN,
+        elevateRemaining,
+        elevatedMinP: ELEVATED_MIN_P,
+        consecutivePredictionLosses,
+      },
+      `prediction LOSS — soft quality: require p≥${ELEVATED_MIN_P} for ${elevateRemaining} round(s) (no hard skip)`,
+    );
+    schedulePersist();
+    return;
+  }
+
   skipTargetGameId = next;
-  // Escalate: 1 loss → at least 2 skips (was 1 — too many back-to-back LOSSes),
-  // then 2→3, … capped at MAX_SKIP_ROUNDS.
   skipRemaining = Math.min(
     MAX_SKIP_ROUNDS,
-    Math.max(2, consecutivePredictionLosses + 1),
+    Math.max(2, consecutivePredictionLosses),
   );
 
   logger.info(
@@ -262,11 +312,9 @@ export function noteValidatedPredictionOutcome(args: {
       consecutivePredictionLosses,
       maxSkip: MAX_SKIP_ROUNDS,
     },
-    `prediction LOSS — cooldown armed: skip ${skipRemaining} round(s) from target=${next ?? "next-attempt"} (loss_on=${lossN} streak=${consecutivePredictionLosses})`,
+    `prediction LOSS — hard cooldown: skip ${skipRemaining} round(s) from target=${next ?? "next-attempt"} (streak=${consecutivePredictionLosses})`,
   );
-  // Mark the first skip target; further targets marked as each prior completes.
   if (next) markCooldownSkipTarget(next);
-  // Also mark the full skip window when numeric (blocks PR race across N+1..N+k).
   if (next && /^\d+$/.test(next) && skipRemaining > 1) {
     let cur: string | null = next;
     for (let i = 1; i < skipRemaining && cur; i++) {
@@ -470,8 +518,28 @@ export function noteLowBandCrashStreak(args: {
     return;
   }
 
-  // Arm from NEXT round. Escalate: 1st hit → base skips; each extra low-band
-  // hit while armed extends remaining by 1 (capped at MAX_SKIP_ROUNDS).
+  lossTargetGameId = args.gameId;
+
+  // Soft (default): elevate selectivity — still allow high-p bets.
+  if (!LOW_BAND_HARD_SKIP) {
+    elevateRemaining = Math.max(elevateRemaining, ELEVATE_ROUNDS);
+    logger.info(
+      {
+        component: "prediction-loss-cooldown",
+        event: "LOW_BAND_SOFT_QUALITY",
+        gameId: args.gameId,
+        multiplier: m,
+        lowBandStreak,
+        elevateRemaining,
+        elevatedMinP: ELEVATED_MIN_P,
+        band: `[${LOW_BAND_MIN}, ${LOW_BAND_MAX}]`,
+      },
+      `low-band ${m.toFixed(2)}x — soft quality p≥${ELEVATED_MIN_P} for ${elevateRemaining} round(s) (no hard skip)`,
+    );
+    schedulePersist();
+    return;
+  }
+
   const next = nextNumericId(args.gameId);
   if (!next) {
     schedulePersist();
@@ -483,18 +551,8 @@ export function noteLowBandCrashStreak(args: {
     LOW_BAND_SKIP_ROUNDS + Math.max(0, lowBandStreak - LOW_BAND_ARM_AT),
   );
   const need = Math.max(LOW_BAND_SKIP_ROUNDS, escalated);
-
-  // Always re-anchor from this crash so a fresh 1.00–1.20x cannot be ignored
-  // while an older skip window is draining.
-  lossTargetGameId = args.gameId;
-  if (skipTargetGameId == null || skipRemaining <= 0) {
-    skipTargetGameId = next;
-    skipRemaining = need;
-  } else {
-    // Extend remaining to at least `need` from *this* next id.
-    skipTargetGameId = next;
-    skipRemaining = Math.max(skipRemaining, need);
-  }
+  skipTargetGameId = next;
+  skipRemaining = Math.max(skipRemaining, need);
 
   let cur: string | null = skipTargetGameId;
   for (let i = 0; i < skipRemaining && cur; i++) {
@@ -513,7 +571,7 @@ export function noteLowBandCrashStreak(args: {
       skipTargetGameId,
       band: `[${LOW_BAND_MIN}, ${LOW_BAND_MAX}]`,
     },
-    `low-band ${m.toFixed(2)}x streak=${lowBandStreak} — skip ${skipRemaining} betting round(s) from ${skipTargetGameId}`,
+    `low-band ${m.toFixed(2)}x streak=${lowBandStreak} — HARD skip ${skipRemaining} from ${skipTargetGameId}`,
   );
   schedulePersist();
 }
@@ -524,6 +582,16 @@ export function noteLowBandCrashStreak(args: {
  * history/model — only betting is skipped.
  */
 export function noteRoundCompletedForCooldown(gameId: string): void {
+  if (elevateRemaining > 0) {
+    elevateRemaining = Math.max(0, elevateRemaining - 1);
+    if (elevateRemaining === 0) {
+      logger.info(
+        { component: "prediction-loss-cooldown", event: "SOFT_QUALITY_CLEARED", gameId },
+        "soft quality window ended — min-p back to normal",
+      );
+    }
+    schedulePersist();
+  }
   if (skipRemaining <= 0 || skipTargetGameId == null) return;
 
   const end = skipWindowEndId();
