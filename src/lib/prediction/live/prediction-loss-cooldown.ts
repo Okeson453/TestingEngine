@@ -48,7 +48,7 @@ export type LossCooldownSnapshot = {
 
 /** Crash multipliers in this closed interval count toward the low-band streak. */
 const LOW_BAND_MIN = Number(process.env.LOW_BAND_STREAK_MIN ?? 1.0);
-const LOW_BAND_MAX = Number(process.env.LOW_BAND_STREAK_MAX ?? 1.2);
+const LOW_BAND_MAX = Number(process.env.LOW_BAND_STREAK_MAX ?? 1.29); // sub-1.30 cluster (was 1.20 — 1.21–1.29 losses bypassed)
 /** How many consecutive low-band crashes arm the skip. */
 const LOW_BAND_ARM_AT = Math.max(
   1,
@@ -57,7 +57,7 @@ const LOW_BAND_ARM_AT = Math.max(
 /** Betting rounds to skip when low-band streak arms. */
 const LOW_BAND_SKIP_ROUNDS = Math.max(
   1,
-  Number(process.env.LOW_BAND_STREAK_SKIP_ROUNDS ?? 2),
+  Number(process.env.LOW_BAND_STREAK_SKIP_ROUNDS ?? 3),
 );
 
 let consecutivePredictionLosses = 0;
@@ -244,8 +244,12 @@ export function noteValidatedPredictionOutcome(args: {
   const next = nextNumericId(lossN);
   lossTargetGameId = lossN;
   skipTargetGameId = next;
-  // Escalate: 1 loss → 1 skip, 2 → 2, … capped at MAX_SKIP_ROUNDS.
-  skipRemaining = Math.min(MAX_SKIP_ROUNDS, consecutivePredictionLosses);
+  // Escalate: 1 loss → at least 2 skips (was 1 — too many back-to-back LOSSes),
+  // then 2→3, … capped at MAX_SKIP_ROUNDS.
+  skipRemaining = Math.min(
+    MAX_SKIP_ROUNDS,
+    Math.max(2, consecutivePredictionLosses + 1),
+  );
 
   logger.info(
     {
