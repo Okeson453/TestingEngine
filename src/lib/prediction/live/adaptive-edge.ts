@@ -14,14 +14,14 @@ const FAIR_130 = 1 / 1.3;
 
 /** Target realized hit rate on emitted signals (absolute). */
 const TARGET_HIT =
-  Number(process.env.SIGNAL_TARGET_HIT_RATE ?? FAIR_130); // break-even — don't chase 80% into silence
+  Number(process.env.SIGNAL_TARGET_HIT_RATE ?? FAIR_130 + 0.05); // ~0.819
 
 /** Base edge from env — default 0 aligns with absolute 65% probability gate.
  *  Set MIN_SIGNAL_EDGE>0 to re-enable fair+edge selectivity. */
 const BASE_EDGE = Number(process.env.MIN_SIGNAL_EDGE ?? 0);
 
 /** Soft cap — was 0.08 (needP≈0.85) which silenced the engine for hours. */
-const MAX_EDGE = Number(process.env.SIGNAL_MAX_EDGE ?? 0.015); // needP ceiling ≈ 0.784
+const MAX_EDGE = Number(process.env.SIGNAL_MAX_EDGE ?? 0.04);
 /** Floor for adaptive edge. Default 0 so a zero BASE_EDGE stays at absolute
  *  probability gate (65%) until outcomes justify raising selectivity. */
 const MIN_EDGE_FLOOR = Number(process.env.SIGNAL_MIN_EDGE_FLOOR ?? 0);
@@ -41,38 +41,22 @@ const EDGE_BLEND = Number(process.env.SIGNAL_EDGE_BLEND ?? 0.35);
  * keeps predicting (loss-cooldown still enforces post-LOSS skips).
  */
 const SILENCE_RECOVERY_MS = Number(
-  process.env.SIGNAL_EDGE_SILENCE_RECOVERY_MS ?? 15 * 60 * 1000,
-); // 15 min
+  process.env.SIGNAL_EDGE_SILENCE_RECOVERY_MS ?? 45 * 60 * 1000,
+); // 45 min
 
 type Outcome = { win: boolean; at: number };
 const outcomes: Outcome[] = [];
 
 let currentEdge = Math.max(MIN_EDGE_FLOOR, Math.min(MAX_EDGE, BASE_EDGE));
 let lastOutcomeAt = 0;
-/** Consecutive no-issue decisions — recover from adaptive lock (needP≈80%). */
-let consecutiveNoIssue = 0;
-const VETO_RECOVERY_AFTER = Math.max(
-  5,
-  Number(process.env.SIGNAL_EDGE_VETO_RECOVERY_AFTER ?? 12),
-);
 
 export function recordSignalOutcome(win: boolean, at: number = Date.now()): void {
   outcomes.push({ win, at });
   lastOutcomeAt = at;
-  consecutiveNoIssue = 0;
   if (outcomes.length > WINDOW * 2) {
     outcomes.splice(0, outcomes.length - WINDOW);
   }
   recompute();
-}
-
-/** After many consecutive no-issue rounds, snap edge to BASE (unblock book). */
-export function recordNoIssueDecision(): void {
-  consecutiveNoIssue += 1;
-  if (consecutiveNoIssue >= VETO_RECOVERY_AFTER && currentEdge > BASE_EDGE + 1e-9) {
-    currentEdge = Math.max(MIN_EDGE_FLOOR, Math.min(MAX_EDGE, BASE_EDGE));
-    consecutiveNoIssue = 0;
-  }
 }
 
 function timeWeight(at: number, now: number): number {
@@ -101,7 +85,7 @@ function recompute(): void {
   const gap = TARGET_HIT - hitRate;
   // Softer upward gain: a ~70% window no longer forces the full 0.08 ceiling.
   // gap>0 → underperforming → raise; gap<0 → overperforming → ease.
-  const adjustment = Math.max(-0.02, Math.min(0.015, gap * 0.35));
+  const adjustment = Math.max(-0.02, Math.min(0.035, gap * 0.45));
   const targetEdge = Math.max(
     MIN_EDGE_FLOOR,
     Math.min(MAX_EDGE, BASE_EDGE + adjustment),
@@ -161,6 +145,5 @@ export function getAdaptiveEdgeStats(): {
 export function _resetAdaptiveEdgeForTests(): void {
   outcomes.length = 0;
   lastOutcomeAt = 0;
-  consecutiveNoIssue = 0;
   currentEdge = Math.max(MIN_EDGE_FLOOR, Math.min(MAX_EDGE, BASE_EDGE));
 }

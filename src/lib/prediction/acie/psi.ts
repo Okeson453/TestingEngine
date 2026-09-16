@@ -59,8 +59,8 @@ export class PredictiveSequenceIntelligence {
   private readonly tpl: TemporalPatternLearner;
 
   /** Scratch buffers reused across calls (avoid GC on hot path) */
-  private readonly probScratch: number[] = new Array(MODEL_NAMES.length);
-  private readonly weightScratch: number[] = new Array(MODEL_NAMES.length);
+  private readonly probScratch: number[] = new Array(7);
+  private readonly weightScratch: number[] = new Array(7);
   private readonly modelScratch: ModelEstimate[] = MODEL_NAMES.map((name) => ({
     modelName: name,
     probability: 0.65,
@@ -228,11 +228,27 @@ export class PredictiveSequenceIntelligence {
 
     const streakAware = this.fastStreakAware(baseline, sequenceState, history);
 
+    // ── Momentum / streak model (ANTI-MOMENTUM) ────────────────────
+    const streakBelow = sequenceState.currentStreakBelow130 | 0;
+    const streakAbove = sequenceState.currentStreakAbove130 | 0;
+
+    // NEW: Penalize probability after consecutive losses (mean-reversion skepticism)
+    // Previous gambler's-fallacy bump removed.
+    // Mild anti-momentum only (hard skip gate removed from strategy).
+    // Keep small penalties so long low streaks don't inflate P.
+    let momentum = baseline;
+    if (streakBelow >= 2) {
+      // Max useful streak signal is 2; do not wait until 3/4/5.
+      const penalty = Math.min(0.06, streakBelow * 0.02);
+      momentum = clamp01(baseline - penalty);
+    } else if (streakAbove >= 5) {
+      momentum = clamp01(baseline - 0.015);
+    }
+
     // Single-pass last SHORT_WINDOW for Bayesian + volatility
-    // Prior Beta(8,4) mean 0.667 → Beta(11, 3.5) mean 0.759 ≈ empirical 0.756
     const short = this.shortWindowStats(crashPoints);
-    const priorA = 11;
-    const priorB = 3.5;
+    const priorA = 8;
+    const priorB = 4;
     const shortBayesian = clamp01(
       (priorA + short.hits) / (priorA + priorB + short.count)
     );
@@ -244,19 +260,15 @@ export class PredictiveSequenceIntelligence {
       else if (vol < 2.5 && baseline >= 0.6) volAdj = clamp01(baseline + 0.02);
     }
 
-    // Streak2Recovery: P(hit | streak_below==2, regime==normal)
-    const streak2 = this.streak2Recovery(sequenceState, regime, history);
-
     // Write into reusable scratch (order matches MODEL_NAMES)
-    // Frequency, Conditional, Regime, StreakAware, ShortBayesian, Vol, Streak2Recovery
     const m = this.modelScratch;
     m[0].probability = clamp01(baseline);
     m[1].probability = clamp01(conditional);
     m[2].probability = clamp01(regimeAdj);
     m[3].probability = clamp01(streakAware);
-    m[4].probability = shortBayesian;
-    m[5].probability = clamp01(volAdj);
-    m[6].probability = clamp01(streak2);
+    m[4].probability = clamp01(momentum);
+    m[5].probability = shortBayesian;
+    m[6].probability = clamp01(volAdj);
   }
 
   /** Single reverse pass over last SHORT_WINDOW crash points */
@@ -325,35 +337,6 @@ export class PredictiveSequenceIntelligence {
     return clamp01(nextRoundHitRate - streakPenalty);
   }
 
-  /**
-   * Empirical P(hit | streak_below==2 AND regime=='normal').
-   * Walk-forward: WR ≈ 79.87% in this state vs ~75.4% baseline.
-   * Falls back to fair 1/1.30 when sample is insufficient.
-   */
-  private streak2Recovery(
-    sequenceState: SequenceState,
-    regime: RegimeLabel,
-    history: readonly SOLRecord[],
-  ): number {
-    const sb = sequenceState.currentStreakBelow130 | 0;
-    if (sb !== 2 || regime !== 'normal') return 1 / ACIE_TARGET;
-    if (history.length < 40) return 1 / ACIE_TARGET;
-
-    const start = history.length > 600 ? history.length - 600 : 0;
-    let matches = 0;
-    let hits = 0;
-    for (let i = start; i < history.length; i++) {
-      const r = history[i];
-      const rs = r.sequenceState;
-      if ((rs.currentStreakBelow130 | 0) !== 2) continue;
-      if (r.regime !== 'normal') continue;
-      matches++;
-      if (r.reached130) hits++;
-    }
-    if (matches < 30) return 1 / ACIE_TARGET;
-    return clamp01(hits / matches);
-  }
-
   private resolveWeightsInto(
     models: ModelEstimate[],
     sampleSize: number,
@@ -381,12 +364,13 @@ export class PredictiveSequenceIntelligence {
     }
 
     const mature = sampleSize >= 200;
-    // Order = MODEL_NAMES: Frequency, Conditional, Regime, StreakAware,
-    // ShortWindowBayesian, VolatilityAdjusted, Streak2Recovery.
-    // Momentum weight redistributed after removal.
+    // Prefer sequence-conditioned models (Conditional, Streak) over raw
+    // frequency / weak momentum when the history is mature. Order = MODEL_NAMES:
+    // Frequency, ConditionalFrequency, RegimeAdjusted, StreakAware,
+    // MomentumReversion, ShortWindowBayesian, VolatilityAdjusted.
     const raw = mature
-      ? [0.10, 0.22, 0.12, 0.18, 0.14, 0.10, 0.14]
-      : [0.20, 0.20, 0.10, 0.15, 0.13, 0.10, 0.12];
+      ? [0.10, 0.24, 0.12, 0.20, 0.08, 0.14, 0.12]
+      : [0.22, 0.20, 0.12, 0.16, 0.10, 0.12, 0.08];
     let sum = 0;
     for (let i = 0; i < n; i++) {
       this.weightScratch[i] = raw[i] ?? 0.1;

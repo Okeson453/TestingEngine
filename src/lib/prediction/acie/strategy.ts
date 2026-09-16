@@ -41,12 +41,11 @@ export const DEFAULT_STRATEGY_POLICY: StrategyPolicy = {
   fallbackThreshold: ABS_FLOOR,
   maxCalibrationError: 0.12,
   highUncertainty: 0.18,
-  // streak_below==2 in normal regime has WR≈80% — do not skip at 2
-  consecutiveLossReduceAt: 3,
+  consecutiveLossReduceAt: 2,
   reducedStakeFactor: 0.45,
   defaultStake: 700,
-  /** Skip at 3 consecutive losses (was 2). */
-  consecutiveLossSkipAt: 3,
+  /** Skip as soon as streak hits 2 — never wait for 3/4/5. */
+  consecutiveLossSkipAt: 2,
   /** Keep skipping for the duration of the ongoing streak (capped). */
   consecutiveLossMaxSkip: 8,
   lossStreakThresholdEscalation: 0.02,
@@ -62,17 +61,17 @@ export const HIGH_FREQUENCY_STRATEGY_POLICY: StrategyPolicy = {
   fallbackThreshold: ABS_FLOOR,
   maxCalibrationError: 0.14,
   highUncertainty: 0.22,
-  consecutiveLossReduceAt: 3,
+  consecutiveLossReduceAt: 2,
   reducedStakeFactor: 0.55,
   defaultStake: 700,
-  consecutiveLossSkipAt: 3,
+  consecutiveLossSkipAt: 2,
   consecutiveLossMaxSkip: 6,
   lossStreakThresholdEscalation: 0.015,
 };
 
 /** Resolve active policy: QUALITY (default) or HF when ACIE_STRATEGY_MODE=hf. */
 function resolveDefaultPolicy(): StrategyPolicy {
-  const mode = String(process.env.ACIE_STRATEGY_MODE ?? "hf").toLowerCase();
+  const mode = String(process.env.ACIE_STRATEGY_MODE ?? "quality").toLowerCase();
   return mode === "hf" || mode === "high_frequency"
     ? HIGH_FREQUENCY_STRATEGY_POLICY
     : DEFAULT_STRATEGY_POLICY;
@@ -96,7 +95,7 @@ export class StrategyLayer {
     const p = this.policy;
     const cl = riskState?.consecutiveLosses ?? 0;
 
-    // Max losing streak gate (default skip-at 3).
+    // Max losing streak = 2: once cl >= 2, SKIP until the streak breaks.
     if (cl >= p.consecutiveLossSkipAt && p.consecutiveLossMaxSkip > 0) {
       const skipRounds = cl - p.consecutiveLossSkipAt + 1;
       if (skipRounds <= p.consecutiveLossMaxSkip) {
@@ -110,13 +109,6 @@ export class StrategyLayer {
           `${cl} consecutive losses — max skip exhausted, prob ${(probability * 100).toFixed(1)}% too weak.`
         );
       }
-    }
-
-    // Hostile regimes: empirical WR below fair with high variance
-    if (regime === 'low-cluster' || regime === 'deep-low') {
-      return this.skip(
-        `Regime=${regime}: empirical WR below fair with high variance; require normal/high-activity.`,
-      );
     }
 
     // Extreme calibration failure — skip only in strict mode
@@ -156,22 +148,19 @@ export class StrategyLayer {
     // Regime-adaptive + mild loss-streak threshold escalation (only after reduceAt)
     threshold = this.regimeAdjustedThreshold(threshold, regime, ctx);
 
-    // Daily volume: 1500 is TARGET + hard MAX.
+    // Soft daily pacing
     const used = riskState.dailyEntriesUsed ?? 0;
-    const limit = riskState.dailyEntriesLimit ?? 1500;
-    if (limit > 0 && used >= limit) {
-      return this.skip(
-        `Daily signal volume limit reached: ${used}/${limit}.`,
-      );
-    }
-    // Near cap → tighten; behind target pace → ease slightly (never below floor).
-    if (limit > 0 && used / limit > 0.9) {
-      threshold += 0.04;
-    } else if (limit > 0 && used / limit > 0.75) {
-      threshold += 0.02;
-    } else if (limit > 0 && used / limit < 0.5) {
-      // Pace toward daily target — modest ease for both quality and HF.
-      threshold -= this.selectiveOnly ? 0.01 : 0.02;
+    const limit = riskState.dailyEntriesLimit ?? 500;
+    if (limit > 0 && used / limit > 0.85) {
+      threshold += 0.03;
+    } else if (
+      !this.selectiveOnly &&
+      limit > 0 &&
+      used / limit < 0.25 &&
+      used < limit * 0.25
+    ) {
+      // HF only: never lower the bar in selective quality mode.
+      threshold -= 0.015;
     }
 
     if (uncertainty.total > p.highUncertainty && evidence !== 'SUPPORTED') {

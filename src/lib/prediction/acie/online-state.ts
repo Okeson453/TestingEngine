@@ -64,10 +64,9 @@ const MODEL_NAMES = [
   'ConditionalFrequencyModel',
   'RegimeAdjustedModel',
   'StreakAwareModel',
-  // MomentumReversionModel removed: r=-0.005 vs hit (negatively correlated)
+  'MomentumReversionModel',
   'ShortWindowBayesianModel',
   'VolatilityAdjustedModel',
-  'Streak2RecoveryModel',
 ] as const;
 
 export type OnlineModelName = (typeof MODEL_NAMES)[number];

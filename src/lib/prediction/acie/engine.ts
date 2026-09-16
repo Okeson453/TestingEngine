@@ -42,7 +42,6 @@ import { acieHeavyEvidenceLatencyMs } from '../metrics-acie.ts';
 import { PlattCalibrator } from '../calibration/platt-calibrator.ts';
 import { scheduleAcieStateSave } from './state-persistence.ts';
 import { getLogger } from '../../observability/logger.ts';
-import { evaluateMotifGate } from './temporal-motif-gate.ts';
 
 const logger = getLogger('acie-engine');
 
@@ -114,8 +113,7 @@ export class ACIEEngine {
     this.heavyEvery = opts.heavyValidationEvery ?? 50;
     // Evidence window derives from unified history (§7.3).
     this.evidenceMaxN = Number(process.env.ACIE_EVIDENCE_MAX_N ?? Math.min(1000, ACIE_MAX_HISTORY));
-    // Faster regime adaptation (was 0.05)
-    this.ewmaAlpha = opts.ewmaAlpha ?? 0.10;
+    this.ewmaAlpha = opts.ewmaAlpha ?? 0.05;
   }
 
   /** Seed historical crashes — each point still goes through lightweight online updates. */
@@ -136,30 +134,11 @@ export class ACIEEngine {
     online: OnlineAdaptiveState;
     crashPoints: number[];
     consecutiveLosses: number;
-    /** §5.2 Platt params so calibrated path survives restart */
-    platt?: {
-      A: number;
-      B: number;
-      fitted: boolean;
-      sampleCount: number;
-      preferCalibrated: boolean;
-      rawBrierEwma: number;
-      calBrierEwma: number;
-    };
   } {
     return {
       online: { ...this.online },
       crashPoints: this.crashPoints.slice(-ACIE_MAX_HISTORY),
       consecutiveLosses: this.consecutiveLosses,
-      platt: {
-        A: this.platt.A,
-        B: this.platt.B,
-        fitted: this.platt.fitted,
-        sampleCount: this.platt.sampleCount,
-        preferCalibrated: this.preferCalibrated,
-        rawBrierEwma: this.rawBrierEwma,
-        calBrierEwma: this.calBrierEwma,
-      },
     };
   }
 
@@ -167,15 +146,6 @@ export class ACIEEngine {
     online?: OnlineAdaptiveState;
     crashPoints?: number[];
     consecutiveLosses?: number;
-    platt?: {
-      A?: number;
-      B?: number;
-      fitted?: boolean;
-      sampleCount?: number;
-      preferCalibrated?: boolean;
-      rawBrierEwma?: number;
-      calBrierEwma?: number;
-    };
   }): void {
     if (snap.crashPoints?.length) {
       this.seedHistory(
@@ -191,22 +161,6 @@ export class ACIEEngine {
     }
     if (typeof snap.consecutiveLosses === 'number') {
       this.consecutiveLosses = snap.consecutiveLosses;
-    }
-    // Restore Platt so Strategy sees calibrated probabilities immediately after restart.
-    if (snap.platt && typeof snap.platt.A === 'number' && typeof snap.platt.B === 'number') {
-      this.platt.A = snap.platt.A;
-      this.platt.B = snap.platt.B;
-      this.platt.fitted = Boolean(snap.platt.fitted);
-      this.platt.sampleCount = Number(snap.platt.sampleCount ?? 0);
-      if (typeof snap.platt.preferCalibrated === 'boolean') {
-        this.preferCalibrated = snap.platt.preferCalibrated;
-      }
-      if (typeof snap.platt.rawBrierEwma === 'number') {
-        this.rawBrierEwma = snap.platt.rawBrierEwma;
-      }
-      if (typeof snap.platt.calBrierEwma === 'number') {
-        this.calBrierEwma = snap.platt.calBrierEwma;
-      }
     }
   }
 
@@ -514,7 +468,7 @@ export class ACIEEngine {
       currentExposure: riskState?.currentExposure ?? 0,
       consecutiveLosses: riskState?.consecutiveLosses ?? this.consecutiveLosses,
       dailyEntriesUsed: riskState?.dailyEntriesUsed ?? 0,
-      dailyEntriesLimit: riskState?.dailyEntriesLimit ?? 1500,
+      dailyEntriesLimit: riskState?.dailyEntriesLimit ?? 500,
       balance: riskState?.balance ?? 0,
     };
 
@@ -607,46 +561,6 @@ export class ACIEEngine {
       };
     }
 
-    // Layer 3: temporal motif gate — OFF by default (checkout; set ACIE_MOTIF_GATE=1 to enable).
-    // Disable with ACIE_MOTIF_GATE=0 if higher volume is preferred over ~80% WR.
-    const motifGateEnabled = process.env.ACIE_MOTIF_GATE === '1';
-    let motifGate:
-      | { passed: boolean; motif: '001111' | '011011' | null; enabled: boolean }
-      | undefined;
-    if (motifGateEnabled) {
-      const solRecords = this.sol.getRecords();
-      const r = evaluateMotifGate(solRecords);
-      motifGate = { passed: r.passes, motif: r.matchedMotif, enabled: true };
-      if (signal && !r.passes) {
-        signal = null;
-        strategy.action = 'SKIP';
-        strategy.isOpportunity = false;
-        strategy.reason =
-          (strategy.reason ? strategy.reason + ' | ' : '') +
-          'Motif gate: prior 6 outcomes not in {001111, 011011}.';
-        strategy.stake = 0;
-        logger.info(
-          {
-            component: 'acie-motif-gate',
-            event: 'MOTIF_BLOCK',
-            matchedMotif: r.matchedMotif,
-            historyDepth: r.historyDepth,
-          },
-          'pattern motif gate blocked ENTRY (need 001111 or 011011)',
-        );
-      } else if (signal && r.passes) {
-        logger.info(
-          {
-            component: 'acie-motif-gate',
-            event: 'MOTIF_PASS',
-            matchedMotif: r.matchedMotif,
-            historyDepth: r.historyDepth,
-          },
-          `pattern motif gate passed (${r.matchedMotif})`,
-        );
-      }
-    }
-
     return {
       psi,
       evidence: { ...evidence, status: evidenceStatus },
@@ -654,7 +568,6 @@ export class ACIEEngine {
       signal,
       sequenceState,
       regime,
-      motifGate,
       // Pass 19: expose the exact decision inputs for per-round edge logging.
       diagnostics: {
         modelProbabilities: { ...this.lastModelProbabilities },
@@ -667,11 +580,6 @@ export class ACIEEngine {
     };
   }
 
-  /**
-   * §5.3 Lightweight real-time evidence — O(1) every crash.
-   * Uses online EWMA Brier, drift, calibration bins, and short-window
-   * residual bias so Strategy reacts within a few rounds (not every 50).
-   */
   private lightweightEvidence(): EvidenceReport {
     const bins = onlineCalibrationBins(this.online).filter((b) => b.sampleSize > 0);
     const meanCal =
@@ -680,22 +588,14 @@ export class ACIEEngine {
           bins.reduce((s, b) => s + b.sampleSize, 0)
         : 0.1;
     const n = this.online.observationCount;
-    const residualBias = Math.abs(this.online.lastDrift?.residualBias ?? 0);
-    const drift = Boolean(this.online.lastDrift?.detected);
-    const brier = this.online.ewmaBrier;
-
     let status: EvidenceReport['status'] = 'INSUFFICIENT';
-    // Tighter real-time thresholds: react before the heavy 50-round cycle.
-    if (n >= 200 && !drift && brier < 0.22 && residualBias < 0.08 && meanCal < 0.12) {
+    if (n >= 500 && !this.online.lastDrift.detected && this.online.ewmaBrier < 0.22) {
       status = 'SUPPORTED';
-    } else if (n >= 80 && brier < 0.28 && residualBias < 0.12) {
+    } else if (n >= 150 && this.online.ewmaBrier < 0.28) {
       status = 'WEAK';
-    } else if (n >= 80 && (drift || brier > 0.32 || residualBias > 0.15)) {
+    } else if (n >= 150 && (this.online.lastDrift.detected || this.online.ewmaBrier > 0.35)) {
       status = 'DEGRADED';
-    } else if (n >= 80) {
-      status = 'WEAK';
     }
-
     return {
       status,
       baselineProbability: this.online.ewmaHitRate,
@@ -703,13 +603,13 @@ export class ACIEEngine {
       improvementSignificant: false,
       calibrationStatus: meanCal < 0.05 ? 'good' : meanCal < 0.1 ? 'good' : 'poor',
       meanCalibrationError: meanCal,
-      performanceTrend: drift ? 'degrading' : 'stable',
-      driftDetected: drift,
+      performanceTrend: this.online.lastDrift.detected ? 'degrading' : 'stable',
+      driftDetected: this.online.lastDrift.detected,
       sampleSize: n,
-      sampleAdequate: n >= 200,
+      sampleAdequate: n >= 500,
       recommendedMode:
         status === 'SUPPORTED' ? 'ACTIVE' : status === 'WEAK' ? 'CAUTIOUS' : 'OBSERVATION',
-      reasoning: `Online evidence n=${n} ewmaBrier=${brier.toFixed(3)} residual=${residualBias.toFixed(3)} drift=${this.online.lastDrift.reason}`,
+      reasoning: `Online evidence n=${n} ewmaBrier=${this.online.ewmaBrier.toFixed(3)} drift=${this.online.lastDrift.reason}`,
       calibration: null,
     };
   }
