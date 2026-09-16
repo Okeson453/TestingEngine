@@ -49,14 +49,30 @@ const outcomes: Outcome[] = [];
 
 let currentEdge = Math.max(MIN_EDGE_FLOOR, Math.min(MAX_EDGE, BASE_EDGE));
 let lastOutcomeAt = 0;
+/** Consecutive no-issue decisions — recover from adaptive lock (needP≈80%). */
+let consecutiveNoIssue = 0;
+const VETO_RECOVERY_AFTER = Math.max(
+  5,
+  Number(process.env.SIGNAL_EDGE_VETO_RECOVERY_AFTER ?? 12),
+);
 
 export function recordSignalOutcome(win: boolean, at: number = Date.now()): void {
   outcomes.push({ win, at });
   lastOutcomeAt = at;
+  consecutiveNoIssue = 0;
   if (outcomes.length > WINDOW * 2) {
     outcomes.splice(0, outcomes.length - WINDOW);
   }
   recompute();
+}
+
+/** After many consecutive no-issue rounds, snap edge to BASE (unblock book). */
+export function recordNoIssueDecision(): void {
+  consecutiveNoIssue += 1;
+  if (consecutiveNoIssue >= VETO_RECOVERY_AFTER && currentEdge > BASE_EDGE + 1e-9) {
+    currentEdge = Math.max(MIN_EDGE_FLOOR, Math.min(MAX_EDGE, BASE_EDGE));
+    consecutiveNoIssue = 0;
+  }
 }
 
 function timeWeight(at: number, now: number): number {
@@ -145,5 +161,6 @@ export function getAdaptiveEdgeStats(): {
 export function _resetAdaptiveEdgeForTests(): void {
   outcomes.length = 0;
   lastOutcomeAt = 0;
+  consecutiveNoIssue = 0;
   currentEdge = Math.max(MIN_EDGE_FLOOR, Math.min(MAX_EDGE, BASE_EDGE));
 }

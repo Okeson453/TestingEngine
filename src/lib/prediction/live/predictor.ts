@@ -65,7 +65,7 @@ import {
   evaluateSheath,
   recordPredictionOutcome,
 } from "@/lib/core/sheath-mode";
-import { getAdaptiveMinEdge, getAdaptiveEdgeStats } from "@/lib/prediction/live/adaptive-edge";
+import { getAdaptiveMinEdge, getAdaptiveEdgeStats, recordNoIssueDecision } from "@/lib/prediction/live/adaptive-edge";
 import { recordNoBetDecision } from "@/lib/prediction/live/decision-audit";
 import {
   shouldForceLossCooldownSkip,
@@ -1831,6 +1831,9 @@ export async function onGameEndPredict(
     });
     const skip = skipCheck.skip;
     const vetoReason = skipCheck.reason;
+    if (skip && vetoReason !== "loss_cooldown") {
+      try { recordNoIssueDecision(); } catch { /* soft */ }
+    }
     if (skip && vetoReason === "loss_cooldown") {
       consumeLossCooldownSkip(targetGameId);
       logger.info(
@@ -1960,7 +1963,7 @@ export async function onGameEndPredict(
       return {
         predictionId: null,
         targetGameId,
-        kind: "skipped_no_edge",
+        kind: "skipped_no_edge", // recordNoIssue below
         temporalValidity: "TEMPORALLY_VALID",
         sourceGameId: gameId,
         sourceCrashAt: crashedAt,
